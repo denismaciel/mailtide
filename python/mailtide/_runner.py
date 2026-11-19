@@ -161,16 +161,21 @@ class Runner:
         return await self._core.accounts()
 
     async def drift(
-        self, account: str, message_ids: list[str] | None = None, sample: int = 50
+        self,
+        account: str,
+        message_ids: list[str] | None = None,
+        sample: int = 50,
+        budget_s: float = 120.0,
     ) -> list[DriftResult]:
         """Compare the mirror with Gmail, read-only, for ``message_ids`` or a
         random ``sample`` of mirrored messages. ``verdict == "differs"`` is
         drift; ``explained`` differences (pending actions, awaiting
         verification, Gmail ahead of the mirror) are not. Fetches go through
-        the quota gate like a sync's."""
+        the quota gate like a sync's, waiting out deferrals within
+        ``budget_s``; any left over are reported as ``deferred``."""
         if message_ids is None:
             message_ids = await self._sample(account, sample)
-        return await self._core.drift(account, message_ids)
+        return await self._core.drift(account, message_ids, budget_s)
 
     async def _sample(self, account: str, size: int) -> list[str]:
         ids: list[str] = []

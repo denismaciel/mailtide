@@ -365,12 +365,15 @@ where
 
     /// Compare the mirror with Gmail for `ids` (a sample the host picks),
     /// read-only: nothing is fixed, and the requests go through the quota
-    /// gate like a sync's. Ids the mirror doesn't have are left out.
+    /// gate like a sync's, waiting out its deferrals within `budget`. Ids the
+    /// mirror doesn't have are left out.
     pub async fn drift(
         &self,
         account: &AccountId,
         ids: &[MessageId],
+        budget: Duration,
     ) -> Result<Vec<(MessageId, Checked)>, RunError> {
+        let deadline = Instant::now() + budget;
         let views = self
             .store
             .messages(account, ids)
@@ -393,7 +396,17 @@ where
                 epoch: mailtide::ids::Epoch(0),
                 seq,
             };
-            let result = match self.gmail(command, call, &mut report).await? {
+            let mut answer = self.gmail(command, call.clone(), &mut report).await?;
+            while let EventKind::RequestDeferred { until, .. } = answer {
+                let wait =
+                    Duration::from_millis(u64::try_from(until.0 - self.clock.now().0).unwrap_or(0));
+                if !self.clock.can_wait() || Instant::now() + wait >= deadline {
+                    break;
+                }
+                tokio::time::sleep(wait).await;
+                answer = self.gmail(command, call.clone(), &mut report).await?;
+            }
+            let result = match answer {
                 EventKind::MessageFetched { message, .. } => {
                     Checked::Compared(mailtide::drift::compare(&view, Some(&message)))
                 }

@@ -1280,9 +1280,14 @@ mod _core {
             self: Arc<Self>,
             account: AccountId,
             ids: Vec<MessageId>,
+            budget: Duration,
         ) -> PyResult<Vec<DriftResult>> {
             self.ensure_schema().await?;
-            let checked = self.inner.drift(&account, &ids).await.map_err(run_error)?;
+            let checked = self
+                .inner
+                .drift(&account, &ids, budget)
+                .await
+                .map_err(run_error)?;
             Ok(checked
                 .into_iter()
                 .map(|(id, checked)| DriftResult::new(id, checked))
@@ -1583,17 +1588,20 @@ mod _core {
             future(py, &self.shared, self.shared.clone().accounts())
         }
 
+        #[pyo3(signature = (account, message_ids, budget_s=120.0))]
         fn drift<'py>(
             &self,
             py: Python<'py>,
             account: &str,
             message_ids: Vec<String>,
+            budget_s: f64,
         ) -> PyResult<Bound<'py, PyAny>> {
             let ids = message_ids.into_iter().map(MessageId).collect();
+            let budget = seconds(budget_s, "budget_s")?;
             future(
                 py,
                 &self.shared,
-                self.shared.clone().drift(account_id(account)?, ids),
+                self.shared.clone().drift(account_id(account)?, ids, budget),
             )
         }
 
@@ -1842,17 +1850,20 @@ mod _core {
 
         /// Compare the mirror with Gmail for `message_ids`; see
         /// `mailtide.Runner.drift`.
+        #[pyo3(signature = (account, message_ids, budget_s=120.0))]
         fn drift(
             &self,
             py: Python<'_>,
             account: &str,
             message_ids: Vec<String>,
+            budget_s: f64,
         ) -> PyResult<Vec<DriftResult>> {
             let ids = message_ids.into_iter().map(MessageId).collect();
+            let budget = seconds(budget_s, "budget_s")?;
             block(
                 py,
                 &self.shared,
-                self.shared.clone().drift(account_id(account)?, ids),
+                self.shared.clone().drift(account_id(account)?, ids, budget),
             )
         }
 
