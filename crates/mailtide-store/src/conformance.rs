@@ -83,6 +83,15 @@ where
         ("admitted actions survive a newer engine's claim", |s| {
             Box::pin(admission_is_unfenced(s))
         }),
+        ("status reads without claiming", |s| {
+            Box::pin(status_does_not_claim(s))
+        }),
+        ("resume restores a blocked account", |s| {
+            Box::pin(resume_restores(s))
+        }),
+        ("forget removes an account and fences its engine", |s| {
+            Box::pin(forget_fences(s))
+        }),
         (
             "blocking wraps the stored state, not the engine's view",
             |s| Box::pin(block_wraps_stored_state(s)),
@@ -676,5 +685,142 @@ async fn admission_is_unfenced<S: Store>(store: &S) -> Result<(), String> {
         jobs.iter()
             .any(|job| job.kind == JobKind::Deliver(MessageId("a".into()))),
         "the current engine delivers it",
+    )
+}
+
+fn block_commit(snapshot: &StoreSnapshot, seq: u64) -> Commit {
+    let mut c = commit(snapshot, seq);
+    c.account_ops = vec![mailtide::commit::AccountOp::Block(
+        mailtide::retry::BlockingFailure {
+            class: mailtide::retry::Blocking::Account(
+                mailtide::retry::AccountProblem::DelegationRevoked,
+            ),
+            detail: "revoked".into(),
+        },
+    )];
+    c
+}
+
+async fn status_does_not_claim<S: Store>(store: &S) -> Result<(), String> {
+    expect(
+        store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .is_none(),
+        "an unknown account has no status",
+    )?;
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![observe("a", &["INBOX"], 1), observe("b", &["INBOX"], 2)];
+    apply(store, &c).await?;
+    let status = store
+        .status(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("status of a known account")?;
+    expect(
+        status.epoch == snapshot.epoch,
+        "reading status must not bump the epoch",
+    )?;
+    expect(status.messages == 2, "two messages")?;
+    expect(status.pending_imports == 2, "both await import")?;
+    expect(status.jobs.ready == 2, "two import jobs ready")?;
+    let accounts = store.accounts().await.map_err(|e| format!("{e:?}"))?;
+    expect(accounts == vec![account()], "the account is listed")?;
+    // The running engine's commits still apply: nothing was claimed.
+    let mut later = commit(&snapshot, 1);
+    later.messages = vec![observe("c", &["INBOX"], 3)];
+    expect(
+        matches!(apply(store, &later).await?, CommitOutcome::Applied { .. }),
+        "the engine keeps its claim",
+    )
+}
+
+async fn resume_restores<S: Store>(store: &S) -> Result<(), String> {
+    expect(
+        store
+            .resume(&account(), Timestamp(0))
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::status::ResumeOutcome::Unknown,
+        "unknown accounts can't resume",
+    )?;
+    let snapshot = claim(store).await?;
+    expect(
+        store
+            .resume(&account(), Timestamp(0))
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::status::ResumeOutcome::NotBlocked,
+        "a running account isn't blocked",
+    )?;
+    let mut c = commit(&snapshot, 0);
+    c.cursor = Some(CursorMove {
+        expected: None,
+        to: HistoryId(5),
+    });
+    c.sync = Some(mailtide::state::SyncState::Live);
+    apply(store, &c).await?;
+    apply(store, &block_commit(&snapshot, 1)).await?;
+    let outcome = store
+        .resume(&account(), Timestamp(0))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        matches!(
+            outcome,
+            mailtide::status::ResumeOutcome::Resumed {
+                phase: mailtide::state::SyncPhase::Live,
+                ..
+            }
+        ),
+        "resumes into the phase it was blocked in",
+    )?;
+    let status = store
+        .status(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("status")?;
+    expect(
+        status.sync == mailtide::state::SyncState::Live,
+        "no longer blocked",
+    )
+}
+
+async fn forget_fences<S: Store>(store: &S) -> Result<(), String> {
+    expect(
+        store
+            .forget(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::status::ForgetOutcome::Unknown,
+        "nothing to forget",
+    )?;
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![observe("a", &["INBOX"], 1)];
+    apply(store, &c).await?;
+    expect(
+        store
+            .forget(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::status::ForgetOutcome::Forgotten { messages: 1 },
+        "one message forgotten",
+    )?;
+    expect(
+        store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .is_none(),
+        "the account is gone",
+    )?;
+    let mut late = commit(&snapshot, 1);
+    late.messages = vec![observe("b", &["INBOX"], 2)];
+    expect(
+        matches!(apply(store, &late).await?, CommitOutcome::Rejected(_)),
+        "the old engine is fenced out",
     )
 }

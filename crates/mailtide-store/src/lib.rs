@@ -18,7 +18,9 @@ use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
 
+pub mod config;
 pub mod conformance;
 pub mod memory;
 pub mod postgres;
@@ -37,6 +39,8 @@ pub enum StoreError {
     Rejected(mailtide::commit::Rejection),
     /// Stored data failed validation when read back.
     Corrupt(String),
+    /// The store can't be opened with this configuration.
+    Misconfigured(String),
 }
 
 /// The store contract.
@@ -84,6 +88,32 @@ pub trait Store: Send + Sync {
         request: &ActionRequest,
         now: Timestamp,
     ) -> impl Future<Output = Result<u32, StoreError>> + Send;
+
+    /// What the store holds about an account, read without claiming it (so
+    /// it never preempts a running sync). `None` for an unknown account.
+    fn status(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<Option<AccountStatus>, StoreError>> + Send;
+
+    /// Every account the store holds.
+    fn accounts(&self) -> impl Future<Output = Result<Vec<AccountId>, StoreError>> + Send;
+
+    /// Resume a blocked account after an operator fixed the cause (see
+    /// [`mailtide::mirror::AccountMirror::resume`]).
+    fn resume(
+        &self,
+        account: &AccountId,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<ResumeOutcome, StoreError>> + Send;
+
+    /// Delete everything the store holds for an account (shadow resets,
+    /// offboarding). An engine still running for it is fenced out: its
+    /// commits are rejected. Blob content is the caller's to delete.
+    fn forget(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<ForgetOutcome, StoreError>> + Send;
 
     /// How hosts see these messages; unknown ids are left out.
     fn messages(

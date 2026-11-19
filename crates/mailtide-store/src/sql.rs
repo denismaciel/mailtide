@@ -24,6 +24,7 @@ use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
 use mailtide::revision::{Change, ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
+use mailtide::status::{AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome};
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolOptions;
 use sqlx::{Any, AssertSqlSafe, Pool, Row, Transaction};
@@ -31,6 +32,7 @@ use sqlx::{Any, AssertSqlSafe, Pool, Row, Transaction};
 type AnyPool = Pool<Any>;
 
 use crate::StoreError;
+use crate::config::{Connect, DatabaseUrl, PoolConfig};
 
 /// Which database the URL points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,26 +163,48 @@ fn scope_from(text: &str) -> Result<ListScope, StoreError> {
 }
 
 impl SqlStore {
-    /// Connect to `url` (`postgres://…` or `sqlite:…`).
-    pub async fn connect(url: &str) -> Result<Self, StoreError> {
+    /// Open a store at `url` with `pool` limits (Postgres only; `SQLite`
+    /// always uses one connection, opened eagerly).
+    pub async fn connect(url: &DatabaseUrl, pool: &PoolConfig) -> Result<Self, StoreError> {
         sqlx::any::install_default_drivers();
-        let dialect = if url.starts_with("sqlite:") {
-            Dialect::Sqlite
-        } else {
-            Dialect::Postgres
-        };
-        let options = match dialect {
+        let (dialect, options, connect) = match url {
             // One connection: SQLite serializes writers, and an in-memory
             // database lives only as long as its connection.
-            Dialect::Sqlite => PoolOptions::<Any>::new()
-                .max_connections(1)
-                .min_connections(1)
-                .idle_timeout(None)
-                .max_lifetime(None),
-            Dialect::Postgres => PoolOptions::<Any>::new().max_connections(8),
+            DatabaseUrl::SqliteMemory(_) | DatabaseUrl::SqliteFile(_) => (
+                Dialect::Sqlite,
+                PoolOptions::<Any>::new()
+                    .max_connections(1)
+                    .min_connections(1)
+                    .idle_timeout(None)
+                    .max_lifetime(None),
+                Connect::Eager,
+            ),
+            DatabaseUrl::Postgres(_) => (
+                Dialect::Postgres,
+                PoolOptions::<Any>::new()
+                    .max_connections(pool.max_connections())
+                    .min_connections(pool.min_connections())
+                    .acquire_timeout(pool.acquire_timeout())
+                    .idle_timeout(pool.idle_timeout())
+                    .max_lifetime(pool.max_lifetime()),
+                pool.connect(),
+            ),
         };
-        let pool = options.connect(url).await.map_err(|e| unavailable(&e))?;
+        let pool = match connect {
+            Connect::Lazy => options.connect_lazy(url.as_str()),
+            Connect::Eager => options.connect(url.as_str()).await,
+        }
+        .map_err(|e| unavailable(&e))?;
         Ok(Self { pool, dialect })
+    }
+
+    /// Whether the database answers within the pool's acquire timeout.
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| unavailable(&e))
     }
 
     /// Bring the schema up to date. Safe to call on every start and from
@@ -259,15 +283,49 @@ impl SqlStore {
         self.pool.begin().await.map_err(|e| unavailable(&e))
     }
 
+    /// The account row, locked for the transaction (Postgres).
     async fn load_account(
         &self,
         tx: &mut Transaction<'static, Any>,
         account: &AccountId,
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
+        self.read_account(tx, account, self.lock_suffix()).await
+    }
+
+    /// The account row without locking it, for reads that must not wait on
+    /// a running commit.
+    async fn load_account_unlocked(
+        &self,
+        tx: &mut Transaction<'static, Any>,
+        account: &AccountId,
+    ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
+        self.read_account(tx, account, "").await
+    }
+
+    async fn count(
+        &self,
+        tx: &mut Transaction<'static, Any>,
+        sql: &'static str,
+        account: &AccountId,
+    ) -> Result<u64, StoreError> {
+        let row = sqlx::query(sql)
+            .bind(account.as_str())
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        let n: i64 = row.try_get("n").map_err(|e| corrupt("count", e))?;
+        Ok(uint(n))
+    }
+
+    async fn read_account(
+        &self,
+        tx: &mut Transaction<'static, Any>,
+        account: &AccountId,
+        lock: &'static str,
+    ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
             "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq
-             FROM mailtide_accounts WHERE account = $1{}",
-            self.lock_suffix()
+             FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
         let row = sqlx::query(AssertSqlSafe(sql))
@@ -501,7 +559,7 @@ impl SqlStore {
         tx: &mut Transaction<'static, Any>,
         before: &AccountMirror,
         after: &AccountMirror,
-        commit: &Commit,
+        labels: &[LabelOp],
     ) -> Result<(), StoreError> {
         let account = after.account.as_str();
         Self::write_account(tx, &after.account, &after.record, after.seq).await?;
@@ -561,7 +619,7 @@ impl SqlStore {
         }
         write_seen(tx, account, before, after).await?;
         write_intents(tx, account, before, after).await?;
-        for op in &commit.labels {
+        for op in labels {
             match op {
                 LabelOp::ReplaceAll(labels) => {
                     sqlx::query("DELETE FROM mailtide_labels WHERE account = $1")
@@ -675,7 +733,7 @@ impl SqlStore {
                 tx.rollback().await.map_err(|e| unavailable(&e))?;
             }
             CommitOutcome::Applied { .. } => {
-                Self::write_diff(&mut tx, &before, &mirror, commit).await?;
+                Self::write_diff(&mut tx, &before, &mirror, &commit.labels).await?;
                 tx.commit()
                     .await
                     .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
@@ -1060,6 +1118,153 @@ impl crate::Store for SqlStore {
         Self::changes(self, account, since, limit).await
     }
 
+    async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {
+        let mut tx = self.begin().await?;
+        let Some((record, seq)) = self.load_account_unlocked(&mut tx, account).await? else {
+            return Ok(None);
+        };
+        let messages = self
+            .count(
+                &mut tx,
+                "SELECT COUNT(*) AS n FROM mailtide_messages WHERE account = $1",
+                account,
+            )
+            .await?;
+        let pending_imports = self
+            .count(
+                &mut tx,
+                "SELECT COUNT(*) AS n FROM mailtide_messages WHERE account = $1 AND content IS NULL",
+                account,
+            )
+            .await?;
+        let unverified = self
+            .count(
+                &mut tx,
+                "SELECT COUNT(*) AS n FROM mailtide_messages WHERE account = $1 AND unverified IS NOT NULL",
+                account,
+            )
+            .await?;
+        let mut jobs = JobCounts::default();
+        for row in sqlx::query(
+            "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure FROM mailtide_jobs WHERE account = $1",
+        )
+        .bind(account.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| unavailable(&e))?
+        {
+            jobs.add(&job_from_row(&row)?.state);
+        }
+        let mut actions = ActionCounts::default();
+        for row in sqlx::query("SELECT intent FROM mailtide_intents WHERE account = $1")
+            .bind(account.as_str())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+        {
+            let text: String = row.try_get("intent").map_err(|e| corrupt("intent", e))?;
+            actions.add(&parse::<Intent>("intent", &text)?.state);
+        }
+        tx.rollback().await.map_err(|e| unavailable(&e))?;
+        Ok(Some(AccountStatus {
+            account: account.clone(),
+            sync: record.sync,
+            epoch: record.epoch,
+            cursor: record.cursor,
+            watch_expiration: record.watch_expiration,
+            last_activity: record.last_activity,
+            cooldown: record.cooldown,
+            state: seq,
+            messages,
+            pending_imports,
+            unverified,
+            jobs,
+            actions,
+        }))
+    }
+
+    async fn accounts(&self) -> Result<Vec<AccountId>, StoreError> {
+        let rows = sqlx::query("SELECT account FROM mailtide_accounts ORDER BY account")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        rows.iter()
+            .map(|row| {
+                let text: String = row.try_get("account").map_err(|e| corrupt("account", e))?;
+                AccountId::parse(&text).map_err(|e| corrupt("account", format!("{e:?}")))
+            })
+            .collect()
+    }
+
+    async fn resume(
+        &self,
+        account: &AccountId,
+        now: Timestamp,
+    ) -> Result<ResumeOutcome, StoreError> {
+        let mut tx = self.begin().await?;
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Ok(ResumeOutcome::Unknown);
+        };
+        let mut mirror = AccountMirror::new(account.clone());
+        mirror.record = record;
+        mirror.seq = seq;
+        for row in sqlx::query(
+            "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure FROM mailtide_jobs WHERE account = $1 AND state = 'blocked'",
+        )
+        .bind(account.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| unavailable(&e))?
+        {
+            let job = job_from_row(&row)?;
+            mirror.jobs.insert(job.kind.clone(), job);
+        }
+        let before = mirror.clone();
+        let outcome = mirror.resume(now);
+        Self::write_diff(&mut tx, &before, &mirror, &[]).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(outcome)
+    }
+
+    async fn forget(&self, account: &AccountId) -> Result<ForgetOutcome, StoreError> {
+        let mut tx = self.begin().await?;
+        if self.load_account(&mut tx, account).await?.is_none() {
+            return Ok(ForgetOutcome::Unknown);
+        }
+        let messages = self
+            .count(
+                &mut tx,
+                "SELECT COUNT(*) AS n FROM mailtide_messages WHERE account = $1",
+                account,
+            )
+            .await?;
+        for table in [
+            "mailtide_messages",
+            "mailtide_tombstones",
+            "mailtide_jobs",
+            "mailtide_seen",
+            "mailtide_labels",
+            "mailtide_intents",
+            "mailtide_changes",
+            "mailtide_accounts",
+        ] {
+            // Table names are constants, never input.
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE account = $1"
+            )))
+            .bind(account.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(ForgetOutcome::Forgotten { messages })
+    }
+
     async fn admit(
         &self,
         account: &AccountId,
@@ -1103,7 +1308,7 @@ impl crate::Store for SqlStore {
             .await?;
         let before = mirror.clone();
         let admitted = mirror.admit_action(request, now);
-        Self::write_diff(&mut tx, &before, &mirror, &carrier).await?;
+        Self::write_diff(&mut tx, &before, &mirror, &[]).await?;
         tx.commit()
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;

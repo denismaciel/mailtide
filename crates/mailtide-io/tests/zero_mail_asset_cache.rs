@@ -295,6 +295,10 @@ impl BlobStore for Unavailable {
     async fn delete(&self, _key: &BlobRef) -> Result<(), BlobError> {
         Err(BlobError::Unavailable("R2 unavailable".into()))
     }
+
+    async fn delete_account(&self, _account: &AccountId) -> Result<u64, BlobError> {
+        Err(BlobError::Unavailable("R2 unavailable".into()))
+    }
 }
 
 /// Zero: mail-asset-cache > immutable mailbox attachment cache > returns provider data when R2 reads or writes fail

@@ -12,22 +12,32 @@ Status: v0.1, pre-release. See [SPEC.md](SPEC.md) and
 
 ```python
 import mailtide
+from mailtide.config import Blobs, Config, Database, Poll
 
 runner = mailtide.Runner(
-    "postgres://…/app",  # or "postgres:///app?host=/socket/dir", "sqlite:mail.db?mode=rwc"
-    "gs://bucket/mail",  # raw .eml blobs: gs://, s3://, file:///
-    token_source,  # account -> (access_token, expires_at_ms), sync or async
-    watch_topic="projects/p/topics/gmail",
+    Config(
+        # sqlx URLs: postgres://u@host/db, a Unix socket as
+        # postgres:///db?host=/cloudsql/project:region:instance, or sqlite:…
+        database=Database("postgres:///app?host=/cloudsql/p:r:i", max_connections=2),
+        blobs=Blobs("gs://bucket/mail"),  # raw .eml: gs://, s3://, file:///, memory:///
+        watch=Poll(),  # the host owns users.watch; or Topic("projects/p/topics/gmail")
+    ),
+    token_source,  # account -> (access_token, expires_at_ms), sync or async; cached
 )
-await runner.migrate()
+await runner.migrate()  # in the deploy step
 
 outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
-outcome.stop, outcome.next_run_at_ms
-
-await runner.act("alice@example.com", "archive", thread_id="18c…")  # shows at once
+await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from request paths
+status = await runner.status("alice@example.com")  # never preempts a running sync
 page = await runner.changes("alice@example.com", since=None)  # change feed
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 ```
+
+Invalid configuration raises `ValueError` naming the field. Failures are typed:
+`StoreUnavailable`, `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`,
+`QuotaGateError`, `Superseded` (all `MailtideError`). A blocked account
+(`DelegationRevoked` from the token source) stays blocked until
+`await runner.resume(account)`; `forget(account)` deletes its rows and blobs.
 
 No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
 

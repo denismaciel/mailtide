@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import mailtide
 import pytest
+from conftest import make_config, tokens
 from fake_gmail import Mailbox
 
 ACCOUNT = "alice@example.com"
@@ -17,12 +18,7 @@ def test_bootstrap_import_and_follow(gmail: tuple[Mailbox, str]) -> None:
     mailbox, origin = gmail
     mailbox.add("m1", ["INBOX", "UNREAD"])
     mailbox.add("m2", [])
-    runner = mailtide.BlockingRunner(
-        "sqlite::memory:",
-        "memory:///",
-        lambda account: ("test-token", 2**62),
-        gmail_origin=origin,
-    )
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
     runner.migrate()
 
     outcome = runner.run(ACCOUNT, budget_s=30)
@@ -46,13 +42,7 @@ def test_bootstrap_import_and_follow(gmail: tuple[Mailbox, str]) -> None:
 def test_actions_overlay_deliver_and_settle(gmail: tuple[Mailbox, str]) -> None:
     mailbox, origin = gmail
     mailbox.add("m1", ["INBOX", "UNREAD"])
-    runner = mailtide.BlockingRunner(
-        "sqlite::memory:",
-        "memory:///",
-        lambda account: ("test-token", 2**62),
-        gmail_origin=origin,
-        confirm_timeout_s=0,
-    )
+    runner = mailtide.BlockingRunner(make_config(origin, confirm_timeout_s=0), tokens)
     runner.migrate()
     assert runner.run(ACCOUNT, budget_s=30).stop == "idle"
 
@@ -90,13 +80,7 @@ def test_concurrent_use_from_many_threads(gmail: tuple[Mailbox, str]) -> None:
     ids = [f"m{i}" for i in range(24)]
     for mid in ids:
         mailbox.add(mid, ["INBOX", "UNREAD"])
-    runner = mailtide.BlockingRunner(
-        "sqlite::memory:",
-        "memory:///",
-        lambda account: ("test-token", 2**62),
-        gmail_origin=origin,
-        confirm_timeout_s=0,
-    )
+    runner = mailtide.BlockingRunner(make_config(origin, confirm_timeout_s=0), tokens)
     runner.migrate()
 
     # Racing runs of one account: the store fences them; the newest wins.

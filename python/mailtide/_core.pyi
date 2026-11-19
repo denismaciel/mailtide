@@ -1,9 +1,17 @@
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, final
 
+from mailtide.config import Config
+
 class MailtideError(Exception): ...
 class DelegationRevoked(MailtideError): ...
 class InvalidPush(MailtideError): ...
+class StoreUnavailable(MailtideError): ...
+class OutcomeUnknown(MailtideError): ...
+class CorruptState(MailtideError): ...
+class BlobUnavailable(MailtideError): ...
+class QuotaGateError(MailtideError): ...
+class Superseded(MailtideError): ...
 
 @final
 class Status:
@@ -94,20 +102,50 @@ class ParsedMessage:
     attachments: list[Attachment]
 
 @final
+class AccountStatus:
+    account: str
+    phase: Literal["bootstrapping", "live", "reconciling", "blocked"]
+    blocked: str | None
+    epoch: int
+    cursor: int | None
+    watch_expiration_ms: int | None
+    last_activity_ms: int | None
+    cooldown_until_ms: int | None
+    state: str
+    messages: int
+    pending_imports: int
+    unverified: int
+    jobs_ready: int
+    jobs_running: int
+    jobs_blocked: int
+    actions_pending: int
+    actions_delivered: int
+    actions_blocked: int
+
+@final
+class ResumeResult:
+    outcome: Literal["resumed", "not_blocked", "unknown"]
+    phase: Literal["bootstrapping", "live", "reconciling"] | None
+    jobs: int
+
+@final
+class ForgetResult:
+    outcome: Literal["forgotten", "unknown"]
+    messages: int
+    blobs: int
+
+@final
+class Health:
+    database: Literal["ok", "unavailable"]
+    detail: str | None
+
+TokenSource = Callable[[str], tuple[str, int] | Awaitable[tuple[str, int]]]
+
+@final
 class Runner:
     """Internal: methods return asyncio futures; use ``mailtide.Runner``."""
 
-    def __init__(
-        self,
-        database_url: str,
-        blob_url: str,
-        token_source: Callable[[str], tuple[str, int] | Awaitable[tuple[str, int]]],
-        *,
-        watch_topic: str | None = None,
-        gmail_origin: str | None = None,
-        request_timeout_s: float = 60.0,
-        confirm_timeout_s: float = 60.0,
-    ) -> None: ...
+    def __init__(self, config: Config, token_source: TokenSource) -> None: ...
     def migrate(self) -> Awaitable[None]: ...
     def run(self, account: str, budget_s: float = 60.0) -> Awaitable[RunOutcome]: ...
     def act(
@@ -122,6 +160,22 @@ class Runner:
         destination: Literal["inbox", "archive"] = "inbox",
         budget_s: float = 30.0,
     ) -> Awaitable[RunOutcome]: ...
+    def admit(
+        self,
+        account: str,
+        action: Action,
+        *,
+        message_ids: list[str] | None = None,
+        thread_id: str | None = None,
+        add_labels: list[str] = ...,
+        remove_labels: list[str] = ...,
+        destination: Literal["inbox", "archive"] = "inbox",
+    ) -> Awaitable[int]: ...
+    def status(self, account: str) -> Awaitable[AccountStatus | None]: ...
+    def accounts(self) -> Awaitable[list[str]]: ...
+    def resume(self, account: str) -> Awaitable[ResumeResult]: ...
+    def forget(self, account: str) -> Awaitable[ForgetResult]: ...
+    def health(self) -> Awaitable[Health]: ...
     def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
     def changes(
         self, account: str, since: str | None = None, limit: int = 500
@@ -130,17 +184,7 @@ class Runner:
 
 @final
 class BlockingRunner:
-    def __init__(
-        self,
-        database_url: str,
-        blob_url: str,
-        token_source: Callable[[str], tuple[str, int]],
-        *,
-        watch_topic: str | None = None,
-        gmail_origin: str | None = None,
-        request_timeout_s: float = 60.0,
-        confirm_timeout_s: float = 60.0,
-    ) -> None: ...
+    def __init__(self, config: Config, token_source: TokenSource) -> None: ...
     def migrate(self) -> None: ...
     def run(self, account: str, budget_s: float = 60.0) -> RunOutcome: ...
     def act(
@@ -155,6 +199,22 @@ class BlockingRunner:
         destination: Literal["inbox", "archive"] = "inbox",
         budget_s: float = 30.0,
     ) -> RunOutcome: ...
+    def admit(
+        self,
+        account: str,
+        action: Action,
+        *,
+        message_ids: list[str] | None = None,
+        thread_id: str | None = None,
+        add_labels: list[str] = ...,
+        remove_labels: list[str] = ...,
+        destination: Literal["inbox", "archive"] = "inbox",
+    ) -> int: ...
+    def status(self, account: str) -> AccountStatus | None: ...
+    def accounts(self) -> list[str]: ...
+    def resume(self, account: str) -> ResumeResult: ...
+    def forget(self, account: str) -> ForgetResult: ...
+    def health(self) -> Health: ...
     def messages(self, account: str, message_ids: list[str]) -> list[MessageView]: ...
     def changes(self, account: str, since: str | None = None, limit: int = 500) -> ChangePage: ...
     def read_blob(self, account: str, message_id: str) -> bytes: ...

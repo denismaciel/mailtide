@@ -26,6 +26,33 @@ pub trait GmailTransport: Send + Sync {
     ) -> impl Future<Output = Result<HttpResponse, TransportError>> + Send;
 }
 
+/// HTTP settings for the Gmail transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// Gmail's origin; override only for tests (it receives the bearer token).
+    pub origin: String,
+    /// The whole request, connect to last byte.
+    pub request_timeout: Duration,
+    /// Establishing the connection.
+    pub connect_timeout: Duration,
+    /// Sent as `User-Agent`.
+    pub user_agent: String,
+}
+
+impl HttpConfig {
+    /// Gmail's origin, `timeout` per request, a 10 s connect timeout, and
+    /// `mailtide/<version>` as the user agent.
+    #[must_use]
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            origin: ORIGIN.to_owned(),
+            request_timeout: timeout,
+            connect_timeout: Duration::from_secs(10),
+            user_agent: format!("mailtide/{}", env!("CARGO_PKG_VERSION")),
+        }
+    }
+}
+
 /// The production transport (reqwest, rustls).
 #[derive(Debug, Clone)]
 pub struct ReqwestTransport {
@@ -36,15 +63,26 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     /// A transport to Gmail with `timeout` per request.
     pub fn new(timeout: Duration) -> Result<Self, TransportError> {
-        Self::with_origin(ORIGIN, timeout)
+        Self::with_config(&HttpConfig::new(timeout))
     }
 
     /// A transport to another origin (tests, proxies).
     pub fn with_origin(origin: &str, timeout: Duration) -> Result<Self, TransportError> {
+        Self::with_config(&HttpConfig {
+            origin: origin.to_owned(),
+            ..HttpConfig::new(timeout)
+        })
+    }
+
+    /// A transport with every HTTP setting explicit.
+    pub fn with_config(config: &HttpConfig) -> Result<Self, TransportError> {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .timeout(config.request_timeout)
+            .connect_timeout(config.connect_timeout)
+            .user_agent(config.user_agent.as_str())
             .build()
             .map_err(|e| TransportError::NotSent(e.to_string()))?;
+        let origin = config.origin.as_str();
         Ok(Self {
             client,
             origin: origin.trim_end_matches('/').to_owned(),

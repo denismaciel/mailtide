@@ -450,10 +450,14 @@ the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
 
-Python stays thin; everything else is Rust. `mailtide.Runner(database_url,
-blob_url, token_source, *, watch_topic=None)` is async (every method is a
-coroutine); `mailtide.BlockingRunner` has the same methods, blocking, for code
-without an event loop. Build one per process, after forking:
+Python stays thin; everything else is Rust. `mailtide.Runner(config,
+token_source)` is async (every method is a coroutine); `mailtide.BlockingRunner`
+has the same methods, blocking, for code without an event loop. `config` is a
+`mailtide.config.Config` of plain frozen dataclasses (database URL and pool
+limits, blob URL, watch mode, HTTP, engine tunables, quota budget); the Rust
+core parses and validates it once and raises `ValueError` naming the first
+invalid field. Postgres pools default to 2 connections opened lazily; a run
+uses one at a time. Build one runner per process, after forking:
 
 - `await migrate()`; `await run(account, budget_s) -> RunOutcome` (call on a
   schedule and on each verified push; `stop` says why it stopped: `idle` with
@@ -461,11 +465,18 @@ without an event loop. Build one per process, after forking:
   `superseded`);
 - `await act(account, action, message_ids=… | thread_id=…) -> RunOutcome`:
   admitted durably first (`outcome.admitted`), then delivered;
+- `await admit(account, action, …) -> int`: admit durably without
+  delivering (the account's next run delivers); never preempts a sync;
+- `await status(account)`, `await accounts()`, `await health()`: reads that
+  never claim an account; `await resume(account)` after an operator fixed a
+  block; `await forget(account)` deletes its rows and blobs;
 - `await messages(account, ids) -> list[MessageView]`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
-- exceptions `MailtideError`, `DelegationRevoked` (raised by the token source
+- exceptions: `MailtideError` and its subclasses `StoreUnavailable`,
+  `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`, `QuotaGateError`,
+  `Superseded`, `InvalidPush`, and `DelegationRevoked` (raised by the token source
   to block an account; the block is committed, and later runs make no
   credential calls), `InvalidPush`.
 

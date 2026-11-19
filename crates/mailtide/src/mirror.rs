@@ -1111,6 +1111,64 @@ impl AccountMirror {
         applied
     }
 
+    /// What the store holds about the account (pure; no claim).
+    #[must_use]
+    pub fn status(&self) -> crate::status::AccountStatus {
+        let mut jobs = crate::status::JobCounts::default();
+        for job in self.jobs.values() {
+            jobs.add(&job.state);
+        }
+        let mut actions = crate::status::ActionCounts::default();
+        for intent in self.intents.values() {
+            actions.add(&intent.state);
+        }
+        let count = |pred: &dyn Fn(&MessageRecord) -> bool| {
+            self.messages.values().filter(|r| pred(r)).count() as u64
+        };
+        crate::status::AccountStatus {
+            account: self.account.clone(),
+            sync: self.record.sync.clone(),
+            epoch: self.record.epoch,
+            cursor: self.record.cursor,
+            watch_expiration: self.record.watch_expiration,
+            last_activity: self.record.last_activity,
+            cooldown: self.record.cooldown.clone(),
+            state: self.seq,
+            messages: self.messages.len() as u64,
+            pending_imports: count(&|r| matches!(r.content, Content::Pending)),
+            unverified: count(&|r| r.unverified.is_some()),
+            jobs,
+            actions,
+        }
+    }
+
+    /// Resume a blocked account after an operator fixed the cause: restore
+    /// the phase it was blocked in and make jobs blocked by the account
+    /// problem ready again (jobs Gmail refused for good stay blocked). The
+    /// next engine to claim the account carries on.
+    pub fn resume(&mut self, now: Timestamp) -> crate::status::ResumeOutcome {
+        let resume = match &self.record.sync {
+            SyncState::Blocked { resume, .. } => (**resume).clone(),
+            SyncState::Bootstrapping(_) | SyncState::Live | SyncState::Reconciling(_) => {
+                return crate::status::ResumeOutcome::NotBlocked;
+            }
+        };
+        let phase = resume.phase();
+        self.record.sync = resume;
+        let mut jobs = 0;
+        for job in self.jobs.values_mut() {
+            if let JobState::Blocked(crate::retry::BlockingFailure {
+                class: crate::retry::Blocking::Account(_),
+                ..
+            }) = job.state
+            {
+                job.state = JobState::Ready { due_at: now };
+                jobs += 1;
+            }
+        }
+        crate::status::ResumeOutcome::Resumed { phase, jobs }
+    }
+
     /// Admit a user action directly, outside any engine: a user's intent is
     /// not fenced by whichever engine currently holds the account, so a sync
     /// that supersedes another can't lose it. Delivery is a durable job the

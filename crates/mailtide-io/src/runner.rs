@@ -16,7 +16,7 @@ use mailtide::outbox::ActionRequest;
 use mailtide::quota::Admission;
 use mailtide::retry::{BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::schedule::TimerKind;
-use mailtide::status::Status;
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status};
 use mailtide::{Engine, EngineConfig};
 use mailtide_gmail::request::{self, RequestConfig};
 use mailtide_gmail::{decode, errors, headers};
@@ -106,6 +106,15 @@ pub struct RunOutcome {
     pub stop: StopReason,
 }
 
+/// What forgetting an account removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forgotten {
+    /// What the store removed.
+    pub store: ForgetOutcome,
+    /// Raw content objects deleted.
+    pub blobs: u64,
+}
+
 /// Infrastructure failures (the run may be retried).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
@@ -115,6 +124,8 @@ pub enum RunError {
     Corrupt(String),
     /// The quota gate failed.
     Quota(String),
+    /// Blob storage failed.
+    Blobs(String),
 }
 
 /// One Gmail response, decoded into the engine's terms.
@@ -163,6 +174,49 @@ where
     /// The transport.
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    /// Admit a user action without delivering it: the next run of the
+    /// account (whichever process holds it) delivers. Returns how many
+    /// messages it reached. Use this from request paths.
+    pub async fn admit(
+        &self,
+        account: &AccountId,
+        action: &ActionRequest,
+    ) -> Result<u32, RunError> {
+        self.store
+            .admit(account, action, now())
+            .await
+            .map_err(RunError::Store)
+    }
+
+    /// What the store holds about `account`, without claiming it.
+    pub async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, RunError> {
+        self.store.status(account).await.map_err(RunError::Store)
+    }
+
+    /// Every account the store holds.
+    pub async fn accounts(&self) -> Result<Vec<AccountId>, RunError> {
+        self.store.accounts().await.map_err(RunError::Store)
+    }
+
+    /// Resume a blocked account once its cause is fixed.
+    pub async fn resume(&self, account: &AccountId) -> Result<ResumeOutcome, RunError> {
+        self.store
+            .resume(account, now())
+            .await
+            .map_err(RunError::Store)
+    }
+
+    /// Delete everything stored for `account`: rows, then raw content.
+    pub async fn forget(&self, account: &AccountId) -> Result<Forgotten, RunError> {
+        let store = self.store.forget(account).await.map_err(RunError::Store)?;
+        let blobs = self
+            .blobs
+            .delete_account(account)
+            .await
+            .map_err(|e| RunError::Blobs(format!("{e:?}")))?;
+        Ok(Forgotten { store, blobs })
     }
 
     /// Admit a user action and deliver it, syncing as [`Self::run`] does.
@@ -428,6 +482,10 @@ where
                     return Outcome::Failed(transient(detail));
                 }
             };
+            if response.status == 401 {
+                // The token was rejected: the next call mints a fresh one.
+                self.tokens.invalidate(account);
+            }
             if !response.is_success() {
                 return match (errors::classify(&response), gmail_request) {
                     (Failure::NotFound, GmailRequest::ListHistory { .. }) => {

@@ -11,6 +11,7 @@ use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
 
 use crate::{Store, StoreError};
 
@@ -91,6 +92,34 @@ impl Store for MemoryStore {
         limit: u32,
     ) -> Result<ChangePage, StoreError> {
         self.with_account(account, |mirror| mirror.changes(since, limit))
+    }
+
+    async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {
+        Ok(self.lock()?.get(account).map(AccountMirror::status))
+    }
+
+    async fn accounts(&self) -> Result<Vec<AccountId>, StoreError> {
+        Ok(self.lock()?.keys().cloned().collect())
+    }
+
+    async fn resume(
+        &self,
+        account: &AccountId,
+        now: Timestamp,
+    ) -> Result<ResumeOutcome, StoreError> {
+        Ok(self
+            .lock()?
+            .get_mut(account)
+            .map_or(ResumeOutcome::Unknown, |mirror| mirror.resume(now)))
+    }
+
+    async fn forget(&self, account: &AccountId) -> Result<ForgetOutcome, StoreError> {
+        Ok(self
+            .lock()?
+            .remove(account)
+            .map_or(ForgetOutcome::Unknown, |mirror| ForgetOutcome::Forgotten {
+                messages: mirror.messages.len() as u64,
+            }))
     }
 
     async fn admit(

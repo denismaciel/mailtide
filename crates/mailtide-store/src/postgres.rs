@@ -7,6 +7,7 @@ use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
 
 use crate::sql::SqlStore;
 use crate::{Store, StoreError};
@@ -20,7 +21,11 @@ pub struct PostgresStore {
 impl PostgresStore {
     /// Connect to `url`, e.g. `postgres://user:pass@host/db`.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        SqlStore::connect(url).await.map(|inner| Self { inner })
+        let url = crate::config::DatabaseUrl::parse(url)
+            .map_err(|e| StoreError::Misconfigured(e.to_string()))?;
+        SqlStore::connect(&url, &crate::config::PoolConfig::default())
+            .await
+            .map(|inner| Self { inner })
     }
 
     /// Create mailtide's tables if they don't exist.
@@ -62,6 +67,26 @@ impl Store for PostgresStore {
         limit: u32,
     ) -> Result<ChangePage, StoreError> {
         self.inner.changes(account, since, limit).await
+    }
+
+    async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {
+        crate::Store::status(&self.inner, account).await
+    }
+
+    async fn accounts(&self) -> Result<Vec<AccountId>, StoreError> {
+        crate::Store::accounts(&self.inner).await
+    }
+
+    async fn resume(
+        &self,
+        account: &AccountId,
+        now: Timestamp,
+    ) -> Result<ResumeOutcome, StoreError> {
+        crate::Store::resume(&self.inner, account, now).await
+    }
+
+    async fn forget(&self, account: &AccountId) -> Result<ForgetOutcome, StoreError> {
+        crate::Store::forget(&self.inner, account).await
     }
 
     async fn admit(

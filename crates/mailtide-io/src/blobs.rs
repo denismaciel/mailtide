@@ -28,6 +28,11 @@ pub trait BlobStore: Send + Sync {
     fn get(&self, key: &BlobRef) -> impl Future<Output = Result<Vec<u8>, BlobError>> + Send;
     /// Delete the content at `key`; deleting a missing key is fine.
     fn delete(&self, key: &BlobRef) -> impl Future<Output = Result<(), BlobError>> + Send;
+    /// Delete everything stored for `account`; returns how many objects.
+    fn delete_account(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 }
 
 /// The deterministic key for a message's raw content, so a retried import
@@ -97,6 +102,21 @@ impl BlobStore for ObjectBlobs {
             .await
             .map(|b| b.to_vec())
             .map_err(|e| unavailable(&e))
+    }
+
+    async fn delete_account(&self, account: &AccountId) -> Result<u64, BlobError> {
+        use futures_util::StreamExt as _;
+        let prefix = self.prefix.clone().join(account.as_str());
+        let mut listing = self.store.list(Some(&prefix));
+        let mut deleted = 0;
+        while let Some(meta) = listing.next().await {
+            let meta = meta.map_err(|e| unavailable(&e))?;
+            match self.store.delete(&meta.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted += 1,
+                Err(e) => return Err(unavailable(&e)),
+            }
+        }
+        Ok(deleted)
     }
 
     async fn delete(&self, key: &BlobRef) -> Result<(), BlobError> {

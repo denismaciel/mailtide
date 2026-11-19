@@ -7,6 +7,7 @@ import time
 
 import mailtide
 import pytest
+from conftest import make_config
 from fake_gmail import Mailbox
 
 ACCOUNT = "alice@example.com"
@@ -17,13 +18,7 @@ def tokens(account: str) -> tuple[str, int]:
 
 
 def runner(origin: str, token_source=tokens) -> mailtide.Runner:
-    return mailtide.Runner(
-        "sqlite::memory:",
-        "memory:///",
-        token_source,
-        gmail_origin=origin,
-        confirm_timeout_s=0,
-    )
+    return mailtide.Runner(make_config(origin, confirm_timeout_s=0), token_source)
 
 
 def test_methods_are_awaitable(gmail: tuple[Mailbox, str]) -> None:
@@ -124,7 +119,7 @@ def test_a_block_is_durable_and_stops_calling_the_token_source() -> None:
         raise mailtide.DelegationRevoked(f"{account} revoked")
 
     async def main() -> None:
-        r = mailtide.Runner("sqlite::memory:", "memory:///", revoked)
+        r = mailtide.Runner(make_config(), revoked)
         await r.migrate()
         first = await r.run(ACCOUNT, budget_s=10)
         assert first.stop == "blocked"
