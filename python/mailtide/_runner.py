@@ -6,6 +6,8 @@ awaiting task drops the Rust work (in-flight requests stop, an open
 transaction rolls back; every commit is atomic and fenced, so that is safe).
 """
 
+import asyncio
+import contextvars
 from collections.abc import Awaitable, Callable
 from typing import Literal
 
@@ -16,6 +18,7 @@ from mailtide._core import (
     ForgetResult,
     Health,
     MessageView,
+    Progress,
     ResumeResult,
     RunOutcome,
     StateTooOld,
@@ -61,12 +64,28 @@ class Runner:
         """Create or upgrade mailtide's tables (safe to call concurrently)."""
         await self._core.migrate()
 
-    async def run(self, account: str, budget_s: float = 60.0) -> RunOutcome:
+    async def run(
+        self,
+        account: str,
+        budget_s: float = 60.0,
+        on_progress: Callable[[Progress], object] | None = None,
+    ) -> RunOutcome:
         """Sync ``account`` until caught up, blocked or ``budget_s`` elapses.
 
         Call it on a schedule and whenever a verified push arrives.
+        ``on_progress(Progress)`` runs on this event loop, in the caller's
+        context (so e.g. a durable-workflow activity can heartbeat from it),
+        at most once a second while the run makes progress.
         """
-        return await self._core.run(account, budget_s)
+        if on_progress is None:
+            return await self._core.run(account, budget_s, None)
+        loop = asyncio.get_running_loop()
+        context = contextvars.copy_context()
+
+        def schedule(progress: Progress) -> None:
+            loop.call_soon_threadsafe(on_progress, progress, context=context)
+
+        return await self._core.run(account, budget_s, schedule)
 
     async def act(
         self,

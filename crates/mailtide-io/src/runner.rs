@@ -6,6 +6,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use tracing::Instrument as _;
+
 use mailtide::command::{Command, CommandKind, GmailCall, GmailRequest};
 use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
 use mailtide::engine::Stopped;
@@ -45,6 +47,62 @@ pub struct RunnerConfig {
     pub engine: EngineConfig,
     /// Push notifications.
     pub watch: WatchMode,
+    /// How accounts appear in logs.
+    pub log_accounts: LogAccounts,
+}
+
+/// How accounts (email addresses) appear in log events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogAccounts {
+    /// A stable 16-hex-digit hash: correlatable, not personal data.
+    #[default]
+    Hashed,
+    /// The address itself.
+    Plain,
+}
+
+/// A running sync's progress, for heartbeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// Commits applied so far.
+    pub commits: u32,
+    /// Messages imported so far.
+    pub imported: u32,
+    /// Gmail requests sent so far.
+    pub gmail_requests: u32,
+    /// Time since the run started.
+    pub elapsed: Duration,
+}
+
+/// Progress reports go out at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
+impl StopReason {
+    /// A stable name for logs and hosts.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Idle { .. } => "idle",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::CoolingDown { .. } => "cooling_down",
+            Self::Blocked(_) => "blocked",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// The request kind, for logs (no ids).
+fn request_kind(request: &GmailRequest) -> &'static str {
+    match request {
+        GmailRequest::GetProfile => "get_profile",
+        GmailRequest::ListHistory { .. } => "list_history",
+        GmailRequest::ListMessages { .. } => "list_messages",
+        GmailRequest::GetMessage { .. } => "get_message",
+        GmailRequest::ImportMessage { .. } => "import_message",
+        GmailRequest::ListLabels => "list_labels",
+        GmailRequest::Watch => "watch",
+        GmailRequest::Modify(_) => "modify",
+    }
 }
 
 /// Everything the runner needs.
@@ -127,6 +185,40 @@ pub enum RunError {
     Quota(String),
     /// Blob storage failed.
     Blobs(String),
+}
+
+impl RunError {
+    /// A stable name for logs (no detail: it may carry data).
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Store(StoreError::Unavailable(_)) => "store_unavailable",
+            Self::Store(StoreError::OutcomeUnknown(_)) => "outcome_unknown",
+            Self::Store(StoreError::Corrupt(_)) | Self::Corrupt(_) => "corrupt",
+            Self::Store(StoreError::Misconfigured(_)) => "misconfigured",
+            Self::Store(StoreError::Rejected(_)) => "superseded",
+            Self::Quota(_) => "quota_gate",
+            Self::Blobs(_) => "blobs",
+        }
+    }
+}
+
+/// The failure class, for logs (no detail: Gmail error text can quote data).
+fn failure_kind(failure: &Failure) -> &'static str {
+    match failure {
+        Failure::NotFound => "not_found",
+        Failure::Retryable(retryable) => match retryable.class {
+            Retryable::Transient => "transient",
+            Retryable::AccountRateLimited => "account_rate_limited",
+            Retryable::AccountConcurrency => "account_concurrency",
+            Retryable::AccountBandwidth => "account_bandwidth",
+            Retryable::ProjectRateLimited => "project_rate_limited",
+        },
+        Failure::Blocking(blocking) => match blocking.class {
+            Blocking::Permanent => "refused",
+            Blocking::Account(_) => "account_problem",
+        },
+    }
 }
 
 /// One Gmail response, decoded into the engine's terms.
@@ -239,9 +331,65 @@ where
         Ok(outcome)
     }
 
+    /// How `account` appears in logs.
+    fn log_account(&self, account: &AccountId) -> String {
+        match self.config.log_accounts {
+            LogAccounts::Hashed => format!(
+                "{:016x}",
+                mailtide::ids::stable_hash(account.as_str().as_bytes())
+            ),
+            LogAccounts::Plain => account.as_str().to_owned(),
+        }
+    }
+
     /// Sync `account` until caught up, stopped, or `budget` elapses.
     pub async fn run(&self, account: &AccountId, budget: Duration) -> Result<RunOutcome, RunError> {
-        let deadline = Instant::now() + budget;
+        self.run_reporting(account, budget, None).await
+    }
+
+    /// [`Self::run`], calling `progress` between commands at most once a
+    /// second (for heartbeats).
+    pub async fn run_reporting(
+        &self,
+        account: &AccountId,
+        budget: Duration,
+        progress: Option<&(dyn Fn(&Progress) + Sync)>,
+    ) -> Result<RunOutcome, RunError> {
+        let span = tracing::info_span!("mailtide.run", account = %self.log_account(account));
+        let started = Instant::now();
+        let outcome = self
+            .run_inner(account, budget, progress)
+            .instrument(span.clone())
+            .await;
+        let _entered = span.enter();
+        match &outcome {
+            Ok(RunOutcome { report, stop }) => {
+                if let StopReason::Blocked(failure) = stop {
+                    tracing::error!(class = ?failure.class, "account blocked; resume it once the cause is fixed");
+                }
+                tracing::info!(
+                    stop = stop.code(),
+                    commits = report.commits,
+                    imported = report.imported,
+                    gmail_requests = report.gmail_requests,
+                    duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "run finished"
+                );
+            }
+            Err(error) => tracing::warn!(error = error.code(), "run failed"),
+        }
+        outcome
+    }
+
+    async fn run_inner(
+        &self,
+        account: &AccountId,
+        budget: Duration,
+        progress: Option<&(dyn Fn(&Progress) + Sync)>,
+    ) -> Result<RunOutcome, RunError> {
+        let started = Instant::now();
+        let mut reported = started;
+        let deadline = started + budget;
         let snapshot = match self.store.claim(account, ENGINE_VERSION).await {
             Ok(snapshot) => snapshot,
             Err(StoreError::Rejected(_)) => {
@@ -281,6 +429,17 @@ where
                 }
                 if Instant::now() > deadline {
                     return Ok(finish(report, &engine, StopReason::BudgetExhausted));
+                }
+                if let Some(progress) = progress
+                    && reported.elapsed() >= PROGRESS_EVERY
+                {
+                    reported = Instant::now();
+                    progress(&Progress {
+                        commits: report.commits,
+                        imported: report.imported,
+                        gmail_requests: report.gmail_requests,
+                        elapsed: started.elapsed(),
+                    });
                 }
                 let id = command.id;
                 match command.kind {
@@ -392,13 +551,13 @@ where
                 Err(error) => Err(RunError::Store(error)),
             },
             CommandKind::DeleteBlob { account, message } => {
-                match self.blobs.delete(&blob_key(&account, &message)).await {
-                    Ok(()) => Ok(Some(EventKind::BlobDeleted { command: id })),
-                    // The job stays claimed; the next run releases and retries it.
-                    Err(error) => {
-                        tracing::warn!(?error, "blob delete failed");
-                        Ok(None)
-                    }
+                if let Ok(()) = self.blobs.delete(&blob_key(&account, &message)).await {
+                    Ok(Some(EventKind::BlobDeleted { command: id }))
+                } else {
+                    // The job stays claimed; the next run releases and
+                    // retries it. No error text: it can carry the object path.
+                    tracing::warn!("blob delete failed; it is retried");
+                    Ok(None)
                 }
             }
             CommandKind::Schedule { .. } | CommandKind::ReportStatus(_) => Ok(None),
@@ -415,10 +574,13 @@ where
                 report.commits += 1;
                 Ok(Some(EventKind::CommitApplied { commit: commit.id }))
             }
-            Ok(CommitOutcome::Rejected(reason)) => Ok(Some(EventKind::CommitRejected {
-                commit: commit.id,
-                reason,
-            })),
+            Ok(CommitOutcome::Rejected(reason)) => {
+                tracing::warn!(reason = ?reason, "commit refused by the store");
+                Ok(Some(EventKind::CommitRejected {
+                    commit: commit.id,
+                    reason,
+                }))
+            }
             Err(error) => Err(RunError::Store(error)),
         }
     }
@@ -447,6 +609,11 @@ where
         {
             Admission::Granted(lease) => lease,
             Admission::Deferred { until } => {
+                tracing::debug!(
+                    request = request_kind(&call.request),
+                    until = until.0,
+                    "deferred by the quota gate"
+                );
                 return Ok(EventKind::RequestDeferred { command, until });
             }
         };
@@ -456,10 +623,26 @@ where
             gate: &self.quota,
             lease: Some(lease),
         };
+        let sent = Instant::now();
         let outcome = self
             .perform(&call.account, command, &call.request, &topic, report)
             .await;
         let lease = held.lease.take().unwrap_or(lease);
+        let duration_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match &outcome {
+            Outcome::Event(_) => tracing::debug!(
+                request = request_kind(&call.request),
+                cost = call.cost.0,
+                duration_ms,
+                "gmail request"
+            ),
+            Outcome::Failed(failure) => tracing::warn!(
+                request = request_kind(&call.request),
+                failure = failure_kind(failure),
+                duration_ms,
+                "gmail request failed"
+            ),
+        }
         let bytes = match &outcome {
             Outcome::Event(EventKind::MessageImported { message, .. }) => message.size,
             Outcome::Event(_) | Outcome::Failed(_) => 0,

@@ -214,6 +214,7 @@ fn runner(gmail: FakeGmail, gate: RecordingGate) -> TestRunner {
             RunnerConfig {
                 engine: EngineConfig::default(),
                 watch: WatchMode::Disabled,
+                log_accounts: mailtide_io::runner::LogAccounts::default(),
             },
         ),
     }

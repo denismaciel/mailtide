@@ -134,6 +134,7 @@ fn runner<B: BlobStore>(
         RunnerConfig {
             engine: EngineConfig::default(),
             watch: WatchMode::Disabled,
+            log_accounts: mailtide_io::runner::LogAccounts::default(),
         },
     )
 }

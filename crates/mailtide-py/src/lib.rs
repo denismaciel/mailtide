@@ -7,6 +7,7 @@
 
 use pyo3::prelude::*;
 
+mod logbridge;
 mod settings;
 
 // Safe without the GIL: every class is frozen (immutable after creation, and
@@ -719,6 +720,13 @@ mod _core {
         account_bytes_per_day: i64,
     }
 
+    #[derive(FromPyObject)]
+    struct LogArg {
+        level: String,
+        accounts: String,
+        logger: String,
+    }
+
     /// `mailtide.config.Config`.
     #[derive(FromPyObject)]
     struct ConfigArg {
@@ -728,6 +736,7 @@ mod _core {
         http: HttpArg,
         engine: EngineArg,
         quota: QuotaArg,
+        log: LogArg,
         token_cache_margin_s: f64,
     }
 
@@ -770,6 +779,11 @@ mod _core {
                     project_concurrency: c.quota.project_concurrency,
                     account_bytes_per_day: c.quota.account_bytes_per_day,
                 },
+                log: crate::settings::RawLog {
+                    level: c.log.level,
+                    accounts: c.log.accounts,
+                    logger: c.log.logger,
+                },
                 token_cache_margin_s: c.token_cache_margin_s,
             }
         }
@@ -778,6 +792,8 @@ mod _core {
     /// Everything both runners share.
     struct Shared {
         inner: Inner,
+        /// This runner's log bridge; every future it runs carries it.
+        dispatch: tracing::Dispatch,
     }
 
     /// Parse and validate the configuration, then build the runner. Nothing
@@ -807,9 +823,11 @@ mod _core {
             RunnerConfig {
                 engine: settings.engine,
                 watch: settings.watch,
+                log_accounts: settings.log_accounts,
             },
         );
-        Ok(Arc::new(Shared { inner }))
+        let dispatch = crate::logbridge::dispatch(settings.log_verbosity, settings.logger);
+        Ok(Arc::new(Shared { inner, dispatch }))
     }
 
     // ------------------------------------------------------------ results
@@ -878,6 +896,15 @@ mod _core {
                 actions_blocked: s.actions.blocked,
             }
         }
+    }
+
+    /// A running sync's progress, for heartbeats.
+    #[pyclass(frozen, get_all)]
+    struct Progress {
+        commits: u32,
+        imported: u32,
+        gmail_requests: u32,
+        elapsed_ms: u64,
     }
 
     /// What `resume` did.
@@ -1010,9 +1037,28 @@ mod _core {
             self: Arc<Self>,
             account: AccountId,
             budget: Duration,
+            on_progress: Option<Py<PyAny>>,
         ) -> PyResult<RunOutcome> {
+            let report = |p: &runner::Progress| {
+                if let Some(callback) = &on_progress {
+                    Python::attach(|py| {
+                        let progress = Progress {
+                            commits: p.commits,
+                            imported: p.imported,
+                            gmail_requests: p.gmail_requests,
+                            elapsed_ms: u64::try_from(p.elapsed.as_millis()).unwrap_or(u64::MAX),
+                        };
+                        // A failing callback must not fail the sync.
+                        let _ = callback.call1(py, (progress,));
+                    });
+                }
+            };
+            let progress: Option<&(dyn Fn(&runner::Progress) + Sync)> = match on_progress {
+                Some(_) => Some(&report),
+                None => None,
+            };
             self.inner
-                .run(&account, budget)
+                .run_reporting(&account, budget, progress)
                 .await
                 .map(RunOutcome::from)
                 .map_err(run_error)
@@ -1185,18 +1231,23 @@ mod _core {
 
     fn future<'py, T>(
         py: Python<'py>,
+        shared: &Shared,
         fut: impl Future<Output = PyResult<T>> + Send + 'static,
     ) -> PyResult<Bound<'py, PyAny>>
     where
         T: for<'a> IntoPyObject<'a> + Send + 'static,
     {
-        pyo3_async_runtimes::tokio::future_into_py(py, fut)
+        use tracing::instrument::WithSubscriber as _;
+        pyo3_async_runtimes::tokio::future_into_py(py, fut.with_subscriber(shared.dispatch.clone()))
     }
 
     fn block<T: Send>(
         py: Python<'_>,
+        shared: &Shared,
         fut: impl Future<Output = PyResult<T>> + Send,
     ) -> PyResult<T> {
+        use tracing::instrument::WithSubscriber as _;
+        let fut = fut.with_subscriber(shared.dispatch.clone());
         py.detach(|| runtime().block_on(fut))
     }
 
@@ -1213,21 +1264,25 @@ mod _core {
         }
 
         fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-            future(py, self.shared.clone().migrate())
+            future(py, &self.shared, self.shared.clone().migrate())
         }
 
-        #[pyo3(signature = (account, budget_s=60.0))]
+        #[pyo3(signature = (account, budget_s=60.0, on_progress=None))]
         fn run<'py>(
             &self,
             py: Python<'py>,
             account: &str,
             budget_s: f64,
+            on_progress: Option<Py<PyAny>>,
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
-                self.shared
-                    .clone()
-                    .run(account_id(account)?, seconds(budget_s, "budget_s")?),
+                &self.shared,
+                self.shared.clone().run(
+                    account_id(account)?,
+                    seconds(budget_s, "budget_s")?,
+                    on_progress,
+                ),
             )
         }
 
@@ -1255,6 +1310,7 @@ mod _core {
             )?;
             future(
                 py,
+                &self.shared,
                 self.shared.clone().act(
                     account_id(account)?,
                     request,
@@ -1284,27 +1340,43 @@ mod _core {
                 remove_labels,
                 destination,
             )?;
-            future(py, self.shared.clone().admit(account_id(account)?, request))
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().admit(account_id(account)?, request),
+            )
         }
 
         fn status<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
-            future(py, self.shared.clone().status(account_id(account)?))
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().status(account_id(account)?),
+            )
         }
 
         fn accounts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-            future(py, self.shared.clone().accounts())
+            future(py, &self.shared, self.shared.clone().accounts())
         }
 
         fn resume<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
-            future(py, self.shared.clone().resume(account_id(account)?))
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().resume(account_id(account)?),
+            )
         }
 
         fn forget<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
-            future(py, self.shared.clone().forget(account_id(account)?))
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().forget(account_id(account)?),
+            )
         }
 
         fn health<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-            future(py, self.shared.clone().health())
+            future(py, &self.shared, self.shared.clone().health())
         }
 
         fn messages<'py>(
@@ -1314,7 +1386,11 @@ mod _core {
             message_ids: Vec<String>,
         ) -> PyResult<Bound<'py, PyAny>> {
             let ids = message_ids.into_iter().map(MessageId).collect();
-            future(py, self.shared.clone().messages(account_id(account)?, ids))
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().messages(account_id(account)?, ids),
+            )
         }
 
         #[pyo3(signature = (account, since=None, limit=500))]
@@ -1327,6 +1403,7 @@ mod _core {
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
+                &self.shared,
                 self.shared
                     .clone()
                     .changes(account_id(account)?, parse_since(since)?, limit),
@@ -1341,6 +1418,7 @@ mod _core {
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
+                &self.shared,
                 self.shared
                     .clone()
                     .compact(account_id(account)?, parse_state(through)?),
@@ -1357,6 +1435,7 @@ mod _core {
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
+                &self.shared,
                 self.shared
                     .clone()
                     .message_ids(account_id(account)?, after.map(MessageId), limit),
@@ -1371,6 +1450,7 @@ mod _core {
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
+                &self.shared,
                 self.shared
                     .clone()
                     .read_blob(account_id(account)?, MessageId(message_id.to_owned())),
@@ -1390,17 +1470,28 @@ mod _core {
 
         /// Create or upgrade mailtide's tables (safe to call concurrently).
         fn migrate(&self, py: Python<'_>) -> PyResult<()> {
-            block(py, self.shared.clone().migrate())
+            block(py, &self.shared, self.shared.clone().migrate())
         }
 
         /// Sync `account` until caught up, blocked or `budget_s` elapses.
-        #[pyo3(signature = (account, budget_s=60.0))]
-        fn run(&self, py: Python<'_>, account: &str, budget_s: f64) -> PyResult<RunOutcome> {
+        /// `on_progress(Progress)` is called between commands at most once a
+        /// second, from a mailtide thread.
+        #[pyo3(signature = (account, budget_s=60.0, on_progress=None))]
+        fn run(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            budget_s: f64,
+            on_progress: Option<Py<PyAny>>,
+        ) -> PyResult<RunOutcome> {
             block(
                 py,
-                self.shared
-                    .clone()
-                    .run(account_id(account)?, seconds(budget_s, "budget_s")?),
+                &self.shared,
+                self.shared.clone().run(
+                    account_id(account)?,
+                    seconds(budget_s, "budget_s")?,
+                    on_progress,
+                ),
             )
         }
 
@@ -1429,6 +1520,7 @@ mod _core {
             )?;
             block(
                 py,
+                &self.shared,
                 self.shared.clone().act(
                     account_id(account)?,
                     request,
@@ -1459,32 +1551,48 @@ mod _core {
                 remove_labels,
                 destination,
             )?;
-            block(py, self.shared.clone().admit(account_id(account)?, request))
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().admit(account_id(account)?, request),
+            )
         }
 
         /// What the store holds about `account`, without claiming it.
         fn status(&self, py: Python<'_>, account: &str) -> PyResult<Option<AccountStatus>> {
-            block(py, self.shared.clone().status(account_id(account)?))
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().status(account_id(account)?),
+            )
         }
 
         /// Every account the store holds.
         fn accounts(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-            block(py, self.shared.clone().accounts())
+            block(py, &self.shared, self.shared.clone().accounts())
         }
 
         /// Resume a blocked account once its cause is fixed.
         fn resume(&self, py: Python<'_>, account: &str) -> PyResult<ResumeResult> {
-            block(py, self.shared.clone().resume(account_id(account)?))
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().resume(account_id(account)?),
+            )
         }
 
         /// Delete everything stored for `account` (rows and raw content).
         fn forget(&self, py: Python<'_>, account: &str) -> PyResult<ForgetResult> {
-            block(py, self.shared.clone().forget(account_id(account)?))
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().forget(account_id(account)?),
+            )
         }
 
         /// Whether the database answers.
         fn health(&self, py: Python<'_>) -> PyResult<Health> {
-            block(py, self.shared.clone().health())
+            block(py, &self.shared, self.shared.clone().health())
         }
 
         /// How these messages should look; unknown ids are left out.
@@ -1495,7 +1603,11 @@ mod _core {
             message_ids: Vec<String>,
         ) -> PyResult<Vec<MessageView>> {
             let ids = message_ids.into_iter().map(MessageId).collect();
-            block(py, self.shared.clone().messages(account_id(account)?, ids))
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().messages(account_id(account)?, ids),
+            )
         }
 
         /// Mirror changes for `account` after state string `since`.
@@ -1509,6 +1621,7 @@ mod _core {
         ) -> PyResult<Py<PyAny>> {
             block(
                 py,
+                &self.shared,
                 self.shared
                     .clone()
                     .changes(account_id(account)?, parse_since(since)?, limit),
@@ -1521,7 +1634,7 @@ mod _core {
                 .shared
                 .clone()
                 .compact(account_id(account)?, parse_state(through)?);
-            block(py, fut)
+            block(py, &self.shared, fut)
         }
 
         /// Up to `limit` message ids after `after`, in id order.
@@ -1537,7 +1650,7 @@ mod _core {
                 self.shared
                     .clone()
                     .message_ids(account_id(account)?, after.map(MessageId), limit);
-            block(py, fut)
+            block(py, &self.shared, fut)
         }
 
         /// The raw RFC 822 bytes of an imported message.
@@ -1549,6 +1662,7 @@ mod _core {
         ) -> PyResult<Py<PyBytes>> {
             block(
                 py,
+                &self.shared,
                 self.shared
                     .clone()
                     .read_blob(account_id(account)?, MessageId(message_id.to_owned())),

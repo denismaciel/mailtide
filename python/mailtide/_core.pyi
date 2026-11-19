@@ -196,6 +196,13 @@ class AccountStatus:
     actions_blocked: int
 
 @final
+class Progress:
+    commits: int
+    imported: int
+    gmail_requests: int
+    elapsed_ms: int
+
+@final
 class ResumeResult:
     outcome: Literal["resumed", "not_blocked", "unknown"]
     phase: Literal["bootstrapping", "live", "reconciling"] | None
@@ -220,7 +227,12 @@ class Runner:
 
     def __init__(self, config: Config, token_source: TokenSource) -> None: ...
     def migrate(self) -> Awaitable[None]: ...
-    def run(self, account: str, budget_s: float = 60.0) -> Awaitable[RunOutcome]: ...
+    def run(
+        self,
+        account: str,
+        budget_s: float = 60.0,
+        on_progress: Callable[[Progress], object] | None = None,
+    ) -> Awaitable[RunOutcome]: ...
     def act(
         self,
         account: str,
@@ -263,7 +275,12 @@ class Runner:
 class BlockingRunner:
     def __init__(self, config: Config, token_source: TokenSource) -> None: ...
     def migrate(self) -> None: ...
-    def run(self, account: str, budget_s: float = 60.0) -> RunOutcome: ...
+    def run(
+        self,
+        account: str,
+        budget_s: float = 60.0,
+        on_progress: Callable[[Progress], object] | None = None,
+    ) -> RunOutcome: ...
     def act(
         self,
         account: str,

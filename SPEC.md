@@ -536,6 +536,22 @@ Gmail over HTTP.
 
 ## 13. Observability
 
+Logs: the driver emits `tracing` events (a span per run carrying the
+account; `run finished` at INFO with stop, commits, imports, requests and
+duration; each Gmail request at DEBUG, failures and refused commits at WARN,
+a block at ERROR). Each Python runner bridges them to
+`logging.getLogger(config.log.logger)` through its own dispatcher (never a
+process-global subscriber): levels are filtered in Rust, a bounded queue and
+a drain thread keep logging off the sync path (dropped events are counted
+and reported), and fields arrive under `record.mailtide`. Accounts are
+hashed unless the host opts in; addresses, subjects, error bodies and tokens
+are never logged. Progress: `run(..., on_progress=...)` reports between
+commands at most once a second; the async runner calls it on the caller's
+event loop in the caller's context, so durable-workflow activities can
+heartbeat. Metrics come from `RunOutcome` and `status()`; mailtide ships no
+metrics or OpenTelemetry dependency.
+
+
 - Per-account status: phase, cursor age, notification lag, jobs by state and
   priority, blocked items, cooldowns, import progress (discovered / stored /
   remaining).

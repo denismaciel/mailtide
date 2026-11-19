@@ -76,6 +76,24 @@ class Quota:
 
 
 @dataclass(frozen=True, slots=True)
+class Log:
+    """How mailtide's events reach Python ``logging``.
+
+    Events go to ``logging.getLogger(logger)`` with structured fields under
+    ``record.mailtide`` (a dict: ``stop``, ``commits``, ``request``,
+    ``duration_ms``, ``account``, ...), so the host's handlers and JSON
+    formatters pick them up. Levels below ``level`` are dropped in Rust and
+    cost nothing. Accounts are logged as stable hashes unless
+    ``accounts="plain"``; addresses, subjects, error bodies and tokens are
+    never logged.
+    """
+
+    level: Literal["off", "error", "warning", "info", "debug", "trace"] = "info"
+    accounts: Literal["hashed", "plain"] = "hashed"
+    logger: str = "mailtide"
+
+
+@dataclass(frozen=True, slots=True)
 class Poll:
     """No push: mailtide never calls ``users.watch`` and finds changes by
     polling (or when the host calls ``run`` on its own verified pushes). Use
@@ -102,4 +120,5 @@ class Config:
     http: Http = Http()
     engine: Engine = Engine()
     quota: Quota = Quota()
+    log: Log = Log()
     token_cache_margin_s: float = 60.0

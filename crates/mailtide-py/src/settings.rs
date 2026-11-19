@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use mailtide::EngineConfig;
 use mailtide::quota::Budget;
-use mailtide_io::runner::WatchMode;
+use mailtide_io::runner::{LogAccounts, WatchMode};
 use mailtide_io::transport::HttpConfig;
 use mailtide_store::config::{Connect, DatabaseUrl, PoolConfig};
 
@@ -65,6 +65,14 @@ pub struct RawWatch {
     pub name: Option<String>,
 }
 
+/// `mailtide.config.Log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawLog {
+    pub level: String,
+    pub accounts: String,
+    pub logger: String,
+}
+
 /// `mailtide.config.Config`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawConfig {
@@ -74,6 +82,7 @@ pub struct RawConfig {
     pub http: RawHttp,
     pub engine: RawEngine,
     pub quota: RawQuota,
+    pub log: RawLog,
     pub token_cache_margin_s: f64,
 }
 
@@ -88,6 +97,9 @@ pub struct Settings {
     pub engine: EngineConfig,
     pub budget: Budget,
     pub token_cache_margin: Duration,
+    pub log_verbosity: crate::logbridge::Verbosity,
+    pub log_accounts: LogAccounts,
+    pub logger: String,
 }
 
 /// The first invalid field and why.
@@ -250,9 +262,43 @@ fn budget(raw: &RawQuota) -> Result<Budget, Invalid> {
     Ok(budget)
 }
 
+fn log(raw: &RawLog) -> Result<(crate::logbridge::Verbosity, LogAccounts, String), Invalid> {
+    use crate::logbridge::Verbosity;
+    use tracing::Level;
+    let verbosity = match raw.level.as_str() {
+        "off" => Verbosity::Off,
+        "error" => Verbosity::Up(Level::ERROR),
+        "warning" => Verbosity::Up(Level::WARN),
+        "info" => Verbosity::Up(Level::INFO),
+        "debug" => Verbosity::Up(Level::DEBUG),
+        "trace" => Verbosity::Up(Level::TRACE),
+        other => {
+            return Err(invalid(
+                "log.level",
+                format!("{other:?} is not off, error, warning, info, debug or trace"),
+            ));
+        }
+    };
+    let accounts = match raw.accounts.as_str() {
+        "hashed" => LogAccounts::Hashed,
+        "plain" => LogAccounts::Plain,
+        other => {
+            return Err(invalid(
+                "log.accounts",
+                format!("{other:?} is not \"hashed\" or \"plain\""),
+            ));
+        }
+    };
+    if raw.logger.trim().is_empty() {
+        return Err(invalid("log.logger", "needs a logger name"));
+    }
+    Ok((verbosity, accounts, raw.logger.clone()))
+}
+
 /// Validate the whole configuration, section by section.
 pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
     let (database_url, pool) = pool(&raw.database)?;
+    let (log_verbosity, log_accounts, logger) = log(&raw.log)?;
     Ok(Settings {
         database_url,
         pool,
@@ -262,6 +308,9 @@ pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
         engine: engine(&raw.engine)?,
         budget: budget(&raw.quota)?,
         token_cache_margin: duration("token_cache_margin_s", raw.token_cache_margin_s)?,
+        log_verbosity,
+        log_accounts,
+        logger,
     })
 }
 
@@ -306,6 +355,11 @@ mod tests {
                 account_concurrency: 8,
                 project_concurrency: 128,
                 account_bytes_per_day: 2_000_000_000,
+            },
+            log: RawLog {
+                level: "info".into(),
+                accounts: "hashed".into(),
+                logger: "mailtide".into(),
             },
             token_cache_margin_s: 60.0,
         }
