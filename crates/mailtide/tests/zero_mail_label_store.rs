@@ -235,6 +235,7 @@ impl Mailbox {
                 .map(|group| group.versions.clone())
                 .unwrap_or_default(),
             at: Timestamp(at),
+            by: job.attempt,
         }];
         self.mirror.apply(&commit)
     }

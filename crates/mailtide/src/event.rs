@@ -107,6 +107,13 @@ pub enum EventKind {
         /// The claimed jobs, each now held by the command's attempt.
         jobs: Vec<crate::jobs::ClaimedJob>,
     },
+    /// The store refused the claim: another engine holds the account.
+    JobsClaimRejected {
+        /// The command it answers.
+        command: CommandId,
+        /// Why.
+        reason: crate::commit::Rejection,
+    },
     /// The host deleted a message's raw content.
     BlobDeleted {
         /// The command it answers.

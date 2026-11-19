@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
-use mailtide::jobs::{AttemptId, ClaimedJob};
+use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
@@ -78,11 +78,13 @@ impl Store for MemoryStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
-    ) -> Result<Vec<ClaimedJob>, StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         self.with_account(account, |mirror| {
-            mirror.claim_jobs(epoch, limit, now, attempt)
-        })?
-        .map_err(StoreError::Rejected)
+            match mirror.claim_jobs(epoch, limit, now, attempt) {
+                Ok(jobs) => ClaimOutcome::Claimed(jobs),
+                Err(rejection) => ClaimOutcome::Rejected(rejection),
+            }
+        })
     }
 
     async fn changes(

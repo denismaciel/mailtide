@@ -219,11 +219,25 @@ async fn cursor_fencing<S: Store>(store: &S) -> Result<(), String> {
         outcome == CommitOutcome::Rejected(Rejection::CursorMismatch),
         "a wrong expected cursor must be rejected",
     )?;
-    let mut right = commit(&snapshot, 1);
+    // A cursor alone would contradict the bootstrapping lifecycle.
+    let mut contradictory = commit(&snapshot, 1);
+    contradictory.cursor = Some(CursorMove {
+        expected: snapshot.cursor,
+        to: HistoryId(2),
+    });
+    expect(
+        apply(store, &contradictory).await?
+            == CommitOutcome::Rejected(Rejection::InvalidTransition),
+        "a cursor without leaving bootstrapping must be refused",
+    )?;
+    // The first cursor arrives with the move to Live, as reconciliation
+    // finishes.
+    let mut right = commit(&snapshot, 2);
     right.cursor = Some(CursorMove {
         expected: snapshot.cursor,
         to: HistoryId(2),
     });
+    right.sync = Some(mailtide::state::SyncState::Live);
     let outcome = apply(store, &right).await?;
     expect(
         matches!(outcome, CommitOutcome::Applied { .. }),
@@ -275,7 +289,8 @@ async fn tombstones<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(1))
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
     expect(
         !jobs
             .iter()
@@ -297,7 +312,8 @@ async fn unknown_patch<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(1))
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
     expect(
         jobs.iter()
             .any(|job| job.kind == JobKind::Verify(MessageId("x".into()))),
@@ -313,12 +329,14 @@ async fn claims<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(7))
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
     let job = jobs.first().ok_or("the import must be claimable")?;
     let again = store
         .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(8))
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
     expect(again.is_empty(), "a running job must not be claimed twice")?;
     let mut stale = commit(&snapshot, 1);
     stale.claim = Some(mailtide::jobs::JobClaim {
@@ -382,13 +400,17 @@ async fn stale_claims<S: Store>(store: &S) -> Result<(), String> {
         .claim_jobs(&account(), old.epoch, 10, Timestamp(0), AttemptId(1))
         .await;
     expect(
-        stale == Err(StoreError::Rejected(Rejection::StaleEpoch)),
+        stale
+            == Ok(mailtide::jobs::ClaimOutcome::Rejected(
+                Rejection::StaleEpoch,
+            )),
         "a claim from an older epoch must be refused",
     )?;
     let current = store
         .claim_jobs(&account(), new.epoch, 10, Timestamp(0), AttemptId(2))
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
     expect(
         current.len() == 1,
         "the current epoch must still claim the job",
@@ -419,6 +441,7 @@ async fn claim_all<S: Store>(
         )
         .await
         .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)
 }
 
 async fn actions<S: Store>(store: &S) -> Result<(), String> {
@@ -464,6 +487,7 @@ async fn actions<S: Store>(store: &S) -> Result<(), String> {
     delivered.intents = vec![IntentOp::Delivered {
         versions: group.versions.clone(),
         at: Timestamp(5),
+        by: deliver.attempt,
     }];
     apply(store, &delivered).await?;
     expect(
@@ -823,4 +847,14 @@ async fn forget_fences<S: Store>(store: &S) -> Result<(), String> {
         matches!(apply(store, &late).await?, CommitOutcome::Rejected(_)),
         "the old engine is fenced out",
     )
+}
+
+/// The jobs of a claim that must not be refused.
+fn claimed(
+    outcome: mailtide::jobs::ClaimOutcome,
+) -> Result<Vec<mailtide::jobs::ClaimedJob>, String> {
+    match outcome {
+        mailtide::jobs::ClaimOutcome::Claimed(jobs) => Ok(jobs),
+        mailtide::jobs::ClaimOutcome::Rejected(reason) => Err(format!("claim refused: {reason:?}")),
+    }
 }

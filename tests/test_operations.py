@@ -110,3 +110,15 @@ def test_a_resumed_account_syncs_again(gmail: tuple[Mailbox, str]) -> None:
     assert (resumed.outcome, resumed.phase) == ("resumed", "bootstrapping")
     assert runner.run(ACCOUNT, budget_s=30).stop == "idle"
     assert runner.status(ACCOUNT).messages == 1
+
+
+def test_missing_gmail_scope_blocks_instead_of_looping(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    mailbox.refuse = "insufficientPermissions"
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    outcome = runner.run(ACCOUNT, budget_s=30)
+    assert outcome.stop == "blocked"
+    assert outcome.blocked is not None and outcome.blocked.startswith("api_access_denied")
+    assert mailbox.requests <= 2, f"no retry loop ({mailbox.requests} requests)"
+    assert runner.status(ACCOUNT).phase == "blocked"

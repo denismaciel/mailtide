@@ -78,6 +78,10 @@ pub enum AccountProblem {
     MailDisabled,
     /// The domain blocks Gmail API apps (`domainPolicy`).
     DomainPolicy,
+    /// The credentials lack a Gmail scope, or the Gmail API is disabled for
+    /// the project (403 `insufficientPermissions`, `accessNotConfigured`,
+    /// `forbidden`): every request will be refused until an operator fixes it.
+    ApiAccessDenied,
 }
 
 /// What a cooldown applies to.

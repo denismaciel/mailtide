@@ -613,6 +613,7 @@ fn durable_spam_cleanup_preserves_newer_user_moves_even_after_their_provider_ack
     c.intents = vec![IntentOp::Delivered {
         versions: group.versions,
         at: Timestamp(0),
+        by: restored.attempt,
     }];
     c.jobs = vec![JobOp::Finish {
         claim: restored.claim(),
@@ -665,6 +666,7 @@ fn durable_spam_cleanup_rolls_back_target_removal_alongside_intent_admission_and
         IntentOp::Delivered {
             versions: versions.clone(),
             at: Timestamp(0),
+            by: AttemptId(99),
         },
         on_thread("a", Action::SetRead(mailtide::outbox::ReadState::Read)),
     ];

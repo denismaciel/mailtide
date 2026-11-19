@@ -410,7 +410,12 @@ pub fn tombstone(
         JobKind::Verify(id.clone()),
         JobKind::Deliver(id.clone()),
     ];
-    if has_content || import_running {
+    // Content may exist even when the row says otherwise: an import can
+    // write its blob and crash before committing. Deleting a missing blob is
+    // a no-op, so every deleted message that had a row gets a delayed
+    // cleanup; then no crash window can leak content.
+    let _ = (has_content, import_running);
+    if current.is_some() {
         decision.enqueue.push(NewJob {
             kind: JobKind::BlobCleanup(id.clone()),
             priority: plan.priority,
@@ -692,6 +697,11 @@ impl AccountMirror {
         }
         let mut next = self.clone();
         let skipped = next.apply_unguarded(commit);
+        // Never persist a lifecycle and cursor that contradict each other
+        // (e.g. Live without a cursor): the next engine couldn't start.
+        if next.snapshot().validate().is_err() {
+            return CommitOutcome::Rejected(Rejection::InvalidTransition);
+        }
         *self = next;
         CommitOutcome::Applied {
             state: self.seq,
@@ -745,7 +755,7 @@ impl AccountMirror {
             self.settle(op, commit.claim.as_ref(), seq);
         }
         for op in &commit.intents {
-            if !self.apply_intent(op, commit.claim.as_ref(), &commit.job_plan, seq) {
+            if !self.apply_intent(op, &commit.job_plan, seq) {
                 skipped += 1;
             }
         }
@@ -882,11 +892,20 @@ impl AccountMirror {
             (MessageOp::Observe(observation), Some(claim))
                 if claim.kind == JobKind::Verify(observation.id.clone()) =>
             {
-                &observation.id
+                (&observation.id, claim.attempt)
             }
-            _ => return,
+            // Only a verification fetch can confirm a delivery: an
+            // observation from history or an import may predate it.
+            (
+                MessageOp::Observe(_)
+                | MessageOp::PatchLabels { .. }
+                | MessageOp::MarkImported { .. }
+                | MessageOp::Listed { .. }
+                | MessageOp::FinishReconcile { .. },
+                _,
+            ) => return,
         };
-        let attempt = claim.map_or(AttemptId(0), |c| c.attempt);
+        let (id, attempt) = id;
         let before = self.intents.len();
         self.intents
             .retain(|(message, _), intent| message != id || !settles(intent, attempt));
@@ -896,13 +915,7 @@ impl AccountMirror {
     }
 
     /// Apply one intent operation; `false` if it changed nothing.
-    fn apply_intent(
-        &mut self,
-        op: &IntentOp,
-        claim: Option<&JobClaim>,
-        plan: &JobPlan,
-        seq: StateSeq,
-    ) -> bool {
+    fn apply_intent(&mut self, op: &IntentOp, plan: &JobPlan, seq: StateSeq) -> bool {
         match op {
             IntentOp::Request(request) => {
                 let (targets, action): (Vec<MessageId>, _) = match request {
@@ -937,13 +950,13 @@ impl AccountMirror {
                 }
                 admitted
             }
-            IntentOp::Delivered { versions, at } => {
+            IntentOp::Delivered { versions, at, by } => {
                 let mut any = false;
                 for delivery in versions {
                     if let Some(intent) = self.matching(delivery) {
                         intent.state = IntentState::Delivered {
                             at: *at,
-                            attempt: claim.map_or(AttemptId(0), |c| c.attempt),
+                            attempt: *by,
                         };
                         any = true;
                     }
@@ -1185,7 +1198,7 @@ impl AccountMirror {
         };
         self.seq = StateSeq(self.seq.0 + 1);
         let seq = self.seq;
-        self.apply_intent(&IntentOp::Request(request.clone()), None, &plan, seq);
+        self.apply_intent(&IntentOp::Request(request.clone()), &plan, seq);
         let admitted = self.log.iter().filter(|(s, _)| *s == seq).count();
         if admitted > 0 {
             self.record.last_activity = Some(self.record.last_activity.map_or(now, |t| t.max(now)));
@@ -1496,6 +1509,27 @@ mod tests {
             "provisional until its import observes it"
         );
         assert!(mirror.seen.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_message_whose_import_may_have_crashed_schedules_cleanup() {
+        // The import wrote the blob, then the process died before its
+        // commit: the row still says Pending and no import is running.
+        let mut mirror = claimed();
+        let mut c = commit(&mirror);
+        c.messages = vec![MessageOp::Observe(observation("a", &["INBOX"], 1))];
+        mirror.apply(&c);
+        let mut deleted = commit(&mirror);
+        deleted.messages = vec![MessageOp::Tombstone {
+            id: MessageId("a".into()),
+            evidence: DeletionEvidence::History { at: HistoryId(2) },
+        }];
+        mirror.apply(&deleted);
+        assert!(
+            mirror
+                .jobs
+                .contains_key(&JobKind::BlobCleanup(MessageId("a".into())))
+        );
     }
 
     #[test]

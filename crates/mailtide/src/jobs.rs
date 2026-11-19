@@ -70,6 +70,15 @@ pub struct Job {
     pub state: JobState,
 }
 
+/// What a claim for due jobs produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// These jobs are now held by the claim's attempt (possibly none).
+    Claimed(Vec<ClaimedJob>),
+    /// The store refused: another engine holds the account.
+    Rejected(crate::commit::Rejection),
+}
+
 /// A job claimed for this engine: the store hands these out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedJob {

@@ -16,9 +16,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mailtide::EngineConfig;
 use mailtide::ids::{AccountId, Timestamp};
 use mailtide::quota::{Admission, Budget, Lease, Priority, QuotaUnits};
-use mailtide::retry::{Cooldown, Failure, QuotaTarget};
+use mailtide::retry::{Cooldown, QuotaTarget};
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
-use mailtide_io::auth::{AccessToken, TokenSource};
+use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
 use mailtide_io::blobs::ObjectBlobs;
 use mailtide_io::quota_gate::{GateError, LocalGate, QuotaGate};
 use mailtide_io::runner::{RunOutcome, Runner, RunnerConfig, StopReason, WatchMode};
@@ -171,7 +171,7 @@ impl QuotaGate for RecordingGate {
 struct CountingTokens(Arc<AtomicU32>);
 
 impl TokenSource for CountingTokens {
-    async fn token(&self, _account: &AccountId) -> Result<AccessToken, Failure> {
+    async fn token(&self, _account: &AccountId) -> Result<AccessToken, TokenError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(AccessToken {
             secret: "test".into(),

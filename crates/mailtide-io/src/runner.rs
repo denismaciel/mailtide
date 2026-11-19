@@ -7,14 +7,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use mailtide::command::{Command, CommandKind, GmailCall, GmailRequest};
-use mailtide::commit::{AccountOp, CommitOutcome};
+use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
 use mailtide::engine::Stopped;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::ImportedMessage;
-use mailtide::ids::{AccountId, CommandId, ENGINE_VERSION, HistoryId, Timestamp};
+use mailtide::ids::{AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, Timestamp};
+use mailtide::jobs::ClaimOutcome;
 use mailtide::outbox::ActionRequest;
 use mailtide::quota::Admission;
-use mailtide::retry::{BlockingFailure, Failure, Retryable, RetryableFailure};
+use mailtide::retry::{Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::schedule::TimerKind;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status};
 use mailtide::{Engine, EngineConfig};
@@ -269,7 +270,13 @@ where
                     // them so the outcome is durable; the store rejects any
                     // that are stale.
                     queue.push_front(command);
-                    self.flush_commits(&mut queue, &mut report).await?;
+                    let refused = self.flush_commits(&mut queue, &mut report).await?;
+                    // A block the store refused never happened: another
+                    // engine holds the account.
+                    let stop = match (stop, refused) {
+                        (StopReason::Blocked(_), Some(_)) => StopReason::Superseded,
+                        (stop, _) => stop,
+                    };
                     return Ok(finish(report, &engine, stop));
                 }
                 if Instant::now() > deadline {
@@ -329,13 +336,17 @@ where
         &self,
         queue: &mut VecDeque<Command>,
         report: &mut SyncReport,
-    ) -> Result<(), RunError> {
+    ) -> Result<Option<Rejection>, RunError> {
+        let mut refused = None;
         while let Some(command) = queue.pop_front() {
-            if let CommandKind::Commit(commit) = command.kind {
-                self.apply_commit(&commit, report).await?;
+            if let CommandKind::Commit(commit) = command.kind
+                && let Some(EventKind::CommitRejected { reason, .. }) =
+                    self.apply_commit(&commit, report).await?
+            {
+                refused = Some(reason);
             }
         }
-        Ok(())
+        Ok(refused)
     }
 
     /// Perform one command; `None` if it produces no event.
@@ -371,8 +382,13 @@ where
                 .claim_jobs(&account, epoch, limit, now, attempt)
                 .await
             {
-                Ok(jobs) => Ok(Some(EventKind::JobsClaimed { command: id, jobs })),
-                Err(StoreError::Rejected(_)) => Ok(None),
+                Ok(ClaimOutcome::Claimed(jobs)) => {
+                    Ok(Some(EventKind::JobsClaimed { command: id, jobs }))
+                }
+                Ok(ClaimOutcome::Rejected(reason)) => Ok(Some(EventKind::JobsClaimRejected {
+                    command: id,
+                    reason,
+                })),
                 Err(error) => Err(RunError::Store(error)),
             },
             CommandKind::DeleteBlob { account, message } => {
@@ -468,7 +484,7 @@ where
     ) -> Outcome {
         let token = match self.tokens.token(account).await {
             Ok(token) => token,
-            Err(failure) => return Outcome::Failed(failure),
+            Err(error) => return Outcome::Failed(error.into_failure()),
         };
         let config = RequestConfig {
             watch_topic: topic.to_owned(),
@@ -520,10 +536,20 @@ where
             GmailRequest::ListMessages { .. } => {
                 decode::list(body).map(|page| EventKind::MessagesListed { command, page })
             }
-            GmailRequest::GetMessage { .. } => decode::message_minimal(body)
-                .map(|message| EventKind::MessageFetched { command, message }),
-            GmailRequest::ImportMessage { .. } => match decode::message_raw(body) {
-                Ok(raw) => return self.import(account, command, raw, report).await,
+            GmailRequest::GetMessage { id } => match decode::message_minimal(body) {
+                Ok(message) if message.id == *id => {
+                    Ok(EventKind::MessageFetched { command, message })
+                }
+                Ok(message) => return Outcome::Failed(mismatch(id, &message.id)),
+                Err(error) => Err(error),
+            },
+            // Check the identity before writing anything: a body naming
+            // another message must not be stored under its key.
+            GmailRequest::ImportMessage { id } => match decode::message_raw(body) {
+                Ok(raw) if raw.observation.id == *id => {
+                    return self.import(account, command, raw, report).await;
+                }
+                Ok(raw) => return Outcome::Failed(mismatch(id, &raw.observation.id)),
                 Err(error) => Err(error),
             },
             GmailRequest::ListLabels => {
@@ -537,7 +563,13 @@ where
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
-            Err(error) => Outcome::Failed(transient(format!("undecodable response: {error:?}"))),
+            // A malformed body won't heal by waiting: refuse it for good
+            // (a job blocks; a sync request blocks the account for an
+            // operator) instead of re-fetching forever.
+            Err(error) => Outcome::Failed(Failure::Blocking(BlockingFailure {
+                class: Blocking::Permanent,
+                detail: format!("undecodable response: {error:?}"),
+            })),
         }
     }
 
@@ -579,6 +611,15 @@ impl<Q: QuotaGate> Drop for LeaseGuard<'_, Q> {
             self.gate.abandon(lease);
         }
     }
+}
+
+/// Gmail answered for a different message than requested: retry (never
+/// store it under the requested id).
+fn mismatch(requested: &MessageId, answered: &MessageId) -> Failure {
+    transient(format!(
+        "response for message {} answered request for {}",
+        answered.0, requested.0
+    ))
 }
 
 fn transient(detail: String) -> Failure {

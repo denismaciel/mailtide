@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use mailtide::ids::{AccountId, Timestamp};
-use mailtide::retry::Failure;
+use mailtide::retry::{
+    AccountProblem, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure,
+};
 
 /// A bearer token for one account.
 #[derive(Clone, PartialEq, Eq)]
@@ -24,6 +26,35 @@ impl std::fmt::Debug for AccessToken {
     }
 }
 
+/// Why a token couldn't be minted. Narrower than a Gmail [`Failure`] on
+/// purpose: a token source knows nothing about messages, so it can't claim
+/// one is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenError {
+    /// Try again later (network, the identity service).
+    Transient(String),
+    /// The account can't be accessed until an operator acts.
+    Account(AccountProblem, String),
+}
+
+impl TokenError {
+    /// The engine's view of it.
+    #[must_use]
+    pub fn into_failure(self) -> Failure {
+        match self {
+            Self::Transient(detail) => Failure::Retryable(RetryableFailure {
+                class: Retryable::Transient,
+                retry_after: None,
+                detail,
+            }),
+            Self::Account(problem, detail) => Failure::Blocking(BlockingFailure {
+                class: Blocking::Account(problem),
+                detail,
+            }),
+        }
+    }
+}
+
 /// Mints access tokens.
 pub trait TokenSource: Send + Sync {
     /// A valid token for `account`, or a classified failure (delegation
@@ -31,7 +62,7 @@ pub trait TokenSource: Send + Sync {
     fn token(
         &self,
         account: &AccountId,
-    ) -> impl Future<Output = Result<AccessToken, Failure>> + Send;
+    ) -> impl Future<Output = Result<AccessToken, TokenError>> + Send;
 
     /// Gmail rejected `account`'s current token (401): drop any cached copy
     /// so the next call mints a fresh one.
@@ -70,7 +101,7 @@ impl<A> CachedTokens<A> {
 }
 
 impl<A: TokenSource> TokenSource for CachedTokens<A> {
-    async fn token(&self, account: &AccountId) -> Result<AccessToken, Failure> {
+    async fn token(&self, account: &AccountId) -> Result<AccessToken, TokenError> {
         if let Some(token) = self.cached(account) {
             return Ok(token);
         }
@@ -94,14 +125,12 @@ impl<A: TokenSource> TokenSource for CachedTokens<A> {
 pub struct StaticTokens(pub BTreeMap<AccountId, AccessToken>);
 
 impl TokenSource for StaticTokens {
-    async fn token(&self, account: &AccountId) -> Result<AccessToken, Failure> {
+    async fn token(&self, account: &AccountId) -> Result<AccessToken, TokenError> {
         self.0.get(account).cloned().ok_or_else(|| {
-            Failure::Blocking(mailtide::retry::BlockingFailure {
-                class: mailtide::retry::Blocking::Account(
-                    mailtide::retry::AccountProblem::DelegationRevoked,
-                ),
-                detail: "no token configured".into(),
-            })
+            TokenError::Account(
+                AccountProblem::DelegationRevoked,
+                "no token configured".into(),
+            )
         })
     }
 }

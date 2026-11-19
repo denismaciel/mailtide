@@ -270,6 +270,15 @@ impl Engine {
             EventKind::CommitApplied { commit } => self.on_applied(commit, now),
             EventKind::CommitRejected { commit, reason } => self.on_rejected(commit, reason, now),
             EventKind::JobsClaimed { command, jobs } => self.on_claimed(command, jobs, now),
+            EventKind::JobsClaimRejected { command, reason } => {
+                if self.waiting.remove(&command) != Some(Waiting::Claim) {
+                    return Vec::new();
+                }
+                // Another engine holds the account: stop.
+                self.claiming = false;
+                self.stopped = Some(Stopped::Superseded(reason));
+                vec![self.status_command()]
+            }
             EventKind::BlobDeleted { command } => self.on_blob_deleted(command, now),
             EventKind::RequestFailed { command, failure } => self.on_failed(command, &failure, now),
             EventKind::RequestDeferred { command, until } => self.on_deferred(command, until),
@@ -773,9 +782,16 @@ impl Engine {
         out
     }
 
-    fn take_job(&mut self, command: CommandId) -> Option<ClaimedJob> {
+    /// The job `command` was issued for, if `answers` says this result is
+    /// one for it (right kind, right message). A result that doesn't fit
+    /// leaves the job waiting for its real answer.
+    fn take_job(
+        &mut self,
+        command: CommandId,
+        answers: impl FnOnce(&JobKind) -> bool,
+    ) -> Option<ClaimedJob> {
         match self.waiting.remove(&command) {
-            Some(Waiting::Job(job)) => Some(job),
+            Some(Waiting::Job(job)) if answers(&job.kind) => Some(job),
             Some(other) => {
                 self.waiting.insert(command, other);
                 None
@@ -829,7 +845,7 @@ impl Engine {
     }
 
     fn on_modified(&mut self, command: CommandId, now: Timestamp) -> Vec<Command> {
-        let Some(job) = self.take_job(command) else {
+        let Some(job) = self.take_job(command, |kind| matches!(kind, JobKind::Deliver(_))) else {
             return Vec::new();
         };
         let versions = job
@@ -837,7 +853,11 @@ impl Engine {
             .as_ref()
             .map(|g| g.versions.clone())
             .unwrap_or_default();
-        let intents = vec![IntentOp::Delivered { versions, at: now }];
+        let intents = vec![IntentOp::Delivered {
+            versions,
+            at: now,
+            by: job.attempt,
+        }];
         vec![self.finish_job_with(&job, JobOutcome::Done, Vec::new(), intents, now)]
     }
 
@@ -847,7 +867,8 @@ impl Engine {
         message: ImportedMessage,
         now: Timestamp,
     ) -> Vec<Command> {
-        let Some(job) = self.take_job(command) else {
+        let expected = JobKind::Import(message.observation.id.clone());
+        let Some(job) = self.take_job(command, |kind| *kind == expected) else {
             return Vec::new();
         };
         self.imported += 1;
@@ -867,7 +888,8 @@ impl Engine {
         message: MessageObservation,
         now: Timestamp,
     ) -> Vec<Command> {
-        let Some(job) = self.take_job(command) else {
+        let expected = JobKind::Verify(message.id.clone());
+        let Some(job) = self.take_job(command, |kind| *kind == expected) else {
             return Vec::new();
         };
         vec![self.finish_job(
@@ -879,7 +901,11 @@ impl Engine {
     }
 
     fn on_not_found(&mut self, command: CommandId, id: MessageId, now: Timestamp) -> Vec<Command> {
-        let Some(job) = self.take_job(command) else {
+        let answers = |kind: &JobKind| match kind {
+            JobKind::Import(m) | JobKind::Verify(m) | JobKind::Deliver(m) => *m == id,
+            JobKind::BlobCleanup(_) => false,
+        };
+        let Some(job) = self.take_job(command, answers) else {
             return Vec::new();
         };
         let ops = vec![MessageOp::Tombstone {
@@ -892,7 +918,8 @@ impl Engine {
     }
 
     fn on_blob_deleted(&mut self, command: CommandId, now: Timestamp) -> Vec<Command> {
-        let Some(job) = self.take_job(command) else {
+        let Some(job) = self.take_job(command, |kind| matches!(kind, JobKind::BlobCleanup(_)))
+        else {
             return Vec::new();
         };
         vec![self.finish_job(&job, JobOutcome::Done, Vec::new(), now)]
@@ -948,9 +975,14 @@ impl Engine {
                 }
                 Some(_) | None => Vec::new(),
             },
-            // This engine's view is stale: stop, and let the host build a
-            // new engine from the store.
-            Rejection::StaleEpoch | Rejection::StaleVersion | Rejection::CursorMismatch => {
+            // This engine's view is stale (another engine, a newer version,
+            // a moved cursor), or it built a commit the store refused as
+            // contradictory: continuing would repeat it. Stop; the reason
+            // reaches the host, which builds a new engine from the store.
+            Rejection::StaleEpoch
+            | Rejection::StaleVersion
+            | Rejection::CursorMismatch
+            | Rejection::InvalidTransition => {
                 self.stopped = Some(Stopped::Superseded(reason));
                 vec![self.status_command()]
             }
@@ -999,36 +1031,31 @@ impl Engine {
             return Vec::new();
         };
         match failure {
-            Failure::Blocking(
-                blocking @ BlockingFailure {
-                    class: Blocking::Account(_),
-                    ..
-                },
-            ) => return self.block(blocking.clone(), now),
             Failure::Retryable(retryable) => {
                 let mut out = self.cool_down(retryable, now);
                 out.extend(self.retry(waiting, retryable, now));
-                return out;
+                out
             }
-            Failure::NotFound | Failure::Blocking(_) => {}
+            Failure::Blocking(blocking) => self.on_refused(command, waiting, blocking, now),
+            Failure::NotFound => self.on_missing(command, waiting, now),
         }
-        match waiting {
-            Waiting::Job(job) => match (failure, &job.kind) {
-                // A 404 that wasn't decoded as MessageNotFound: treat alike.
-                (
-                    Failure::NotFound,
-                    JobKind::Import(id) | JobKind::Verify(id) | JobKind::Deliver(id),
-                ) => {
-                    let id = id.clone();
-                    self.waiting.insert(command, Waiting::Job(job));
-                    self.on_not_found(command, id, now)
-                }
-                (Failure::NotFound, JobKind::BlobCleanup(_)) => {
-                    vec![self.finish_job(&job, JobOutcome::Done, Vec::new(), now)]
-                }
-                (Failure::Blocking(blocking), JobKind::Deliver(_)) => {
-                    // Gmail refuses this change for good: block the intents
-                    // (they stop overlaying) and finish the job.
+    }
+
+    /// Gmail refused a request for good.
+    fn on_refused(
+        &mut self,
+        command: CommandId,
+        waiting: Waiting,
+        blocking: &BlockingFailure,
+        now: Timestamp,
+    ) -> Vec<Command> {
+        match (&blocking.class, waiting) {
+            // The account itself is unusable: everything stops.
+            (Blocking::Account(_), _) => self.block(blocking.clone(), now),
+            (Blocking::Permanent, Waiting::Job(job)) => match &job.kind {
+                // This change can't be applied: block its intents (they stop
+                // overlaying) and finish the job.
+                JobKind::Deliver(_) => {
                     let versions = job
                         .modify
                         .as_ref()
@@ -1040,7 +1067,7 @@ impl Engine {
                     }];
                     vec![self.finish_job_with(&job, JobOutcome::Done, Vec::new(), intents, now)]
                 }
-                (Failure::Blocking(blocking), _) => {
+                JobKind::Import(_) | JobKind::Verify(_) | JobKind::BlobCleanup(_) => {
                     vec![self.finish_job(
                         &job,
                         JobOutcome::Block(blocking.clone()),
@@ -1048,21 +1075,63 @@ impl Engine {
                         now,
                     )]
                 }
-                (Failure::Retryable(_), _) => Vec::new(),
             },
-            Waiting::History if *failure == Failure::NotFound => {
+            // A sync request mailtide built itself, refused for good, will be
+            // refused next time too: stop for an operator instead of looping.
+            (
+                Blocking::Permanent,
+                Waiting::History | Waiting::Labels | Waiting::Baseline | Waiting::Listing,
+            ) => {
+                self.pass = None;
+                self.block(blocking.clone(), now)
+            }
+            (Blocking::Permanent, Waiting::Claim) => {
+                // Claims go to the store, which doesn't answer with Gmail
+                // failures; free the slot regardless.
+                let _ = command;
+                self.claiming = false;
+                Vec::new()
+            }
+            // The watch can't be renewed: polling still finds changes; the
+            // next engine tries again.
+            (Blocking::Permanent, Waiting::Watch) => Vec::new(),
+        }
+    }
+
+    /// Gmail answered 404.
+    fn on_missing(&mut self, command: CommandId, waiting: Waiting, now: Timestamp) -> Vec<Command> {
+        match waiting {
+            Waiting::Job(job) => match &job.kind {
+                JobKind::Import(id) | JobKind::Verify(id) | JobKind::Deliver(id) => {
+                    let id = id.clone();
+                    self.waiting.insert(command, Waiting::Job(job));
+                    self.on_not_found(command, id, now)
+                }
+                // Already gone: nothing to clean up.
+                JobKind::BlobCleanup(_) => {
+                    vec![self.finish_job(&job, JobOutcome::Done, Vec::new(), now)]
+                }
+            },
+            // The cursor is too old: reconcile.
+            Waiting::History => {
                 self.pass = None;
                 self.history_expired(now)
+            }
+            // These endpoints don't 404 for a working account: treat it as a
+            // refusal rather than loop.
+            Waiting::Labels | Waiting::Baseline | Waiting::Listing => {
+                self.pass = None;
+                self.block(
+                    BlockingFailure {
+                        class: Blocking::Permanent,
+                        detail: "unexpected 404 on a sync request".into(),
+                    },
+                    now,
+                )
             }
             Waiting::Claim => {
                 self.claiming = false;
                 Vec::new()
-            }
-            Waiting::History | Waiting::Labels | Waiting::Baseline | Waiting::Listing => {
-                // A permanent or not-found failure on a sync request: start
-                // over from a clean reconciliation rather than loop.
-                self.pass = None;
-                self.begin_reconcile(ReconcileReason::Requested, now)
             }
             Waiting::Watch => Vec::new(),
         }
@@ -1372,6 +1441,82 @@ mod tests {
         let mut engine = live(100);
         assert_eq!(gmail_requests(&push(&mut engine, 105)).len(), 1);
         assert!(gmail_requests(&push(&mut engine, 110)).is_empty());
+    }
+
+    #[test]
+    fn a_permanent_refusal_of_a_sync_request_blocks_instead_of_looping() {
+        let mut engine = engine_with(
+            None,
+            SyncState::Bootstrapping(ReconcileProgress::begin(ReconcileReason::Bootstrap)),
+        );
+        let start = engine.start(Timestamp(0));
+        let labels = start
+            .iter()
+            .find(|c| matches!(&c.kind, CommandKind::Gmail(call) if call.request == GmailRequest::ListLabels))
+            .expect("labels are listed first")
+            .id;
+        let refusal = BlockingFailure {
+            class: Blocking::Permanent,
+            detail: "400".into(),
+        };
+        let commands = engine.handle(event(EventKind::RequestFailed {
+            command: labels,
+            failure: Failure::Blocking(refusal.clone()),
+        }));
+        assert!(gmail_requests(&commands).is_empty(), "no retry loop");
+        assert_eq!(engine.stopped(), Some(&Stopped::Blocked(refusal)));
+    }
+
+    #[test]
+    fn a_result_for_another_message_leaves_the_job_waiting() {
+        let mut engine = live(100);
+        let job = ClaimedJob {
+            kind: JobKind::Import(MessageId("a".into())),
+            priority: Priority::Live,
+            failed_attempts: 0,
+            attempt: AttemptId(1),
+            modify: None,
+        };
+        let claim = engine.claim_jobs(Timestamp(0));
+        let claim = claim.first().expect("a claim").id;
+        let commands = engine.handle(event(EventKind::JobsClaimed {
+            command: claim,
+            jobs: vec![job],
+        }));
+        let import = commands
+            .iter()
+            .find(|c| matches!(&c.kind, CommandKind::Gmail(_)))
+            .expect("the import is fetched")
+            .id;
+        let wrong = engine.handle(event(EventKind::MessageNotFound {
+            command: import,
+            message_id: MessageId("b".into()),
+        }));
+        assert!(
+            first_commit(wrong).is_none(),
+            "b's 404 must not finish a's import"
+        );
+        let right = engine.handle(event(EventKind::MessageNotFound {
+            command: import,
+            message_id: MessageId("a".into()),
+        }));
+        assert!(first_commit(right).is_some(), "a's own answer still lands");
+    }
+
+    #[test]
+    fn a_refused_claim_stops_the_engine() {
+        let mut engine = live(100);
+        let claim = engine.claim_jobs(Timestamp(0));
+        let claim = claim.first().expect("a claim").id;
+        let commands = engine.handle(event(EventKind::JobsClaimRejected {
+            command: claim,
+            reason: Rejection::StaleEpoch,
+        }));
+        assert!(gmail_requests(&commands).is_empty());
+        assert_eq!(
+            engine.stopped(),
+            Some(&Stopped::Superseded(Rejection::StaleEpoch))
+        );
     }
 
     #[test]

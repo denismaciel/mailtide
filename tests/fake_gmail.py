@@ -16,6 +16,7 @@ class Mailbox:
         self.lock = threading.Lock()
         self.delay_s = 0.0
         self.requests = 0
+        self.refuse: str | None = None  # a 403 reason every request gets
         self.history_id = 0
         self.messages: dict[str, dict] = {}
         self.history: list[dict] = []
@@ -58,6 +59,13 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                 time.sleep(mailbox.delay_s)  # a slow Gmail, to test cancellation
             with mailbox.lock:
                 mailbox.requests += 1
+                if mailbox.refuse:
+                    error = {
+                        "code": 403,
+                        "message": "refused",
+                        "errors": [{"reason": mailbox.refuse}],
+                    }
+                    return self.reply(403, {"error": error})
                 self._get()
 
         def do_POST(self) -> None:  # noqa: N802

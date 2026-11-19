@@ -84,6 +84,9 @@ pub fn classify(response: &HttpResponse) -> Failure {
         429 if message.contains("bandwidth") => retryable(Retryable::AccountBandwidth),
         429 => retryable(Retryable::AccountRateLimited),
         403 if has("domainPolicy") => blocking(Blocking::Account(AccountProblem::DomainPolicy)),
+        403 if has("insufficientPermissions") || has("accessNotConfigured") || has("forbidden") => {
+            blocking(Blocking::Account(AccountProblem::ApiAccessDenied))
+        }
         403 if has("userRateLimitExceeded") => retryable(Retryable::AccountRateLimited),
         403 if has("rateLimitExceeded") || has("quotaExceeded") || has("dailyLimitExceeded") => {
             retryable(Retryable::ProjectRateLimited)
@@ -140,6 +143,26 @@ mod tests {
         match failure {
             Failure::Retryable(retryable) => Some(retryable.class),
             Failure::NotFound | Failure::Blocking(_) => None,
+        }
+    }
+
+    #[test]
+    fn missing_scopes_and_disabled_apis_are_account_problems() {
+        for reason in [
+            "insufficientPermissions",
+            "accessNotConfigured",
+            "forbidden",
+        ] {
+            assert!(
+                matches!(
+                    classify(&response(403, reason, "x")),
+                    Failure::Blocking(BlockingFailure {
+                        class: Blocking::Account(AccountProblem::ApiAccessDenied),
+                        ..
+                    })
+                ),
+                "{reason}"
+            );
         }
     }
 

@@ -226,4 +226,7 @@ pub enum Rejection {
     CursorMismatch,
     /// The job claim no longer holds (another attempt took the job).
     StaleClaim,
+    /// Applying it would leave the lifecycle and cursor contradicting each
+    /// other (a bug in the writer); nothing was applied.
+    InvalidTransition,
 }

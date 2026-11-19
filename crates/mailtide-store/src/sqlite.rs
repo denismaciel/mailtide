@@ -2,7 +2,7 @@
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
-use mailtide::jobs::{AttemptId, ClaimedJob};
+use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
@@ -54,7 +54,7 @@ impl Store for SqliteStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
-    ) -> Result<Vec<ClaimedJob>, StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         self.inner
             .claim_jobs(account, epoch, limit, now, attempt)
             .await

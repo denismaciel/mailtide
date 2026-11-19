@@ -14,7 +14,7 @@ use mailtide::gmail::LabelKind;
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
-use mailtide::jobs::{AttemptId, ClaimedJob, Job, JobKind, JobState};
+use mailtide::jobs::{AttemptId, ClaimOutcome, ClaimedJob, Job, JobKind, JobState};
 use mailtide::labels::LabelSet;
 use mailtide::mirror::{
     AccountMirror, AccountRecord, Content, MessageRecord, MessageView, StoredContent,
@@ -749,14 +749,14 @@ impl SqlStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
-    ) -> Result<Vec<ClaimedJob>, StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         let mut tx = self.begin().await?;
         let current = self
             .load_account(&mut tx, account)
             .await?
             .map(|(record, _)| record.epoch);
         if current != Some(epoch) {
-            return Err(StoreError::Rejected(Rejection::StaleEpoch));
+            return Ok(ClaimOutcome::Rejected(Rejection::StaleEpoch));
         }
         let skip_locked = match self.dialect {
             Dialect::Postgres => " FOR UPDATE SKIP LOCKED",
@@ -806,7 +806,7 @@ impl SqlStore {
         tx.commit()
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
-        Ok(claimed)
+        Ok(ClaimOutcome::Claimed(claimed))
     }
 
     pub(crate) async fn changes(
@@ -1105,7 +1105,7 @@ impl crate::Store for SqlStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
-    ) -> Result<Vec<ClaimedJob>, StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         Self::claim_jobs(self, account, epoch, limit, now, attempt).await
     }
 

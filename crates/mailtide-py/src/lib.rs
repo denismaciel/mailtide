@@ -27,14 +27,12 @@ mod _core {
     use mailtide::outbox::{
         Action, ActionRequest, Importance, ReadState, RestoreDestination, StarState,
     };
-    use mailtide::retry::{
-        AccountProblem, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure,
-    };
+    use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
     use mailtide::revision::{StateSeq, StateString};
     use mailtide::state::SyncPhase;
     use mailtide_gmail::push::{self, Jwks, PushExpectations};
     use mailtide_io::auth::CachedTokens;
-    use mailtide_io::auth::{AccessToken, TokenSource};
+    use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
     use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
@@ -179,6 +177,7 @@ mod _core {
             Blocking::Account(AccountProblem::UserDeleted) => "user_deleted",
             Blocking::Account(AccountProblem::MailDisabled) => "mail_disabled",
             Blocking::Account(AccountProblem::DomainPolicy) => "domain_policy",
+            Blocking::Account(AccountProblem::ApiAccessDenied) => "api_access_denied",
             Blocking::Permanent => "permanent",
         };
         format!("{class}: {}", failure.detail)
@@ -399,31 +398,23 @@ mod _core {
     /// (async `Runner` only).
     struct PyTokens(Py<PyAny>);
 
-    fn token_failure(py: Python<'_>, err: &PyErr) -> Failure {
+    fn token_failure(py: Python<'_>, err: &PyErr) -> TokenError {
         if err.is_instance_of::<DelegationRevoked>(py) {
-            Failure::Blocking(BlockingFailure {
-                class: Blocking::Account(AccountProblem::DelegationRevoked),
-                detail: "token source raised DelegationRevoked".into(),
-            })
+            TokenError::Account(
+                AccountProblem::DelegationRevoked,
+                "token source raised DelegationRevoked".into(),
+            )
         } else {
-            Failure::Retryable(RetryableFailure {
-                class: Retryable::Transient,
-                retry_after: None,
-                detail: format!("token source failed: {}", err.get_type(py)),
-            })
+            TokenError::Transient(format!("token source failed: {}", err.get_type(py)))
         }
     }
 
-    fn transient(detail: &str) -> Failure {
-        Failure::Retryable(RetryableFailure {
-            class: Retryable::Transient,
-            retry_after: None,
-            detail: detail.to_owned(),
-        })
+    fn transient(detail: &str) -> TokenError {
+        TokenError::Transient(detail.to_owned())
     }
 
     impl TokenSource for PyTokens {
-        async fn token(&self, account: &AccountId) -> Result<AccessToken, Failure> {
+        async fn token(&self, account: &AccountId) -> Result<AccessToken, TokenError> {
             let callable = Python::attach(|py| self.0.clone_ref(py));
             let account = account.as_str().to_owned();
             let called = tokio::task::spawn_blocking(move || {

@@ -401,12 +401,15 @@ pub enum IntentOp {
     /// labels into versioned intents, and enqueue their delivery. Targets
     /// that can't take it (drafts, unknown messages) are skipped.
     Request(ActionRequest),
-    /// Gmail accepted these versions at `at`; they now await confirmation.
+    /// Gmail accepted these versions at `at`; they now await confirmation by
+    /// a fetch claimed after `by`, the delivery job's claim.
     Delivered {
         /// The versions delivered.
         versions: Vec<Delivery>,
         /// When.
         at: Timestamp,
+        /// The claim of the job that delivered them.
+        by: crate::jobs::AttemptId,
     },
     /// Gmail refused these versions for good.
     Block {

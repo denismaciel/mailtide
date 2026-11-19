@@ -13,7 +13,7 @@ use std::future::Future;
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
-use mailtide::jobs::{AttemptId, ClaimedJob};
+use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
@@ -69,7 +69,7 @@ pub trait Store: Send + Sync {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
-    ) -> impl Future<Output = Result<Vec<ClaimedJob>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<ClaimOutcome, StoreError>> + Send;
 
     /// Changes after `since`, for consumers.
     fn changes(

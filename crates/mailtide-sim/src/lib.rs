@@ -901,12 +901,16 @@ impl Sim {
                 attempt,
                 ..
             } => {
-                // A claim from a dead engine is refused; nobody listens anyway.
-                let jobs = self
-                    .mirror
-                    .claim_jobs(epoch, limit, now, attempt)
-                    .unwrap_or_default();
-                self.deliver(EventKind::JobsClaimed { command: id, jobs });
+                // A claim from an older engine is refused, and the engine is
+                // told (it stops as superseded), exactly as the runner does.
+                let kind = match self.mirror.claim_jobs(epoch, limit, now, attempt) {
+                    Ok(jobs) => EventKind::JobsClaimed { command: id, jobs },
+                    Err(reason) => EventKind::JobsClaimRejected {
+                        command: id,
+                        reason,
+                    },
+                };
+                self.deliver(kind);
             }
             CommandKind::DeleteBlob { message, .. } => {
                 self.blobs.remove(&message);
@@ -1019,6 +1023,21 @@ impl Sim {
         }
         if let Some(extra) = mirror.difference(&gmail).next() {
             return Some(format!("{} is mirrored but not in Gmail", extra.0));
+        }
+        // Raw content of deleted messages must be scheduled for cleanup,
+        // including content written by an import that crashed before its
+        // commit.
+        if let Some(orphan) = self.blobs.iter().find(|id| {
+            !self.gmail.messages.contains_key(*id)
+                && !self
+                    .mirror
+                    .jobs
+                    .contains_key(&JobKind::BlobCleanup((*id).clone()))
+        }) {
+            return Some(format!(
+                "{} has content but no cleanup after deletion",
+                orphan.0
+            ));
         }
         for (id, message) in &self.gmail.messages {
             let record = &self.mirror.messages[id];
