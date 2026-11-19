@@ -240,6 +240,12 @@ mod _core {
         gmail_requests: u32,
         /// For `act`: how many messages the action admitted changes for.
         admitted: u32,
+        /// Requests that failed and will be retried after backoff (token
+        /// source, Gmail or blob store). Nonzero with `stop == "idle"` means
+        /// the run isn't caught up: it is waiting to retry.
+        failed_requests: u32,
+        /// The last failure's class, e.g. `transient` or `blob_store`.
+        last_failure: Option<&'static str>,
         status: Option<Status>,
     }
 
@@ -602,6 +608,8 @@ mod _core {
                 imported: report.imported,
                 gmail_requests: report.gmail_requests,
                 admitted: report.admitted,
+                failed_requests: report.failed_requests,
+                last_failure: report.last_failure,
                 status: report.status.map(Status::from),
             }
         }

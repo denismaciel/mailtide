@@ -40,6 +40,8 @@ class RunOutcome:
     imported: int
     gmail_requests: int
     admitted: int
+    failed_requests: int
+    last_failure: str | None
     status: Status | None
 
 @final

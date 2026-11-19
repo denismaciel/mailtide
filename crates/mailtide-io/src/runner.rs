@@ -157,6 +157,11 @@ pub struct SyncReport {
     pub gmail_requests: u32,
     /// For [`Runner::act`]: messages the action admitted intents for.
     pub admitted: u32,
+    /// Requests that failed (token source, Gmail or blob store); they are
+    /// retried after backoff, so a run can end `Idle` with work failing.
+    pub failed_requests: u32,
+    /// The last failure's class (`transient`, `not_found`, ...), if any.
+    pub last_failure: Option<&'static str>,
     /// The account's status at the end.
     pub status: Option<Status>,
 }
@@ -842,21 +847,29 @@ where
                 duration_ms,
                 "gmail request"
             ),
-            Outcome::Failed(failure) => tracing::warn!(
-                request = request_kind(&call.request),
-                failure = failure_kind(failure),
-                duration_ms,
-                "gmail request failed"
-            ),
+            Outcome::Failed(failure) => {
+                report.failed_requests += 1;
+                report.last_failure = Some(failure_kind(failure));
+                tracing::warn!(
+                    request = request_kind(&call.request),
+                    failure = failure_kind(failure),
+                    duration_ms,
+                    "gmail request failed"
+                );
+            }
             // No error text: it can carry the object path.
-            Outcome::StoreFailed(error) => tracing::warn!(
-                request = request_kind(&call.request),
-                error = match error {
-                    BlobError::Unavailable(_) => "unavailable",
-                    BlobError::Misconfigured(_) => "misconfigured",
-                },
-                "blob write failed"
-            ),
+            Outcome::StoreFailed(error) => {
+                report.failed_requests += 1;
+                report.last_failure = Some("blob_store");
+                tracing::warn!(
+                    request = request_kind(&call.request),
+                    error = match error {
+                        BlobError::Unavailable(_) => "unavailable",
+                        BlobError::Misconfigured(_) => "misconfigured",
+                    },
+                    "blob write failed"
+                );
+            }
         }
         let bytes = match &outcome {
             Outcome::Event(EventKind::MessageImported { message, .. }) => message.size,

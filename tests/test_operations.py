@@ -138,3 +138,19 @@ def test_an_invalid_label_change_is_rejected_when_built(gmail: tuple[Mailbox, st
         )
     with pytest.raises(ValueError, match="SENT"):
         runner.admit("alice@example.com", "change_labels", message_ids=["m1"], add_labels=["SENT"])
+
+
+def test_a_failing_token_source_shows_in_the_outcome(gmail: tuple[Mailbox, str]) -> None:
+    """Failures are retried after backoff, so the run can end idle; the
+    outcome must still say requests are failing."""
+    _, origin = gmail
+
+    def broken(account: str) -> tuple[str, int]:
+        raise RuntimeError("credentials unavailable")
+
+    runner = mailtide.BlockingRunner(make_config(origin), broken)
+    runner.migrate()
+    out = runner.run("alice@example.com", budget_s=5)
+    assert out.failed_requests >= 1
+    assert out.last_failure == "transient"
+    assert out.gmail_requests == 0
