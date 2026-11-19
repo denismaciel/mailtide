@@ -715,9 +715,10 @@ where
                 limit,
                 now,
                 attempt,
+                floor,
             } => match self
                 .store
-                .claim_jobs(&account, epoch, limit, now, attempt)
+                .claim_jobs(&account, epoch, limit, now, attempt, floor)
                 .await
             {
                 Ok(ClaimOutcome::Claimed { jobs, next_due }) => Ok(Some(EventKind::JobsClaimed {

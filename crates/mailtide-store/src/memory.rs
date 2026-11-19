@@ -78,9 +78,10 @@ impl Store for MemoryStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
+        floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
         self.with_account(account, |mirror| {
-            match mirror.claim_jobs(epoch, limit, now, attempt) {
+            match mirror.claim_jobs_from(epoch, limit, now, attempt, floor) {
                 Ok(jobs) => ClaimOutcome::Claimed {
                     jobs,
                     next_due: mirror.next_due(),

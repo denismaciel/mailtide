@@ -875,6 +875,7 @@ impl SqlStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
+        floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
         let mut tx = self.begin().await?;
         let current = self
@@ -890,7 +891,7 @@ impl SqlStore {
         };
         let sql = format!(
             "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure FROM mailtide_jobs
-             WHERE account = $1 AND state = 'ready' AND due_at <= $2
+             WHERE account = $1 AND state = 'ready' AND due_at <= $2 AND priority >= $4
              ORDER BY priority DESC, due_at ASC, kind ASC, message ASC LIMIT $3{skip_locked}"
         );
         // Only a constant lock clause is appended.
@@ -898,6 +899,7 @@ impl SqlStore {
             .bind(account.as_str())
             .bind(now.0)
             .bind(i64::from(limit))
+            .bind(priority_code(floor))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| unavailable(&e))?;
@@ -1278,8 +1280,9 @@ impl crate::Store for SqlStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
+        floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
-        Self::claim_jobs(self, account, epoch, limit, now, attempt).await
+        Self::claim_jobs(self, account, epoch, limit, now, attempt, floor).await
     }
 
     async fn changes(

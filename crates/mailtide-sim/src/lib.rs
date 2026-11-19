@@ -903,11 +903,15 @@ impl Sim {
                 limit,
                 now,
                 attempt,
+                floor,
                 ..
             } => {
                 // A claim from an older engine is refused, and the engine is
                 // told (it stops as superseded), exactly as the runner does.
-                let kind = match self.mirror.claim_jobs(epoch, limit, now, attempt) {
+                let kind = match self
+                    .mirror
+                    .claim_jobs_from(epoch, limit, now, attempt, floor)
+                {
                     Ok(jobs) => EventKind::JobsClaimed {
                         command: id,
                         jobs,

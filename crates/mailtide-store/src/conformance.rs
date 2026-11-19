@@ -109,6 +109,9 @@ where
         ("claims report when the next ready job is due", |s| {
             Box::pin(claims_report_next_due(s))
         }),
+        ("claims skip classes below the floor", |s| {
+            Box::pin(claims_respect_the_floor(s))
+        }),
     ];
     let mut results = Vec::new();
     for (name, case) in cases {
@@ -302,7 +305,14 @@ async fn tombstones<S: Store>(store: &S) -> Result<(), String> {
         "an observation of a tombstoned message must be skipped",
     )?;
     let jobs = store
-        .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(1))
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(1),
+            Priority::Backfill,
+        )
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(claimed)?;
@@ -325,7 +335,14 @@ async fn unknown_patch<S: Store>(store: &S) -> Result<(), String> {
     }];
     apply(store, &c).await?;
     let jobs = store
-        .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(1))
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(1),
+            Priority::Backfill,
+        )
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(claimed)?;
@@ -342,13 +359,27 @@ async fn claims<S: Store>(store: &S) -> Result<(), String> {
     c.messages = vec![observe("a", &["INBOX"], 1)];
     apply(store, &c).await?;
     let jobs = store
-        .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(7))
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(7),
+            Priority::Backfill,
+        )
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(claimed)?;
     let job = jobs.first().ok_or("the import must be claimable")?;
     let again = store
-        .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(8))
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(8),
+            Priority::Backfill,
+        )
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(claimed)?;
@@ -419,7 +450,14 @@ async fn stale_claims<S: Store>(store: &S) -> Result<(), String> {
     apply(store, &c).await?;
     let new = claim(store).await?;
     let stale = store
-        .claim_jobs(&account(), old.epoch, 10, Timestamp(0), AttemptId(1))
+        .claim_jobs(
+            &account(),
+            old.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(1),
+            Priority::Backfill,
+        )
         .await;
     expect(
         stale
@@ -429,7 +467,14 @@ async fn stale_claims<S: Store>(store: &S) -> Result<(), String> {
         "a claim from an older epoch must be refused",
     )?;
     let current = store
-        .claim_jobs(&account(), new.epoch, 10, Timestamp(0), AttemptId(2))
+        .claim_jobs(
+            &account(),
+            new.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(2),
+            Priority::Backfill,
+        )
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(claimed)?;
@@ -460,6 +505,7 @@ async fn claim_all<S: Store>(
             100,
             Timestamp(0),
             AttemptId(attempt),
+            Priority::Backfill,
         )
         .await
         .map_err(|e| format!("{e:?}"))
@@ -1025,6 +1071,7 @@ async fn claim_order<S: Store>(store: &S) -> Result<(), String> {
                 1,
                 Timestamp(10),
                 AttemptId(attempt),
+                Priority::Backfill,
             )
             .await
             .map_err(|e| format!("{e:?}"))
@@ -1054,7 +1101,14 @@ async fn claims_report_next_due<S: Store>(store: &S) -> Result<(), String> {
     ];
     apply(store, &c).await?;
     let outcome = store
-        .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(1))
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(1),
+            Priority::Backfill,
+        )
         .await
         .map_err(|e| format!("{e:?}"))?;
     let ClaimOutcome::Claimed { jobs, next_due } = outcome else {
@@ -1064,5 +1118,33 @@ async fn claims_report_next_due<S: Store>(store: &S) -> Result<(), String> {
     expect(
         next_due == Some(Timestamp(60_000)),
         &format!("the running job doesn't count; the next is at 60s, got {next_due:?}"),
+    )
+}
+
+async fn claims_respect_the_floor<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::quota::Priority::{Backfill, Live};
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.jobs = vec![
+        enqueue(JobKind::Import(MessageId("old".into())), Backfill, 0),
+        enqueue(JobKind::Import(MessageId("new".into())), Live, 0),
+    ];
+    apply(store, &c).await?;
+    let jobs = store
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(1),
+            Live,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
+    let kinds: Vec<_> = jobs.iter().map(mailtide::jobs::ClaimedJob::kind).collect();
+    expect(
+        kinds == vec![JobKind::Import(MessageId("new".into()))],
+        &format!("only live work above a backfill floor, got {kinds:?}"),
     )
 }

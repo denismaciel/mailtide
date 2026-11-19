@@ -242,7 +242,15 @@ pub enum JobOp {
 /// then earliest due (pure; stores use it to hand out claims).
 #[must_use]
 pub fn pick_next(jobs: &[Job], now: Timestamp) -> Option<&Job> {
+    pick_next_from(jobs, now, Priority::Backfill)
+}
+
+/// [`pick_next`] among jobs of at least `floor` priority (the engine raises
+/// the floor while the quota gate holds back a lower class).
+#[must_use]
+pub fn pick_next_from(jobs: &[Job], now: Timestamp, floor: Priority) -> Option<&Job> {
     jobs.iter()
+        .filter(|job| job.priority >= floor)
         .filter_map(|job| match job.state {
             JobState::Ready { due_at } if due_at <= now => Some((job, due_at)),
             JobState::Ready { .. } | JobState::Running(_) | JobState::Blocked(_) => None,

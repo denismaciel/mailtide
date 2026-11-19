@@ -54,9 +54,10 @@ impl Store for PostgresStore {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
+        floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
         self.inner
-            .claim_jobs(account, epoch, limit, now, attempt)
+            .claim_jobs(account, epoch, limit, now, attempt, floor)
             .await
     }
 

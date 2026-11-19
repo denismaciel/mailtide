@@ -165,6 +165,10 @@ pub struct Engine {
     follow_up: bool,
     /// Jobs claimed and not yet finished.
     running_jobs: u32,
+    /// Priority classes the quota gate is holding back, until when. Claims
+    /// skip them meanwhile: otherwise every claim picks up held-back jobs
+    /// only to defer (and commit) each again, once per freed quota slot.
+    held_back: BTreeMap<Priority, Timestamp>,
     /// A claim is outstanding.
     claiming: bool,
     /// When the scheduled `Jobs` timer fires, if one is set (a host keeps
@@ -200,6 +204,7 @@ impl Engine {
             notified: None,
             follow_up: false,
             running_jobs: 0,
+            held_back: BTreeMap::new(),
             claiming: false,
             jobs_due: None,
             sync_failures: 0,
@@ -725,11 +730,28 @@ impl Engine {
         if self.claiming || self.running_jobs >= JOB_CONCURRENCY || self.cooling_down(now) {
             return Vec::new();
         }
+        self.held_back.retain(|_, until| *until > now);
+        // Wake when the first held-back class reopens: claims skip it until
+        // then, so nothing else would bring its jobs back.
+        let mut out: Vec<Command> = self
+            .held_back
+            .values()
+            .min()
+            .copied()
+            .map(|reopen| self.schedule_jobs(reopen))
+            .into_iter()
+            .collect();
+        let floor = [Priority::Backfill, Priority::Live, Priority::Foreground]
+            .into_iter()
+            .find(|priority| !self.held_back.contains_key(priority));
+        let Some(floor) = floor else {
+            return out;
+        };
         self.claiming = true;
         let attempt = self.attempt();
         let id = self.command_id();
         self.waiting.insert(id, Waiting::Claim);
-        vec![Command {
+        out.push(Command {
             id,
             kind: CommandKind::ClaimJobs {
                 account: self.state.account.clone(),
@@ -737,8 +759,10 @@ impl Engine {
                 limit: JOB_CONCURRENCY - self.running_jobs,
                 now,
                 attempt,
+                floor,
             },
-        }]
+        });
+        out
     }
 
     fn on_claimed(
@@ -1021,10 +1045,19 @@ impl Engine {
 
     fn on_deferred(&mut self, command: CommandId, until: Timestamp) -> Vec<Command> {
         match self.waiting.remove(&command) {
-            Some(Waiting::Job(job)) => vec![
-                self.finish_job(&job, JobOutcome::Defer { due_at: until }, Vec::new(), until),
-                self.schedule_jobs(until),
-            ],
+            Some(Waiting::Job(job)) => {
+                // This class and every lower one wait until the gate reopens.
+                for priority in [Priority::Backfill, Priority::Live, Priority::Foreground] {
+                    if priority <= job.priority {
+                        let held = self.held_back.entry(priority).or_insert(until);
+                        *held = (*held).max(until);
+                    }
+                }
+                vec![
+                    self.finish_job(&job, JobOutcome::Defer { due_at: until }, Vec::new(), until),
+                    self.schedule_jobs(until),
+                ]
+            }
             Some(Waiting::Claim) => {
                 self.claiming = false;
                 vec![self.schedule_jobs(until)]
@@ -1380,6 +1413,60 @@ mod tests {
             snapshot.validate().expect("valid snapshot"),
             EngineConfig::default(),
         )
+    }
+
+    /// After the gate defers a backfill job, claims skip backfill until it
+    /// reopens (instead of deferring and committing each queued job again),
+    /// but still take live work.
+    #[test]
+    fn a_backfill_deferral_raises_the_claim_floor_until_the_gate_reopens() {
+        let mut engine = live(100);
+        let claim = engine.claim_jobs(Timestamp(0));
+        let claim = claim.first().expect("a claim").id;
+        let job = ClaimedJob {
+            work: ClaimedWork::Import(MessageId("old".into())),
+            priority: Priority::Backfill,
+            failed_attempts: 0,
+            attempt: AttemptId(1),
+        };
+        let commands = engine.handle(event(EventKind::JobsClaimed {
+            command: claim,
+            jobs: vec![job],
+            next_due: None,
+        }));
+        let import = commands
+            .iter()
+            .find(|c| matches!(&c.kind, CommandKind::Gmail(_)))
+            .expect("an import")
+            .id;
+        let _ = engine.handle(event(EventKind::RequestDeferred {
+            command: import,
+            until: Timestamp(5_000),
+        }));
+        let floor = |commands: &[Command]| {
+            commands.iter().find_map(|c| match c.kind {
+                CommandKind::ClaimJobs { floor, .. } => Some(floor),
+                _ => None,
+            })
+        };
+        engine.claiming = false;
+        let held = engine.claim_jobs(Timestamp(1_000));
+        assert_eq!(floor(&held), Some(Priority::Live));
+        assert!(
+            held.iter().any(|c| matches!(
+                c.kind,
+                CommandKind::Schedule {
+                    timer: TimerKind::Jobs,
+                    at: Timestamp(5_000)
+                }
+            )),
+            "a wake for when backfill reopens"
+        );
+        engine.claiming = false;
+        assert_eq!(
+            floor(&engine.claim_jobs(Timestamp(5_000))),
+            Some(Priority::Backfill)
+        );
     }
 
     #[test]

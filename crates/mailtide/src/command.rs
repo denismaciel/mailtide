@@ -44,6 +44,9 @@ pub enum CommandKind {
         now: Timestamp,
         /// The attempt the claims belong to.
         attempt: crate::jobs::AttemptId,
+        /// Only jobs of at least this priority: lower classes are held back
+        /// by the quota gate.
+        floor: crate::quota::Priority,
     },
     /// Delete a message's raw content at its deterministic key; report
     /// `BlobDeleted`.

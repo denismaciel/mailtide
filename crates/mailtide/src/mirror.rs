@@ -1287,13 +1287,25 @@ impl AccountMirror {
         now: Timestamp,
         attempt: AttemptId,
     ) -> Result<Vec<ClaimedJob>, Rejection> {
+        self.claim_jobs_from(epoch, limit, now, attempt, crate::quota::Priority::Backfill)
+    }
+
+    /// [`Self::claim_jobs`] for jobs of at least `floor` priority.
+    pub fn claim_jobs_from(
+        &mut self,
+        epoch: Epoch,
+        limit: u32,
+        now: Timestamp,
+        attempt: AttemptId,
+        floor: crate::quota::Priority,
+    ) -> Result<Vec<ClaimedJob>, Rejection> {
         if epoch != self.record.epoch {
             return Err(Rejection::StaleEpoch);
         }
         let mut claimed = Vec::new();
         for _ in 0..limit {
             let jobs: Vec<Job> = self.jobs.values().cloned().collect();
-            let Some(job) = crate::jobs::pick_next(&jobs, now) else {
+            let Some(job) = crate::jobs::pick_next_from(&jobs, now, floor) else {
                 break;
             };
             let kind = job.kind.clone();

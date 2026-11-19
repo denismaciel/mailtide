@@ -60,8 +60,9 @@ pub trait Store: Send + Sync {
         commit: &Commit,
     ) -> impl Future<Output = Result<CommitOutcome, StoreError>> + Send;
 
-    /// Claim up to `limit` jobs due at `now` for `attempt`, highest priority
-    /// first (see [`mailtide::jobs::pick_next`]).
+    /// Claim up to `limit` jobs of at least `floor` priority due at `now`
+    /// for `attempt`, highest priority first (see
+    /// [`mailtide::jobs::pick_next_from`]).
     fn claim_jobs(
         &self,
         account: &AccountId,
@@ -69,6 +70,7 @@ pub trait Store: Send + Sync {
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
+        floor: mailtide::quota::Priority,
     ) -> impl Future<Output = Result<ClaimOutcome, StoreError>> + Send;
 
     /// The change feed after `since`, or `TooOld` if it was compacted away.
