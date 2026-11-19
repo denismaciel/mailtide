@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mailtide = { path = "../mailtide", version = "0.1.0" }
+mailtide = { path = "../mailtide", version = "0.2.0" }
 base64 = "0.23"
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto", "use_pem"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,3 +1,5 @@
+import importlib.metadata
+
 import mailtide
 import pytest
 from conftest import make_config
@@ -10,7 +12,7 @@ def tokens(account: str) -> tuple[str, int]:
 
 
 def test_version_matches_package() -> None:
-    assert mailtide.version() == "0.1.0"
+    assert mailtide.version() == importlib.metadata.version("mailtide")
 
 
 def test_parse_message() -> None:
