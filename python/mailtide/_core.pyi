@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, final
 
 class MailtideError(Exception): ...
@@ -95,6 +95,41 @@ class ParsedMessage:
 
 @final
 class Runner:
+    """Internal: methods return asyncio futures; use ``mailtide.Runner``."""
+
+    def __init__(
+        self,
+        database_url: str,
+        blob_url: str,
+        token_source: Callable[[str], tuple[str, int] | Awaitable[tuple[str, int]]],
+        *,
+        watch_topic: str | None = None,
+        gmail_origin: str | None = None,
+        request_timeout_s: float = 60.0,
+        confirm_timeout_s: float = 60.0,
+    ) -> None: ...
+    def migrate(self) -> Awaitable[None]: ...
+    def run(self, account: str, budget_s: float = 60.0) -> Awaitable[RunOutcome]: ...
+    def act(
+        self,
+        account: str,
+        action: Action,
+        *,
+        message_ids: list[str] | None = None,
+        thread_id: str | None = None,
+        add_labels: list[str] = ...,
+        remove_labels: list[str] = ...,
+        destination: Literal["inbox", "archive"] = "inbox",
+        budget_s: float = 30.0,
+    ) -> Awaitable[RunOutcome]: ...
+    def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
+    def changes(
+        self, account: str, since: str | None = None, limit: int = 500
+    ) -> Awaitable[ChangePage]: ...
+    def read_blob(self, account: str, message_id: str) -> Awaitable[bytes]: ...
+
+@final
+class BlockingRunner:
     def __init__(
         self,
         database_url: str,

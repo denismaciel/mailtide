@@ -29,7 +29,7 @@ def test_verify_push_rejects_missing_token() -> None:
 
 
 def test_empty_account_has_no_changes() -> None:
-    runner = mailtide.Runner("sqlite::memory:", "memory:///", tokens)
+    runner = mailtide.BlockingRunner("sqlite::memory:", "memory:///", tokens)
     runner.migrate()
     page = runner.changes(ACCOUNT)
     assert page.changes == []
@@ -40,7 +40,7 @@ def test_revoked_delegation_blocks_the_account() -> None:
     def revoked(account: str) -> tuple[str, int]:
         raise mailtide.DelegationRevoked(f"{account} revoked")
 
-    runner = mailtide.Runner("sqlite::memory:", "memory:///", revoked)
+    runner = mailtide.BlockingRunner("sqlite::memory:", "memory:///", revoked)
     runner.migrate()
     outcome = runner.run(ACCOUNT, budget_s=10)
     assert outcome.stop == "blocked"
@@ -48,6 +48,6 @@ def test_revoked_delegation_blocks_the_account() -> None:
 
 
 def test_invalid_account_is_a_value_error() -> None:
-    runner = mailtide.Runner("sqlite::memory:", "memory:///", tokens)
+    runner = mailtide.BlockingRunner("sqlite::memory:", "memory:///", tokens)
     with pytest.raises(ValueError):
         runner.run("not-an-address")

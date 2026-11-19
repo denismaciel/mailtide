@@ -14,20 +14,22 @@ Status: v0.1, pre-release. See [SPEC.md](SPEC.md) and
 import mailtide
 
 runner = mailtide.Runner(
-    "postgres://…/app",  # or "sqlite:mail.db?mode=rwc"
+    "postgres://…/app",  # or "postgres:///app?host=/socket/dir", "sqlite:mail.db?mode=rwc"
     "gs://bucket/mail",  # raw .eml blobs: gs://, s3://, file:///
-    token_source,  # account -> (access_token, expires_at_ms)
+    token_source,  # account -> (access_token, expires_at_ms), sync or async
     watch_topic="projects/p/topics/gmail",
 )
-runner.migrate()
+await runner.migrate()
 
-outcome = runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
+outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
 outcome.stop, outcome.next_run_at_ms
 
-runner.act("alice@example.com", "archive", thread_id="18c…")  # shows at once, settles on Gmail
-page = runner.changes("alice@example.com", since=None)  # change feed
-views = runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
+await runner.act("alice@example.com", "archive", thread_id="18c…")  # shows at once
+page = await runner.changes("alice@example.com", since=None)  # change feed
+views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 ```
+
+No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
 
 ## Layout
 

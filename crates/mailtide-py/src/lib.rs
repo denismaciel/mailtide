@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 // Rust works. On free-threaded CPython the module keeps the GIL disabled.
 #[pymodule(gil_used = false)]
 mod _core {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use pyo3::create_exception;
@@ -310,219 +311,173 @@ mod _core {
 
     // ------------------------------------------------------------ runner
 
-    /// Tokens from a Python callable `(account) -> (token, expires_at_ms)`.
+    /// The process-wide Tokio runtime both runners share (created lazily, so
+    /// create runners after forking).
+    fn runtime() -> &'static tokio::runtime::Runtime {
+        pyo3_async_runtimes::tokio::get_runtime()
+    }
+
+    fn seconds(value: f64, what: &str) -> PyResult<Duration> {
+        Duration::try_from_secs_f64(value)
+            .map_err(|e| PyValueError::new_err(format!("{what}: {e}")))
+    }
+
+    /// Tokens from a Python callable `(account) -> (token, expires_at_ms)`,
+    /// sync or async. A sync callable runs on Tokio's blocking pool (minting
+    /// may do network I/O); an async one is awaited on the caller's event loop
+    /// (async `Runner` only).
     struct PyTokens(Py<PyAny>);
+
+    fn token_failure(py: Python<'_>, err: &PyErr) -> Failure {
+        if err.is_instance_of::<DelegationRevoked>(py) {
+            Failure::Blocking(BlockingFailure {
+                class: Blocking::Account(AccountProblem::DelegationRevoked),
+                detail: "token source raised DelegationRevoked".into(),
+            })
+        } else {
+            Failure::Retryable(RetryableFailure {
+                class: Retryable::Transient,
+                retry_after: None,
+                detail: format!("token source failed: {}", err.get_type(py)),
+            })
+        }
+    }
+
+    fn transient(detail: &str) -> Failure {
+        Failure::Retryable(RetryableFailure {
+            class: Retryable::Transient,
+            retry_after: None,
+            detail: detail.to_owned(),
+        })
+    }
 
     impl TokenSource for PyTokens {
         async fn token(&self, account: &AccountId) -> Result<AccessToken, Failure> {
+            let callable = Python::attach(|py| self.0.clone_ref(py));
+            let account = account.as_str().to_owned();
+            let called = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    callable
+                        .call1(py, (account,))
+                        .map_err(|e| token_failure(py, &e))
+                })
+            })
+            .await
+            .map_err(|_| transient("token source panicked"))??;
+            // An async token source returned an awaitable: await it on the
+            // event loop that awaits this run.
+            let awaitable = Python::attach(|py| {
+                let value = called.bind(py);
+                if value.hasattr("__await__").unwrap_or(false) {
+                    pyo3_async_runtimes::tokio::into_future(value.clone())
+                        .map(Some)
+                        .map_err(|_| transient("async token sources need the async Runner"))
+                } else {
+                    Ok(None)
+                }
+            })?;
+            let value = match awaitable {
+                Some(future) => future
+                    .await
+                    .map_err(|e| Python::attach(|py| token_failure(py, &e)))?,
+                None => called,
+            };
             Python::attach(|py| {
-                let result = self
-                    .0
-                    .call1(py, (account.as_str(),))
-                    .and_then(|value| value.extract::<(String, i64)>(py));
-                match result {
-                    Ok((secret, expires_at)) => Ok(AccessToken {
+                value
+                    .extract::<(String, i64)>(py)
+                    .map(|(secret, expires_at)| AccessToken {
                         secret,
                         expires_at: Timestamp(expires_at),
-                    }),
-                    Err(err) if err.is_instance_of::<DelegationRevoked>(py) => {
-                        Err(Failure::Blocking(BlockingFailure {
-                            class: Blocking::Account(AccountProblem::DelegationRevoked),
-                            detail: err.to_string(),
-                        }))
-                    }
-                    Err(err) => Err(Failure::Retryable(RetryableFailure {
-                        class: Retryable::Transient,
-                        retry_after: None,
-                        detail: format!("token source failed: {err}"),
-                    })),
-                }
+                    })
+                    .map_err(|_| transient("token source must return (token, expires_at_ms)"))
             })
         }
     }
 
     type Inner = runner::Runner<SqlStore, ObjectBlobs, ReqwestTransport, LocalGate, PyTokens>;
 
-    /// Syncs Gmail accounts into a database and blob store. Build one per
-    /// process and share it: every method may be called from several threads
-    /// at once (also on free-threaded Python). Concurrent runs of the same
-    /// account are safe: the store fences them, and all but the newest stop
-    /// as `superseded`. `token_source` may be called from several threads at
-    /// once.
-    #[pyclass(frozen)]
-    struct Runner {
+    /// Everything both runners share.
+    struct Shared {
         inner: Inner,
-        runtime: tokio::runtime::Runtime,
     }
 
-    #[pymethods]
-    impl Runner {
-        /// `database_url`: `postgres://…` or `sqlite:…`. `blob_url`: `gs://…`,
-        /// `s3://…`, `file:///…` or `memory:///`. `token_source(account)`
-        /// returns `(access_token, expires_at_ms)` or raises
-        /// `DelegationRevoked`. `watch_topic`: the Pub/Sub topic for push, or
-        /// `None` to rely on polling. `gmail_origin` overrides Gmail's URL
-        /// (tests, proxies). `confirm_timeout_s`: how long after delivering an
-        /// action its confirmation fetch runs.
-        #[new]
-        #[allow(clippy::too_many_arguments)]
-        #[pyo3(signature = (database_url, blob_url, token_source, *, watch_topic=None, gmail_origin=None, request_timeout_s=60.0, confirm_timeout_s=60.0))]
-        fn new(
-            py: Python<'_>,
-            database_url: &str,
-            blob_url: &str,
-            token_source: Py<PyAny>,
-            watch_topic: Option<String>,
-            gmail_origin: Option<String>,
-            request_timeout_s: f64,
-            confirm_timeout_s: f64,
-        ) -> PyResult<Self> {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| error("runtime", e))?;
-            let store = py
-                .detach(|| runtime.block_on(SqlStore::connect(database_url)))
-                .map_err(|e| error("database", e))?;
-            let blobs = if blob_url == "memory:///" {
-                ObjectBlobs::memory()
-            } else {
-                ObjectBlobs::from_url(blob_url).map_err(|e| error("blob store", e))?
-            };
-            let timeout = Duration::try_from_secs_f64(request_timeout_s)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let transport = match gmail_origin {
-                Some(origin) => ReqwestTransport::with_origin(&origin, timeout),
-                None => ReqwestTransport::new(timeout),
-            }
-            .map_err(|e| error("http client", e))?;
-            let config = RunnerConfig {
-                engine: EngineConfig {
-                    confirm_timeout: Duration::try_from_secs_f64(confirm_timeout_s)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                    ..EngineConfig::default()
-                },
-                watch: watch_topic.map_or(WatchMode::Disabled, WatchMode::Topic),
-            };
-            let inner = runner::Runner::new(
-                store,
-                blobs,
-                transport,
-                LocalGate::new(Budget::GMAIL_DEFAULT),
-                PyTokens(token_source),
-                config,
-            );
-            Ok(Self { inner, runtime })
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        py: Python<'_>,
+        database_url: &str,
+        blob_url: &str,
+        token_source: Py<PyAny>,
+        watch_topic: Option<String>,
+        gmail_origin: Option<String>,
+        request_timeout_s: f64,
+        confirm_timeout_s: f64,
+    ) -> PyResult<Arc<Shared>> {
+        let store = py
+            .detach(|| runtime().block_on(SqlStore::connect(database_url)))
+            .map_err(|e| error("database", e))?;
+        let blobs = if blob_url == "memory:///" {
+            ObjectBlobs::memory()
+        } else {
+            ObjectBlobs::from_url(blob_url).map_err(|e| error("blob store", e))?
+        };
+        let timeout = seconds(request_timeout_s, "request_timeout_s")?;
+        let transport = match gmail_origin {
+            Some(origin) => ReqwestTransport::with_origin(&origin, timeout),
+            None => ReqwestTransport::new(timeout),
         }
+        .map_err(|e| error("http client", e))?;
+        let config = RunnerConfig {
+            engine: EngineConfig {
+                confirm_timeout: seconds(confirm_timeout_s, "confirm_timeout_s")?,
+                ..EngineConfig::default()
+            },
+            watch: watch_topic.map_or(WatchMode::Disabled, WatchMode::Topic),
+        };
+        let inner = runner::Runner::new(
+            store,
+            blobs,
+            transport,
+            LocalGate::new(Budget::GMAIL_DEFAULT),
+            PyTokens(token_source),
+            config,
+        );
+        Ok(Arc::new(Shared { inner }))
+    }
 
-        /// Create mailtide's tables if they don't exist.
-        fn migrate(&self, py: Python<'_>) -> PyResult<()> {
-            py.detach(|| self.runtime.block_on(self.inner.store().migrate()))
-                .map_err(|e| error("migrate", e))
+    fn action_request(
+        action: &str,
+        message_ids: Option<Vec<String>>,
+        thread_id: Option<String>,
+        add_labels: Vec<String>,
+        remove_labels: Vec<String>,
+        destination: &str,
+    ) -> PyResult<ActionRequest> {
+        let action = parse_action(action, add_labels, remove_labels, destination)?;
+        match (message_ids, thread_id) {
+            (Some(ids), None) => Ok(ActionRequest::Messages {
+                ids: ids.into_iter().map(MessageId).collect(),
+                action,
+            }),
+            (None, Some(thread)) => Ok(ActionRequest::Thread {
+                id: ThreadId(thread),
+                action,
+            }),
+            _ => Err(PyValueError::new_err(
+                "pass exactly one of message_ids or thread_id",
+            )),
         }
+    }
 
-        /// Sync `account` until caught up, blocked or `budget_s` elapses.
-        /// Call it on a schedule and whenever a push arrives.
-        #[pyo3(signature = (account, budget_s=60.0))]
-        fn run(&self, py: Python<'_>, account: &str, budget_s: f64) -> PyResult<RunOutcome> {
-            let account = account_id(account)?;
-            let budget = Duration::try_from_secs_f64(budget_s)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let outcome = py
-                .detach(|| self.runtime.block_on(self.inner.run(&account, budget)))
-                .map_err(|e| error("run", e))?;
-            Ok(outcome.into())
+    fn parse_since(since: Option<String>) -> PyResult<StateSeq> {
+        match since {
+            None => Ok(StateSeq(0)),
+            Some(state) => StateSeq::decode(&StateString(state.clone()))
+                .map_err(|_| PyValueError::new_err(format!("invalid state string {state:?}"))),
         }
+    }
 
-        /// Act on messages (or a whole thread) as the user asked, and deliver
-        /// it to Gmail. `action` is one of `mark_read`, `mark_unread`, `star`,
-        /// `unstar`, `mark_important`, `mark_not_important`, `archive`,
-        /// `move_to_inbox`, `trash`, `restore`, `spam`, `not_spam`,
-        /// `change_labels`. The change shows in `messages()` at once and
-        /// settles when Gmail confirms it.
-        #[pyo3(signature = (account, action, *, message_ids=None, thread_id=None, add_labels=Vec::new(), remove_labels=Vec::new(), destination="inbox", budget_s=30.0))]
-        #[allow(clippy::too_many_arguments)]
-        fn act(
-            &self,
-            py: Python<'_>,
-            account: &str,
-            action: &str,
-            message_ids: Option<Vec<String>>,
-            thread_id: Option<String>,
-            add_labels: Vec<String>,
-            remove_labels: Vec<String>,
-            destination: &str,
-            budget_s: f64,
-        ) -> PyResult<RunOutcome> {
-            let account = account_id(account)?;
-            let action = parse_action(action, add_labels, remove_labels, destination)?;
-            let request = match (message_ids, thread_id) {
-                (Some(ids), None) => ActionRequest::Messages {
-                    ids: ids.into_iter().map(MessageId).collect(),
-                    action,
-                },
-                (None, Some(thread)) => ActionRequest::Thread {
-                    id: ThreadId(thread),
-                    action,
-                },
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "pass exactly one of message_ids or thread_id",
-                    ));
-                }
-            };
-            let budget = Duration::try_from_secs_f64(budget_s)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let outcome = py
-                .detach(|| {
-                    self.runtime
-                        .block_on(self.inner.act(&account, request, budget))
-                })
-                .map_err(|e| error("act", e))?;
-            Ok(outcome.into())
-        }
-
-        /// How these messages should look; unknown ids are left out.
-        fn messages(
-            &self,
-            py: Python<'_>,
-            account: &str,
-            message_ids: Vec<String>,
-        ) -> PyResult<Vec<MessageView>> {
-            let account = account_id(account)?;
-            let ids: Vec<MessageId> = message_ids.into_iter().map(MessageId).collect();
-            let views = py
-                .detach(|| {
-                    self.runtime
-                        .block_on(self.inner.store().messages(&account, &ids))
-                })
-                .map_err(|e| error("messages", e))?;
-            Ok(views.into_iter().map(MessageView::from).collect())
-        }
-
-        /// Mirror changes for `account` after state string `since` (`None`
-        /// for everything).
-        #[pyo3(signature = (account, since=None, limit=500))]
-        fn changes(
-            &self,
-            py: Python<'_>,
-            account: &str,
-            since: Option<String>,
-            limit: u32,
-        ) -> PyResult<ChangePage> {
-            let account = account_id(account)?;
-            let since = match since {
-                None => StateSeq(0),
-                Some(state) => StateSeq::decode(&StateString(state.clone())).map_err(|_| {
-                    PyValueError::new_err(format!("invalid state string {state:?}"))
-                })?,
-            };
-            let page = py
-                .detach(|| {
-                    self.runtime
-                        .block_on(self.inner.store().changes(&account, since, limit))
-                })
-                .map_err(|e| error("changes", e))?;
+    fn change_page(page: &mailtide::revision::ChangePage) -> PyResult<ChangePage> {
+        Python::attach(|py| {
             let loads = py.import("json")?.getattr("loads")?;
             let changes = page
                 .changes
@@ -538,6 +493,234 @@ mod _core {
                 next: page.next.encode().0,
                 has_more: page.has_more,
             })
+        })
+    }
+
+    // The operations, as futures both runners drive.
+    impl Shared {
+        async fn migrate(self: Arc<Self>) -> PyResult<()> {
+            self.inner
+                .store()
+                .migrate()
+                .await
+                .map_err(|e| error("migrate", e))
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            account: AccountId,
+            budget: Duration,
+        ) -> PyResult<RunOutcome> {
+            self.inner
+                .run(&account, budget)
+                .await
+                .map(RunOutcome::from)
+                .map_err(|e| error("run", e))
+        }
+
+        async fn act(
+            self: Arc<Self>,
+            account: AccountId,
+            request: ActionRequest,
+            budget: Duration,
+        ) -> PyResult<RunOutcome> {
+            self.inner
+                .act(&account, request, budget)
+                .await
+                .map(RunOutcome::from)
+                .map_err(|e| error("act", e))
+        }
+
+        async fn messages(
+            self: Arc<Self>,
+            account: AccountId,
+            ids: Vec<MessageId>,
+        ) -> PyResult<Vec<MessageView>> {
+            let views = self
+                .inner
+                .store()
+                .messages(&account, &ids)
+                .await
+                .map_err(|e| error("messages", e))?;
+            Ok(views.into_iter().map(MessageView::from).collect())
+        }
+
+        async fn changes(
+            self: Arc<Self>,
+            account: AccountId,
+            since: StateSeq,
+            limit: u32,
+        ) -> PyResult<ChangePage> {
+            let page = self
+                .inner
+                .store()
+                .changes(&account, since, limit)
+                .await
+                .map_err(|e| error("changes", e))?;
+            change_page(&page)
+        }
+
+        async fn read_blob(
+            self: Arc<Self>,
+            account: AccountId,
+            message: MessageId,
+        ) -> PyResult<Py<PyBytes>> {
+            let bytes = self
+                .inner
+                .blobs()
+                .get(&blob_key(&account, &message))
+                .await
+                .map_err(|e| error("read blob", e))?;
+            Ok(Python::attach(|py| PyBytes::new(py, &bytes).unbind()))
+        }
+    }
+
+    /// Syncs Gmail accounts into a database and blob store; every method is a
+    /// coroutine. Build one per process (after forking) and share it: methods
+    /// may run concurrently, from any thread or event loop (also on
+    /// free-threaded Python). Cancelling an awaiting task stops the work:
+    /// in-flight requests are dropped and an open transaction rolls back,
+    /// which is safe because every commit is atomic and fenced. Concurrent
+    /// runs of one account are safe: all but the newest stop as `superseded`.
+    /// `token_source(account)` may be sync or async and may be called
+    /// concurrently.
+    #[pyclass(frozen)]
+    struct Runner {
+        shared: Arc<Shared>,
+    }
+
+    /// The same as `Runner` with blocking methods, for code without an event
+    /// loop (scripts, threads). Calls release the GIL while Rust works. Its
+    /// token source must be sync.
+    #[pyclass(frozen)]
+    struct BlockingRunner {
+        shared: Arc<Shared>,
+    }
+
+    #[pymethods]
+    impl Runner {
+        /// `database_url`: `postgres://…` (Unix sockets:
+        /// `postgres:///db?host=/socket/dir`) or `sqlite:…`. `blob_url`:
+        /// `gs://…`, `s3://…`, `file:///…` or `memory:///`.
+        /// `token_source(account)` returns `(access_token, expires_at_ms)`
+        /// or raises `DelegationRevoked`. `watch_topic`: the Pub/Sub topic
+        /// for push, or `None` to rely on polling. `gmail_origin` overrides
+        /// Gmail's URL (tests). `confirm_timeout_s`: how long after
+        /// delivering an action its confirmation fetch runs.
+        #[new]
+        #[allow(clippy::too_many_arguments)]
+        #[pyo3(signature = (database_url, blob_url, token_source, *, watch_topic=None, gmail_origin=None, request_timeout_s=60.0, confirm_timeout_s=60.0))]
+        fn new(
+            py: Python<'_>,
+            database_url: &str,
+            blob_url: &str,
+            token_source: Py<PyAny>,
+            watch_topic: Option<String>,
+            gmail_origin: Option<String>,
+            request_timeout_s: f64,
+            confirm_timeout_s: f64,
+        ) -> PyResult<Self> {
+            Ok(Self {
+                shared: open(
+                    py,
+                    database_url,
+                    blob_url,
+                    token_source,
+                    watch_topic,
+                    gmail_origin,
+                    request_timeout_s,
+                    confirm_timeout_s,
+                )?,
+            })
+        }
+
+        /// Create or upgrade mailtide's tables (safe to call concurrently).
+        fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            pyo3_async_runtimes::tokio::future_into_py(py, self.shared.clone().migrate())
+        }
+
+        /// Sync `account` until caught up, blocked or `budget_s` elapses.
+        /// Call it on a schedule and whenever a push arrives.
+        #[pyo3(signature = (account, budget_s=60.0))]
+        fn run<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let fut = self
+                .shared
+                .clone()
+                .run(account_id(account)?, seconds(budget_s, "budget_s")?);
+            pyo3_async_runtimes::tokio::future_into_py(py, fut)
+        }
+
+        /// Act on messages (or a whole thread) as the user asked, and deliver
+        /// it to Gmail. `action` is one of `mark_read`, `mark_unread`, `star`,
+        /// `unstar`, `mark_important`, `mark_not_important`, `archive`,
+        /// `move_to_inbox`, `trash`, `restore`, `spam`, `not_spam`,
+        /// `change_labels`. The change is admitted durably before anything
+        /// else, shows in `messages()` at once, and settles when Gmail
+        /// confirms it.
+        #[pyo3(signature = (account, action, *, message_ids=None, thread_id=None, add_labels=Vec::new(), remove_labels=Vec::new(), destination="inbox", budget_s=30.0))]
+        #[allow(clippy::too_many_arguments)]
+        fn act<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            action: &str,
+            message_ids: Option<Vec<String>>,
+            thread_id: Option<String>,
+            add_labels: Vec<String>,
+            remove_labels: Vec<String>,
+            destination: &str,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let request = action_request(
+                action,
+                message_ids,
+                thread_id,
+                add_labels,
+                remove_labels,
+                destination,
+            )?;
+            let fut = self.shared.clone().act(
+                account_id(account)?,
+                request,
+                seconds(budget_s, "budget_s")?,
+            );
+            pyo3_async_runtimes::tokio::future_into_py(py, fut)
+        }
+
+        /// How these messages should look; unknown ids are left out.
+        fn messages<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_ids: Vec<String>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let ids = message_ids.into_iter().map(MessageId).collect();
+            pyo3_async_runtimes::tokio::future_into_py(
+                py,
+                self.shared.clone().messages(account_id(account)?, ids),
+            )
+        }
+
+        /// Mirror changes for `account` after state string `since` (`None`
+        /// for everything).
+        #[pyo3(signature = (account, since=None, limit=500))]
+        fn changes<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            since: Option<String>,
+            limit: u32,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let fut = self
+                .shared
+                .clone()
+                .changes(account_id(account)?, parse_since(since)?, limit);
+            pyo3_async_runtimes::tokio::future_into_py(py, fut)
         }
 
         /// The raw RFC 822 bytes of an imported message.
@@ -546,12 +729,139 @@ mod _core {
             py: Python<'py>,
             account: &str,
             message_id: &str,
-        ) -> PyResult<Bound<'py, PyBytes>> {
-            let key = blob_key(&account_id(account)?, &MessageId(message_id.to_owned()));
-            let bytes = py
-                .detach(|| self.runtime.block_on(self.inner.blobs().get(&key)))
-                .map_err(|e| error("read blob", e))?;
-            Ok(PyBytes::new(py, &bytes))
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let fut = self
+                .shared
+                .clone()
+                .read_blob(account_id(account)?, MessageId(message_id.to_owned()));
+            pyo3_async_runtimes::tokio::future_into_py(py, fut)
+        }
+    }
+
+    #[pymethods]
+    impl BlockingRunner {
+        /// `database_url`: `postgres://…` (Unix sockets:
+        /// `postgres:///db?host=/socket/dir`) or `sqlite:…`. `blob_url`:
+        /// `gs://…`, `s3://…`, `file:///…` or `memory:///`.
+        /// `token_source(account)` returns `(access_token, expires_at_ms)`
+        /// or raises `DelegationRevoked`. `watch_topic`: the Pub/Sub topic
+        /// for push, or `None` to rely on polling. `gmail_origin` overrides
+        /// Gmail's URL (tests). `confirm_timeout_s`: how long after
+        /// delivering an action its confirmation fetch runs.
+        #[new]
+        #[allow(clippy::too_many_arguments)]
+        #[pyo3(signature = (database_url, blob_url, token_source, *, watch_topic=None, gmail_origin=None, request_timeout_s=60.0, confirm_timeout_s=60.0))]
+        fn new(
+            py: Python<'_>,
+            database_url: &str,
+            blob_url: &str,
+            token_source: Py<PyAny>,
+            watch_topic: Option<String>,
+            gmail_origin: Option<String>,
+            request_timeout_s: f64,
+            confirm_timeout_s: f64,
+        ) -> PyResult<Self> {
+            Ok(Self {
+                shared: open(
+                    py,
+                    database_url,
+                    blob_url,
+                    token_source,
+                    watch_topic,
+                    gmail_origin,
+                    request_timeout_s,
+                    confirm_timeout_s,
+                )?,
+            })
+        }
+
+        /// Create or upgrade mailtide's tables (safe to call concurrently).
+        fn migrate(&self, py: Python<'_>) -> PyResult<()> {
+            let fut = self.shared.clone().migrate();
+            py.detach(|| runtime().block_on(fut))
+        }
+
+        /// Sync `account` until caught up, blocked or `budget_s` elapses.
+        #[pyo3(signature = (account, budget_s=60.0))]
+        fn run(&self, py: Python<'_>, account: &str, budget_s: f64) -> PyResult<RunOutcome> {
+            let fut = self
+                .shared
+                .clone()
+                .run(account_id(account)?, seconds(budget_s, "budget_s")?);
+            py.detach(|| runtime().block_on(fut))
+        }
+
+        /// See `Runner.act`.
+        #[pyo3(signature = (account, action, *, message_ids=None, thread_id=None, add_labels=Vec::new(), remove_labels=Vec::new(), destination="inbox", budget_s=30.0))]
+        #[allow(clippy::too_many_arguments)]
+        fn act(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            action: &str,
+            message_ids: Option<Vec<String>>,
+            thread_id: Option<String>,
+            add_labels: Vec<String>,
+            remove_labels: Vec<String>,
+            destination: &str,
+            budget_s: f64,
+        ) -> PyResult<RunOutcome> {
+            let request = action_request(
+                action,
+                message_ids,
+                thread_id,
+                add_labels,
+                remove_labels,
+                destination,
+            )?;
+            let fut = self.shared.clone().act(
+                account_id(account)?,
+                request,
+                seconds(budget_s, "budget_s")?,
+            );
+            py.detach(|| runtime().block_on(fut))
+        }
+
+        /// How these messages should look; unknown ids are left out.
+        fn messages(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_ids: Vec<String>,
+        ) -> PyResult<Vec<MessageView>> {
+            let ids = message_ids.into_iter().map(MessageId).collect();
+            let fut = self.shared.clone().messages(account_id(account)?, ids);
+            py.detach(|| runtime().block_on(fut))
+        }
+
+        /// Mirror changes for `account` after state string `since`.
+        #[pyo3(signature = (account, since=None, limit=500))]
+        fn changes(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            since: Option<String>,
+            limit: u32,
+        ) -> PyResult<ChangePage> {
+            let fut = self
+                .shared
+                .clone()
+                .changes(account_id(account)?, parse_since(since)?, limit);
+            py.detach(|| runtime().block_on(fut))
+        }
+
+        /// The raw RFC 822 bytes of an imported message.
+        fn read_blob(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_id: &str,
+        ) -> PyResult<Py<PyBytes>> {
+            let fut = self
+                .shared
+                .clone()
+                .read_blob(account_id(account)?, MessageId(message_id.to_owned()));
+            py.detach(|| runtime().block_on(fut))
         }
     }
 

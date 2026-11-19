@@ -210,6 +210,12 @@ where
         loop {
             while let Some(command) = queue.pop_front() {
                 if let Some(stop) = stopped(&engine) {
+                    // The engine stopped (blocked or superseded) but may have
+                    // queued guarded commits, e.g. the block itself: apply
+                    // them so the outcome is durable; the store rejects any
+                    // that are stale.
+                    queue.push_front(command);
+                    self.flush_commits(&mut queue, &mut report).await?;
                     return Ok(finish(report, &engine, stop));
                 }
                 if Instant::now() > deadline {
@@ -262,6 +268,20 @@ where
                 }));
             }
         }
+    }
+
+    /// Apply the queued commits of a stopped engine; drop everything else.
+    async fn flush_commits(
+        &self,
+        queue: &mut VecDeque<Command>,
+        report: &mut SyncReport,
+    ) -> Result<(), RunError> {
+        while let Some(command) = queue.pop_front() {
+            if let CommandKind::Commit(commit) = command.kind {
+                self.apply_commit(&commit, report).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Perform one command; `None` if it produces no event.
@@ -360,9 +380,16 @@ where
                 return Ok(EventKind::RequestDeferred { command, until });
             }
         };
+        // If this future is dropped mid-request (cancellation), the guard
+        // gives the lease back.
+        let mut held = LeaseGuard {
+            gate: &self.quota,
+            lease: Some(lease),
+        };
         let outcome = self
             .perform(&call.account, command, &call.request, &topic, report)
             .await;
+        let lease = held.lease.take().unwrap_or(lease);
         let bytes = match &outcome {
             Outcome::Event(EventKind::MessageImported { message, .. }) => message.size,
             Outcome::Event(_) | Outcome::Failed(_) => 0,
@@ -479,6 +506,20 @@ where
                 observation: raw.observation,
             }),
         })
+    }
+}
+
+/// Gives a quota lease back if the request holding it is abandoned.
+struct LeaseGuard<'a, Q: QuotaGate> {
+    gate: &'a Q,
+    lease: Option<mailtide::quota::Lease>,
+}
+
+impl<Q: QuotaGate> Drop for LeaseGuard<'_, Q> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.gate.abandon(lease);
+        }
     }
 }
 

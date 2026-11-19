@@ -451,20 +451,33 @@ the memory store and SQLite on every test run, and Postgres in CI.
 ## 11. Python bindings
 
 Python stays thin; everything else is Rust. `mailtide.Runner(database_url,
-blob_url, token_source, *, watch_topic=None)` per process:
+blob_url, token_source, *, watch_topic=None)` is async (every method is a
+coroutine); `mailtide.BlockingRunner` has the same methods, blocking, for code
+without an event loop. Build one per process, after forking:
 
-- `migrate()`; `run(account, budget_s) -> RunOutcome` (call on a schedule and
-  on each verified push; `stop` says why it stopped: `idle` with the next due
-  time, `budget_exhausted`, `cooling_down`, `blocked`, `superseded`);
-- `act(account, action, message_ids=… | thread_id=…) -> RunOutcome`;
-- `messages(account, ids) -> list[MessageView]`;
-  `changes(account, since) -> ChangePage`; `read_blob(account, id) -> bytes`;
+- `await migrate()`; `await run(account, budget_s) -> RunOutcome` (call on a
+  schedule and on each verified push; `stop` says why it stopped: `idle` with
+  the next due time, `budget_exhausted`, `cooling_down`, `blocked`,
+  `superseded`);
+- `await act(account, action, message_ids=… | thread_id=…) -> RunOutcome`:
+  admitted durably first (`outcome.admitted`), then delivered;
+- `await messages(account, ids) -> list[MessageView]`;
+  `await changes(account, since) -> ChangePage`;
+  `await read_blob(account, id) -> bytes`;
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
 - exceptions `MailtideError`, `DelegationRevoked` (raised by the token source
-  to block an account), `InvalidPush`.
+  to block an account; the block is committed, and later runs make no
+  credential calls), `InvalidPush`.
 
-Calls release the GIL and run on a process-wide Tokio runtime. One `Runner`
-is shared by all threads; every method may be called concurrently, including on
+Async methods run on one process-wide Tokio runtime and work with
+`asyncio.create_task`, `TaskGroup` and `asyncio.timeout`. **Cancelling** an
+awaiting task drops the Rust work: in-flight requests stop, an open
+transaction rolls back, and the request's quota lease is returned. That is
+safe because every commit is atomic and fenced. The token source may be sync
+(run on Tokio's blocking pool, since minting may do network I/O) or async
+(awaited on the caller's event loop; async `Runner` only).
+
+Every method may be called concurrently from any thread, including on
 free-threaded CPython, where the module keeps the GIL disabled (all classes
 are immutable; shared Rust state is behind locks or the connection pool).
 Wheels: abi3 for CPython ≥ 3.12, plus free-threaded 3.14t and 3.15t.

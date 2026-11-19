@@ -33,7 +33,8 @@ pure, and I/O lives in one driver crate.
 
 ## Python (thin)
 
-`python/mailtide` only re-exports `_core`, ships `.pyi` stubs and `py.typed`,
+`python/mailtide` re-exports `_core`, wraps the async runner's futures as
+coroutines (`_runner.py`), and ships `.pyi` stubs and `py.typed`.
 A host:
 
 1. provides a `TokenSource` (e.g. Google domain-wide delegation) and config
