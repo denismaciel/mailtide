@@ -117,13 +117,50 @@ pub enum Action {
     MarkSpam,
     /// Not spam.
     MarkNotSpam(RestoreDestination),
-    /// Add and remove user labels.
-    ChangeLabels {
-        /// Labels to add.
-        add: Vec<LabelId>,
-        /// Labels to remove.
-        remove: Vec<LabelId>,
-    },
+    /// Add and remove labels.
+    ChangeLabels(LabelDelta),
+}
+
+/// Labels to add and remove, valid by construction: no read-only label, at
+/// most one location added, and no label both added and removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelDelta {
+    add: Vec<LabelId>,
+    remove: Vec<LabelId>,
+}
+
+impl LabelDelta {
+    /// Validate a change, as the caller gave it.
+    pub fn new(add: Vec<LabelId>, remove: Vec<LabelId>) -> Result<Self, AdmissionError> {
+        for label in add.iter().chain(&remove) {
+            if READ_ONLY.contains(&label.0.as_str()) {
+                return Err(AdmissionError::ReadOnlyLabel(label.clone()));
+            }
+        }
+        if let Some(both) = add.iter().find(|label| remove.contains(label)) {
+            return Err(AdmissionError::AddedAndRemoved(both.clone()));
+        }
+        let locations = add
+            .iter()
+            .filter(|label| LOCATIONS.contains(&label.0.as_str()))
+            .count();
+        if locations > 1 {
+            return Err(AdmissionError::ConflictingLocations);
+        }
+        Ok(Self { add, remove })
+    }
+
+    /// Labels to add.
+    #[must_use]
+    pub fn add(&self) -> &[LabelId] {
+        &self.add
+    }
+
+    /// Labels to remove.
+    #[must_use]
+    pub fn remove(&self) -> &[LabelId] {
+        &self.remove
+    }
 }
 
 /// Read or unread.
@@ -171,7 +208,26 @@ pub enum AdmissionError {
     ReadOnlyLabel(LabelId),
     /// Only one of INBOX, SPAM, TRASH may be added at once.
     ConflictingLocations,
+    /// The same label is both added and removed.
+    AddedAndRemoved(LabelId),
 }
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DraftTarget(id) => write!(f, "message {} is a draft", id.0),
+            Self::ReadOnlyLabel(label) => write!(f, "label {} can't be added or removed", label.0),
+            Self::ConflictingLocations => {
+                f.write_str("only one of INBOX, SPAM and TRASH may be added at once")
+            }
+            Self::AddedAndRemoved(label) => {
+                write!(f, "label {} is both added and removed", label.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
 
 /// Label changes an action implies, including implicit ones: trash and spam
 /// remove INBOX; restoring goes where the action says. Every implied change is
@@ -210,19 +266,8 @@ pub fn expand(
             (system::INBOX, LabelChange::Remove),
         ],
         Action::MarkNotSpam(destination) => restore(system::SPAM, *destination),
-        Action::ChangeLabels { add, remove } => {
-            for label in add.iter().chain(remove) {
-                if READ_ONLY.contains(&label.0.as_str()) {
-                    return Err(AdmissionError::ReadOnlyLabel(label.clone()));
-                }
-            }
-            let locations = add
-                .iter()
-                .filter(|label| LOCATIONS.contains(&label.0.as_str()))
-                .count();
-            if locations > 1 {
-                return Err(AdmissionError::ConflictingLocations);
-            }
+        Action::ChangeLabels(delta) => {
+            let (add, remove) = (delta.add(), delta.remove());
             let mut changes: Vec<(LabelId, LabelChange)> = add
                 .iter()
                 .map(|label| (label.clone(), LabelChange::Add))
@@ -504,21 +549,17 @@ mod tests {
             ),
             Err(AdmissionError::DraftTarget(m("d")))
         );
-        let add_sent = Action::ChangeLabels {
-            add: vec![label("SENT")],
-            remove: Vec::new(),
-        };
         assert_eq!(
-            expand(&m("a"), &add_sent, &set(["INBOX"])),
+            LabelDelta::new(vec![label("SENT")], Vec::new()),
             Err(AdmissionError::ReadOnlyLabel(label("SENT")))
         );
-        let two_locations = Action::ChangeLabels {
-            add: vec![label("SPAM"), label("TRASH")],
-            remove: Vec::new(),
-        };
         assert_eq!(
-            expand(&m("a"), &two_locations, &set([])),
+            LabelDelta::new(vec![label("SPAM"), label("TRASH")], Vec::new()),
             Err(AdmissionError::ConflictingLocations)
+        );
+        assert_eq!(
+            LabelDelta::new(vec![label("Label_1")], vec![label("Label_1")]),
+            Err(AdmissionError::AddedAndRemoved(label("Label_1")))
         );
     }
 

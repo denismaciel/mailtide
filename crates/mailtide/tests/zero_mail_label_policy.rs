@@ -7,7 +7,9 @@
 
 use mailtide::ids::{LabelId, MessageId};
 use mailtide::labels::{LabelSet, set};
-use mailtide::outbox::{Action, AdmissionError, LabelChange, RestoreDestination, expand};
+use mailtide::outbox::{
+    Action, AdmissionError, LabelChange, LabelDelta, RestoreDestination, expand,
+};
 
 fn m() -> MessageId {
     MessageId("m".into())
@@ -17,11 +19,22 @@ fn label(id: &str) -> LabelId {
     LabelId(id.into())
 }
 
-fn change_labels(add: &[&str], remove: &[&str]) -> Action {
-    Action::ChangeLabels {
-        add: add.iter().map(|id| label(id)).collect(),
-        remove: remove.iter().map(|id| label(id)).collect(),
-    }
+fn change_labels(add: &[&str], remove: &[&str]) -> Result<Action, AdmissionError> {
+    LabelDelta::new(
+        add.iter().map(|id| label(id)).collect(),
+        remove.iter().map(|id| label(id)).collect(),
+    )
+    .map(Action::ChangeLabels)
+}
+
+/// Validate, then expand (mailtide rejects invalid changes when the action is
+/// built; Zero rejects them when it is normalized).
+fn expand_change(
+    add: &[&str],
+    remove: &[&str],
+    labels: &LabelSet,
+) -> Result<Vec<(LabelId, LabelChange)>, AdmissionError> {
+    change_labels(add, remove).and_then(|action| expand(&m(), &action, labels))
 }
 
 fn changes(pairs: &[(&str, LabelChange)]) -> Vec<(LabelId, LabelChange)> {
@@ -62,16 +75,16 @@ fn durable_label_routing_records_gmail_implicit_inbox_removal_without_mutating_c
             changes(&[(location, LabelChange::Add), ("INBOX", LabelChange::Remove)])
         );
         // Zero: normalizeDurableLabelMutation([label, 'INBOX'], ['Label_123']).
-        let raw = change_labels(&[location, "INBOX"], &["Label_123"]);
+        let raw = (vec![location, "INBOX"], vec!["Label_123"]);
         let copy = raw.clone();
-        match expand(&m(), &raw, &inbox) {
+        match expand_change(&raw.0, &raw.1, &inbox) {
             Err(AdmissionError::ConflictingLocations) => {}
             Ok(expanded) => assert!(!after(&inbox, &expanded).contains(&label("INBOX"))),
             Err(other) => panic!("unexpected {other:?}"),
         }
         assert_eq!(raw, copy, "the caller's action is untouched");
         // Zero: normalizeDurableLabelMutation([label], ['Label_123']).
-        let raw = change_labels(&[location], &["Label_123"]);
+        let raw = change_labels(&[location], &["Label_123"]).unwrap();
         let expanded = expand(&m(), &raw, &inbox).unwrap();
         assert_eq!(after(&inbox, &expanded), set([location]));
     }
@@ -94,7 +107,7 @@ fn durable_label_routing_routes_reversible_system_moves_and_custom_label_combina
             .chain(remove.iter().map(|id| (*id, Remove)))
             .collect();
         assert_eq!(
-            expand(&m(), &change_labels(add, remove), &labels),
+            expand_change(add, remove, &labels),
             Ok(changes(&expected)),
             "{add:?} / {remove:?}"
         );
@@ -128,13 +141,13 @@ fn durable_label_routing_keeps_synthetic_names_immutable_labels_and_mixed_operat
     let labels = set(["INBOX"]);
     for immutable in ["DRAFT", "SENT", "CHAT"] {
         assert_eq!(
-            expand(&m(), &change_labels(&[immutable], &["INBOX"]), &labels),
+            expand_change(&[immutable], &["INBOX"], &labels),
             Err(AdmissionError::ReadOnlyLabel(label(immutable)))
         );
         assert_eq!(
-            expand(&m(), &change_labels(&["Label_123"], &[immutable]), &labels),
+            expand_change(&["Label_123"], &[immutable], &labels),
             Err(AdmissionError::ReadOnlyLabel(label(immutable)))
         );
     }
-    assert_eq!(expand(&m(), &change_labels(&[], &[]), &labels), Ok(vec![]));
+    assert_eq!(expand_change(&[], &[], &labels), Ok(vec![]));
 }

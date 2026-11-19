@@ -19,8 +19,8 @@ use mailtide::jobs::{AttemptId, ClaimedJob, JobClaim, JobKind, JobOp, JobOutcome
 use mailtide::labels::{self, LabelSet, set};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::{
-    Action, ActionRequest, Importance, IntentOp, IntentState, LabelChange, ModifyGroup, ReadState,
-    RestoreDestination, StarState, plan_delivery,
+    Action, ActionRequest, Importance, IntentOp, IntentState, LabelChange, LabelDelta, ModifyGroup,
+    ReadState, RestoreDestination, StarState, plan_delivery,
 };
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
@@ -65,10 +65,7 @@ fn observation(thread: &str, id: &str, labels: &[&str], checkpoint: u64) -> Mess
 }
 
 fn change_labels(add: &[&str], remove: &[&str]) -> Action {
-    Action::ChangeLabels {
-        add: ids(add),
-        remove: ids(remove),
-    }
+    Action::ChangeLabels(LabelDelta::new(ids(add), ids(remove)).expect("a valid change"))
 }
 
 fn has(labels: &LabelSet, id: &str) -> bool {

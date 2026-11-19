@@ -33,7 +33,8 @@ use mailtide::jobs::{JobKind, JobState};
 use mailtide::labels::{self, LabelSet};
 use mailtide::mirror::{AccountMirror, Content};
 use mailtide::outbox::{
-    Action, ActionRequest, IntentState, ModifyGroup, ReadState, RestoreDestination, StarState,
+    Action, ActionRequest, IntentState, LabelDelta, ModifyGroup, ReadState, RestoreDestination,
+    StarState,
 };
 use mailtide::reconcile::ListScope;
 use mailtide::retry::{Failure, Retryable, RetryableFailure};
@@ -751,10 +752,13 @@ impl Sim {
             7 => Action::RestoreFromTrash(RestoreDestination::Inbox),
             8 => Action::MarkSpam,
             9 => Action::MarkNotSpam(RestoreDestination::Archive),
-            _ => Action::ChangeLabels {
-                add: vec![LabelId("Label_1".into())],
-                remove: vec![LabelId("Label_2".into())],
-            },
+            _ => Action::ChangeLabels(
+                LabelDelta::new(
+                    vec![LabelId("Label_1".into())],
+                    vec![LabelId("Label_2".into())],
+                )
+                .expect("a valid change"),
+            ),
         }
     }
 

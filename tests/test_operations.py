@@ -122,3 +122,19 @@ def test_missing_gmail_scope_blocks_instead_of_looping(gmail: tuple[Mailbox, str
     assert outcome.blocked is not None and outcome.blocked.startswith("api_access_denied")
     assert mailbox.requests <= 2, f"no retry loop ({mailbox.requests} requests)"
     assert runner.status(ACCOUNT).phase == "blocked"
+
+
+def test_an_invalid_label_change_is_rejected_when_built(gmail: tuple[Mailbox, str]) -> None:
+    _, origin = gmail
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    with pytest.raises(ValueError, match="both added and removed"):
+        runner.admit(
+            "alice@example.com",
+            "change_labels",
+            message_ids=["m1"],
+            add_labels=["Label_1"],
+            remove_labels=["Label_1"],
+        )
+    with pytest.raises(ValueError, match="SENT"):
+        runner.admit("alice@example.com", "change_labels", message_ids=["m1"], add_labels=["SENT"])

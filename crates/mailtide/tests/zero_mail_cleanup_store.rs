@@ -24,7 +24,8 @@ use mailtide::jobs::{AttemptId, ClaimedJob, JobKind, JobOp, JobOutcome, JobState
 use mailtide::labels::{LabelSet, set};
 use mailtide::mirror::AccountMirror;
 use mailtide::outbox::{
-    Action, ActionRequest, Delivery, IntentOp, IntentState, IntentVersion, LabelChange, ModifyGroup,
+    Action, ActionRequest, Delivery, IntentOp, IntentState, IntentVersion, LabelChange, LabelDelta,
+    ModifyGroup,
 };
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
@@ -253,18 +254,16 @@ fn labels(ids: &[&str]) -> Vec<LabelId> {
 
 /// The cleanup: out of spam (and the inbox), into the trash.
 fn cleanup() -> Action {
-    Action::ChangeLabels {
-        add: labels(&["TRASH"]),
-        remove: labels(&["SPAM", "INBOX"]),
-    }
+    Action::ChangeLabels(
+        LabelDelta::new(labels(&["TRASH"]), labels(&["SPAM", "INBOX"])).expect("a valid change"),
+    )
 }
 
 /// The user moving a thread back to spam.
 fn back_to_spam() -> Action {
-    Action::ChangeLabels {
-        add: labels(&["SPAM"]),
-        remove: labels(&["TRASH"]),
-    }
+    Action::ChangeLabels(
+        LabelDelta::new(labels(&["SPAM"]), labels(&["TRASH"])).expect("a valid change"),
+    )
 }
 
 fn on_thread(thread: &str, action: Action) -> IntentOp {
@@ -357,10 +356,9 @@ fn durable_spam_cleanup_protects_a_real_no_op_restore_after_discovery_and_surviv
         &mut mirror,
         vec![on_thread(
             "a",
-            Action::ChangeLabels {
-                add: Vec::new(),
-                remove: labels(&["TRASH"]),
-            },
+            Action::ChangeLabels(
+                LabelDelta::new(Vec::new(), labels(&["TRASH"])).expect("a valid change"),
+            ),
         )],
     );
     assert!(

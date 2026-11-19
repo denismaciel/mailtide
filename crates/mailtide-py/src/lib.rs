@@ -26,7 +26,7 @@ mod _core {
 
     use mailtide::ids::{AccountId, LabelId, MessageId, ThreadId, Timestamp};
     use mailtide::outbox::{
-        Action, ActionRequest, Importance, ReadState, RestoreDestination, StarState,
+        Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
     };
     use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
     use mailtide::revision::{StateSeq, StateString};
@@ -535,10 +535,13 @@ mod _core {
             "restore" => Action::RestoreFromTrash(destination),
             "spam" => Action::MarkSpam,
             "not_spam" => Action::MarkNotSpam(destination),
-            "change_labels" => Action::ChangeLabels {
-                add: add_labels.into_iter().map(LabelId).collect(),
-                remove: remove_labels.into_iter().map(LabelId).collect(),
-            },
+            "change_labels" => Action::ChangeLabels(
+                LabelDelta::new(
+                    add_labels.into_iter().map(LabelId).collect(),
+                    remove_labels.into_iter().map(LabelId).collect(),
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            ),
             other => return Err(PyValueError::new_err(format!("unknown action {other:?}"))),
         })
     }
