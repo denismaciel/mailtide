@@ -148,6 +148,7 @@ mod _core {
             RunError::Corrupt(detail) => CorruptState::new_err(detail),
             RunError::Quota(detail) => QuotaGateError::new_err(detail),
             RunError::Blobs(detail) => BlobUnavailable::new_err(detail),
+            RunError::Invariant(detail) => MailtideError::new_err(detail),
         }
     }
 

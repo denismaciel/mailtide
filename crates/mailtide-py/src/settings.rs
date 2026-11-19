@@ -214,8 +214,9 @@ fn http(raw: RawHttp) -> Result<HttpConfig, Invalid> {
     Ok(http)
 }
 
-fn engine(raw: &RawEngine) -> Result<EngineConfig, Invalid> {
+fn engine(raw: &RawEngine, watch: &WatchMode) -> Result<EngineConfig, Invalid> {
     let engine = EngineConfig {
+        watch: watch.policy(),
         poll_active: positive("engine.poll_active_s", raw.poll_active_s)?,
         poll_idle: positive("engine.poll_idle_s", raw.poll_idle_s)?,
         idle_after: positive("engine.idle_after_s", raw.idle_after_s)?,
@@ -299,13 +300,15 @@ fn log(raw: &RawLog) -> Result<(crate::logbridge::Verbosity, LogAccounts, String
 pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
     let (database_url, pool) = pool(&raw.database)?;
     let (log_verbosity, log_accounts, logger) = log(&raw.log)?;
+    let watch = watch(raw.watch)?;
+    let engine = engine(&raw.engine, &watch)?;
     Ok(Settings {
         database_url,
         pool,
         blobs_url: raw.blobs_url,
-        watch: watch(raw.watch)?,
+        watch,
         http: http(raw.http)?,
-        engine: engine(&raw.engine)?,
+        engine,
         budget: budget(&raw.quota)?,
         token_cache_margin: duration("token_cache_margin_s", raw.token_cache_margin_s)?,
         log_verbosity,

@@ -35,14 +35,26 @@ use crate::transport::{GmailTransport, TransportError};
 pub enum WatchMode {
     /// Publish changes to this Pub/Sub topic (`projects/p/topics/t`).
     Topic(String),
-    /// No push: watch requests are deferred a day; polling finds changes.
+    /// No push: the engine never calls `users.watch`; polling (or the
+    /// host's own verified pushes) finds changes.
     Disabled,
+}
+
+impl WatchMode {
+    /// The engine policy this mode implies.
+    #[must_use]
+    pub fn policy(&self) -> mailtide::engine::WatchPolicy {
+        match self {
+            Self::Topic(_) => mailtide::engine::WatchPolicy::Renew,
+            Self::Disabled => mailtide::engine::WatchPolicy::Off,
+        }
+    }
 }
 
 /// Runner settings.
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
-    /// Engine tunables.
+    /// Engine tunables. Its `watch` policy is ignored: `watch` decides it.
     pub engine: EngineConfig,
     /// Push notifications.
     pub watch: WatchMode,
@@ -185,6 +197,8 @@ pub enum RunError {
     Quota(String),
     /// Blob storage failed.
     Blobs(String),
+    /// mailtide broke one of its own rules (a bug; please report it).
+    Invariant(&'static str),
 }
 
 impl RunError {
@@ -199,6 +213,7 @@ impl RunError {
             Self::Store(StoreError::Rejected(_)) => "superseded",
             Self::Quota(_) => "quota_gate",
             Self::Blobs(_) => "blobs",
+            Self::Invariant(_) => "invariant",
         }
     }
 }
@@ -389,6 +404,24 @@ where
         outcome
     }
 
+    /// Claim the account and build its engine; `None` when a newer engine
+    /// holds it.
+    async fn claim_engine(&self, account: &AccountId) -> Result<Option<Engine>, RunError> {
+        let snapshot = match self.store.claim(account, ENGINE_VERSION).await {
+            Ok(snapshot) => snapshot,
+            Err(StoreError::Rejected(_)) => return Ok(None),
+            Err(error) => return Err(RunError::Store(error)),
+        };
+        let snapshot = snapshot
+            .validate()
+            .map_err(|e| RunError::Corrupt(format!("{e:?}")))?;
+        let config = EngineConfig {
+            watch: self.config.watch.policy(),
+            ..self.config.engine.clone()
+        };
+        Ok(Some(Engine::new(snapshot, config)))
+    }
+
     async fn run_inner(
         &self,
         account: &AccountId,
@@ -398,20 +431,12 @@ where
         let started = Instant::now();
         let mut reported = started;
         let deadline = started + budget;
-        let snapshot = match self.store.claim(account, ENGINE_VERSION).await {
-            Ok(snapshot) => snapshot,
-            Err(StoreError::Rejected(_)) => {
-                return Ok(RunOutcome {
-                    report: SyncReport::default(),
-                    stop: StopReason::Superseded,
-                });
-            }
-            Err(error) => return Err(RunError::Store(error)),
+        let Some(mut engine) = self.claim_engine(account).await? else {
+            return Ok(RunOutcome {
+                report: SyncReport::default(),
+                stop: StopReason::Superseded,
+            });
         };
-        let snapshot = snapshot
-            .validate()
-            .map_err(|e| RunError::Corrupt(format!("{e:?}")))?;
-        let mut engine = Engine::new(snapshot, self.config.engine.clone());
         let mut report = SyncReport {
             cursor_before: engine.status().cursor,
             ..SyncReport::default()
@@ -603,10 +628,9 @@ where
     ) -> Result<EventKind, RunError> {
         let topic = match (&call.request, &self.config.watch) {
             (GmailRequest::Watch, WatchMode::Disabled) => {
-                return Ok(EventKind::RequestDeferred {
-                    command,
-                    until: self.clock.now().plus(Duration::from_hours(24)),
-                });
+                return Err(RunError::Invariant(
+                    "the engine asked for a watch with watches off",
+                ));
             }
             (_, WatchMode::Topic(topic)) => topic.clone(),
             (_, WatchMode::Disabled) => String::new(),

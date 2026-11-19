@@ -42,6 +42,8 @@ pub struct EngineConfig {
     pub poll_idle: Duration,
     /// How long without user activity counts as idle.
     pub idle_after: Duration,
+    /// Whether this engine keeps a `users.watch` alive.
+    pub watch: WatchPolicy,
     /// Renew the watch this long before it expires.
     pub watch_renew_margin: Duration,
     /// Delay before importing a draft's body, since drafts churn on save.
@@ -51,12 +53,23 @@ pub struct EngineConfig {
     pub confirm_timeout: Duration,
 }
 
+/// Whether the engine keeps a Gmail push watch alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchPolicy {
+    /// Call `users.watch` on start and renew it before it expires.
+    Renew,
+    /// Never call it: changes are found by polling (or the host's own
+    /// pushes). No renewal timer exists.
+    Off,
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             poll_active: Duration::from_mins(1),
             poll_idle: Duration::from_mins(15),
             idle_after: Duration::from_hours(1),
+            watch: WatchPolicy::Renew,
             watch_renew_margin: Duration::from_hours(1),
             draft_settle: Duration::from_mins(2),
             confirm_timeout: Duration::from_mins(1),
@@ -214,16 +227,19 @@ impl Engine {
             return vec![self.status_command()];
         }
         let poll = self.next_poll(now);
-        let renewal = schedule::next_watch_renewal(
-            self.state.watch_expiration,
-            now,
-            self.config.watch_renew_margin,
-        );
-        let mut out = vec![
-            self.schedule(TimerKind::Poll, poll),
-            self.schedule(TimerKind::WatchRenewal, renewal),
-            self.schedule_jobs(now),
-        ];
+        let mut out = vec![self.schedule(TimerKind::Poll, poll)];
+        match self.config.watch {
+            WatchPolicy::Renew => {
+                let renewal = schedule::next_watch_renewal(
+                    self.state.watch_expiration,
+                    now,
+                    self.config.watch_renew_margin,
+                );
+                out.push(self.schedule(TimerKind::WatchRenewal, renewal));
+            }
+            WatchPolicy::Off => {}
+        }
+        out.push(self.schedule_jobs(now));
         out.extend(self.resume_sync(now));
         out.push(self.status_command());
         out
@@ -334,9 +350,12 @@ impl Engine {
                 }
                 out
             }
-            TimerKind::WatchRenewal => {
-                vec![self.gmail(GmailRequest::Watch, Priority::Live, Waiting::Watch)]
-            }
+            TimerKind::WatchRenewal => match self.config.watch {
+                WatchPolicy::Renew => {
+                    vec![self.gmail(GmailRequest::Watch, Priority::Live, Waiting::Watch)]
+                }
+                WatchPolicy::Off => Vec::new(),
+            },
             TimerKind::Jobs => {
                 if self.jobs_due.is_some_and(|due| due <= now) {
                     self.jobs_due = None;
@@ -1361,6 +1380,47 @@ mod tests {
             snapshot.validate().expect("valid snapshot"),
             EngineConfig::default(),
         )
+    }
+
+    #[test]
+    fn with_watches_off_no_renewal_is_scheduled_or_sent() {
+        let snapshot = StoreSnapshot {
+            account: AccountId("alice@example.com".into()),
+            epoch: Epoch(1),
+            engine_version: ENGINE_VERSION,
+            cursor: Some(HistoryId(100)),
+            sync: SyncState::Live,
+            watch_expiration: None,
+            last_activity: None,
+            cooldown: None,
+            rng_seed: 7,
+        };
+        let config = EngineConfig {
+            watch: WatchPolicy::Off,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(snapshot.validate().expect("valid"), config);
+        let started = engine.start(Timestamp(1_000));
+        assert!(!started.iter().any(|c| matches!(
+            c.kind,
+            CommandKind::Schedule {
+                timer: TimerKind::WatchRenewal,
+                ..
+            }
+        )));
+        let fired = engine.handle(event(EventKind::TimerFired {
+            timer: TimerKind::WatchRenewal,
+        }));
+        assert!(!gmail_requests(&fired).contains(&&GmailRequest::Watch));
+        let mut renewing = live(100);
+        let started = renewing.start(Timestamp(1_000));
+        assert!(started.iter().any(|c| matches!(
+            c.kind,
+            CommandKind::Schedule {
+                timer: TimerKind::WatchRenewal,
+                ..
+            }
+        )));
     }
 
     fn live(cursor: u64) -> Engine {
