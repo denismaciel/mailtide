@@ -116,6 +116,10 @@ class Config:
 
     database: Database
     blobs: Blobs
+    #: ``read_only`` is shadow mode: mirror only, never change the mailbox
+    #: (``act``/``admit`` raise ``ReadOnlyMode``; works with the
+    #: ``gmail.readonly`` scope).
+    access: Literal["read_write", "read_only"] = "read_write"
     watch: Poll | Topic = Poll()
     http: Http = Http()
     engine: Engine = Engine()

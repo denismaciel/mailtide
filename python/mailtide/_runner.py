@@ -8,6 +8,7 @@ transaction rolls back; every commit is atomic and fenced, so that is safe).
 
 import asyncio
 import contextvars
+import random
 from collections.abc import Awaitable, Callable
 from typing import Literal
 
@@ -15,9 +16,11 @@ from mailtide import _core
 from mailtide._core import (
     AccountStatus,
     ChangePage,
+    DriftResult,
     ForgetResult,
     Health,
     MessageView,
+    NotifyResult,
     Progress,
     ResumeResult,
     RunOutcome,
@@ -156,6 +159,32 @@ class Runner:
     async def accounts(self) -> list[str]:
         """Every account the store holds."""
         return await self._core.accounts()
+
+    async def drift(
+        self, account: str, message_ids: list[str] | None = None, sample: int = 50
+    ) -> list[DriftResult]:
+        """Compare the mirror with Gmail, read-only, for ``message_ids`` or a
+        random ``sample`` of mirrored messages. ``verdict == "differs"`` is
+        drift; ``explained`` differences (pending actions, awaiting
+        verification, Gmail ahead of the mirror) are not. Fetches go through
+        the quota gate like a sync's."""
+        if message_ids is None:
+            message_ids = await self._sample(account, sample)
+        return await self._core.drift(account, message_ids)
+
+    async def _sample(self, account: str, size: int) -> list[str]:
+        ids: list[str] = []
+        after: str | None = None
+        while page := await self._core.message_ids(account, after, 1000):
+            ids.extend(page)
+            after = page[-1]
+        return random.sample(ids, min(size, len(ids)))
+
+    async def notify(self, account: str, history_id: int, budget_s: float = 60.0) -> NotifyResult:
+        """The host verified a Gmail push (its own Pub/Sub handler) saying the
+        mailbox reached ``history_id``: sync only if the mirror is behind.
+        Pushes never start an account mailtide doesn't sync yet."""
+        return await self._core.notify(account, history_id, budget_s)
 
     async def resume(self, account: str) -> ResumeResult:
         """Resume a blocked account once its cause is fixed (e.g. credentials)."""

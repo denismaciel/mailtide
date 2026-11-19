@@ -11,6 +11,7 @@
 
 pub mod command;
 pub mod commit;
+pub mod drift;
 pub mod engine;
 pub mod event;
 pub mod gmail;

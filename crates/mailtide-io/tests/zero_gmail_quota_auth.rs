@@ -213,6 +213,7 @@ fn runner(gmail: FakeGmail, gate: RecordingGate) -> TestRunner {
             tokens,
             RunnerConfig {
                 engine: EngineConfig::default(),
+                access: mailtide_io::runner::Access::ReadWrite,
                 watch: WatchMode::Disabled,
                 log_accounts: mailtide_io::runner::LogAccounts::default(),
             },

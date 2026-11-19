@@ -51,9 +51,23 @@ impl WatchMode {
     }
 }
 
+/// Whether the runner may change the mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Access {
+    /// Deliver users' actions to Gmail.
+    #[default]
+    ReadWrite,
+    /// Shadow mode: mirror only. Admitting actions is refused, and actions
+    /// admitted before the switch are blocked (visible as blocked) rather
+    /// than sent. Works with the `gmail.readonly` scope.
+    ReadOnly,
+}
+
 /// Runner settings.
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
+    /// Whether actions reach Gmail.
+    pub access: Access,
     /// Engine tunables. Its `watch` policy is ignored: `watch` decides it.
     pub engine: EngineConfig,
     /// Push notifications.
@@ -199,6 +213,8 @@ pub enum RunError {
     Blobs(String),
     /// mailtide broke one of its own rules (a bug; please report it).
     Invariant(&'static str),
+    /// The runner is read-only: actions are refused.
+    ReadOnly,
 }
 
 impl RunError {
@@ -214,6 +230,7 @@ impl RunError {
             Self::Quota(_) => "quota_gate",
             Self::Blobs(_) => "blobs",
             Self::Invariant(_) => "invariant",
+            Self::ReadOnly => "read_only",
         }
     }
 }
@@ -234,6 +251,28 @@ fn failure_kind(failure: &Failure) -> &'static str {
             Blocking::Account(_) => "account_problem",
         },
     }
+}
+
+/// What a push did.
+#[derive(Debug, Clone)]
+pub enum Notified {
+    /// The mirror had already reached the pushed history id.
+    Current,
+    /// The mirror was behind: this run synced it.
+    Ran(Box<RunOutcome>),
+    /// The account isn't synced here; pushes don't start accounts.
+    UnknownAccount,
+}
+
+/// One message of a drift check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checked {
+    /// Both sides were read and compared.
+    Compared(mailtide::drift::Verdict),
+    /// The quota gate deferred the fetch: try later.
+    Deferred,
+    /// Gmail failed the fetch (its failure class).
+    Failed(&'static str),
 }
 
 /// One Gmail response, decoded into the engine's terms.
@@ -270,6 +309,13 @@ where
         }
     }
 
+    fn writable(&self) -> Result<(), RunError> {
+        match self.config.access {
+            Access::ReadWrite => Ok(()),
+            Access::ReadOnly => Err(RunError::ReadOnly),
+        }
+    }
+
     /// Read the time from `clock` instead of the system.
     #[must_use]
     pub fn with_clock(mut self, clock: crate::Clock) -> Self {
@@ -300,6 +346,7 @@ where
         account: &AccountId,
         action: &ActionRequest,
     ) -> Result<u32, RunError> {
+        self.writable()?;
         self.store
             .admit(account, action, self.clock.now())
             .await
@@ -314,6 +361,52 @@ where
     /// Every account the store holds.
     pub async fn accounts(&self) -> Result<Vec<AccountId>, RunError> {
         self.store.accounts().await.map_err(RunError::Store)
+    }
+
+    /// Compare the mirror with Gmail for `ids` (a sample the host picks),
+    /// read-only: nothing is fixed, and the requests go through the quota
+    /// gate like a sync's. Ids the mirror doesn't have are left out.
+    pub async fn drift(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Vec<(MessageId, Checked)>, RunError> {
+        let views = self
+            .store
+            .messages(account, ids)
+            .await
+            .map_err(RunError::Store)?;
+        let mut report = SyncReport::default();
+        let mut checked = Vec::with_capacity(views.len());
+        for (seq, view) in (0_u64..).zip(views) {
+            let request = GmailRequest::GetMessage {
+                id: view.id.clone(),
+            };
+            let call = GmailCall {
+                account: account.clone(),
+                cost: mailtide::quota::cost(&request),
+                request,
+                priority: mailtide::quota::Priority::Backfill,
+            };
+            // Not an engine's command: epoch 0 never matches a live engine.
+            let command = CommandId {
+                epoch: mailtide::ids::Epoch(0),
+                seq,
+            };
+            let result = match self.gmail(command, call, &mut report).await? {
+                EventKind::MessageFetched { message, .. } => {
+                    Checked::Compared(mailtide::drift::compare(&view, Some(&message)))
+                }
+                EventKind::MessageNotFound { .. } => {
+                    Checked::Compared(mailtide::drift::compare(&view, None))
+                }
+                EventKind::RequestDeferred { .. } => Checked::Deferred,
+                EventKind::RequestFailed { failure, .. } => Checked::Failed(failure_kind(&failure)),
+                _ => return Err(RunError::Invariant("unexpected answer to a message get")),
+            };
+            checked.push((view.id, result));
+        }
+        Ok(checked)
     }
 
     /// Resume a blocked account once its cause is fixed.
@@ -344,6 +437,7 @@ where
         action: ActionRequest,
         budget: Duration,
     ) -> Result<RunOutcome, RunError> {
+        self.writable()?;
         let admitted = self
             .store
             .admit(account, &action, self.clock.now())
@@ -362,6 +456,28 @@ where
                 mailtide::ids::stable_hash(account.as_str().as_bytes())
             ),
             LogAccounts::Plain => account.as_str().to_owned(),
+        }
+    }
+
+    /// A verified push (the host's own, e.g. its existing Pub/Sub handler)
+    /// says Gmail reached `history_id`: sync only if the mirror is behind it.
+    /// Unknown accounts are not started by a push.
+    pub async fn notify(
+        &self,
+        account: &AccountId,
+        history_id: HistoryId,
+        budget: Duration,
+    ) -> Result<Notified, RunError> {
+        let status = self.store.status(account).await.map_err(RunError::Store)?;
+        match status {
+            None => Ok(Notified::UnknownAccount),
+            Some(status) if status.cursor.is_some_and(|cursor| cursor >= history_id) => {
+                Ok(Notified::Current)
+            }
+            Some(_) => self
+                .run(account, budget)
+                .await
+                .map(|outcome| Notified::Ran(Box::new(outcome))),
         }
     }
 
@@ -626,6 +742,16 @@ where
         call: GmailCall,
         report: &mut SyncReport,
     ) -> Result<EventKind, RunError> {
+        if let (GmailRequest::Modify(_), Access::ReadOnly) = (&call.request, self.config.access) {
+            // Never sent: the intents block (shown as blocked), the job ends.
+            return Ok(EventKind::RequestFailed {
+                command,
+                failure: Failure::Blocking(BlockingFailure {
+                    class: Blocking::Permanent,
+                    detail: "read-only runner: action not sent".into(),
+                }),
+            });
+        }
         let topic = match (&call.request, &self.config.watch) {
             (GmailRequest::Watch, WatchMode::Disabled) => {
                 return Err(RunError::Invariant(

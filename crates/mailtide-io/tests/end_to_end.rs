@@ -178,6 +178,7 @@ fn runner(
                 draft_settle: Duration::ZERO,
                 ..EngineConfig::default()
             },
+            access: mailtide_io::runner::Access::ReadWrite,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
         },

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use mailtide::EngineConfig;
 use mailtide::quota::Budget;
-use mailtide_io::runner::{LogAccounts, WatchMode};
+use mailtide_io::runner::{Access, LogAccounts, WatchMode};
 use mailtide_io::transport::HttpConfig;
 use mailtide_store::config::{Connect, DatabaseUrl, PoolConfig};
 
@@ -76,6 +76,7 @@ pub struct RawLog {
 /// `mailtide.config.Config`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawConfig {
+    pub access: String,
     pub database: RawDatabase,
     pub blobs_url: String,
     pub watch: RawWatch,
@@ -89,6 +90,7 @@ pub struct RawConfig {
 /// A validated configuration.
 #[derive(Debug, Clone)]
 pub struct Settings {
+    pub access: Access,
     pub database_url: DatabaseUrl,
     pub pool: PoolConfig,
     pub blobs_url: String,
@@ -300,9 +302,20 @@ fn log(raw: &RawLog) -> Result<(crate::logbridge::Verbosity, LogAccounts, String
 pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
     let (database_url, pool) = pool(&raw.database)?;
     let (log_verbosity, log_accounts, logger) = log(&raw.log)?;
+    let access = match raw.access.as_str() {
+        "read_write" => Access::ReadWrite,
+        "read_only" => Access::ReadOnly,
+        other => {
+            return Err(invalid(
+                "access",
+                format!("{other:?} is not \"read_write\" or \"read_only\""),
+            ));
+        }
+    };
     let watch = watch(raw.watch)?;
     let engine = engine(&raw.engine, &watch)?;
     Ok(Settings {
+        access,
         database_url,
         pool,
         blobs_url: raw.blobs_url,
@@ -323,6 +336,7 @@ mod tests {
 
     fn defaults() -> RawConfig {
         RawConfig {
+            access: "read_write".into(),
             database: RawDatabase {
                 url: "postgres:///app?host=/cloudsql/p:r:i".into(),
                 max_connections: 2,

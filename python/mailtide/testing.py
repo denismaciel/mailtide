@@ -101,7 +101,7 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                     if label is None or label in m["labels"]
                 ]
                 return self.reply(200, {"messages": ids})
-            if len(parts) == 2 and parts[0] == "messages":
+            if len(parts) == 2 and parts[0] == "messages" and parts[1] in mailbox.messages:
                 mid = parts[1]
                 m = mailbox.messages[mid]
                 body = {

@@ -193,6 +193,7 @@ fn gmail_request_admission_with_persisted_quota_storage_keeps_live_and_foregroun
             tokens,
             RunnerConfig {
                 engine: EngineConfig::default(),
+                access: mailtide_io::runner::Access::ReadWrite,
                 watch: WatchMode::Disabled,
                 log_accounts: mailtide_io::runner::LogAccounts::default(),
             },

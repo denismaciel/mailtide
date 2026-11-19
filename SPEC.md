@@ -542,6 +542,23 @@ steps; locally 3,000 seeds). Zero's suites are ported by name and tracked by
 `scripts/zero_tests.py`. Python tests drive the real `Runner` against a fake
 Gmail over HTTP.
 
+## 12a. Running beside an existing system
+
+- **Read-only (shadow) mode**: `Config(access="read_only")` mirrors without
+  ever changing the mailbox: `act`/`admit` raise `ReadOnlyMode`, and actions
+  admitted earlier are blocked (shown as blocked, no longer overlaying)
+  instead of sent. It works with the `gmail.readonly` scope. Combine with
+  `Poll()` when the host already owns the account's watch.
+- **Drift checks**: `drift(account, message_ids=None, sample=50)` fetches a
+  sample from Gmail (through the quota gate) and compares labels with a pure
+  rule: `matches`; `explained` (pending actions, awaiting verification, or
+  Gmail ahead of the mirror's checkpoint, which the next sync closes);
+  `differs` (drift: same checkpoint, different labels); `missing_in_gmail`.
+  Read-only: nothing is repaired.
+- **Host-verified pushes**: `notify(account, history_id)` syncs only when
+  the mirror's cursor is behind `history_id`; it never starts an account
+  mailtide doesn't already sync (`unknown_account`).
+
 ## 13. Observability
 
 Logs: the driver emits `tracing` events (a span per run carrying the

@@ -98,6 +98,12 @@ mod _core {
     );
     create_exception!(
         _core,
+        ReadOnlyMode,
+        MailtideError,
+        "The runner is read-only: actions are refused."
+    );
+    create_exception!(
+        _core,
         Superseded,
         MailtideError,
         "A newer mailtide version already wrote to this account; this one must not."
@@ -116,6 +122,7 @@ mod _core {
         m.add("QuotaGateError", py.get_type::<QuotaGateError>())?;
         m.add("Superseded", py.get_type::<Superseded>())?;
         m.add("SchemaOutOfDate", py.get_type::<SchemaOutOfDate>())?;
+        m.add("ReadOnlyMode", py.get_type::<ReadOnlyMode>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -149,6 +156,9 @@ mod _core {
             RunError::Quota(detail) => QuotaGateError::new_err(detail),
             RunError::Blobs(detail) => BlobUnavailable::new_err(detail),
             RunError::Invariant(detail) => MailtideError::new_err(detail),
+            RunError::ReadOnly => ReadOnlyMode::new_err(
+                "this runner is read-only (config access=\"read_only\"): actions are refused",
+            ),
         }
     }
 
@@ -742,6 +752,7 @@ mod _core {
     /// `mailtide.config.Config`.
     #[derive(FromPyObject)]
     struct ConfigArg {
+        access: String,
         database: DatabaseArg,
         blobs: BlobsArg,
         watch: WatchArg,
@@ -755,6 +766,7 @@ mod _core {
     impl From<ConfigArg> for crate::settings::RawConfig {
         fn from(c: ConfigArg) -> Self {
             Self {
+                access: c.access,
                 database: crate::settings::RawDatabase {
                     url: c.database.url,
                     max_connections: c.database.max_connections,
@@ -840,6 +852,7 @@ mod _core {
             LocalGate::new(settings.budget),
             CachedTokens::new(PyTokens(token_source), settings.token_cache_margin),
             RunnerConfig {
+                access: settings.access,
                 engine: settings.engine,
                 watch: settings.watch,
                 log_accounts: settings.log_accounts,
@@ -939,6 +952,71 @@ mod _core {
         imported: u32,
         gmail_requests: u32,
         elapsed_ms: u64,
+    }
+
+    /// One message of a drift check.
+    #[pyclass(frozen, get_all)]
+    struct DriftResult {
+        message_id: String,
+        /// `matches`, `explained` (a reason the mirror differs for now),
+        /// `differs` (drift), `missing_in_gmail`, `deferred` (quota: check
+        /// later) or `failed` (Gmail failed the fetch).
+        verdict: &'static str,
+        /// For `explained`: `pending_actions`, `unverified` or `mirror_behind`.
+        reason: Option<&'static str>,
+        /// For `differs`: what each side shows.
+        mirror_labels: Option<Vec<String>>,
+        gmail_labels: Option<Vec<String>>,
+        /// For `failed`: the failure class.
+        failure: Option<&'static str>,
+    }
+
+    impl DriftResult {
+        fn new(id: MessageId, checked: runner::Checked) -> Self {
+            use mailtide::drift::{Reason, Verdict};
+            let mut result = Self {
+                message_id: id.0,
+                verdict: "",
+                reason: None,
+                mirror_labels: None,
+                gmail_labels: None,
+                failure: None,
+            };
+            match checked {
+                runner::Checked::Compared(Verdict::Matches) => result.verdict = "matches",
+                runner::Checked::Compared(Verdict::Explained(reason)) => {
+                    result.verdict = "explained";
+                    result.reason = Some(match reason {
+                        Reason::PendingActions => "pending_actions",
+                        Reason::Unverified => "unverified",
+                        Reason::MirrorBehind => "mirror_behind",
+                    });
+                }
+                runner::Checked::Compared(Verdict::Differs { mirror, gmail }) => {
+                    result.verdict = "differs";
+                    result.mirror_labels = Some(names(&mirror));
+                    result.gmail_labels = Some(names(&gmail));
+                }
+                runner::Checked::Compared(Verdict::MissingInGmail) => {
+                    result.verdict = "missing_in_gmail";
+                }
+                runner::Checked::Deferred => result.verdict = "deferred",
+                runner::Checked::Failed(kind) => {
+                    result.verdict = "failed";
+                    result.failure = Some(kind);
+                }
+            }
+            result
+        }
+    }
+
+    /// What a push did.
+    #[pyclass(frozen, get_all)]
+    struct NotifyResult {
+        /// `current` (already synced past it), `ran` or `unknown_account`.
+        outcome: &'static str,
+        /// The sync, when one ran.
+        run: Option<Py<RunOutcome>>,
     }
 
     /// What `resume` did.
@@ -1196,6 +1274,49 @@ mod _core {
                 .into_iter()
                 .map(|a| a.as_str().to_owned())
                 .collect())
+        }
+
+        async fn drift(
+            self: Arc<Self>,
+            account: AccountId,
+            ids: Vec<MessageId>,
+        ) -> PyResult<Vec<DriftResult>> {
+            self.ensure_schema().await?;
+            let checked = self.inner.drift(&account, &ids).await.map_err(run_error)?;
+            Ok(checked
+                .into_iter()
+                .map(|(id, checked)| DriftResult::new(id, checked))
+                .collect())
+        }
+
+        async fn notify(
+            self: Arc<Self>,
+            account: AccountId,
+            history_id: u64,
+            budget: Duration,
+        ) -> PyResult<NotifyResult> {
+            self.ensure_schema().await?;
+            let notified = self
+                .inner
+                .notify(&account, mailtide::ids::HistoryId(history_id), budget)
+                .await
+                .map_err(run_error)?;
+            Ok(match notified {
+                runner::Notified::Current => NotifyResult {
+                    outcome: "current",
+                    run: None,
+                },
+                runner::Notified::UnknownAccount => NotifyResult {
+                    outcome: "unknown_account",
+                    run: None,
+                },
+                runner::Notified::Ran(outcome) => NotifyResult {
+                    outcome: "ran",
+                    run: Some(Python::attach(|py| {
+                        Py::new(py, RunOutcome::from(*outcome))
+                    })?),
+                },
+            })
         }
 
         async fn resume(self: Arc<Self>, account: AccountId) -> PyResult<ResumeResult> {
@@ -1462,6 +1583,39 @@ mod _core {
             future(py, &self.shared, self.shared.clone().accounts())
         }
 
+        fn drift<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_ids: Vec<String>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let ids = message_ids.into_iter().map(MessageId).collect();
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().drift(account_id(account)?, ids),
+            )
+        }
+
+        #[pyo3(signature = (account, history_id, budget_s=60.0))]
+        fn notify<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            history_id: u64,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().notify(
+                    account_id(account)?,
+                    history_id,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
         fn resume<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
@@ -1684,6 +1838,42 @@ mod _core {
         /// Every account the store holds.
         fn accounts(&self, py: Python<'_>) -> PyResult<Vec<String>> {
             block(py, &self.shared, self.shared.clone().accounts())
+        }
+
+        /// Compare the mirror with Gmail for `message_ids`; see
+        /// `mailtide.Runner.drift`.
+        fn drift(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_ids: Vec<String>,
+        ) -> PyResult<Vec<DriftResult>> {
+            let ids = message_ids.into_iter().map(MessageId).collect();
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().drift(account_id(account)?, ids),
+            )
+        }
+
+        /// A verified push reached `history_id`; see `mailtide.Runner.notify`.
+        #[pyo3(signature = (account, history_id, budget_s=60.0))]
+        fn notify(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            history_id: u64,
+            budget_s: f64,
+        ) -> PyResult<NotifyResult> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().notify(
+                    account_id(account)?,
+                    history_id,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
         }
 
         /// Resume a blocked account once its cause is fixed.
