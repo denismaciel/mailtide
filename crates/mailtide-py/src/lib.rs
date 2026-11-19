@@ -704,6 +704,7 @@ mod _core {
     #[derive(FromPyObject)]
     struct BlobsArg {
         url: String,
+        options: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(FromPyObject)]
@@ -777,6 +778,7 @@ mod _core {
                     connect: c.database.connect,
                 },
                 blobs_url: c.blobs.url,
+                blobs_options: c.blobs.options,
                 watch: crate::settings::RawWatch {
                     kind: c.watch.kind,
                     name: c.watch.name,
@@ -841,7 +843,8 @@ mod _core {
         let blobs = if settings.blobs_url == "memory:///" {
             ObjectBlobs::memory()
         } else {
-            ObjectBlobs::from_url(&settings.blobs_url).map_err(blob_error)?
+            ObjectBlobs::from_url_with(&settings.blobs_url, &settings.blobs_options)
+                .map_err(blob_error)?
         };
         let transport =
             ReqwestTransport::with_config(&settings.http).map_err(|e| error("http client", e))?;

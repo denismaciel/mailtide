@@ -26,7 +26,7 @@ use mailtide_gmail::{decode, errors, headers};
 use mailtide_store::{Store, StoreError};
 
 use crate::auth::TokenSource;
-use crate::blobs::{BlobStore, blob_key};
+use crate::blobs::{BlobError, BlobStore, blob_key};
 use crate::quota_gate::QuotaGate;
 use crate::transport::{GmailTransport, TransportError};
 
@@ -279,6 +279,8 @@ pub enum Checked {
 enum Outcome {
     Event(EventKind),
     Failed(Failure),
+    /// Gmail answered but the content couldn't be stored.
+    StoreFailed(BlobError),
 }
 
 impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
@@ -846,19 +848,36 @@ where
                 duration_ms,
                 "gmail request failed"
             ),
+            // No error text: it can carry the object path.
+            Outcome::StoreFailed(error) => tracing::warn!(
+                request = request_kind(&call.request),
+                error = match error {
+                    BlobError::Unavailable(_) => "unavailable",
+                    BlobError::Misconfigured(_) => "misconfigured",
+                },
+                "blob write failed"
+            ),
         }
         let bytes = match &outcome {
             Outcome::Event(EventKind::MessageImported { message, .. }) => message.size,
-            Outcome::Event(_) | Outcome::Failed(_) => 0,
+            Outcome::Event(_) | Outcome::Failed(_) | Outcome::StoreFailed(_) => 0,
         };
         self.quota
             .release(lease, bytes, self.clock.now())
             .await
             .map_err(|e| RunError::Quota(e.0))?;
-        Ok(match outcome {
-            Outcome::Event(event) => event,
-            Outcome::Failed(failure) => EventKind::RequestFailed { command, failure },
-        })
+        match outcome {
+            Outcome::Event(event) => Ok(event),
+            Outcome::Failed(failure) => Ok(EventKind::RequestFailed { command, failure }),
+            // A store that can't work as configured fails the run: retrying
+            // each import can't fix it, and the host must hear about it.
+            Outcome::StoreFailed(BlobError::Misconfigured(detail)) => Err(RunError::Blobs(detail)),
+            // Unavailable: the import retries after backoff.
+            Outcome::StoreFailed(BlobError::Unavailable(detail)) => Ok(EventKind::RequestFailed {
+                command,
+                failure: transient(format!("blob write failed: {detail}")),
+            }),
+        }
     }
 
     async fn perform(
@@ -970,7 +989,7 @@ where
     ) -> Outcome {
         let key = blob_key(account, &raw.observation.id);
         if let Err(error) = self.blobs.put(&key, raw.rfc822.clone()).await {
-            return Outcome::Failed(transient(format!("blob write failed: {error:?}")));
+            return Outcome::StoreFailed(error);
         }
         report.imported += 1;
         Outcome::Event(EventKind::MessageImported {

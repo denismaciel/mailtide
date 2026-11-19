@@ -6,6 +6,7 @@ the offending field. Defaults suit a production host; every value is
 explicit so a host can set it from its own settings.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -34,9 +35,16 @@ class Database:
 class Blobs:
     """Where raw ``.eml`` content lives: ``gs://bucket/prefix``,
     ``s3://bucket/prefix``, ``file:///dir`` or ``memory:///``. Objects are
-    keyed ``{prefix}/{account}/{message_id}.eml``."""
+    keyed ``{prefix}/{account}/{message_id}.eml``.
+
+    Credentials and endpoints come from the backend's standard environment
+    variables (``AWS_*``, ``GOOGLE_*``, ``AZURE_*``; on GCP the metadata
+    server) and then ``options``, which take precedence: ``object_store``
+    config keys such as ``aws_endpoint``, ``aws_allow_http`` or
+    ``google_service_account_path``. Unknown keys are ignored."""
 
     url: str
+    options: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

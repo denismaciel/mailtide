@@ -1,5 +1,6 @@
 //! Raw message content, written once per message at a deterministic key.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -42,6 +43,29 @@ pub fn blob_key(account: &AccountId, message: &MessageId) -> BlobRef {
     BlobRef(format!("{}/{}.eml", account.as_str(), message.0))
 }
 
+/// The settings a store is built with: backend environment variables
+/// (lowercased, as `object_store` config keys), then explicit options.
+fn store_options(
+    env: impl IntoIterator<Item = (String, String)>,
+    options: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut settings: BTreeMap<String, String> = env
+        .into_iter()
+        .filter(|(key, _)| {
+            ["AWS_", "GOOGLE_", "AZURE_"]
+                .iter()
+                .any(|p| key.starts_with(p))
+        })
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
+    settings.extend(
+        options
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone())),
+    );
+    settings
+}
+
 /// Blobs in any `object_store` backend: GCS, S3, local disk or memory.
 #[derive(Debug, Clone)]
 pub struct ObjectBlobs {
@@ -51,10 +75,21 @@ pub struct ObjectBlobs {
 
 impl ObjectBlobs {
     /// Blobs at a URL: `gs://bucket/prefix`, `s3://bucket/prefix`,
-    /// `file:///dir`, or `memory:///`.
+    /// `file:///dir`, or `memory:///`, configured from the environment
+    /// (see [`Self::from_url_with`]).
     pub fn from_url(url: &str) -> Result<Self, BlobError> {
+        Self::from_url_with(url, &BTreeMap::new())
+    }
+
+    /// Blobs at a URL, configured by the backend's standard environment
+    /// variables (`AWS_*`, `GOOGLE_*`, `AZURE_*`, as `object_store` names
+    /// them) and then `options` (e.g. `aws_endpoint`,
+    /// `google_service_account_path`), which take precedence. Unknown keys
+    /// are ignored.
+    pub fn from_url_with(url: &str, options: &BTreeMap<String, String>) -> Result<Self, BlobError> {
         let parsed = url::Url::parse(url).map_err(|e| BlobError::Misconfigured(e.to_string()))?;
-        let (store, prefix) = object_store::parse_url(&parsed)
+        let settings = store_options(std::env::vars(), options);
+        let (store, prefix) = object_store::parse_url_opts(&parsed, settings)
             .map_err(|e| BlobError::Misconfigured(e.to_string()))?;
         Ok(Self {
             store: Arc::from(store),
@@ -124,5 +159,30 @@ impl BlobStore for ObjectBlobs {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(unavailable(&e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    #[test]
+    fn environment_then_explicit_options() {
+        let env = [
+            ("AWS_ENDPOINT".to_owned(), "http://env".to_owned()),
+            ("AWS_REGION".to_owned(), "us-east-1".to_owned()),
+            ("HOME".to_owned(), "/home/x".to_owned()),
+        ];
+        let explicit = BTreeMap::from([("aws_endpoint".to_owned(), "http://explicit".to_owned())]);
+        let settings = store_options(env, &explicit);
+        assert_eq!(
+            settings.get("aws_endpoint").map(String::as_str),
+            Some("http://explicit")
+        );
+        assert_eq!(
+            settings.get("aws_region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert!(!settings.contains_key("home"));
     }
 }
