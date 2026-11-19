@@ -174,4 +174,27 @@ mod tests {
             }
         );
     }
+
+    /// A stored number out of range is corrupt, never read as another value.
+    #[tokio::test]
+    async fn a_negative_stored_cursor_is_corrupt() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        store
+            .claim(&account, EngineVersion(1))
+            .await
+            .expect("claim");
+        store
+            .inner
+            .execute_for_tests("UPDATE mailtide_accounts SET cursor = -5")
+            .await
+            .expect("update");
+        match store.claim(&account, EngineVersion(1)).await {
+            Err(StoreError::Corrupt(reason)) => assert!(reason.contains("history id"), "{reason}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
 }

@@ -156,12 +156,16 @@ fn corrupt(what: &str, error: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt(format!("{what}: {error}"))
 }
 
-fn int(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+/// A number as the database stores it (`BIGINT`). A value that doesn't fit
+/// fails the operation: storing a different number would silently move a
+/// cursor or a checkpoint.
+fn int(field: &str, value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| corrupt(field, format!("{value} exceeds BIGINT")))
 }
 
-fn uint(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or(0)
+/// A stored number back; a negative one is corrupt, never zero.
+fn uint(field: &str, value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| corrupt(field, format!("negative value {value}")))
 }
 
 fn json<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
@@ -429,7 +433,7 @@ impl SqlStore {
             .await
             .map_err(|e| unavailable(&e))?;
         let n: i64 = row.try_get("n").map_err(|e| corrupt("count", e))?;
-        Ok(uint(n))
+        uint("count", n)
     }
 
     async fn read_account(
@@ -461,9 +465,14 @@ impl SqlStore {
             .try_get("cooldown")
             .map_err(|e| corrupt("cooldown", e))?;
         let record = AccountRecord {
-            epoch: Epoch(uint(get_i("epoch")?)),
-            engine_version: EngineVersion(u32::try_from(get_i("engine_version")?).unwrap_or(0)),
-            cursor: get_oi("cursor")?.map(|c| HistoryId(uint(c))),
+            epoch: Epoch(uint("epoch", get_i("epoch")?)?),
+            engine_version: EngineVersion(
+                u32::try_from(get_i("engine_version")?)
+                    .map_err(|e| corrupt("engine_version", e))?,
+            ),
+            cursor: get_oi("cursor")?
+                .map(|c| uint("history id", c).map(HistoryId))
+                .transpose()?,
             sync: parse("sync", &sync)?,
             watch_expiration: get_oi("watch_expiration")?.map(Timestamp),
             last_activity: get_oi("last_activity")?.map(Timestamp),
@@ -472,9 +481,9 @@ impl SqlStore {
                 .map(|c| parse("cooldown", c))
                 .transpose()?,
             rng_seed: get_i("rng_seed")?.cast_unsigned(),
-            log_floor: StateSeq(uint(get_i("log_floor")?)),
+            log_floor: StateSeq(uint("log_floor", get_i("log_floor")?)?),
         };
-        Ok(Some((record, StateSeq(uint(get_i("seq")?)))))
+        Ok(Some((record, StateSeq(uint("seq", get_i("seq")?)?))))
     }
 
     async fn write_account(
@@ -494,16 +503,16 @@ impl SqlStore {
                rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor",
         )
         .bind(account.as_str())
-        .bind(int(record.epoch.0))
+        .bind(int("epoch", record.epoch.0)?)
         .bind(i64::from(record.engine_version.0))
-        .bind(record.cursor.map(|c| int(c.0)))
+        .bind(record.cursor.map(|c| int("cursor", c.0)).transpose()?)
         .bind(json(&record.sync)?)
         .bind(record.watch_expiration.map(|t| t.0))
         .bind(record.last_activity.map(|t| t.0))
         .bind(record.cooldown.as_ref().map(json).transpose()?)
         .bind(record.rng_seed.cast_signed())
-        .bind(int(seq.0))
-        .bind(int(record.log_floor.0))
+        .bind(int("seq", seq.0)?)
+        .bind(int("log_floor", record.log_floor.0)?)
         .execute(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -584,7 +593,7 @@ impl SqlStore {
                  UNION SELECT id FROM mailtide_seen WHERE account = $1",
             )
             .bind(account.as_str())
-            .bind(int(baseline.0))
+            .bind(int("baseline", baseline.0)?)
             .fetch_all(&mut **tx)
             .await
             .map_err(|e| unavailable(&e))?;
@@ -634,7 +643,7 @@ impl SqlStore {
                 .map_err(|e| corrupt("checkpoint", e))?;
             mirror
                 .tombstones
-                .insert(id.clone(), HistoryId(uint(checkpoint)));
+                .insert(id.clone(), HistoryId(uint("checkpoint", checkpoint)?));
         }
         let jobs = sqlx::query(
             "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure
@@ -709,7 +718,7 @@ impl SqlStore {
                 )
                 .bind(account)
                 .bind(id.0.as_str())
-                .bind(int(checkpoint.0))
+                .bind(int("checkpoint", checkpoint.0)?)
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| unavailable(&e))?;
@@ -766,7 +775,7 @@ impl SqlStore {
                 "INSERT INTO mailtide_changes (account, seq, idx, change) VALUES ($1, $2, $3, $4)",
             )
             .bind(account)
-            .bind(int(seq.0))
+            .bind(int("seq", seq.0)?)
             .bind(idx)
             .bind(json(change)?)
             .execute(&mut **tx)
@@ -794,7 +803,7 @@ impl SqlStore {
              ON CONFLICT (account) DO NOTHING",
         )
         .bind(account.as_str())
-        .bind(int(initial.epoch.0))
+        .bind(int("epoch", initial.epoch.0)?)
         .bind(i64::from(initial.engine_version.0))
         .bind(json(&initial.sync)?)
         .bind(initial.rng_seed.cast_signed())
@@ -942,7 +951,9 @@ impl SqlStore {
                     .map_err(|e| corrupt("log_floor", e))
             })
             .transpose()?
-            .map_or(StateSeq(0), |f| StateSeq(uint(f)));
+            .map(|f| uint("log_floor", f).map(StateSeq))
+            .transpose()?
+            .unwrap_or(StateSeq(0));
         if since < floor {
             return Ok(ChangeFeed::TooOld { oldest: floor });
         }
@@ -963,7 +974,7 @@ impl SqlStore {
             "SELECT seq FROM mailtide_changes WHERE account = $1 AND seq > $2 ORDER BY seq, idx LIMIT $3",
         )
         .bind(account.as_str())
-        .bind(int(since.0))
+        .bind(int("since", since.0)?)
         .bind(i64::from(limit.max(1)))
         .fetch_all(&self.pool)
         .await
@@ -980,7 +991,7 @@ impl SqlStore {
             "SELECT seq, idx, change FROM mailtide_changes WHERE account = $1 AND seq > $2 AND seq <= $3 ORDER BY seq, idx",
         )
         .bind(account.as_str())
-        .bind(int(since.0))
+        .bind(int("since", since.0)?)
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await
@@ -999,12 +1010,12 @@ impl SqlStore {
             let seq: i64 = row.try_get("seq").map_err(|e| corrupt("seq", e))?;
             let idx: i64 = row.try_get("idx").map_err(|e| corrupt("idx", e))?;
             changes.push(ChangeEntry {
-                state: StateSeq(uint(seq)),
+                state: StateSeq(uint("seq", seq)?),
                 index: u32::try_from(idx).map_err(|e| corrupt("idx", e))?,
                 change: parse::<Change>("change", &change)?,
             });
         }
-        let next = StateSeq(uint(cutoff));
+        let next = StateSeq(uint("seq", cutoff)?);
         Ok(ChangePage {
             changes,
             next,
@@ -1049,8 +1060,12 @@ fn message_from_row(id: &MessageId, row: &AnyRow) -> Result<MessageRecord, Store
                 .map_err(|e| corrupt("thread_id", e))?,
         ),
         labels: parse::<LabelSet>("labels", &labels)?,
-        checkpoint: checkpoint.map(|c| HistoryId(uint(c))),
-        unverified: unverified.map(|c| HistoryId(uint(c))),
+        checkpoint: checkpoint
+            .map(|c| uint("history id", c).map(HistoryId))
+            .transpose()?,
+        unverified: unverified
+            .map(|c| uint("history id", c).map(HistoryId))
+            .transpose()?,
         content: match content {
             None => Content::Pending,
             Some(text) => Content::Imported(Box::new(parse::<StoredContent>("content", &text)?)),
@@ -1077,8 +1092,8 @@ async fn put_message(
     .bind(record.id.0.as_str())
     .bind(record.thread_id.0.as_str())
     .bind(json(&record.labels)?)
-    .bind(record.checkpoint.map(|c| int(c.0)))
-    .bind(record.unverified.map(|c| int(c.0)))
+    .bind(record.checkpoint.map(|c| int("checkpoint", c.0)).transpose()?)
+    .bind(record.unverified.map(|c| int("unverified", c.0)).transpose()?)
     .bind(content)
     .execute(&mut **tx)
     .await
@@ -1274,7 +1289,7 @@ impl crate::Store for SqlStore {
         let through = through.min(seq);
         let removed = sqlx::query("DELETE FROM mailtide_changes WHERE account = $1 AND seq <= $2")
             .bind(account.as_str())
-            .bind(int(through.0))
+            .bind(int("through", through.0)?)
             .execute(&mut *tx)
             .await
             .map_err(|e| unavailable(&e))?
