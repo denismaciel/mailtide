@@ -17,6 +17,7 @@ def runner_for(gmail: FakeGmail, **changes: object) -> mailtide.BlockingRunner:
     config = dataclasses.replace(make_config(gmail.origin), **changes)
     runner = mailtide.BlockingRunner(config, tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     return runner
 
 
@@ -64,6 +65,7 @@ def test_the_async_runner_samples_mirrored_messages() -> None:
         async def main() -> list[mailtide.DriftResult]:
             runner = mailtide.Runner(make_config(gmail.origin), tokens)
             await runner.migrate()
+            await runner.track("alice@example.com")
             await runner.run(ACCOUNT, budget_s=30)
             return await runner.drift(ACCOUNT, sample=2)
 
@@ -76,7 +78,7 @@ def test_notify_syncs_only_when_behind() -> None:
     with FakeGmail() as gmail:
         gmail.add("m1", ["INBOX"])
         runner = runner_for(gmail)
-        assert runner.notify(ACCOUNT, 1).outcome == "unknown_account"
+        assert runner.notify("stranger@example.com", 1).outcome == "unknown_account"
         runner.run(ACCOUNT, budget_s=30)
         cursor = runner.status(ACCOUNT).cursor
         assert cursor is not None

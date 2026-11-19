@@ -29,7 +29,7 @@ mod _core {
         Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
     };
     use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
-    use mailtide::revision::{StateSeq, StateString};
+    use mailtide::revision::{FeedPosition, StateSeq, StateString};
     use mailtide::state::SyncPhase;
     use mailtide_gmail::push::{self, Jwks, PushExpectations};
     use mailtide_io::auth::CachedTokens;
@@ -104,6 +104,18 @@ mod _core {
     );
     create_exception!(
         _core,
+        AccountNotTracked,
+        MailtideError,
+        "The account isn't tracked: call track(account) to start mirroring it."
+    );
+    create_exception!(
+        _core,
+        BlobNotFound,
+        MailtideError,
+        "No stored content for that message (never imported, or deleted)."
+    );
+    create_exception!(
+        _core,
         Superseded,
         MailtideError,
         "A newer mailtide version already wrote to this account; this one must not."
@@ -123,6 +135,8 @@ mod _core {
         m.add("Superseded", py.get_type::<Superseded>())?;
         m.add("SchemaOutOfDate", py.get_type::<SchemaOutOfDate>())?;
         m.add("ReadOnlyMode", py.get_type::<ReadOnlyMode>())?;
+        m.add("AccountNotTracked", py.get_type::<AccountNotTracked>())?;
+        m.add("BlobNotFound", py.get_type::<BlobNotFound>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -139,6 +153,9 @@ mod _core {
             StoreError::Corrupt(detail) => CorruptState::new_err(detail),
             StoreError::Misconfigured(detail) => PyValueError::new_err(detail),
             StoreError::Rejected(rejection) => Superseded::new_err(format!("{rejection:?}")),
+            StoreError::NotTracked => AccountNotTracked::new_err(
+                "the account isn't tracked: call track(account) to start mirroring it",
+            ),
         }
     }
 
@@ -146,6 +163,7 @@ mod _core {
         match error {
             BlobError::Unavailable(detail) => BlobUnavailable::new_err(detail),
             BlobError::Misconfigured(detail) => PyValueError::new_err(detail),
+            BlobError::NotFound => BlobNotFound::new_err("no stored content for that message"),
         }
     }
 
@@ -350,10 +368,11 @@ mod _core {
     #[allow(clippy::too_many_lines)] // one flat arm per change kind
     fn change_object(
         py: Python<'_>,
+        generation: u64,
         entry: &mailtide::revision::ChangeEntry,
     ) -> PyResult<Py<PyAny>> {
         use mailtide::revision::Change;
-        let state = entry.state.encode().0;
+        let state = position(generation, entry.state);
         let index = entry.index;
         Ok(match &entry.change {
             Change::MessageDiscovered {
@@ -942,7 +961,7 @@ mod _core {
                 watch_expiration_ms: s.watch_expiration.map(|t| t.0),
                 last_activity_ms: s.last_activity.map(|t| t.0),
                 cooldown_until_ms: s.cooldown.map(|c| c.until.0),
-                state: s.state.encode().0,
+                state: position(s.generation, s.state),
                 messages: s.messages,
                 pending_imports: s.pending_imports,
                 unverified: s.unverified,
@@ -963,6 +982,15 @@ mod _core {
         imported: u32,
         gmail_requests: u32,
         elapsed_ms: u64,
+    }
+
+    /// What `track` did.
+    #[pyclass(frozen, get_all)]
+    struct TrackResult {
+        /// `tracked` (mirroring starts on the next run) or `already_tracked`.
+        outcome: &'static str,
+        /// The feed generation, when newly tracked.
+        generation: Option<u64>,
     }
 
     /// One message of a drift check.
@@ -1122,17 +1150,18 @@ mod _core {
         }
     }
 
-    fn parse_state(state: &str) -> PyResult<StateSeq> {
-        StateSeq::decode(&StateString(state.to_owned()))
+    /// A state string: a position in one generation of an account's feed.
+    fn position(generation: u64, seq: StateSeq) -> String {
+        FeedPosition { generation, seq }.encode().0
+    }
+
+    fn parse_state(state: &str) -> PyResult<FeedPosition> {
+        FeedPosition::decode(&StateString(state.to_owned()))
             .map_err(|_| PyValueError::new_err(format!("invalid state string {state:?}")))
     }
 
-    fn parse_since(since: Option<String>) -> PyResult<StateSeq> {
-        match since {
-            None => Ok(StateSeq(0)),
-            Some(state) => StateSeq::decode(&StateString(state.clone()))
-                .map_err(|_| PyValueError::new_err(format!("invalid state string {state:?}"))),
-        }
+    fn parse_since(since: Option<&str>) -> PyResult<Option<FeedPosition>> {
+        since.map(parse_state).transpose()
     }
 
     fn change_page(page: &mailtide::revision::ChangePage) -> PyResult<ChangePage> {
@@ -1140,13 +1169,26 @@ mod _core {
             let changes = page
                 .changes
                 .iter()
-                .map(|entry| change_object(py, entry))
+                .map(|entry| change_object(py, page.generation, entry))
                 .collect::<PyResult<Vec<_>>>()?;
             Ok(ChangePage {
                 changes,
-                next: page.next.encode().0,
+                next: position(page.generation, page.next),
                 has_more: page.has_more,
             })
+        })
+    }
+
+    fn too_old(generation: u64, oldest: StateSeq) -> PyResult<Py<PyAny>> {
+        Python::attach(|py| {
+            Ok(Py::new(
+                py,
+                StateTooOld {
+                    kind: "too_old",
+                    oldest: position(generation, oldest),
+                },
+            )?
+            .into_any())
         })
     }
 
@@ -1381,39 +1423,69 @@ mod _core {
         async fn changes(
             self: Arc<Self>,
             account: AccountId,
-            since: StateSeq,
+            since: Option<FeedPosition>,
             limit: u32,
         ) -> PyResult<Py<PyAny>> {
+            let seq = since.map_or(StateSeq(0), |at| at.seq);
             let feed = self
                 .inner
                 .store()
-                .changes(&account, since, limit)
+                .changes(&account, seq, limit)
                 .await
                 .map_err(store_error)?;
             match feed {
                 mailtide::revision::ChangeFeed::Page(page) => {
+                    // A position from another incarnation of the account, or
+                    // beyond its log, can't be resumed from: rebuild.
+                    if let Some(at) = since
+                        && !at.fits(page.generation, page.head)
+                    {
+                        return too_old(page.generation, page.head);
+                    }
                     let page = change_page(&page)?;
                     Python::attach(|py| Ok(Py::new(py, page)?.into_any()))
                 }
-                mailtide::revision::ChangeFeed::TooOld { oldest } => Python::attach(|py| {
-                    Ok(Py::new(
-                        py,
-                        StateTooOld {
-                            kind: "too_old",
-                            oldest: oldest.encode().0,
-                        },
-                    )?
-                    .into_any())
-                }),
+                mailtide::revision::ChangeFeed::TooOld { generation, oldest } => {
+                    too_old(generation, oldest)
+                }
             }
         }
 
-        async fn compact(self: Arc<Self>, account: AccountId, through: StateSeq) -> PyResult<u64> {
+        async fn compact(
+            self: Arc<Self>,
+            account: AccountId,
+            through: FeedPosition,
+        ) -> PyResult<u64> {
+            let status = self
+                .inner
+                .store()
+                .status(&account)
+                .await
+                .map_err(store_error)?;
+            // A position from another incarnation compacts nothing.
+            if status.is_none_or(|s| s.generation != through.generation) {
+                return Ok(0);
+            }
             self.inner
                 .store()
-                .compact(&account, through)
+                .compact(&account, through.seq)
                 .await
                 .map_err(store_error)
+        }
+
+        async fn track(self: Arc<Self>, account: AccountId) -> PyResult<TrackResult> {
+            use mailtide::status::TrackOutcome;
+            self.ensure_schema().await?;
+            Ok(match self.inner.track(&account).await.map_err(run_error)? {
+                TrackOutcome::Tracked { generation } => TrackResult {
+                    outcome: "tracked",
+                    generation: Some(generation),
+                },
+                TrackOutcome::AlreadyTracked => TrackResult {
+                    outcome: "already_tracked",
+                    generation: None,
+                },
+            })
         }
 
         async fn message_ids(
@@ -1505,6 +1577,14 @@ mod _core {
 
         fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
             future(py, &self.shared, self.shared.clone().schema())
+        }
+
+        fn track<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().track(account_id(account)?),
+            )
         }
 
         #[pyo3(signature = (account, budget_s=60.0, on_progress=None))]
@@ -1674,7 +1754,7 @@ mod _core {
             &self,
             py: Python<'py>,
             account: &str,
-            since: Option<String>,
+            since: Option<&str>,
             limit: u32,
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
@@ -1758,6 +1838,15 @@ mod _core {
         /// Where the database's schema stands against this build.
         fn schema(&self, py: Python<'_>) -> PyResult<SchemaStatus> {
             block(py, &self.shared, self.shared.clone().schema())
+        }
+
+        /// Start mirroring `account`; see `mailtide.Runner.track`.
+        fn track(&self, py: Python<'_>, account: &str) -> PyResult<TrackResult> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().track(account_id(account)?),
+            )
         }
 
         /// Sync `account` until caught up, blocked or `budget_s` elapses.
@@ -1942,7 +2031,7 @@ mod _core {
             &self,
             py: Python<'_>,
             account: &str,
-            since: Option<String>,
+            since: Option<&str>,
             limit: u32,
         ) -> PyResult<Py<PyAny>> {
             block(

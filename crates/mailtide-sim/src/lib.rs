@@ -608,7 +608,7 @@ impl Sim {
 
     fn new(rng: Rng, faults: Faults, script: Option<Vec<UserOp>>) -> Self {
         let account = AccountId("sim@example.com".into());
-        let mut mirror = AccountMirror::new(account.clone());
+        let mut mirror = AccountMirror::new(account.clone(), 1);
         let engine = build_engine(&mut mirror);
         let mut gmail = Gmail::default();
         for n in 0..5 {

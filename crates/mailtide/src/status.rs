@@ -54,6 +54,8 @@ pub struct AccountStatus {
     pub cooldown: Option<Cooldown>,
     /// The change-feed position (pass to `changes` to read from here).
     pub state: crate::revision::StateSeq,
+    /// The account's generation (see [`crate::revision::FeedPosition`]).
+    pub generation: u64,
     /// Message rows.
     pub messages: u64,
     /// Messages whose content isn't stored yet.
@@ -108,6 +110,18 @@ impl ActionCounts {
             crate::outbox::IntentState::Blocked(_) => self.blocked += 1,
         }
     }
+}
+
+/// What `track` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackOutcome {
+    /// The account is now mirrored (a new generation of its feed).
+    Tracked {
+        /// The new generation.
+        generation: u64,
+    },
+    /// It already was; nothing changed.
+    AlreadyTracked,
 }
 
 /// What resuming a blocked account did.

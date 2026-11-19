@@ -144,12 +144,15 @@ pub struct AccountRecord {
     pub rng_seed: u64,
     /// Change-feed entries at or before this state were compacted away.
     pub log_floor: StateSeq,
+    /// Which incarnation of the account this is: set when it is tracked, so
+    /// feed positions from before a forget are recognisably stale.
+    pub generation: u64,
 }
 
 impl AccountRecord {
-    /// A fresh account: no cursor, bootstrapping.
+    /// A freshly tracked account: no cursor, bootstrapping.
     #[must_use]
-    pub fn new(account: &AccountId) -> Self {
+    pub fn new(account: &AccountId, generation: u64) -> Self {
         Self {
             epoch: Epoch(0),
             engine_version: EngineVersion(0),
@@ -160,6 +163,7 @@ impl AccountRecord {
             cooldown: None,
             rng_seed: stable_hash(account.as_str().as_bytes()),
             log_floor: StateSeq(0),
+            generation,
         }
     }
 }
@@ -664,11 +668,11 @@ pub struct AccountMirror {
 }
 
 impl AccountMirror {
-    /// An empty mirror for `account`.
+    /// An empty mirror for a freshly tracked `account`.
     #[must_use]
-    pub fn new(account: AccountId) -> Self {
+    pub fn new(account: AccountId, generation: u64) -> Self {
         Self {
-            record: AccountRecord::new(&account),
+            record: AccountRecord::new(&account, generation),
             account,
             messages: BTreeMap::new(),
             tombstones: BTreeMap::new(),
@@ -1211,6 +1215,7 @@ impl AccountMirror {
             last_activity: self.record.last_activity,
             cooldown: self.record.cooldown.clone(),
             state: self.seq,
+            generation: self.record.generation,
             messages: self.messages.len() as u64,
             pending_imports: count(&|r| matches!(r.content, Content::Pending)),
             unverified: count(&|r| r.unverified.is_some()),
@@ -1360,6 +1365,7 @@ impl AccountMirror {
     pub fn feed(&self, since: StateSeq, limit: u32) -> crate::revision::ChangeFeed {
         if since < self.record.log_floor {
             return crate::revision::ChangeFeed::TooOld {
+                generation: self.record.generation,
                 oldest: self.record.log_floor,
             };
         }
@@ -1396,6 +1402,8 @@ impl AccountMirror {
             });
         }
         ChangePage {
+            generation: self.record.generation,
+            head: self.seq,
             changes,
             next: page.last().map_or(since, |(seq, _)| *seq),
             has_more: after.len() > take,
@@ -1458,7 +1466,7 @@ mod tests {
     }
 
     fn claimed() -> AccountMirror {
-        let mut mirror = AccountMirror::new(account());
+        let mut mirror = AccountMirror::new(account(), 1);
         mirror.claim(ENGINE_VERSION).expect("claim");
         mirror
     }

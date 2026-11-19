@@ -24,7 +24,9 @@ use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
 use mailtide::revision::{Change, ChangeEntry, ChangeFeed, ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
-use mailtide::status::{AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome};
+use mailtide::status::{
+    AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome, TrackOutcome,
+};
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolOptions;
 use sqlx::{Any, AssertSqlSafe, Pool, Row, Transaction};
@@ -75,7 +77,9 @@ const MIGRATIONS: &[&[&str]] = &[&[
         PRIMARY KEY (account, seq, idx))",
 ],
 // 2: change-feed compaction.
-&["ALTER TABLE mailtide_accounts ADD COLUMN log_floor BIGINT NOT NULL DEFAULT 0"]];
+&["ALTER TABLE mailtide_accounts ADD COLUMN log_floor BIGINT NOT NULL DEFAULT 0"],
+// 3: account generations (feed positions name an incarnation).
+&["ALTER TABLE mailtide_accounts ADD COLUMN generation BIGINT NOT NULL DEFAULT 0"]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
@@ -443,7 +447,7 @@ impl SqlStore {
         lock: &'static str,
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
-            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor
+            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -482,6 +486,7 @@ impl SqlStore {
                 .transpose()?,
             rng_seed: get_i("rng_seed")?.cast_unsigned(),
             log_floor: StateSeq(uint("log_floor", get_i("log_floor")?)?),
+            generation: uint("generation", get_i("generation")?)?,
         };
         Ok(Some((record, StateSeq(uint("seq", get_i("seq")?)?))))
     }
@@ -494,13 +499,14 @@ impl SqlStore {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO mailtide_accounts
-               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (account) DO UPDATE SET
                epoch = excluded.epoch, engine_version = excluded.engine_version, cursor = excluded.cursor,
                sync = excluded.sync, watch_expiration = excluded.watch_expiration,
                last_activity = excluded.last_activity, cooldown = excluded.cooldown,
-               rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor",
+               rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor,
+               generation = excluded.generation",
         )
         .bind(account.as_str())
         .bind(int("epoch", record.epoch.0)?)
@@ -513,6 +519,7 @@ impl SqlStore {
         .bind(record.rng_seed.cast_signed())
         .bind(int("seq", seq.0)?)
         .bind(int("log_floor", record.log_floor.0)?)
+        .bind(int("generation", record.generation)?)
         .execute(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -530,7 +537,7 @@ impl SqlStore {
         seq: StateSeq,
         commit: &Commit,
     ) -> Result<AccountMirror, StoreError> {
-        let mut mirror = AccountMirror::new(account.clone());
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
         mirror.record = record;
         mirror.seq = seq;
         let mut ids: BTreeSet<MessageId> = BTreeSet::new();
@@ -787,19 +794,16 @@ impl SqlStore {
 
     // ------------------------------------------------------------ store operations
 
-    pub(crate) async fn claim(
+    pub(crate) async fn track(
         &self,
         account: &AccountId,
-        version: EngineVersion,
-    ) -> Result<StoreSnapshot, StoreError> {
-        let mut tx = self.begin().await?;
-        // Create the row first, then lock it: two first claims racing must
-        // still get different epochs (an upsert of a computed epoch wouldn't).
-        let initial = AccountRecord::new(account);
-        sqlx::query(
+        generation: u64,
+    ) -> Result<TrackOutcome, StoreError> {
+        let initial = AccountRecord::new(account, generation);
+        let inserted = sqlx::query(
             "INSERT INTO mailtide_accounts
-               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq)
-             VALUES ($1, $2, $3, NULL, $4, NULL, NULL, NULL, $5, 0)
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation)
+             VALUES ($1, $2, $3, NULL, $4, NULL, NULL, NULL, $5, 0, 0, $6)
              ON CONFLICT (account) DO NOTHING",
         )
         .bind(account.as_str())
@@ -807,13 +811,30 @@ impl SqlStore {
         .bind(i64::from(initial.engine_version.0))
         .bind(json(&initial.sync)?)
         .bind(initial.rng_seed.cast_signed())
-        .execute(&mut *tx)
+        .bind(int("generation", generation)?)
+        .execute(&self.pool)
         .await
-        .map_err(|e| unavailable(&e))?;
+        .map_err(|e| unavailable(&e))?
+        .rows_affected();
+        Ok(if inserted == 1 {
+            TrackOutcome::Tracked { generation }
+        } else {
+            TrackOutcome::AlreadyTracked
+        })
+    }
+
+    pub(crate) async fn claim(
+        &self,
+        account: &AccountId,
+        version: EngineVersion,
+    ) -> Result<StoreSnapshot, StoreError> {
+        let mut tx = self.begin().await?;
+        // The row exists (track created it) and is locked, so two claims
+        // racing get different epochs.
         let (mut record, seq) = self
             .load_account(&mut tx, account)
             .await?
-            .ok_or_else(|| corrupt("account", "missing after insert"))?;
+            .ok_or(StoreError::NotTracked)?;
         if version < record.engine_version {
             return Err(StoreError::Rejected(Rejection::StaleVersion));
         }
@@ -953,25 +974,38 @@ impl SqlStore {
         since: StateSeq,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
-        let floor = sqlx::query("SELECT log_floor FROM mailtide_accounts WHERE account = $1")
-            .bind(account.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| unavailable(&e))?
-            .map(|row| {
-                row.try_get::<i64, _>("log_floor")
-                    .map_err(|e| corrupt("log_floor", e))
-            })
-            .transpose()?
-            .map(|f| uint("log_floor", f).map(StateSeq))
-            .transpose()?
-            .unwrap_or(StateSeq(0));
+        let row = sqlx::query(
+            "SELECT log_floor, generation, seq FROM mailtide_accounts WHERE account = $1",
+        )
+        .bind(account.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| unavailable(&e))?;
+        let (floor, generation, head) = match row {
+            Some(row) => {
+                let get = |name: &str| {
+                    row.try_get::<i64, _>(name)
+                        .map_err(|e| corrupt(name, e))
+                        .and_then(|v| uint(name, v))
+                };
+                (
+                    StateSeq(get("log_floor")?),
+                    get("generation")?,
+                    StateSeq(get("seq")?),
+                )
+            }
+            None => (StateSeq(0), 0, StateSeq(0)),
+        };
         if since < floor {
-            return Ok(ChangeFeed::TooOld { oldest: floor });
+            return Ok(ChangeFeed::TooOld {
+                generation,
+                oldest: floor,
+            });
         }
-        self.change_page(account, since, limit)
-            .await
-            .map(ChangeFeed::Page)
+        let mut page = self.change_page(account, since, limit).await?;
+        page.generation = generation;
+        page.head = head;
+        Ok(ChangeFeed::Page(page))
     }
 
     async fn change_page(
@@ -993,6 +1027,8 @@ impl SqlStore {
         .map_err(|e| unavailable(&e))?;
         let Some(last) = window.last() else {
             return Ok(ChangePage {
+                generation: 0,
+                head: since,
                 changes: Vec::new(),
                 next: since,
                 has_more: false,
@@ -1029,6 +1065,8 @@ impl SqlStore {
         }
         let next = StateSeq(uint("seq", cutoff)?);
         Ok(ChangePage {
+            generation: 0,
+            head: next,
             changes,
             next,
             has_more,
@@ -1261,6 +1299,14 @@ async fn write_seen(
 }
 
 impl crate::Store for SqlStore {
+    async fn track(
+        &self,
+        account: &AccountId,
+        generation: u64,
+    ) -> Result<TrackOutcome, StoreError> {
+        Self::track(self, account, generation).await
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -1392,6 +1438,7 @@ impl crate::Store for SqlStore {
             last_activity: record.last_activity,
             cooldown: record.cooldown,
             state: seq,
+            generation: record.generation,
             messages,
             pending_imports,
             unverified,
@@ -1422,7 +1469,7 @@ impl crate::Store for SqlStore {
         let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
             return Ok(ResumeOutcome::Unknown);
         };
-        let mut mirror = AccountMirror::new(account.clone());
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
         mirror.record = record;
         mirror.seq = seq;
         for row in sqlx::query(

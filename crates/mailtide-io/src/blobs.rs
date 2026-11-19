@@ -15,6 +15,9 @@ pub enum BlobError {
     Unavailable(String),
     /// The configuration (URL, credentials) is invalid.
     Misconfigured(String),
+    /// No content at that key (never written, or cleaned up after the
+    /// message was deleted).
+    NotFound,
 }
 
 /// Where raw content lives.
@@ -127,11 +130,11 @@ impl BlobStore for ObjectBlobs {
     }
 
     async fn get(&self, key: &BlobRef) -> Result<Vec<u8>, BlobError> {
-        let result = self
-            .store
-            .get(&self.path(key))
-            .await
-            .map_err(|e| unavailable(&e))?;
+        let result = match self.store.get(&self.path(key)).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Err(BlobError::NotFound),
+            Err(e) => return Err(unavailable(&e)),
+        };
         result
             .bytes()
             .await

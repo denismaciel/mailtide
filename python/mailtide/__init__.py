@@ -9,8 +9,10 @@ and whenever a verified push arrives, reads the mirror with ``changes`` and
 from mailtide import config
 from mailtide._core import (
     SCHEMA_VERSION,
+    AccountNotTracked,
     AccountStatus,
     Attachment,
+    BlobNotFound,
     BlobUnavailable,
     BlockingRunner,
     ChangePage,
@@ -45,6 +47,7 @@ from mailtide._core import (
     Status,
     StoreUnavailable,
     Superseded,
+    TrackResult,
     migrations,
     parse_message,
     verify_push,
@@ -64,8 +67,10 @@ Change = (
 )
 
 __all__ = [
+    "AccountNotTracked",
     "AccountStatus",
     "Attachment",
+    "BlobNotFound",
     "BlobUnavailable",
     "BlockingRunner",
     "Change",
@@ -104,6 +109,7 @@ __all__ = [
     "Status",
     "StoreUnavailable",
     "Superseded",
+    "TrackResult",
     "config",
     "migrations",
     "parse_message",

@@ -7,6 +7,7 @@ import pytest
 from conftest import make_config, tokens
 from fake_gmail import Mailbox
 from mailtide.config import Blobs, Config, Database, Engine, Http, Topic
+from mailtide.testing import ManualClock
 
 ACCOUNT = "alice@example.com"
 
@@ -56,6 +57,7 @@ def test_status_admit_resume_forget(gmail: tuple[Mailbox, str]) -> None:
     assert runner.health().database == "ok"
     assert runner.status(ACCOUNT) is None
     assert runner.accounts() == []
+    runner.track(ACCOUNT)
 
     assert runner.run(ACCOUNT, budget_s=30).stop == "idle"
     status = runner.status(ACCOUNT)
@@ -100,6 +102,7 @@ def test_a_resumed_account_syncs_again(gmail: tuple[Mailbox, str]) -> None:
 
     runner = mailtide.BlockingRunner(make_config(origin), source)
     runner.migrate()
+    runner.track("alice@example.com")
     assert runner.run(ACCOUNT, budget_s=10).stop == "blocked"
     status = runner.status(ACCOUNT)
     assert status.phase == "blocked" and "delegation_revoked" in status.blocked
@@ -117,6 +120,7 @@ def test_missing_gmail_scope_blocks_instead_of_looping(gmail: tuple[Mailbox, str
     mailbox.refuse = "insufficientPermissions"
     runner = mailtide.BlockingRunner(make_config(origin), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     outcome = runner.run(ACCOUNT, budget_s=30)
     assert outcome.stop == "blocked"
     assert outcome.blocked is not None and outcome.blocked.startswith("api_access_denied")
@@ -128,6 +132,7 @@ def test_an_invalid_label_change_is_rejected_when_built(gmail: tuple[Mailbox, st
     _, origin = gmail
     runner = mailtide.BlockingRunner(make_config(origin), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     with pytest.raises(ValueError, match="both added and removed"):
         runner.admit(
             "alice@example.com",
@@ -150,7 +155,47 @@ def test_a_failing_token_source_shows_in_the_outcome(gmail: tuple[Mailbox, str])
 
     runner = mailtide.BlockingRunner(make_config(origin), broken)
     runner.migrate()
+    runner.track("alice@example.com")
     out = runner.run("alice@example.com", budget_s=5)
     assert out.failed_requests >= 1
     assert out.last_failure == "transient"
     assert out.gmail_requests == 0
+
+
+def test_only_tracked_accounts_sync(gmail: tuple[Mailbox, str]) -> None:
+    _, origin = gmail
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    with pytest.raises(mailtide.AccountNotTracked):
+        runner.run("carol@example.com", budget_s=5)
+    assert runner.status("carol@example.com") is None
+    first = runner.track("carol@example.com")
+    assert first.outcome == "tracked" and first.generation
+    assert runner.track("carol@example.com").outcome == "already_tracked"
+    assert runner.run("carol@example.com", budget_s=30).stop == "idle"
+
+
+def test_a_state_from_before_forget_is_too_old(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    mailbox.add("m1", ["INBOX"])
+    clock = ManualClock()
+    runner = mailtide.BlockingRunner(make_config(origin), tokens, clock=clock)
+    runner.migrate()
+    runner.track("dave@example.com")
+    runner.run("dave@example.com", budget_s=30)
+    old = runner.changes("dave@example.com").next
+    runner.forget("dave@example.com")
+    clock.advance(1)
+    runner.track("dave@example.com")
+    runner.run("dave@example.com", budget_s=30)
+    assert isinstance(runner.changes("dave@example.com", old), mailtide.StateTooOld)
+    assert isinstance(runner.changes("dave@example.com"), mailtide.ChangePage)
+
+
+def test_a_missing_blob_is_not_found(gmail: tuple[Mailbox, str]) -> None:
+    _, origin = gmail
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    with pytest.raises(mailtide.BlobNotFound) as raised:
+        runner.read_blob("alice@example.com", "nope")
+    assert "alice" not in str(raised.value)

@@ -19,7 +19,7 @@ use mailtide::outbox::ActionRequest;
 use mailtide::quota::Admission;
 use mailtide::retry::{Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::schedule::TimerKind;
-use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status};
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status, TrackOutcome};
 use mailtide::{Engine, EngineConfig};
 use mailtide_gmail::request::{self, RequestConfig};
 use mailtide_gmail::{decode, errors, headers};
@@ -232,6 +232,7 @@ impl RunError {
             Self::Store(StoreError::Corrupt(_)) | Self::Corrupt(_) => "corrupt",
             Self::Store(StoreError::Misconfigured(_)) => "misconfigured",
             Self::Store(StoreError::Rejected(_)) => "superseded",
+            Self::Store(StoreError::NotTracked) => "not_tracked",
             Self::Quota(_) => "quota_gate",
             Self::Blobs(_) => "blobs",
             Self::Invariant(_) => "invariant",
@@ -356,6 +357,17 @@ where
         self.writable()?;
         self.store
             .admit(account, action, self.clock.now())
+            .await
+            .map_err(RunError::Store)
+    }
+
+    /// Start mirroring `account` (a no-op if it already is). Its feed gets a
+    /// new generation, the current time, so positions from an earlier
+    /// incarnation (before a forget) are recognisably stale.
+    pub async fn track(&self, account: &AccountId) -> Result<TrackOutcome, RunError> {
+        let generation = u64::try_from(self.clock.now().0).unwrap_or(0);
+        self.store
+            .track(account, generation)
             .await
             .map_err(RunError::Store)
     }
@@ -864,7 +876,7 @@ where
                 tracing::warn!(
                     request = request_kind(&call.request),
                     error = match error {
-                        BlobError::Unavailable(_) => "unavailable",
+                        BlobError::Unavailable(_) | BlobError::NotFound => "unavailable",
                         BlobError::Misconfigured(_) => "misconfigured",
                     },
                     "blob write failed"
@@ -889,6 +901,11 @@ where
             Outcome::StoreFailed(BlobError::Unavailable(detail)) => Ok(EventKind::RequestFailed {
                 command,
                 failure: transient(format!("blob write failed: {detail}")),
+            }),
+            // A write can't miss an object; treat it as unavailable.
+            Outcome::StoreFailed(BlobError::NotFound) => Ok(EventKind::RequestFailed {
+                command,
+                failure: transient("blob write failed: not found".to_owned()),
             }),
         }
     }

@@ -94,7 +94,7 @@ mod common {
 
     /// A store following history from `cursor`, owned by a current engine.
     pub fn live_mirror(account: AccountId, cursor: u64) -> AccountMirror {
-        let mut mirror = AccountMirror::new(account);
+        let mut mirror = AccountMirror::new(account, 1);
         mirror.claim(ENGINE_VERSION).expect("current version");
         let mut c = commit(&mirror);
         c.sync = Some(SyncState::Live);
@@ -491,7 +491,7 @@ fn durable_spam_cleanup_recovers_admitted_cleanup_intent_and_fences_partial_deli
 /// Zero: mail-cleanup-store > durable spam cleanup > resumes discovery and delivery without changing the enumerated set
 #[test]
 fn durable_spam_cleanup_resumes_discovery_and_delivery_without_changing_the_enumerated_set() {
-    let mut host = Host::new(AccountMirror::new(account()), 0);
+    let mut host = Host::new(AccountMirror::new(account(), 1), 0);
     host.start();
     let call = |host: &mut Host| host.take_gmail().remove(0).0;
     let listed = |ids: &[&str], next: Option<&str>| ListPage {

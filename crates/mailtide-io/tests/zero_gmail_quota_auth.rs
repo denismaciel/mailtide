@@ -206,7 +206,7 @@ fn runner(gmail: FakeGmail, gate: RecordingGate) -> TestRunner {
         gate: Arc::clone(&gate.log),
         tokens: Arc::clone(&tokens.0),
         runner: Runner::new(
-            MemoryStore::new(),
+            MemoryStore::tracking(&[account()]),
             ObjectBlobs::memory(),
             gmail,
             gate,

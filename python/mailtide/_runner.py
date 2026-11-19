@@ -26,6 +26,7 @@ from mailtide._core import (
     RunOutcome,
     SchemaStatus,
     StateTooOld,
+    TrackResult,
 )
 from mailtide.config import Config
 
@@ -73,6 +74,14 @@ class Runner:
     async def migrate(self) -> None:
         """Create or upgrade mailtide's tables (safe to call concurrently)."""
         await self._core.migrate()
+
+    async def track(self, account: str) -> TrackResult:
+        """Start mirroring ``account`` (a no-op if it already is). Only tracked
+        accounts sync: ``run``/``act`` on another raise ``AccountNotTracked``,
+        so a stray push can never start a full import. Tracking again after
+        ``forget`` starts a new generation of the change feed: state strings
+        from before are answered with ``StateTooOld``."""
+        return await self._core.track(account)
 
     async def schema(self) -> SchemaStatus:
         """Where the database's schema stands against this build. Syncing

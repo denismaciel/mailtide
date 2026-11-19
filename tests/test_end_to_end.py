@@ -19,6 +19,7 @@ def test_bootstrap_import_and_follow(gmail: tuple[Mailbox, str]) -> None:
     mailbox.add("m2", [])
     runner = mailtide.BlockingRunner(make_config(origin), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
 
     outcome = runner.run(ACCOUNT, budget_s=30)
     assert outcome.stop == "idle", outcome.blocked
@@ -44,6 +45,7 @@ def test_actions_overlay_deliver_and_settle(gmail: tuple[Mailbox, str]) -> None:
     mailbox.add("m1", ["INBOX", "UNREAD"])
     runner = mailtide.BlockingRunner(make_config(origin, confirm_timeout_s=0), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     assert runner.run(ACCOUNT, budget_s=30).stop == "idle"
 
     outcome = runner.act(ACCOUNT, "archive", message_ids=["m1"])
@@ -82,6 +84,7 @@ def test_concurrent_use_from_many_threads(gmail: tuple[Mailbox, str]) -> None:
         mailbox.add(mid, ["INBOX", "UNREAD"])
     runner = mailtide.BlockingRunner(make_config(origin, confirm_timeout_s=0), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
 
     # Racing runs of one account: the store fences them; the newest wins.
     with ThreadPoolExecutor(max_workers=8) as pool:

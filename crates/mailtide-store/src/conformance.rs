@@ -109,6 +109,9 @@ where
         ("claims report when the next ready job is due", |s| {
             Box::pin(claims_report_next_due(s))
         }),
+        ("only tracked accounts are mirrored", |s| {
+            Box::pin(tracking(s))
+        }),
         ("claims skip classes below the floor", |s| {
             Box::pin(claims_respect_the_floor(s))
         }),
@@ -174,7 +177,15 @@ fn observe_in(thread: &str, id: &str, labels: &[&str], checkpoint: u64) -> Messa
     })
 }
 
+/// The generation conformance accounts are tracked as.
+const GENERATION: u64 = 1;
+
+/// Track the account (idempotent), then claim it.
 async fn claim<S: Store>(store: &S) -> Result<StoreSnapshot, String> {
+    store
+        .track(&account(), GENERATION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     store
         .claim(&account(), ENGINE_VERSION)
         .await
@@ -984,7 +995,7 @@ async fn feed_records_changes<S: Store>(store: &S) -> Result<(), String> {
 fn page(feed: mailtide::revision::ChangeFeed) -> Result<mailtide::revision::ChangePage, String> {
     match feed {
         mailtide::revision::ChangeFeed::Page(page) => Ok(page),
-        mailtide::revision::ChangeFeed::TooOld { oldest } => {
+        mailtide::revision::ChangeFeed::TooOld { oldest, .. } => {
             Err(format!("too old (oldest {oldest:?})"))
         }
     }
@@ -1013,7 +1024,10 @@ async fn compaction<S: Store>(store: &S) -> Result<(), String> {
             .changes(&account(), StateSeq(0), 100)
             .await
             .map_err(|e| format!("{e:?}"))?
-            == mailtide::revision::ChangeFeed::TooOld { oldest: middle },
+            == mailtide::revision::ChangeFeed::TooOld {
+                generation: GENERATION,
+                oldest: middle,
+            },
         "reading from before the floor is too old",
     )?;
     let rest = store
@@ -1147,4 +1161,54 @@ async fn claims_respect_the_floor<S: Store>(store: &S) -> Result<(), String> {
         kinds == vec![JobKind::Import(MessageId("new".into()))],
         &format!("only live work above a backfill floor, got {kinds:?}"),
     )
+}
+
+async fn tracking<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::status::TrackOutcome;
+    let stranger = AccountId("stranger@example.com".into());
+    expect(
+        matches!(
+            store.claim(&stranger, ENGINE_VERSION).await,
+            Err(StoreError::NotTracked)
+        ),
+        "claiming an untracked account is refused",
+    )?;
+    expect(
+        store
+            .status(&stranger)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .is_none(),
+        "a refused claim creates nothing",
+    )?;
+    let first = store
+        .track(&stranger, 5)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(first == TrackOutcome::Tracked { generation: 5 }, "tracked")?;
+    let again = store
+        .track(&stranger, 6)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        again == TrackOutcome::AlreadyTracked,
+        "tracking twice is a no-op",
+    )?;
+    store
+        .claim(&stranger, ENGINE_VERSION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let feed = page(
+        store
+            .changes(&stranger, StateSeq(0), 10)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?;
+    expect(feed.generation == 5, "pages name the generation")?;
+    let status = store
+        .status(&stranger)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("status")?;
+    expect(status.generation == 5, "status names the generation")
 }

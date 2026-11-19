@@ -7,7 +7,7 @@ use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
-use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
 use crate::sql::SqlStore;
 use crate::{Store, StoreError};
@@ -35,6 +35,14 @@ impl PostgresStore {
 }
 
 impl Store for PostgresStore {
+    async fn track(
+        &self,
+        account: &AccountId,
+        generation: u64,
+    ) -> Result<TrackOutcome, StoreError> {
+        self.inner.track(account, generation).await
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -161,6 +169,7 @@ mod tests {
         setup.migrate().await.expect("migrate");
         for round in 0..5 {
             let account = AccountId(format!("race{round}-{}@example.com", std::process::id()));
+            setup.track(&account, 1).await.expect("track");
             let mut handles = Vec::new();
             for _ in 0..4 {
                 let url = url.clone();

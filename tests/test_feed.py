@@ -35,6 +35,7 @@ def test_the_feed_tells_a_pipeline_what_happened(gmail: tuple[Mailbox, str]) -> 
     mailbox.add("out1", ["SENT"])
     runner = mailtide.BlockingRunner(make_config(origin, confirm_timeout_s=0), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     runner.run(ACCOUNT, budget_s=30)
 
     page = runner.changes(ACCOUNT)
@@ -71,6 +72,7 @@ def test_compaction_and_rebuilding(gmail: tuple[Mailbox, str]) -> None:
         mailbox.add(mid, ["INBOX"])
     runner = mailtide.BlockingRunner(make_config(origin), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     runner.run(ACCOUNT, budget_s=30)
     page = runner.changes(ACCOUNT)
     assert isinstance(page, mailtide.ChangePage)

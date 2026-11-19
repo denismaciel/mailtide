@@ -162,7 +162,7 @@ fn commit(mirror: &AccountMirror) -> Commit {
 
 /// A store following history from `cursor`, with `pending` messages to import.
 fn live_mirror(cursor: u64, pending: &[&str]) -> AccountMirror {
-    let mut mirror = AccountMirror::new(AccountId("alice@example.com".into()));
+    let mut mirror = AccountMirror::new(AccountId("alice@example.com".into()), 1);
     mirror.claim(ENGINE_VERSION).expect("current version");
     let mut c = commit(&mirror);
     c.sync = Some(SyncState::Live);

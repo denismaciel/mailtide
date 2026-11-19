@@ -14,11 +14,11 @@ with a flat package index. With uv, in `pyproject.toml`:
 
 ```toml
 [project]
-dependencies = ["mailtide==0.1.0"]
+dependencies = ["mailtide==0.2.0"]
 
 [[tool.uv.index]]
 name = "mailtide"
-url = "https://github.com/denismaciel/mailtide/releases/download/v0.1.0/index.html"
+url = "https://github.com/denismaciel/mailtide/releases/download/v0.2.0/index.html"
 format = "flat"
 explicit = true
 
@@ -26,8 +26,8 @@ explicit = true
 mailtide = { index = "mailtide" }
 ```
 
-Or with pip: `pip install mailtide==0.1.0 --find-links
-https://github.com/denismaciel/mailtide/releases/download/v0.1.0/index.html`.
+Or with pip: `pip install mailtide==0.2.0 --find-links
+https://github.com/denismaciel/mailtide/releases/download/v0.2.0/index.html`.
 Platforms: Linux x86_64/aarch64 (manylinux 2.28), macOS arm64/x86_64.
 
 Status: v0.1, pre-release. See [SPEC.md](SPEC.md) and
@@ -48,6 +48,7 @@ runner = mailtide.Runner(
     token_source,  # account -> (access_token, expires_at_ms), sync or async; cached
 )
 await runner.migrate()  # in the deploy step
+await runner.track("alice@example.com")  # only tracked accounts sync
 
 outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
 await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from request paths

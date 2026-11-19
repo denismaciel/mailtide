@@ -29,6 +29,7 @@ def test_methods_are_awaitable(gmail: tuple[Mailbox, str]) -> None:
     async def main() -> None:
         r = runner(origin)
         await r.migrate()
+        await r.track("alice@example.com")
         outcome = await r.run(ACCOUNT, budget_s=30)
         assert outcome.stop == "idle", outcome.blocked
         assert outcome.imported == 2
@@ -55,6 +56,7 @@ def test_cancelling_a_run_stops_it_and_releases_its_quota(gmail: tuple[Mailbox, 
     async def main() -> None:
         r = runner(origin)
         await r.migrate()
+        await r.track("alice@example.com")
         mailbox.delay_s = 3.0  # Gmail hangs: the run is stuck in a request
         task = asyncio.create_task(r.run(ACCOUNT, budget_s=60))
         await asyncio.sleep(0.5)
@@ -81,6 +83,7 @@ def test_timeouts_compose_with_asyncio(gmail: tuple[Mailbox, str]) -> None:
     async def main() -> None:
         r = runner(origin)
         await r.migrate()
+        await r.track("alice@example.com")
         mailbox.delay_s = 3.0
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.5):
@@ -104,6 +107,7 @@ def test_async_token_sources_are_awaited_on_the_callers_loop(
     async def main() -> None:
         r = runner(origin, mint)
         await r.migrate()
+        await r.track("alice@example.com")
         outcome = await r.run(ACCOUNT, budget_s=30)
         assert outcome.stop == "idle", outcome.blocked
         assert seen_loops and all(loop is asyncio.get_running_loop() for loop in seen_loops)
@@ -121,6 +125,7 @@ def test_a_block_is_durable_and_stops_calling_the_token_source() -> None:
     async def main() -> None:
         r = mailtide.Runner(make_config(), revoked)
         await r.migrate()
+        await r.track("alice@example.com")
         first = await r.run(ACCOUNT, budget_s=10)
         assert first.stop == "blocked"
         assert first.commits >= 1, "the block itself must be committed"
@@ -141,6 +146,7 @@ def test_many_concurrent_awaits_on_one_loop(gmail: tuple[Mailbox, str]) -> None:
     async def main() -> None:
         r = runner(origin)
         await r.migrate()
+        await r.track("alice@example.com")
         stops = await asyncio.gather(*(r.run(ACCOUNT, budget_s=30) for _ in range(6)))
         assert {o.stop for o in stops} <= {"idle", "superseded"}
         assert (await r.run(ACCOUNT, budget_s=30)).stop == "idle"

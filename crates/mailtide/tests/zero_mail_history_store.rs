@@ -107,7 +107,7 @@ mod common {
 
     /// A store following history from `cursor`, owned by a current engine.
     pub fn live_mirror(cursor: u64) -> AccountMirror {
-        let mut mirror = AccountMirror::new(account());
+        let mut mirror = AccountMirror::new(account(), 1);
         mirror.claim(ENGINE_VERSION).expect("current version");
         let mut c = commit(&mirror);
         c.sync = Some(SyncState::Live);

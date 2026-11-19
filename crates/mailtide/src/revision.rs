@@ -17,23 +17,44 @@ pub struct StateSeq(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StateString(pub String);
 
-impl StateSeq {
+/// A position in a specific incarnation of an account's change log: the
+/// account's generation (new each time it is tracked) and the sequence in it.
+/// A position from another generation, or beyond the log's head, is not a
+/// place to resume from: the consumer must rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FeedPosition {
+    /// The account's generation.
+    pub generation: u64,
+    /// The sequence within it.
+    pub seq: StateSeq,
+}
+
+impl FeedPosition {
     /// Encode for consumers.
     #[must_use]
     pub fn encode(self) -> StateString {
-        StateString(format!("{PREFIX}{:x}", self.0))
+        StateString(format!("{PREFIX}{:x}.{:x}", self.generation, self.seq.0))
     }
 
     /// Decode a consumer's state string.
     pub fn decode(state: &StateString) -> Result<Self, InvalidState> {
-        let hex = state.0.strip_prefix(PREFIX).ok_or(InvalidState)?;
-        u64::from_str_radix(hex, 16)
-            .map(Self)
-            .map_err(|_| InvalidState)
+        let body = state.0.strip_prefix(PREFIX).ok_or(InvalidState)?;
+        let (generation, seq) = body.split_once('.').ok_or(InvalidState)?;
+        Ok(Self {
+            generation: u64::from_str_radix(generation, 16).map_err(|_| InvalidState)?,
+            seq: StateSeq(u64::from_str_radix(seq, 16).map_err(|_| InvalidState)?),
+        })
+    }
+
+    /// Whether this is a place to resume `page`'s log from: same generation,
+    /// not beyond its head.
+    #[must_use]
+    pub fn fits(self, generation: u64, head: StateSeq) -> bool {
+        self.generation == generation && self.seq <= head
     }
 }
 
-const PREFIX: &str = "mt1-";
+const PREFIX: &str = "mt2-";
 
 #[cfg(test)]
 mod tests {
@@ -41,21 +62,34 @@ mod tests {
 
     #[test]
     fn state_strings_round_trip() {
-        let seq = StateSeq(48_879);
-        assert_eq!(seq.encode(), StateString("mt1-beef".into()));
-        assert_eq!(StateSeq::decode(&seq.encode()), Ok(seq));
+        let at = FeedPosition {
+            generation: 7,
+            seq: StateSeq(48_879),
+        };
+        assert_eq!(at.encode(), StateString("mt2-7.beef".into()));
+        assert_eq!(FeedPosition::decode(&at.encode()), Ok(at));
     }
 
     #[test]
     fn foreign_state_strings_are_rejected() {
-        assert_eq!(
-            StateSeq::decode(&StateString("beef".into())),
-            Err(InvalidState)
-        );
-        assert_eq!(
-            StateSeq::decode(&StateString("mt1-zz".into())),
-            Err(InvalidState)
-        );
+        for bad in ["beef", "mt1-beef", "mt2-zz.1", "mt2-1"] {
+            assert_eq!(
+                FeedPosition::decode(&StateString(bad.into())),
+                Err(InvalidState),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn positions_fit_only_their_generation_and_log() {
+        let at = FeedPosition {
+            generation: 7,
+            seq: StateSeq(10),
+        };
+        assert!(at.fits(7, StateSeq(10)));
+        assert!(!at.fits(8, StateSeq(10)), "another incarnation");
+        assert!(!at.fits(7, StateSeq(9)), "beyond the head");
     }
 }
 
@@ -165,6 +199,8 @@ pub enum ChangeFeed {
     /// kept. Rebuild from the mirror (`message_ids` + `messages`), then
     /// follow the feed from the account's current state.
     TooOld {
+        /// The account's generation.
+        generation: u64,
         /// The oldest state the feed can still continue from.
         oldest: StateSeq,
     },
@@ -173,6 +209,10 @@ pub enum ChangeFeed {
 /// One page of changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangePage {
+    /// The account's generation (see [`FeedPosition`]).
+    pub generation: u64,
+    /// The log's newest position.
+    pub head: StateSeq,
     /// Changes after the requested state, whole commits only.
     pub changes: Vec<ChangeEntry>,
     /// The state to ask from next.

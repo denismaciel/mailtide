@@ -25,6 +25,7 @@ def test_host_applied_migrations_are_current(tmp_path: Path) -> None:
     status = runner.schema()
     assert (status.state, status.applied) == ("current", mailtide.SCHEMA_VERSION)
     runner.migrate()  # a no-op now
+    runner.track("alice@example.com")
     assert runner.schema().state == "current"
 
 
@@ -34,6 +35,7 @@ def test_an_unmigrated_database_refuses_to_sync() -> None:
     with pytest.raises(mailtide.SchemaOutOfDate, match="migrate"):
         runner.run(ACCOUNT)
     runner.migrate()
+    runner.track("alice@example.com")
     assert runner.schema().state == "current"
 
 
@@ -48,6 +50,7 @@ def test_a_manual_clock_reaches_confirmation_without_sleeping() -> None:
         )  # default confirm_timeout_s: 60
         runner = mailtide.BlockingRunner(config, tokens, clock=clock)
         runner.migrate()
+        runner.track("alice@example.com")
         runner.run(ACCOUNT, budget_s=30)
         runner.act(ACCOUNT, "archive", message_ids=["m1"])
         assert gmail.mailbox.messages["m1"]["labels"] == ["UNREAD"]
@@ -76,6 +79,7 @@ def test_a_fresh_runner_wakes_for_a_pending_confirmation() -> None:
         )
         runner = mailtide.BlockingRunner(config, tokens, clock=clock)
         runner.migrate()
+        runner.track("alice@example.com")
         runner.run(ACCOUNT, budget_s=30)
         delivered = runner.act(ACCOUNT, "archive", message_ids=["m1"])
         assert delivered.stop == "idle"

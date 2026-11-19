@@ -168,7 +168,7 @@ fn runner(
         },
     )]));
     Runner::new(
-        MemoryStore::new(),
+        MemoryStore::tracking(&[account()]),
         ObjectBlobs::memory(),
         gmail,
         LocalGate::new(Budget::GMAIL_DEFAULT),

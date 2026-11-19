@@ -126,7 +126,7 @@ fn runner<B: BlobStore>(
         },
     )]));
     Runner::new(
-        MemoryStore::new(),
+        MemoryStore::tracking(&[account()]),
         blobs,
         gmail,
         LocalGate::new(Budget::GMAIL_DEFAULT),

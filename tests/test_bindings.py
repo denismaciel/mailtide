@@ -32,6 +32,7 @@ def test_verify_push_rejects_missing_token() -> None:
 def test_empty_account_has_no_changes() -> None:
     runner = mailtide.BlockingRunner(make_config(), tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     page = runner.changes(ACCOUNT)
     assert page.changes == []
     assert not page.has_more
@@ -43,6 +44,7 @@ def test_revoked_delegation_blocks_the_account() -> None:
 
     runner = mailtide.BlockingRunner(make_config(), revoked)
     runner.migrate()
+    runner.track("alice@example.com")
     outcome = runner.run(ACCOUNT, budget_s=10)
     assert outcome.stop == "blocked"
     assert outcome.blocked is not None and "delegation_revoked" in outcome.blocked

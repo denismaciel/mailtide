@@ -86,7 +86,7 @@ struct Mailbox {
 
 impl Mailbox {
     fn new() -> Self {
-        let mut mirror = AccountMirror::new(AccountId(ACCOUNT.into()));
+        let mut mirror = AccountMirror::new(AccountId(ACCOUNT.into()), 1);
         let snapshot = mirror.claim(ENGINE_VERSION).expect("claim");
         Self {
             mirror,

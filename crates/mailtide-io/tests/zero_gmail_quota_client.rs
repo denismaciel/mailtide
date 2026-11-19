@@ -186,7 +186,7 @@ fn gmail_request_admission_with_persisted_quota_storage_keeps_live_and_foregroun
             },
         )]));
         let runner = Runner::new(
-            MemoryStore::new(),
+            MemoryStore::tracking(&[account()]),
             ObjectBlobs::memory(),
             Offline,
             RecordingGate(LocalGate::new(Budget::GMAIL_DEFAULT), Arc::clone(&leases)),

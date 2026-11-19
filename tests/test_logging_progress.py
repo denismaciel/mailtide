@@ -43,6 +43,7 @@ def test_events_reach_the_host_logger_without_addresses(gmail: tuple[Mailbox, st
     )
     runner = mailtide.BlockingRunner(config, tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     runner.run(ACCOUNT, budget_s=30)
     wait_for(lambda: any(r.getMessage() == "run finished" for r in handler.records))
 
@@ -69,6 +70,7 @@ def test_off_logs_nothing(gmail: tuple[Mailbox, str]) -> None:
     config = dataclasses.replace(make_config(origin), log=Log(level="off", logger="mailtide.quiet"))
     runner = mailtide.BlockingRunner(config, tokens)
     runner.migrate()
+    runner.track("alice@example.com")
     runner.run(ACCOUNT, budget_s=30)
     time.sleep(0.3)
     assert handler.records == []
@@ -93,6 +95,7 @@ def test_progress_reaches_the_callers_loop_and_context(gmail: tuple[Mailbox, str
 
         runner = mailtide.Runner(make_config(origin), tokens)
         await runner.migrate()
+        await runner.track("alice@example.com")
         outcome = await runner.run(ACCOUNT, budget_s=60, on_progress=on_progress)
         assert outcome.stop == "idle"
         await asyncio.sleep(0)  # let the last scheduled callbacks run

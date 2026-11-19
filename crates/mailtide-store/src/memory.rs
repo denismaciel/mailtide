@@ -11,7 +11,7 @@ use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
-use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
 use crate::{Store, StoreError};
 
@@ -26,6 +26,19 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store already tracking `accounts` (generation 1), for tests and
+    /// tools that build a store synchronously.
+    #[must_use]
+    pub fn tracking(accounts: &[AccountId]) -> Self {
+        let store = Self::default();
+        if let Ok(mut map) = store.lock() {
+            for account in accounts {
+                map.insert(account.clone(), AccountMirror::new(account.clone(), 1));
+            }
+        }
+        store
     }
 
     /// A copy of one account's mirror, for inspection.
@@ -44,20 +57,47 @@ impl MemoryStore {
             .map_err(|_| StoreError::Unavailable("memory store lock poisoned".into()))
     }
 
+    /// Run `f` on a tracked account's mirror.
     fn with_account<T>(
         &self,
         account: &AccountId,
         f: impl FnOnce(&mut AccountMirror) -> T,
     ) -> Result<T, StoreError> {
         let mut accounts = self.lock()?;
-        let mirror = accounts
-            .entry(account.clone())
-            .or_insert_with(|| AccountMirror::new(account.clone()));
+        let mirror = accounts.get_mut(account).ok_or(StoreError::NotTracked)?;
         Ok(f(mirror))
+    }
+
+    /// Run `f` on a tracked account's mirror, or answer `untracked` (what the
+    /// SQL store answers for a missing row).
+    fn on_account<T>(
+        &self,
+        account: &AccountId,
+        untracked: T,
+        f: impl FnOnce(&mut AccountMirror) -> T,
+    ) -> Result<T, StoreError> {
+        let mut accounts = self.lock()?;
+        Ok(accounts.get_mut(account).map_or(untracked, f))
     }
 }
 
 impl Store for MemoryStore {
+    async fn track(
+        &self,
+        account: &AccountId,
+        generation: u64,
+    ) -> Result<TrackOutcome, StoreError> {
+        let mut accounts = self.lock()?;
+        if accounts.contains_key(account) {
+            return Ok(TrackOutcome::AlreadyTracked);
+        }
+        accounts.insert(
+            account.clone(),
+            AccountMirror::new(account.clone(), generation),
+        );
+        Ok(TrackOutcome::Tracked { generation })
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -68,7 +108,11 @@ impl Store for MemoryStore {
     }
 
     async fn apply(&self, commit: &Commit) -> Result<CommitOutcome, StoreError> {
-        self.with_account(&commit.account, |mirror| mirror.apply(commit))
+        self.on_account(
+            &commit.account,
+            CommitOutcome::Rejected(mailtide::commit::Rejection::StaleEpoch),
+            |mirror| mirror.apply(commit),
+        )
     }
 
     async fn claim_jobs(
@@ -80,7 +124,8 @@ impl Store for MemoryStore {
         attempt: AttemptId,
         floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.with_account(account, |mirror| {
+        let untracked = ClaimOutcome::Rejected(mailtide::commit::Rejection::StaleEpoch);
+        self.on_account(account, untracked, |mirror| {
             match mirror.claim_jobs_from(epoch, limit, now, attempt, floor) {
                 Ok(jobs) => ClaimOutcome::Claimed {
                     jobs,
@@ -97,7 +142,14 @@ impl Store for MemoryStore {
         since: StateSeq,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
-        self.with_account(account, |mirror| mirror.feed(since, limit))
+        let untracked = ChangeFeed::Page(mailtide::revision::ChangePage {
+            generation: 0,
+            head: since,
+            changes: Vec::new(),
+            next: since,
+            has_more: false,
+        });
+        self.on_account(account, untracked, |mirror| mirror.feed(since, limit))
     }
 
     async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
@@ -154,7 +206,7 @@ impl Store for MemoryStore {
         request: &ActionRequest,
         now: Timestamp,
     ) -> Result<u32, StoreError> {
-        self.with_account(account, |mirror| mirror.admit_action(request, now))
+        self.on_account(account, 0, |mirror| mirror.admit_action(request, now))
     }
 
     async fn messages(
@@ -162,7 +214,7 @@ impl Store for MemoryStore {
         account: &AccountId,
         ids: &[MessageId],
     ) -> Result<Vec<MessageView>, StoreError> {
-        self.with_account(account, |mirror| {
+        self.on_account(account, Vec::new(), |mirror| {
             ids.iter().filter_map(|id| mirror.view(id)).collect()
         })
     }

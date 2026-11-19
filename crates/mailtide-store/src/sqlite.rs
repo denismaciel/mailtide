@@ -7,7 +7,7 @@ use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
-use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
 use crate::sql::SqlStore;
 use crate::{Store, StoreError};
@@ -35,6 +35,14 @@ impl SqliteStore {
 }
 
 impl Store for SqliteStore {
+    async fn track(
+        &self,
+        account: &AccountId,
+        generation: u64,
+    ) -> Result<TrackOutcome, StoreError> {
+        self.inner.track(account, generation).await
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -184,6 +192,7 @@ mod tests {
             .expect("store");
         store.migrate().await.expect("migrate");
         let account = AccountId("a@example.com".into());
+        store.track(&account, 1).await.expect("track");
         store
             .claim(&account, EngineVersion(1))
             .await

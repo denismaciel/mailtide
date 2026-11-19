@@ -18,7 +18,7 @@ use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
-use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
+use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
 pub mod config;
 pub mod conformance;
@@ -41,10 +41,21 @@ pub enum StoreError {
     Corrupt(String),
     /// The store can't be opened with this configuration.
     Misconfigured(String),
+    /// The account isn't tracked: mirroring starts only with `track`.
+    NotTracked,
 }
 
 /// The store contract.
 pub trait Store: Send + Sync {
+    /// Start mirroring `account` (a no-op if it already is), as incarnation
+    /// `generation` of its feed: use a value never used for this account
+    /// before, e.g. the current time in milliseconds.
+    fn track(
+        &self,
+        account: &AccountId,
+        generation: u64,
+    ) -> impl Future<Output = Result<TrackOutcome, StoreError>> + Send;
+
     /// Claim the account for a new engine: bump its epoch, record `version`,
     /// and return the snapshot to build the engine from. Fails if a newer
     /// engine version already wrote to the account.
