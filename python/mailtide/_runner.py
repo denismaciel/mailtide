@@ -21,6 +21,7 @@ from mailtide._core import (
     Progress,
     ResumeResult,
     RunOutcome,
+    SchemaStatus,
     StateTooOld,
 )
 from mailtide.config import Config
@@ -57,12 +58,23 @@ class Runner:
 
     __slots__ = ("_core",)
 
-    def __init__(self, config: Config, token_source: TokenSource) -> None:
-        self._core = _core.Runner(config, token_source)
+    def __init__(
+        self,
+        config: Config,
+        token_source: TokenSource,
+        *,
+        clock: Callable[[], int] | None = None,
+    ) -> None:
+        self._core = _core.Runner(config, token_source, clock=clock)
 
     async def migrate(self) -> None:
         """Create or upgrade mailtide's tables (safe to call concurrently)."""
         await self._core.migrate()
+
+    async def schema(self) -> SchemaStatus:
+        """Where the database's schema stands against this build. Syncing
+        refuses with ``SchemaOutOfDate`` unless it is ``current``."""
+        return await self._core.schema()
 
     async def run(
         self,

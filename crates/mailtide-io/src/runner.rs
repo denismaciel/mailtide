@@ -27,7 +27,6 @@ use mailtide_store::{Store, StoreError};
 
 use crate::auth::TokenSource;
 use crate::blobs::{BlobStore, blob_key};
-use crate::now;
 use crate::quota_gate::QuotaGate;
 use crate::transport::{GmailTransport, TransportError};
 
@@ -114,6 +113,7 @@ pub struct Runner<S, B, T, Q, A> {
     quota: Q,
     tokens: A,
     config: RunnerConfig,
+    clock: crate::Clock,
 }
 
 /// What one run did.
@@ -251,7 +251,15 @@ where
             quota,
             tokens,
             config,
+            clock: crate::Clock::system(),
         }
+    }
+
+    /// Read the time from `clock` instead of the system.
+    #[must_use]
+    pub fn with_clock(mut self, clock: crate::Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The store, for reads.
@@ -278,7 +286,7 @@ where
         action: &ActionRequest,
     ) -> Result<u32, RunError> {
         self.store
-            .admit(account, action, now())
+            .admit(account, action, self.clock.now())
             .await
             .map_err(RunError::Store)
     }
@@ -296,7 +304,7 @@ where
     /// Resume a blocked account once its cause is fixed.
     pub async fn resume(&self, account: &AccountId) -> Result<ResumeOutcome, RunError> {
         self.store
-            .resume(account, now())
+            .resume(account, self.clock.now())
             .await
             .map_err(RunError::Store)
     }
@@ -323,7 +331,7 @@ where
     ) -> Result<RunOutcome, RunError> {
         let admitted = self
             .store
-            .admit(account, &action, now())
+            .admit(account, &action, self.clock.now())
             .await
             .map_err(RunError::Store)?;
         let mut outcome = self.run(account, budget).await?;
@@ -408,7 +416,7 @@ where
             cursor_before: engine.status().cursor,
             ..SyncReport::default()
         };
-        let mut queue: VecDeque<Command> = engine.start(now()).into();
+        let mut queue: VecDeque<Command> = engine.start(self.clock.now()).into();
         let mut timers: BTreeMap<TimerKind, Timestamp> = BTreeMap::new();
         loop {
             while let Some(command) = queue.pop_front() {
@@ -453,7 +461,7 @@ where
                     | CommandKind::DeleteBlob { .. }) => {
                         if let Some(event) = self.execute(id, kind, &mut report).await? {
                             queue.extend(engine.handle(Event {
-                                now: now(),
+                                now: self.clock.now(),
                                 kind: event,
                             }));
                         }
@@ -463,7 +471,7 @@ where
             if let Some(stop) = stopped(&engine) {
                 return Ok(finish(report, &engine, stop));
             }
-            let clock = now();
+            let clock = self.clock.now();
             let due: Vec<TimerKind> = timers
                 .iter()
                 .filter(|(_, at)| **at <= clock)
@@ -595,7 +603,7 @@ where
             (GmailRequest::Watch, WatchMode::Disabled) => {
                 return Ok(EventKind::RequestDeferred {
                     command,
-                    until: now().plus(Duration::from_hours(24)),
+                    until: self.clock.now().plus(Duration::from_hours(24)),
                 });
             }
             (_, WatchMode::Topic(topic)) => topic.clone(),
@@ -603,7 +611,7 @@ where
         };
         let lease = match self
             .quota
-            .admit(&call.account, call.cost, call.priority, now())
+            .admit(&call.account, call.cost, call.priority, self.clock.now())
             .await
             .map_err(|e| RunError::Quota(e.0))?
         {
@@ -648,7 +656,7 @@ where
             Outcome::Event(_) | Outcome::Failed(_) => 0,
         };
         self.quota
-            .release(lease, bytes, now())
+            .release(lease, bytes, self.clock.now())
             .await
             .map_err(|e| RunError::Quota(e.0))?;
         Ok(match outcome {

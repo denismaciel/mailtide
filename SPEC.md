@@ -497,6 +497,14 @@ safe because every commit is atomic and fenced. The token source may be sync
 (run on Tokio's blocking pool, since minting may do network I/O) or async
 (awaited on the caller's event loop; async `Runner` only).
 
+Schema: `await migrate()` applies mailtide's versioned migrations under an
+advisory lock; hosts that run migrations with their own tool execute
+`mailtide.migrations()` (ordered SQL with its bookkeeping) instead.
+`schema()` reports `current`, `behind` or `ahead`, and `run`/`act`/`admit`
+refuse with `SchemaOutOfDate` unless it is current. Tests: `mailtide.testing`
+ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach
+retries, cleanups and confirmations without sleeping.
+
 Every method may be called concurrently from any thread, including on
 free-threaded CPython, where the module keeps the GIL disabled (all classes
 are immutable; shared Rust state is behind locks or the connection pool).

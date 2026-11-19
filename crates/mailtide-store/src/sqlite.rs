@@ -135,4 +135,43 @@ mod tests {
         let failures: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
         assert!(failures.is_empty(), "{failures:#?}");
     }
+
+    /// A host running the exposed SQL with its own tool ends up exactly where
+    /// `migrate()` would, and `migrate()` then does nothing.
+    #[tokio::test]
+    async fn exposed_migrations_match_migrate() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState, migrations};
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: 0,
+                expected: SCHEMA_VERSION
+            }
+        );
+        for migration in migrations() {
+            for statement in &migration.statements {
+                store
+                    .inner
+                    .execute_for_tests(statement)
+                    .await
+                    .expect("statement");
+            }
+        }
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Current {
+                version: SCHEMA_VERSION
+            }
+        );
+        store.migrate().await.expect("idempotent");
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Current {
+                version: SCHEMA_VERSION
+            }
+        );
+    }
 }

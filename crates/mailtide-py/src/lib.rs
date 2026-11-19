@@ -38,7 +38,7 @@ mod _core {
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
     use mailtide_io::transport::ReqwestTransport;
-    use mailtide_store::sql::SqlStore;
+    use mailtide_store::sql::{SchemaState, SqlStore};
     use mailtide_store::{Store, StoreError};
 
     create_exception!(
@@ -92,6 +92,12 @@ mod _core {
     );
     create_exception!(
         _core,
+        SchemaOutOfDate,
+        MailtideError,
+        "The database's mailtide schema doesn't match this build: run migrations (or upgrade)."
+    );
+    create_exception!(
+        _core,
         Superseded,
         MailtideError,
         "A newer mailtide version already wrote to this account; this one must not."
@@ -109,6 +115,8 @@ mod _core {
         m.add("BlobUnavailable", py.get_type::<BlobUnavailable>())?;
         m.add("QuotaGateError", py.get_type::<QuotaGateError>())?;
         m.add("Superseded", py.get_type::<Superseded>())?;
+        m.add("SchemaOutOfDate", py.get_type::<SchemaOutOfDate>())?;
+        m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -794,12 +802,19 @@ mod _core {
         inner: Inner,
         /// This runner's log bridge; every future it runs carries it.
         dispatch: tracing::Dispatch,
+        /// Set once the schema was seen current (checked before syncing).
+        schema_current: std::sync::atomic::AtomicBool,
     }
 
     /// Parse and validate the configuration, then build the runner. Nothing
     /// connects unless the database is configured `connect="eager"` (or is
     /// SQLite).
-    fn open(py: Python<'_>, config: ConfigArg, token_source: Py<PyAny>) -> PyResult<Arc<Shared>> {
+    fn open(
+        py: Python<'_>,
+        config: ConfigArg,
+        token_source: Py<PyAny>,
+        clock: Option<Py<PyAny>>,
+    ) -> PyResult<Arc<Shared>> {
         let settings = crate::settings::validate(config.into())
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let store = py
@@ -827,7 +842,22 @@ mod _core {
             },
         );
         let dispatch = crate::logbridge::dispatch(settings.log_verbosity, settings.logger);
-        Ok(Arc::new(Shared { inner, dispatch }))
+        let inner = match clock {
+            None => inner,
+            Some(clock) => inner.with_clock(mailtide_io::Clock::from_fn(move || {
+                Python::attach(|py| {
+                    clock
+                        .call0(py)
+                        .and_then(|v| v.extract::<i64>(py))
+                        .map_or_else(|_| mailtide_io::now(), Timestamp)
+                })
+            })),
+        };
+        Ok(Arc::new(Shared {
+            inner,
+            dispatch,
+            schema_current: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
     // ------------------------------------------------------------ results
@@ -1027,8 +1057,64 @@ mod _core {
         })
     }
 
+    /// Where the database's schema stands against this build.
+    #[pyclass(frozen, get_all)]
+    struct SchemaStatus {
+        /// `current`, `behind` (run migrations) or `ahead` (a newer mailtide
+        /// migrated it; this build must not write).
+        state: &'static str,
+        applied: u32,
+        expected: u32,
+    }
+
     // The operations, as futures both runners drive.
     impl Shared {
+        /// Refuse to sync against a schema this build doesn't match: a
+        /// forgotten migration surfaces as one clear error, not a SQL error
+        /// mid-run.
+        async fn ensure_schema(&self) -> PyResult<()> {
+            use std::sync::atomic::Ordering;
+            if self.schema_current.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match self.inner.store().schema().await.map_err(store_error)? {
+                SchemaState::Current { .. } => {
+                    self.schema_current.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+                SchemaState::Behind { applied, expected } => {
+                    Err(SchemaOutOfDate::new_err(format!(
+                        "mailtide schema is at version {applied}, this build needs {expected}: run migrate() (or mailtide.migrations()) first"
+                    )))
+                }
+                SchemaState::Ahead { applied, expected } => Err(SchemaOutOfDate::new_err(format!(
+                    "mailtide schema is at version {applied}, newer than this build ({expected}): upgrade mailtide"
+                ))),
+            }
+        }
+
+        async fn schema(self: Arc<Self>) -> PyResult<SchemaStatus> {
+            Ok(
+                match self.inner.store().schema().await.map_err(store_error)? {
+                    SchemaState::Current { version } => SchemaStatus {
+                        state: "current",
+                        applied: version,
+                        expected: version,
+                    },
+                    SchemaState::Behind { applied, expected } => SchemaStatus {
+                        state: "behind",
+                        applied,
+                        expected,
+                    },
+                    SchemaState::Ahead { applied, expected } => SchemaStatus {
+                        state: "ahead",
+                        applied,
+                        expected,
+                    },
+                },
+            )
+        }
+
         async fn migrate(self: Arc<Self>) -> PyResult<()> {
             self.inner.store().migrate().await.map_err(store_error)
         }
@@ -1039,6 +1125,7 @@ mod _core {
             budget: Duration,
             on_progress: Option<Py<PyAny>>,
         ) -> PyResult<RunOutcome> {
+            self.ensure_schema().await?;
             let report = |p: &runner::Progress| {
                 if let Some(callback) = &on_progress {
                     Python::attach(|py| {
@@ -1070,6 +1157,7 @@ mod _core {
             request: ActionRequest,
             budget: Duration,
         ) -> PyResult<RunOutcome> {
+            self.ensure_schema().await?;
             self.inner
                 .act(&account, request, budget)
                 .await
@@ -1082,6 +1170,7 @@ mod _core {
             account: AccountId,
             request: ActionRequest,
         ) -> PyResult<u32> {
+            self.ensure_schema().await?;
             self.inner
                 .admit(&account, &request)
                 .await
@@ -1257,14 +1346,24 @@ mod _core {
         /// returns `(access_token, expires_at_ms)`, sync or async, or raises
         /// `DelegationRevoked`.
         #[new]
-        fn new(py: Python<'_>, config: ConfigArg, token_source: Py<PyAny>) -> PyResult<Self> {
+        #[pyo3(signature = (config, token_source, *, clock=None))]
+        fn new(
+            py: Python<'_>,
+            config: ConfigArg,
+            token_source: Py<PyAny>,
+            clock: Option<Py<PyAny>>,
+        ) -> PyResult<Self> {
             Ok(Self {
-                shared: open(py, config, token_source)?,
+                shared: open(py, config, token_source, clock)?,
             })
         }
 
         fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
             future(py, &self.shared, self.shared.clone().migrate())
+        }
+
+        fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            future(py, &self.shared, self.shared.clone().schema())
         }
 
         #[pyo3(signature = (account, budget_s=60.0, on_progress=None))]
@@ -1462,15 +1561,26 @@ mod _core {
     impl BlockingRunner {
         /// See `mailtide.Runner`.
         #[new]
-        fn new(py: Python<'_>, config: ConfigArg, token_source: Py<PyAny>) -> PyResult<Self> {
+        #[pyo3(signature = (config, token_source, *, clock=None))]
+        fn new(
+            py: Python<'_>,
+            config: ConfigArg,
+            token_source: Py<PyAny>,
+            clock: Option<Py<PyAny>>,
+        ) -> PyResult<Self> {
             Ok(Self {
-                shared: open(py, config, token_source)?,
+                shared: open(py, config, token_source, clock)?,
             })
         }
 
         /// Create or upgrade mailtide's tables (safe to call concurrently).
         fn migrate(&self, py: Python<'_>) -> PyResult<()> {
             block(py, &self.shared, self.shared.clone().migrate())
+        }
+
+        /// Where the database's schema stands against this build.
+        fn schema(&self, py: Python<'_>) -> PyResult<SchemaStatus> {
+            block(py, &self.shared, self.shared.clone().schema())
         }
 
         /// Sync `account` until caught up, blocked or `budget_s` elapses.
@@ -1671,6 +1781,29 @@ mod _core {
     }
 
     // ------------------------------------------------------------ functions
+
+    /// One schema migration as SQL (see `migrations`).
+    #[pyclass(frozen, get_all)]
+    struct Migration {
+        version: u32,
+        statements: Vec<String>,
+    }
+
+    /// mailtide's schema migrations as SQL, in order, for hosts that run
+    /// migrations with their own tool (e.g. Alembic): execute each
+    /// migration's statements in order, skipping versions already in
+    /// `mailtide_schema`. Each records itself there. Postgres and SQLite
+    /// share it. `Runner.migrate()` does the same natively.
+    #[pyfunction]
+    fn migrations() -> Vec<Migration> {
+        mailtide_store::sql::migrations()
+            .into_iter()
+            .map(|m| Migration {
+                version: m.version,
+                statements: m.statements,
+            })
+            .collect()
+    }
 
     /// Verify a Gmail push request (Pub/Sub OIDC token) and parse it.
     /// `jwks` is Google's certificate document (JSON bytes).

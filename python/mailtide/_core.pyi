@@ -12,6 +12,9 @@ class CorruptState(MailtideError): ...
 class BlobUnavailable(MailtideError): ...
 class QuotaGateError(MailtideError): ...
 class Superseded(MailtideError): ...
+class SchemaOutOfDate(MailtideError): ...
+
+SCHEMA_VERSION: int
 
 @final
 class Status:
@@ -203,6 +206,17 @@ class Progress:
     elapsed_ms: int
 
 @final
+class SchemaStatus:
+    state: Literal["current", "behind", "ahead"]
+    applied: int
+    expected: int
+
+@final
+class Migration:
+    version: int
+    statements: list[str]
+
+@final
 class ResumeResult:
     outcome: Literal["resumed", "not_blocked", "unknown"]
     phase: Literal["bootstrapping", "live", "reconciling"] | None
@@ -225,8 +239,15 @@ TokenSource = Callable[[str], tuple[str, int] | Awaitable[tuple[str, int]]]
 class Runner:
     """Internal: methods return asyncio futures; use ``mailtide.Runner``."""
 
-    def __init__(self, config: Config, token_source: TokenSource) -> None: ...
+    def __init__(
+        self,
+        config: Config,
+        token_source: TokenSource,
+        *,
+        clock: Callable[[], int] | None = None,
+    ) -> None: ...
     def migrate(self) -> Awaitable[None]: ...
+    def schema(self) -> Awaitable[SchemaStatus]: ...
     def run(
         self,
         account: str,
@@ -273,8 +294,15 @@ class Runner:
 
 @final
 class BlockingRunner:
-    def __init__(self, config: Config, token_source: TokenSource) -> None: ...
+    def __init__(
+        self,
+        config: Config,
+        token_source: TokenSource,
+        *,
+        clock: Callable[[], int] | None = None,
+    ) -> None: ...
     def migrate(self) -> None: ...
+    def schema(self) -> SchemaStatus: ...
     def run(
         self,
         account: str,
@@ -320,6 +348,7 @@ class BlockingRunner:
     def read_blob(self, account: str, message_id: str) -> bytes: ...
 
 def version() -> str: ...
+def migrations() -> list[Migration]: ...
 def verify_push(
     authorization: str,
     body: bytes,

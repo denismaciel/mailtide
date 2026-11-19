@@ -77,6 +77,70 @@ const MIGRATIONS: &[&[&str]] = &[&[
 // 2: change-feed compaction.
 &["ALTER TABLE mailtide_accounts ADD COLUMN log_floor BIGINT NOT NULL DEFAULT 0"]];
 
+/// The schema version this build expects.
+#[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
+pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+const _: () = assert!(MIGRATIONS.len() < u32::MAX as usize);
+
+const SCHEMA_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS mailtide_schema (version BIGINT PRIMARY KEY)";
+
+/// One schema migration as SQL, for hosts that run migrations with their own
+/// tool (e.g. an Alembic revision executing each statement in order). Each
+/// migration records itself in `mailtide_schema`; apply them in order,
+/// skipping versions already recorded there. Postgres and `SQLite` share it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Migration {
+    /// Its version (1, 2, ...).
+    pub version: u32,
+    /// The statements, bookkeeping included.
+    pub statements: Vec<String>,
+}
+
+/// Every migration, in order.
+#[must_use]
+pub fn migrations() -> Vec<Migration> {
+    MIGRATIONS
+        .iter()
+        .zip(1_u32..)
+        .map(|(statements, version)| {
+            let mut all = vec![SCHEMA_TABLE.to_owned()];
+            all.extend(statements.iter().map(|s| (*s).to_owned()));
+            all.push(format!(
+                "INSERT INTO mailtide_schema (version) VALUES ({version})"
+            ));
+            Migration {
+                version,
+                statements: all,
+            }
+        })
+        .collect()
+}
+
+/// Where a database's schema stands against this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaState {
+    /// Every migration this build knows is applied.
+    Current {
+        /// The version.
+        version: u32,
+    },
+    /// Migrations are missing: run them before syncing.
+    Behind {
+        /// The newest applied (0: none).
+        applied: u32,
+        /// The newest this build expects.
+        expected: u32,
+    },
+    /// A newer mailtide migrated this database: this build must not write.
+    Ahead {
+        /// The newest applied.
+        applied: u32,
+        /// The newest this build knows.
+        expected: u32,
+    },
+}
+
 /// A store in a SQL database.
 #[derive(Debug, Clone)]
 pub struct SqlStore {
@@ -200,6 +264,45 @@ impl SqlStore {
         Ok(Self { pool, dialect })
     }
 
+    /// Where this database's schema stands (read-only; works on an empty
+    /// database).
+    pub async fn schema(&self) -> Result<SchemaState, StoreError> {
+        let exists = match self.dialect {
+            Dialect::Postgres => {
+                "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_name = 'mailtide_schema' AND table_schema = ANY (current_schemas(false))"
+            }
+            Dialect::Sqlite => {
+                "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'mailtide_schema'"
+            }
+        };
+        let row = sqlx::query(exists)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        let tables: i64 = row.try_get("n").map_err(|e| corrupt("schema", e))?;
+        let applied = if tables == 0 {
+            0
+        } else {
+            let row = sqlx::query("SELECT COALESCE(MAX(version), 0) AS v FROM mailtide_schema")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?;
+            let v: i64 = row.try_get("v").map_err(|e| corrupt("schema version", e))?;
+            u32::try_from(v).map_err(|e| corrupt("schema version", e))?
+        };
+        Ok(match applied.cmp(&SCHEMA_VERSION) {
+            std::cmp::Ordering::Equal => SchemaState::Current { version: applied },
+            std::cmp::Ordering::Less => SchemaState::Behind {
+                applied,
+                expected: SCHEMA_VERSION,
+            },
+            std::cmp::Ordering::Greater => SchemaState::Ahead {
+                applied,
+                expected: SCHEMA_VERSION,
+            },
+        })
+    }
+
     /// Whether the database answers within the pool's acquire timeout.
     pub async fn ping(&self) -> Result<(), StoreError> {
         sqlx::query("SELECT 1")
@@ -222,7 +325,7 @@ impl SqlStore {
                 .await
                 .map_err(|e| unavailable(&e))?;
         }
-        sqlx::query("CREATE TABLE IF NOT EXISTS mailtide_schema (version BIGINT PRIMARY KEY)")
+        sqlx::query(SCHEMA_TABLE)
             .execute(&mut *tx)
             .await
             .map_err(|e| unavailable(&e))?;
@@ -250,6 +353,16 @@ impl SqlStore {
                 .map_err(|e| unavailable(&e))?;
         }
         tx.commit().await.map_err(|e| unavailable(&e))
+    }
+
+    /// Run one statement (tests only).
+    #[cfg(test)]
+    pub(crate) async fn execute_for_tests(&self, statement: &str) -> Result<(), StoreError> {
+        sqlx::query(AssertSqlSafe(statement.to_owned()))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| unavailable(&e))
     }
 
     /// Delete every row (tests only).
