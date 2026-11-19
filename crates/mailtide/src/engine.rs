@@ -22,7 +22,7 @@ use crate::history::{self, CursorUpdate};
 use crate::ids::{
     CommandId, CommitId, ENGINE_VERSION, HistoryId, LabelId, MessageId, PageToken, Timestamp,
 };
-use crate::jobs::{AttemptId, ClaimedJob, JobKind, JobOp, JobOutcome};
+use crate::jobs::{AttemptId, ClaimedJob, ClaimedWork, Delivery, JobKind, JobOp, JobOutcome};
 use crate::outbox::{ActionRequest, IntentOp};
 use crate::quota::{self, Priority};
 use crate::reconcile::{ListScope, ReconcileProgress, ReconcileReason, ReconcileStep};
@@ -732,29 +732,23 @@ impl Engine {
         for job in jobs {
             self.running_jobs += 1;
             let priority = job.priority;
-            match &job.kind {
-                JobKind::Import(id) => {
+            match &job.work {
+                ClaimedWork::Import(id) => {
                     let request = GmailRequest::ImportMessage { id: id.clone() };
                     out.push(self.gmail(request, priority, Waiting::Job(job)));
                 }
-                JobKind::Verify(id) => {
+                ClaimedWork::Verify(id) => {
                     let request = GmailRequest::GetMessage { id: id.clone() };
                     out.push(self.gmail(request, priority, Waiting::Job(job)));
                 }
-                JobKind::Deliver(_) => match job.modify.clone() {
-                    Some(group) => {
-                        out.push(self.gmail(
-                            GmailRequest::Modify(group),
-                            priority,
-                            Waiting::Job(job),
-                        ));
-                    }
-                    // Settled or superseded since it was enqueued.
-                    None => {
-                        out.push(self.finish_job(&job, JobOutcome::Done, Vec::new(), now));
-                    }
-                },
-                JobKind::BlobCleanup(message) => {
+                ClaimedWork::Deliver(_, Delivery::Send(group)) => {
+                    let request = GmailRequest::Modify(group.clone());
+                    out.push(self.gmail(request, priority, Waiting::Job(job)));
+                }
+                ClaimedWork::Deliver(_, Delivery::Settled) => {
+                    out.push(self.finish_job(&job, JobOutcome::Done, Vec::new(), now));
+                }
+                ClaimedWork::BlobCleanup(message) => {
                     let message = message.clone();
                     let id = self.command_id();
                     self.waiting.insert(id, Waiting::Job(job));
@@ -783,7 +777,7 @@ impl Engine {
         answers: impl FnOnce(&JobKind) -> bool,
     ) -> Option<ClaimedJob> {
         match self.waiting.remove(&command) {
-            Some(Waiting::Job(job)) if answers(&job.kind) => Some(job),
+            Some(Waiting::Job(job)) if answers(&job.kind()) => Some(job),
             Some(other) => {
                 self.waiting.insert(command, other);
                 None
@@ -840,11 +834,7 @@ impl Engine {
         let Some(job) = self.take_job(command, |kind| matches!(kind, JobKind::Deliver(_))) else {
             return Vec::new();
         };
-        let versions = job
-            .modify
-            .as_ref()
-            .map(|g| g.versions.clone())
-            .unwrap_or_default();
+        let versions = job.delivery_versions();
         let intents = vec![IntentOp::Delivered {
             versions,
             at: now,
@@ -1044,15 +1034,11 @@ impl Engine {
         match (&blocking.class, waiting) {
             // The account itself is unusable: everything stops.
             (Blocking::Account(_), _) => self.block(blocking.clone(), now),
-            (Blocking::Permanent, Waiting::Job(job)) => match &job.kind {
+            (Blocking::Permanent, Waiting::Job(job)) => match job.kind() {
                 // This change can't be applied: block its intents (they stop
                 // overlaying) and finish the job.
                 JobKind::Deliver(_) => {
-                    let versions = job
-                        .modify
-                        .as_ref()
-                        .map(|g| g.versions.clone())
-                        .unwrap_or_default();
+                    let versions = job.delivery_versions();
                     let intents = vec![IntentOp::Block {
                         versions,
                         failure: blocking.clone(),
@@ -1093,7 +1079,7 @@ impl Engine {
     /// Gmail answered 404.
     fn on_missing(&mut self, command: CommandId, waiting: Waiting, now: Timestamp) -> Vec<Command> {
         match waiting {
-            Waiting::Job(job) => match &job.kind {
+            Waiting::Job(job) => match job.kind() {
                 JobKind::Import(id) | JobKind::Verify(id) | JobKind::Deliver(id) => {
                     let id = id.clone();
                     self.waiting.insert(command, Waiting::Job(job));
@@ -1460,11 +1446,10 @@ mod tests {
     fn a_result_for_another_message_leaves_the_job_waiting() {
         let mut engine = live(100);
         let job = ClaimedJob {
-            kind: JobKind::Import(MessageId("a".into())),
+            work: ClaimedWork::Import(MessageId("a".into())),
             priority: Priority::Live,
             failed_attempts: 0,
             attempt: AttemptId(1),
-            modify: None,
         };
         let claim = engine.claim_jobs(Timestamp(0));
         let claim = claim.first().expect("a claim").id;

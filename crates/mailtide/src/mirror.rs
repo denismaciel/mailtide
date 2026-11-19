@@ -18,7 +18,7 @@ use crate::ids::{
     stable_hash,
 };
 use crate::jobs::{
-    AttemptId, ClaimedJob, Job, JobClaim, JobKind, JobOp, JobOutcome, JobState, NewJob,
+    AttemptId, ClaimedJob, ClaimedWork, Job, JobClaim, JobKind, JobOp, JobOutcome, JobState, NewJob,
 };
 use crate::labels::{self, LabelSet};
 use crate::outbox::{self, ActionRequest, Delivery, Intent, IntentOp, IntentState, IntentVersion};
@@ -1290,18 +1290,16 @@ impl AccountMirror {
                 break;
             };
             let kind = job.kind.clone();
-            let modify = match &kind {
-                JobKind::Deliver(id) => outbox::plan_delivery(&self.intents_of(id))
+            let work = ClaimedWork::plan(kind.clone(), |id| {
+                outbox::plan_delivery(&self.intents_of(id))
                     .into_iter()
-                    .next(),
-                JobKind::Import(_) | JobKind::Verify(_) | JobKind::BlobCleanup(_) => None,
-            };
+                    .next()
+            });
             claimed.push(ClaimedJob {
-                kind: kind.clone(),
+                work,
                 priority: job.priority,
                 failed_attempts: job.failed_attempts,
                 attempt,
-                modify,
             });
             if let Some(job) = self.jobs.get_mut(&kind) {
                 job.state = JobState::Running(attempt);

@@ -14,7 +14,7 @@ use mailtide::gmail::LabelKind;
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
-use mailtide::jobs::{AttemptId, ClaimOutcome, ClaimedJob, Job, JobKind, JobState};
+use mailtide::jobs::{AttemptId, ClaimOutcome, ClaimedJob, ClaimedWork, Job, JobKind, JobState};
 use mailtide::labels::LabelSet;
 use mailtide::mirror::{
     AccountMirror, AccountRecord, Content, MessageRecord, MessageView, StoredContent,
@@ -915,18 +915,17 @@ impl SqlStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| unavailable(&e))?;
-            let modify = match &job.kind {
+            let group = match &job.kind {
                 JobKind::Deliver(id) => plan_delivery(&load_intents(&mut tx, account, id).await?)
                     .into_iter()
                     .next(),
                 JobKind::Import(_) | JobKind::Verify(_) | JobKind::BlobCleanup(_) => None,
             };
             claimed.push(ClaimedJob {
-                kind: job.kind,
+                work: ClaimedWork::plan(job.kind, |_| group),
                 priority: job.priority,
                 failed_attempts: job.failed_attempts,
                 attempt,
-                modify,
             });
         }
         tx.commit()

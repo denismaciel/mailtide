@@ -79,28 +79,101 @@ pub enum ClaimOutcome {
     Rejected(crate::commit::Rejection),
 }
 
+/// What a claimed job does, with what it needs as of the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimedWork {
+    /// Fetch raw content and record it.
+    Import(MessageId),
+    /// Fetch labels to confirm or tombstone the message.
+    Verify(MessageId),
+    /// Delete a tombstoned message's raw content.
+    BlobCleanup(MessageId),
+    /// Send the message's pending label changes.
+    Deliver(MessageId, Delivery),
+}
+
+/// A delivery job's plan, read when it was claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    /// Send these label changes.
+    Send(crate::outbox::ModifyGroup),
+    /// Nothing is pending any more (settled or superseded): finish the job.
+    Settled,
+}
+
+impl ClaimedWork {
+    /// The work for `kind`; `plan` reads a delivery's pending changes.
+    pub fn plan(
+        kind: JobKind,
+        plan: impl FnOnce(&MessageId) -> Option<crate::outbox::ModifyGroup>,
+    ) -> Self {
+        match kind {
+            JobKind::Import(id) => Self::Import(id),
+            JobKind::Verify(id) => Self::Verify(id),
+            JobKind::BlobCleanup(id) => Self::BlobCleanup(id),
+            JobKind::Deliver(id) => {
+                let delivery = plan(&id).map_or(Delivery::Settled, Delivery::Send);
+                Self::Deliver(id, delivery)
+            }
+        }
+    }
+
+    /// The job this is.
+    #[must_use]
+    pub fn kind(&self) -> JobKind {
+        match self {
+            Self::Import(id) => JobKind::Import(id.clone()),
+            Self::Verify(id) => JobKind::Verify(id.clone()),
+            Self::BlobCleanup(id) => JobKind::BlobCleanup(id.clone()),
+            Self::Deliver(id, _) => JobKind::Deliver(id.clone()),
+        }
+    }
+}
+
 /// A job claimed for this engine: the store hands these out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedJob {
     /// What it does.
-    pub kind: JobKind,
+    pub work: ClaimedWork,
     /// Admission class.
     pub priority: Priority,
     /// Failed attempts so far.
     pub failed_attempts: u32,
     /// The claim; results apply only while it holds.
     pub attempt: AttemptId,
-    /// For [`JobKind::Deliver`]: the label changes to send, as of the claim
-    /// (`None` when nothing is pending any more).
-    pub modify: Option<crate::outbox::ModifyGroup>,
 }
 
 impl ClaimedJob {
+    /// The job this claims.
+    #[must_use]
+    pub fn kind(&self) -> JobKind {
+        self.work.kind()
+    }
+
+    /// The label changes a delivery sends (none for other jobs or a settled
+    /// delivery).
+    #[must_use]
+    pub fn group(&self) -> Option<&crate::outbox::ModifyGroup> {
+        match &self.work {
+            ClaimedWork::Deliver(_, Delivery::Send(group)) => Some(group),
+            ClaimedWork::Deliver(_, Delivery::Settled)
+            | ClaimedWork::Import(_)
+            | ClaimedWork::Verify(_)
+            | ClaimedWork::BlobCleanup(_) => None,
+        }
+    }
+
+    /// The intent versions a delivery sends.
+    #[must_use]
+    pub fn delivery_versions(&self) -> Vec<crate::outbox::Delivery> {
+        self.group().map(|g| g.versions.clone()).unwrap_or_default()
+    }
+
     /// The claim reference a finishing commit carries.
     #[must_use]
     pub fn claim(&self) -> JobClaim {
         JobClaim {
-            kind: self.kind.clone(),
+            kind: self.kind(),
             attempt: self.attempt,
         }
     }

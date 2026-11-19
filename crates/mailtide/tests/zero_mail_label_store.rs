@@ -180,7 +180,7 @@ impl Mailbox {
             )
             .expect("claim jobs");
         let (keep, release): (Vec<_>, Vec<_>) =
-            claimed.into_iter().partition(|job| wanted(&job.kind));
+            claimed.into_iter().partition(|job| wanted(&job.kind()));
         if !release.is_empty() {
             let mut commit = self.commit();
             commit.jobs = release
@@ -213,7 +213,7 @@ impl Mailbox {
         probe
             .deliveries(now)
             .into_iter()
-            .filter_map(|job| job.modify)
+            .filter_map(|job| job.group().cloned())
             .collect()
     }
 
@@ -227,7 +227,7 @@ impl Mailbox {
         }];
         commit.intents = vec![IntentOp::Delivered {
             versions: job
-                .modify
+                .group()
                 .as_ref()
                 .map(|group| group.versions.clone())
                 .unwrap_or_default(),
@@ -391,7 +391,7 @@ fn durable_message_label_outbox_coalesces_toggles_survives_store_reconstruction_
     mailbox.act(&["m"], Action::SetRead(ReadState::Unread));
     mailbox.act(&["m"], Action::SetRead(ReadState::Read));
     let batch = mailbox.deliveries(1000).remove(0);
-    assert_eq!(batch.modify.as_ref().unwrap().versions.len(), 1);
+    assert_eq!(batch.group().unwrap().versions.len(), 1);
     mailbox.retry(&batch, 5000);
     assert!(mailbox.peek(4999).is_empty(), "not before the retry time");
     mailbox.restart();
@@ -686,7 +686,7 @@ fn durable_message_label_outbox_preserves_a_newer_spam_to_inbox_restore_while_ol
         set(["INBOX", "UNREAD", "IMPORTANT", "Label_123"])
     );
     let restore = mailbox.deliveries(1100).remove(0);
-    let group = restore.modify.clone().unwrap();
+    let group = restore.group().cloned().unwrap();
     let label = |id: &str| LabelId(id.into());
     assert!(group.add.contains(&label("INBOX")));
     assert!(group.remove.contains(&label("TRASH")));
@@ -724,7 +724,7 @@ fn durable_message_label_outbox_queues_an_inbox_restore_after_trash_even_before_
     assert_eq!(mailbox.thread("t"), set(["TRASH"]));
     mailbox.act_thread("t", Action::RestoreFromTrash(RestoreDestination::Inbox));
     let restore = mailbox.deliveries(3000).remove(0);
-    let group = restore.modify.clone().unwrap();
+    let group = restore.group().cloned().unwrap();
     assert_eq!(group.add, ids(&["INBOX"]));
     assert_eq!(group.remove, ids(&["TRASH"]));
     assert!(applied(&mailbox.ack(&restore, 3000)));
@@ -780,7 +780,7 @@ fn durable_message_label_outbox_retries_custom_label_and_importance_intent_indep
     mailbox.observe("t", "draft", &["DRAFT"], 1);
     mailbox.act_thread("t", change_labels(&["IMPORTANT", "Label_123"], &[]));
     let batches = mailbox.deliveries(1000);
-    let targets: Vec<_> = batches.iter().map(|job| job.kind.clone()).collect();
+    let targets: Vec<_> = batches.iter().map(|job| job.kind().clone()).collect();
     assert_eq!(
         targets,
         vec![JobKind::Deliver(m("a")), JobKind::Deliver(m("b"))]
@@ -794,7 +794,7 @@ fn durable_message_label_outbox_retries_custom_label_and_importance_intent_indep
     assert_eq!(retried.len(), 2);
     for job in &retried {
         assert_eq!(job.failed_attempts, 1);
-        let group = job.modify.as_ref().unwrap();
+        let group = job.group().unwrap();
         assert_eq!(group.add, ids(&["Label_123"]));
         assert_eq!(group.remove, ids(&["IMPORTANT"]));
     }
@@ -902,7 +902,7 @@ fn durable_message_label_outbox_respects_per_request_gmail_label_array_limits_wi
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
     mailbox.act_thread("t", change_labels(&many, &[]));
     let batch = mailbox.deliveries(1000).remove(0);
-    assert_eq!(batch.modify.as_ref().unwrap().add.len(), 100);
+    assert_eq!(batch.group().unwrap().add.len(), 100);
     assert!(applied(&mailbox.ack(&batch, 1000)));
     let rest = mailbox.peek(1000);
     assert_eq!(rest.len(), 1);

@@ -379,7 +379,7 @@ fn durable_spam_cleanup_protects_a_real_no_op_restore_after_discovery_and_surviv
     // What goes to Gmail is the restore, never the cleanup's trash.
     let jobs = claim(&mut mirror, 4, 0, 1);
     assert_eq!(jobs.len(), 1);
-    let group = jobs[0].modify.clone().expect("pending changes");
+    let group = jobs[0].group().cloned().expect("pending changes");
     assert!(!group.add.contains(&label("TRASH")));
     assert!(group.remove.contains(&label("TRASH")));
     assert!(group.versions.contains(&Delivery {
@@ -602,9 +602,9 @@ fn durable_spam_cleanup_preserves_newer_user_moves_even_after_their_provider_ack
     let jobs = claim(&mut mirror, 2, 0, 1);
     let restored = jobs
         .iter()
-        .find(|job| job.kind == JobKind::Deliver(m("r")))
+        .find(|job| job.kind() == JobKind::Deliver(m("r")))
         .expect("r is delivered");
-    let group = restored.modify.clone().expect("pending changes");
+    let group = restored.group().cloned().expect("pending changes");
     assert!(group.add.contains(&label("SPAM")) && !group.add.contains(&label("TRASH")));
     let mut c = commit(&mirror);
     c.claim = Some(restored.claim());
@@ -620,7 +620,7 @@ fn durable_spam_cleanup_preserves_newer_user_moves_even_after_their_provider_ack
     apply(&mut mirror, &c);
     // The confirmation fetch after delivery shows the move.
     let verify = claim(&mut mirror, 1, 0, 2).remove(0);
-    assert_eq!(verify.kind, JobKind::Verify(m("r")));
+    assert_eq!(verify.kind(), JobKind::Verify(m("r")));
     let mut confirm = commit(&mirror);
     confirm.claim = Some(verify.claim());
     confirm.messages = vec![MessageOp::Observe(MessageObservation {
@@ -651,7 +651,7 @@ fn durable_spam_cleanup_rolls_back_target_removal_alongside_intent_admission_and
     admit(&mut mirror, vec![on_thread("a", cleanup())]);
     let kind = JobKind::Deliver(m("a"));
     let job = claim(&mut mirror, 1, 0, 1).remove(0);
-    let versions = job.modify.clone().expect("pending").versions;
+    let versions = job.group().cloned().expect("pending").versions;
 
     // Finishing the delivery and admitting more intents in one commit that
     // fails applies neither.
@@ -703,7 +703,7 @@ fn durable_spam_cleanup_rolls_back_target_removal_alongside_intent_admission_and
     let mut refused = commit(&mirror);
     refused.claim = Some(job.claim());
     refused.intents = vec![IntentOp::Block {
-        versions: job.modify.clone().expect("pending").versions,
+        versions: job.group().cloned().expect("pending").versions,
         failure: BlockingFailure {
             class: Blocking::Permanent,
             detail: "invalid label".into(),

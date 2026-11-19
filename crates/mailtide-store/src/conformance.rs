@@ -303,7 +303,7 @@ async fn tombstones<S: Store>(store: &S) -> Result<(), String> {
     expect(
         !jobs
             .iter()
-            .any(|job| job.kind == JobKind::Import(MessageId("a".into()))),
+            .any(|job| job.kind() == JobKind::Import(MessageId("a".into()))),
         "a tombstoned message must not be imported",
     )
 }
@@ -325,7 +325,7 @@ async fn unknown_patch<S: Store>(store: &S) -> Result<(), String> {
         .and_then(claimed)?;
     expect(
         jobs.iter()
-            .any(|job| job.kind == JobKind::Verify(MessageId("x".into()))),
+            .any(|job| job.kind() == JobKind::Verify(MessageId("x".into()))),
         "an unknown message must get a verification job",
     )
 }
@@ -349,7 +349,7 @@ async fn claims<S: Store>(store: &S) -> Result<(), String> {
     expect(again.is_empty(), "a running job must not be claimed twice")?;
     let mut stale = commit(&snapshot, 1);
     stale.claim = Some(mailtide::jobs::JobClaim {
-        kind: job.kind.clone(),
+        kind: job.kind().clone(),
         attempt: AttemptId(99),
     });
     stale.jobs = vec![JobOp::Finish {
@@ -484,12 +484,13 @@ async fn actions<S: Store>(store: &S) -> Result<(), String> {
     let jobs = claim_all(store, &snapshot, 1).await?;
     let deliver = jobs
         .iter()
-        .find(|job| job.kind == JobKind::Deliver(MessageId("a".into())))
+        .find(|job| job.kind() == JobKind::Deliver(MessageId("a".into())))
         .ok_or("the action must be deliverable")?;
-    let group = deliver
-        .modify
-        .clone()
-        .ok_or("delivery carries the change")?;
+    let mailtide::jobs::ClaimedWork::Deliver(_, mailtide::jobs::Delivery::Send(group)) =
+        &deliver.work
+    else {
+        return Err("delivery carries the change".into());
+    };
     expect(
         group.remove == vec![mailtide::ids::LabelId("UNREAD".into())] && group.add.is_empty(),
         "delivery removes UNREAD",
@@ -527,7 +528,7 @@ async fn actions<S: Store>(store: &S) -> Result<(), String> {
     let jobs = claim_all(store, &snapshot, 2).await?;
     let verify = jobs
         .iter()
-        .find(|job| job.kind == JobKind::Verify(MessageId("a".into())))
+        .find(|job| job.kind() == JobKind::Verify(MessageId("a".into())))
         .ok_or("delivery must queue a confirmation fetch")?;
     let mut confirmed = commit(&snapshot, 4);
     confirmed.claim = Some(verify.claim());
@@ -728,7 +729,7 @@ async fn admission_is_unfenced<S: Store>(store: &S) -> Result<(), String> {
     let jobs = claim_all(store, &new, 1).await?;
     expect(
         jobs.iter()
-            .any(|job| job.kind == JobKind::Deliver(MessageId("a".into()))),
+            .any(|job| job.kind() == JobKind::Deliver(MessageId("a".into()))),
         "the current engine delivers it",
     )
 }

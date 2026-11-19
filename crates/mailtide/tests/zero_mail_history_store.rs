@@ -159,8 +159,8 @@ mod common {
             )
             .expect("current epoch");
         assert_eq!(
-            claimed.iter().map(|j| &j.kind).collect::<Vec<_>>(),
-            vec![kind]
+            claimed.iter().map(mailtide::jobs::ClaimedJob::kind).collect::<Vec<_>>(),
+            vec![kind.clone()]
         );
         let claim = claimed[0].claim();
         let mut c = commit(mirror);
@@ -418,7 +418,7 @@ fn claim_ids(mirror: &mut AccountMirror, limit: u32, now: i64, attempt: u64) -> 
         )
         .expect("current epoch")
         .into_iter()
-        .map(|j| j.kind)
+        .map(|j| j.kind())
         .collect()
 }
 
@@ -859,7 +859,7 @@ fn durable_gmail_history_checkpoints_deduplicates_browser_cache_misses_without_r
         .claim_jobs(mirror.record.epoch, 4, Timestamp(60_000), AttemptId(3))
         .expect("current epoch");
     assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].kind, kind);
+    assert_eq!(claimed[0].kind(), kind);
     assert_eq!(claimed[0].failed_attempts, 1);
     assert_eq!(claimed[0].priority, Priority::Foreground);
 }
