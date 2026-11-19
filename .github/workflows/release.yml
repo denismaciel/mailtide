@@ -1,6 +1,7 @@
 name: Release
 
-# A v* tag on main builds, tests and publishes wheels to a GitHub release with
+# A v* tag on main builds, tests and publishes wheels (abi3 for CPython >= 3.12,
+# plus free-threaded 3.14t and 3.15t) to a GitHub release with
 # a flat package index (index.html), which uv and pip install from:
 #
 #   [[tool.uv.index]]
@@ -67,12 +68,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # One abi3 wheel per platform serves every CPython >= 3.12.
+      # One abi3 wheel per platform serves every GIL CPython >= 3.12; the
+      # free-threaded builds (3.14t, 3.15t) need version-specific wheels.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e
+        if: runner.os == 'macOS'
+        with:
+          enable-cache: false
+          version: "0.12.4"
+      - name: Install the interpreters to build for (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          uv python install 3.12 3.14t 3.15t
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --locked --out dist
+          args: --release --locked --out dist --interpreter python3.12 python3.14t python3.15t
+      - name: Require the abi3 and both free-threaded wheels
+        run: |
+          ls dist
+          ls dist/*-abi3-*.whl dist/*-cp314t-*.whl dist/*-cp315t-*.whl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
@@ -86,7 +102,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-15-intel]
-        python: ["3.12", "3.14"]
+        python: ["3.12", "3.15", "3.14t", "3.15t"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

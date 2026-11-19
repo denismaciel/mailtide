@@ -15,6 +15,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimedJob};
 use mailtide::mirror::MessageView;
+use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
 
@@ -73,6 +74,16 @@ pub trait Store: Send + Sync {
         since: StateSeq,
         limit: u32,
     ) -> impl Future<Output = Result<ChangePage, StoreError>> + Send;
+
+    /// Admit a user action without an engine (no epoch fence), atomically;
+    /// the current engine delivers it. Returns how many messages got new
+    /// intents (0 for unknown or draft targets, or nothing new).
+    fn admit(
+        &self,
+        account: &AccountId,
+        request: &ActionRequest,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send;
 
     /// How hosts see these messages; unknown ids are left out.
     fn messages(

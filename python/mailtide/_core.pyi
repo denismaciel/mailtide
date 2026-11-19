@@ -27,6 +27,7 @@ class RunOutcome:
     commits: int
     imported: int
     gmail_requests: int
+    admitted: int
     status: Status | None
 
 @final

@@ -70,6 +70,8 @@ pub struct SyncReport {
     pub imported: u32,
     /// Gmail requests sent.
     pub gmail_requests: u32,
+    /// For [`Runner::act`]: messages the action admitted intents for.
+    pub admitted: u32,
     /// The account's status at the end.
     pub status: Option<Status>,
 }
@@ -163,28 +165,27 @@ where
         &self.transport
     }
 
-    /// Sync `account` until caught up, stopped, or `budget` elapses.
-    pub async fn run(&self, account: &AccountId, budget: Duration) -> Result<RunOutcome, RunError> {
-        self.run_with(account, budget, None).await
-    }
-
     /// Admit a user action and deliver it, syncing as [`Self::run`] does.
-    /// The action shows in [`Store::messages`] as soon as it is admitted.
+    /// Admission goes straight to the store, so it holds even when this run
+    /// is superseded by a concurrent one (which then delivers it).
     pub async fn act(
         &self,
         account: &AccountId,
         action: ActionRequest,
         budget: Duration,
     ) -> Result<RunOutcome, RunError> {
-        self.run_with(account, budget, Some(action)).await
+        let admitted = self
+            .store
+            .admit(account, &action, now())
+            .await
+            .map_err(RunError::Store)?;
+        let mut outcome = self.run(account, budget).await?;
+        outcome.report.admitted = admitted;
+        Ok(outcome)
     }
 
-    async fn run_with(
-        &self,
-        account: &AccountId,
-        budget: Duration,
-        action: Option<ActionRequest>,
-    ) -> Result<RunOutcome, RunError> {
+    /// Sync `account` until caught up, stopped, or `budget` elapses.
+    pub async fn run(&self, account: &AccountId, budget: Duration) -> Result<RunOutcome, RunError> {
         let deadline = Instant::now() + budget;
         let snapshot = match self.store.claim(account, ENGINE_VERSION).await {
             Ok(snapshot) => snapshot,
@@ -205,12 +206,6 @@ where
             ..SyncReport::default()
         };
         let mut queue: VecDeque<Command> = engine.start(now()).into();
-        if let Some(action) = action {
-            queue.extend(engine.handle(Event {
-                now: now(),
-                kind: EventKind::ActionRequested { action },
-            }));
-        }
         let mut timers: BTreeMap<TimerKind, Timestamp> = BTreeMap::new();
         loop {
             while let Some(command) = queue.pop_front() {

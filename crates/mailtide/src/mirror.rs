@@ -1111,6 +1111,30 @@ impl AccountMirror {
         applied
     }
 
+    /// Admit a user action directly, outside any engine: a user's intent is
+    /// not fenced by whichever engine currently holds the account, so a sync
+    /// that supersedes another can't lose it. Delivery is a durable job the
+    /// current engine runs. Returns how many messages got new intents.
+    pub fn admit_action(&mut self, request: &ActionRequest, now: Timestamp) -> u32 {
+        let plan = JobPlan {
+            priority: Priority::Foreground,
+            import_due_at: now,
+            draft_import_due_at: now,
+            verify_due_at: now,
+            cleanup_due_at: now,
+            deliver_due_at: now,
+            confirm_due_at: now,
+        };
+        self.seq = StateSeq(self.seq.0 + 1);
+        let seq = self.seq;
+        self.apply_intent(&IntentOp::Request(request.clone()), None, &plan, seq);
+        let admitted = self.log.iter().filter(|(s, _)| *s == seq).count();
+        if admitted > 0 {
+            self.record.last_activity = Some(self.record.last_activity.map_or(now, |t| t.max(now)));
+        }
+        u32::try_from(admitted).unwrap_or(u32::MAX)
+    }
+
     /// Claim up to `limit` due jobs for `attempt`, for the engine of `epoch`.
     /// A claim from an older engine is refused, so its jobs can't be held by
     /// an engine that no longer exists.

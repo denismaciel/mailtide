@@ -5,6 +5,8 @@ database (Postgres or SQLite), stores raw messages in blob storage, and
 carries user actions back to Gmail. Rust core with no I/O of its own
 (sans-IO), Python bindings via maturin.
 
+Wheels for CPython ≥ 3.12 (abi3) and free-threaded 3.14t/3.15t; thread safe.
+
 Status: v0.1, pre-release. See [SPEC.md](SPEC.md) and
 [ARCHITECTURE.md](ARCHITECTURE.md).
 

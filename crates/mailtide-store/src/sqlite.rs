@@ -4,6 +4,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimedJob};
 use mailtide::mirror::MessageView;
+use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
 
@@ -61,6 +62,15 @@ impl Store for SqliteStore {
         limit: u32,
     ) -> Result<ChangePage, StoreError> {
         self.inner.changes(account, since, limit).await
+    }
+
+    async fn admit(
+        &self,
+        account: &AccountId,
+        request: &ActionRequest,
+        now: Timestamp,
+    ) -> Result<u32, StoreError> {
+        crate::Store::admit(&self.inner, account, request, now).await
     }
 
     async fn messages(

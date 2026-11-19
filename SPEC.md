@@ -286,8 +286,11 @@ when an operator asks for it. Repeated expiries back off.
 
 ## 7. Actions (write path)
 
-1. **Admission.** The host sends `ActionRequested{Messages{ids, action} |
-   Thread{id, action}}`. The engine commits `IntentOp::Request`; the store
+1. **Admission.** `Store::admit(account, Messages{ids, action} | Thread{id,
+   action})` (what `Runner.act` calls; sans-IO hosts may instead send
+   `ActionRequested` to the engine, which commits `IntentOp::Request`). It is
+   **not fenced by any engine's epoch**: a user's action must survive a
+   concurrent sync superseding another. The store
    expands it against each message's effective labels into one versioned
    intent per (message, label), and enqueues a Foreground `Deliver` job, in
    one transaction. A thread action reaches every non-draft message the
@@ -460,8 +463,11 @@ blob_url, token_source, *, watch_topic=None)` per process:
 - exceptions `MailtideError`, `DelegationRevoked` (raised by the token source
   to block an account), `InvalidPush`.
 
-Calls release the GIL and run on a process-wide Tokio runtime. abi3 wheels
-for Python ≥ 3.12.
+Calls release the GIL and run on a process-wide Tokio runtime. One `Runner`
+is shared by all threads; every method may be called concurrently, including on
+free-threaded CPython, where the module keeps the GIL disabled (all classes
+are immutable; shared Rust state is behind locks or the connection pool).
+Wheels: abi3 for CPython ≥ 3.12, plus free-threaded 3.14t and 3.15t.
 
 ## 12. Testing
 

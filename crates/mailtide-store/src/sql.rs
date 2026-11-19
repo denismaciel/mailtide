@@ -1060,6 +1060,56 @@ impl crate::Store for SqlStore {
         Self::changes(self, account, since, limit).await
     }
 
+    async fn admit(
+        &self,
+        account: &AccountId,
+        request: &ActionRequest,
+        now: Timestamp,
+    ) -> Result<u32, StoreError> {
+        let mut tx = self.begin().await?;
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            // Nothing synced yet: no message can be a target.
+            return Ok(0);
+        };
+        // The rows the action touches, loaded as for a commit carrying it.
+        let carrier = Commit {
+            id: mailtide::ids::CommitId {
+                epoch: record.epoch,
+                seq: 0,
+            },
+            account: account.clone(),
+            epoch: record.epoch,
+            engine_version: record.engine_version,
+            cursor: None,
+            claim: None,
+            sync: None,
+            messages: Vec::new(),
+            labels: Vec::new(),
+            account_ops: Vec::new(),
+            job_plan: mailtide::commit::JobPlan {
+                priority: mailtide::quota::Priority::Foreground,
+                import_due_at: now,
+                draft_import_due_at: now,
+                verify_due_at: now,
+                cleanup_due_at: now,
+                deliver_due_at: now,
+                confirm_due_at: now,
+            },
+            jobs: Vec::new(),
+            intents: vec![IntentOp::Request(request.clone())],
+        };
+        let mut mirror = self
+            .load_partial(&mut tx, account, record, seq, &carrier)
+            .await?;
+        let before = mirror.clone();
+        let admitted = mirror.admit_action(request, now);
+        Self::write_diff(&mut tx, &before, &mirror, &carrier).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(admitted)
+    }
+
     async fn messages(
         &self,
         account: &AccountId,

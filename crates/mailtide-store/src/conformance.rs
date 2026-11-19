@@ -80,6 +80,9 @@ where
         ("change pages never split a commit", |s| {
             Box::pin(whole_commit_pages(s))
         }),
+        ("admitted actions survive a newer engine's claim", |s| {
+            Box::pin(admission_is_unfenced(s))
+        }),
         (
             "blocking wraps the stored state, not the engine's view",
             |s| Box::pin(block_wraps_stored_state(s)),
@@ -642,5 +645,36 @@ async fn block_wraps_stored_state<S: Store>(store: &S) -> Result<(), String> {
     expect(
         matches!(&snapshot.sync, mailtide::state::SyncState::Blocked { resume, .. } if **resume == mailtide::state::SyncState::Live),
         "blocked, resuming into the stored Live state",
+    )
+}
+
+async fn admission_is_unfenced<S: Store>(store: &S) -> Result<(), String> {
+    let old = claim(store).await?;
+    let mut c = commit(&old, 0);
+    c.messages = vec![observe("a", &["INBOX"], 10)];
+    apply(store, &c).await?;
+    // A newer engine claims the account; the user's action still lands.
+    let new = claim(store).await?;
+    let admitted = store
+        .admit(
+            &account(),
+            &ActionRequest::Messages {
+                ids: vec![MessageId("a".into()), MessageId("unknown".into())],
+                action: Action::Archive,
+            },
+            Timestamp(0),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(admitted == 1, "one known message admitted")?;
+    expect(
+        view(store, "a").await?.labels.is_empty(),
+        "the action overlays at once",
+    )?;
+    let jobs = claim_all(store, &new, 1).await?;
+    expect(
+        jobs.iter()
+            .any(|job| job.kind == JobKind::Deliver(MessageId("a".into()))),
+        "the current engine delivers it",
     )
 }

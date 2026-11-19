@@ -7,7 +7,11 @@
 
 use pyo3::prelude::*;
 
-#[pymodule]
+// Safe without the GIL: every class is frozen (immutable after creation, and
+// Sync, which PyO3 checks), Rust state shared across threads is behind
+// Mutexes or a connection pool, and calls release the GIL/attachment while
+// Rust works. On free-threaded CPython the module keeps the GIL disabled.
+#[pymodule(gil_used = false)]
 mod _core {
     use std::time::Duration;
 
@@ -143,6 +147,8 @@ mod _core {
         commits: u32,
         imported: u32,
         gmail_requests: u32,
+        /// For `act`: how many messages the action admitted changes for.
+        admitted: u32,
         status: Option<Status>,
     }
 
@@ -296,6 +302,7 @@ mod _core {
                 commits: report.commits,
                 imported: report.imported,
                 gmail_requests: report.gmail_requests,
+                admitted: report.admitted,
                 status: report.status.map(Status::from),
             }
         }
@@ -337,7 +344,11 @@ mod _core {
     type Inner = runner::Runner<SqlStore, ObjectBlobs, ReqwestTransport, LocalGate, PyTokens>;
 
     /// Syncs Gmail accounts into a database and blob store. Build one per
-    /// process; it is safe to call from several threads.
+    /// process and share it: every method may be called from several threads
+    /// at once (also on free-threaded Python). Concurrent runs of the same
+    /// account are safe: the store fences them, and all but the newest stop
+    /// as `superseded`. `token_source` may be called from several threads at
+    /// once.
     #[pyclass(frozen)]
     struct Runner {
         inner: Inner,

@@ -19,14 +19,19 @@ jobs:
 
   python:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Free-threaded: the bindings must keep the GIL off and be thread safe.
+        python: ["3.12", "3.15t"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run pytest
+      - run: uv sync --python ${{ matrix.python }}
+      - run: uv run --python ${{ matrix.python }} ruff check .
+      - run: uv run --python ${{ matrix.python }} ruff format --check .
+      - run: uv run --python ${{ matrix.python }} pytest
 
   zero-parity:
     runs-on: ubuntu-latest

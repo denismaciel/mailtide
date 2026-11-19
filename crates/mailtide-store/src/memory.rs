@@ -8,6 +8,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimedJob};
 use mailtide::mirror::{AccountMirror, MessageView};
+use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
 
@@ -90,6 +91,15 @@ impl Store for MemoryStore {
         limit: u32,
     ) -> Result<ChangePage, StoreError> {
         self.with_account(account, |mirror| mirror.changes(since, limit))
+    }
+
+    async fn admit(
+        &self,
+        account: &AccountId,
+        request: &ActionRequest,
+        now: Timestamp,
+    ) -> Result<u32, StoreError> {
+        self.with_account(account, |mirror| mirror.admit_action(request, now))
     }
 
     async fn messages(
