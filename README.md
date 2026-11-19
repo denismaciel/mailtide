@@ -7,6 +7,29 @@ carries user actions back to Gmail. Rust core with no I/O of its own
 
 Wheels for CPython ≥ 3.12 (abi3) and free-threaded 3.14t/3.15t; thread safe.
 
+## Install
+
+Wheels are attached to each [GitHub release](https://github.com/denismaciel/mailtide/releases)
+with a flat package index. With uv, in `pyproject.toml`:
+
+```toml
+[project]
+dependencies = ["mailtide==0.1.0"]
+
+[[tool.uv.index]]
+name = "mailtide"
+url = "https://github.com/denismaciel/mailtide/releases/download/v0.1.0/index.html"
+format = "flat"
+explicit = true
+
+[tool.uv.sources]
+mailtide = { index = "mailtide" }
+```
+
+Or with pip: `pip install mailtide==0.1.0 --find-links
+https://github.com/denismaciel/mailtide/releases/download/v0.1.0/index.html`.
+Platforms: Linux x86_64/aarch64 (manylinux 2.28), macOS arm64/x86_64.
+
 Status: v0.1, pre-release. See [SPEC.md](SPEC.md) and
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
