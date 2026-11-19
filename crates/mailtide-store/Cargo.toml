@@ -12,7 +12,7 @@ authors.workspace = true
 mailtide = { path = "../mailtide", version = "0.1.0" }
 serde = "1"
 serde_json = "1"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "postgres", "sqlite", "tls-rustls-ring-webpki"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "postgres", "sqlite", "tls-rustls-aws-lc-rs"] }
 
 [lints]
 workspace = true
