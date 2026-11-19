@@ -441,8 +441,10 @@ engine's epoch, so results meant for a dead engine are ignored).
   `CursorMismatch`, `StaleClaim`) are outcomes, not errors.
 - `claim_jobs(account, epoch, limit, now, attempt)`: refused for an older
   epoch; `Deliver` jobs carry their pending changes.
-- `changes(account, since, limit)`: the change feed, with opaque state
-  strings.
+- `changes(account, since, limit)`: the change feed (`ChangeFeed::Page` of
+  `ChangeEntry { state, index, change }`, whole commits only, or `TooOld`
+  after compaction); `compact(account, through)`;
+  `message_ids(account, after, limit)` to rebuild a consumer.
 - `messages(account, ids)`: `MessageView`s for hosts.
 
 The conformance suite (`mailtide_store::conformance`, 12 cases) runs against
@@ -470,7 +472,14 @@ uses one at a time. Build one runner per process, after forking:
 - `await status(account)`, `await accounts()`, `await health()`: reads that
   never claim an account; `await resume(account)` after an operator fixed a
   block; `await forget(account)` deletes its rows and blobs;
-- `await messages(account, ids) -> list[MessageView]`;
+- `await messages(account, ids) -> list[MessageView]` (labels with pending
+  actions applied, observed labels, and `content` once imported);
+- `await changes(account, since) -> ChangePage | StateTooOld`: typed entries,
+  each with a stable `(state, index)` identity: `MessageDiscovered`,
+  `MessageImported` (once per message, with its labels then, e.g. `SENT`, and
+  its blob), `LabelsChanged` (added/removed), `OverlayChanged`,
+  `MessageDeleted` (last thread and labels), `LabelDefinitionsChanged`;
+  `await compact(account, through)`; `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;

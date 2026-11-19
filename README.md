@@ -29,7 +29,7 @@ await runner.migrate()  # in the deploy step
 outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
 await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from request paths
 status = await runner.status("alice@example.com")  # never preempts a running sync
-page = await runner.changes("alice@example.com", since=None)  # change feed
+page = await runner.changes("alice@example.com", since=None)  # typed feed: match on entries
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 ```
 

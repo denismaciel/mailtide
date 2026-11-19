@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, final
+from typing import Literal, final
 
 from mailtide.config import Config
 
@@ -39,10 +39,93 @@ class RunOutcome:
     status: Status | None
 
 @final
+class MessageDiscovered:
+    kind: Literal["message_discovered"]
+    state: str
+    index: int
+    id: str
+    thread_id: str
+    labels: list[str]
+
+@final
+class MessageImported:
+    kind: Literal["message_imported"]
+    state: str
+    index: int
+    id: str
+    thread_id: str
+    labels: list[str]
+    internal_date_ms: int
+    blob: str
+    size: int
+
+@final
+class LabelsChanged:
+    kind: Literal["labels_changed"]
+    state: str
+    index: int
+    id: str
+    thread_id: str
+    added: list[str]
+    removed: list[str]
+
+@final
+class OverlayChanged:
+    kind: Literal["overlay_changed"]
+    state: str
+    index: int
+    id: str
+    thread_id: str
+    labels: list[str]
+
+@final
+class MessageDeleted:
+    kind: Literal["message_deleted"]
+    state: str
+    index: int
+    id: str
+    thread_id: str | None
+    labels: list[str] | None
+
+@final
+class LabelDefinitionsChanged:
+    kind: Literal["label_definitions_changed"]
+    state: str
+    index: int
+
+Change = (
+    MessageDiscovered
+    | MessageImported
+    | LabelsChanged
+    | OverlayChanged
+    | MessageDeleted
+    | LabelDefinitionsChanged
+)
+
+@final
+class StateTooOld:
+    kind: Literal["too_old"]
+    oldest: str
+
+@final
 class ChangePage:
-    changes: list[dict[str, Any]]
+    changes: list[Change]
     next: str
     has_more: bool
+
+@final
+class MessageContent:
+    blob: str
+    size: int
+    internal_date_ms: int
+    rfc822_message_id: str | None
+    in_reply_to: str | None
+    references: list[str]
+    sender: str | None
+    to: list[str]
+    cc: list[str]
+    subject: str | None
+    snippet: str | None
 
 @final
 class MessageView:
@@ -54,17 +137,7 @@ class MessageView:
     unverified: bool
     pending_actions: int
     blocked_actions: int
-    imported: bool
-    size: int | None
-    internal_date_ms: int | None
-    rfc822_message_id: str | None
-    in_reply_to: str | None
-    references: list[str]
-    sender: str | None
-    to: list[str]
-    cc: list[str]
-    subject: str | None
-    snippet: str | None
+    content: MessageContent | None
 
 Action = Literal[
     "mark_read",
@@ -179,7 +252,11 @@ class Runner:
     def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
     def changes(
         self, account: str, since: str | None = None, limit: int = 500
-    ) -> Awaitable[ChangePage]: ...
+    ) -> Awaitable[ChangePage | StateTooOld]: ...
+    def compact(self, account: str, through: str) -> Awaitable[int]: ...
+    def message_ids(
+        self, account: str, after: str | None = None, limit: int = 1000
+    ) -> Awaitable[list[str]]: ...
     def read_blob(self, account: str, message_id: str) -> Awaitable[bytes]: ...
 
 @final
@@ -216,7 +293,13 @@ class BlockingRunner:
     def forget(self, account: str) -> ForgetResult: ...
     def health(self) -> Health: ...
     def messages(self, account: str, message_ids: list[str]) -> list[MessageView]: ...
-    def changes(self, account: str, since: str | None = None, limit: int = 500) -> ChangePage: ...
+    def changes(
+        self, account: str, since: str | None = None, limit: int = 500
+    ) -> ChangePage | StateTooOld: ...
+    def compact(self, account: str, through: str) -> int: ...
+    def message_ids(
+        self, account: str, after: str | None = None, limit: int = 1000
+    ) -> list[str]: ...
     def read_blob(self, account: str, message_id: str) -> bytes: ...
 
 def version() -> str: ...

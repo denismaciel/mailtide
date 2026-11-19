@@ -223,14 +223,228 @@ mod _core {
         status: Option<Status>,
     }
 
-    /// Changes to the mirror after a state string.
+    /// Changes to the mirror after a state string, whole commits only.
     #[pyclass(frozen, get_all)]
     struct ChangePage {
-        /// Each change as a dict (`{"Message": {...}}`, `{"MessageDeleted": ...}`, ...).
+        /// The changes, oldest first: `MessageDiscovered`, `MessageImported`,
+        /// `LabelsChanged`, `OverlayChanged`, `MessageDeleted` or
+        /// `LabelDefinitionsChanged` (match on the class or on `kind`).
         changes: Vec<Py<PyAny>>,
         /// The state string to ask from next.
         next: String,
         has_more: bool,
+    }
+
+    /// The requested state was compacted away; rebuild from `message_ids` +
+    /// `messages`, then follow the feed from `status().state`.
+    #[pyclass(frozen, get_all)]
+    struct StateTooOld {
+        kind: &'static str,
+        /// The oldest state the feed can still continue from.
+        oldest: String,
+    }
+
+    fn names(labels: &mailtide::labels::LabelSet) -> Vec<String> {
+        labels.iter().map(|l| l.0.clone()).collect()
+    }
+
+    /// A message row appeared, with the labels Gmail showed then.
+    #[pyclass(frozen, get_all)]
+    struct MessageDiscovered {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        id: String,
+        thread_id: String,
+        labels: Vec<String>,
+    }
+
+    /// The message's raw content was stored for the first time (once per
+    /// message): drive new-mail processing from this.
+    #[pyclass(frozen, get_all)]
+    struct MessageImported {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        id: String,
+        thread_id: String,
+        /// Labels as of the import (`SENT` marks outgoing mail).
+        labels: Vec<String>,
+        internal_date_ms: i64,
+        blob: String,
+        size: u64,
+    }
+
+    /// Gmail's labels for the message changed.
+    #[pyclass(frozen, get_all)]
+    struct LabelsChanged {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        id: String,
+        thread_id: String,
+        added: Vec<String>,
+        removed: Vec<String>,
+    }
+
+    /// Pending user actions changed how the message should look.
+    #[pyclass(frozen, get_all)]
+    struct OverlayChanged {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        id: String,
+        thread_id: String,
+        /// The labels users should see now.
+        labels: Vec<String>,
+    }
+
+    /// The message was deleted in Gmail.
+    #[pyclass(frozen, get_all)]
+    struct MessageDeleted {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        id: String,
+        /// Its thread and last labels, if the mirror held the message.
+        thread_id: Option<String>,
+        labels: Option<Vec<String>>,
+    }
+
+    /// The account's label definitions were replaced.
+    #[pyclass(frozen, get_all)]
+    struct LabelDefinitionsChanged {
+        kind: &'static str,
+        state: String,
+        index: u32,
+    }
+
+    /// One feed entry as its Python class (exhaustive: a new change kind is a
+    /// compile error here).
+    #[allow(clippy::too_many_lines)] // one flat arm per change kind
+    fn change_object(
+        py: Python<'_>,
+        entry: &mailtide::revision::ChangeEntry,
+    ) -> PyResult<Py<PyAny>> {
+        use mailtide::revision::Change;
+        let state = entry.state.encode().0;
+        let index = entry.index;
+        Ok(match &entry.change {
+            Change::MessageDiscovered {
+                id,
+                thread_id,
+                labels,
+            } => Py::new(
+                py,
+                MessageDiscovered {
+                    kind: "message_discovered",
+                    state,
+                    index,
+                    id: id.0.clone(),
+                    thread_id: thread_id.0.clone(),
+                    labels: names(labels),
+                },
+            )?
+            .into_any(),
+            Change::MessageImported {
+                id,
+                thread_id,
+                labels,
+                internal_date,
+                blob,
+                size,
+            } => Py::new(
+                py,
+                MessageImported {
+                    kind: "message_imported",
+                    state,
+                    index,
+                    id: id.0.clone(),
+                    thread_id: thread_id.0.clone(),
+                    labels: names(labels),
+                    internal_date_ms: internal_date.0,
+                    blob: blob.0.clone(),
+                    size: *size,
+                },
+            )?
+            .into_any(),
+            Change::LabelsChanged {
+                id,
+                thread_id,
+                added,
+                removed,
+            } => Py::new(
+                py,
+                LabelsChanged {
+                    kind: "labels_changed",
+                    state,
+                    index,
+                    id: id.0.clone(),
+                    thread_id: thread_id.0.clone(),
+                    added: names(added),
+                    removed: names(removed),
+                },
+            )?
+            .into_any(),
+            Change::OverlayChanged {
+                id,
+                thread_id,
+                labels,
+            } => Py::new(
+                py,
+                OverlayChanged {
+                    kind: "overlay_changed",
+                    state,
+                    index,
+                    id: id.0.clone(),
+                    thread_id: thread_id.0.clone(),
+                    labels: names(labels),
+                },
+            )?
+            .into_any(),
+            Change::MessageDeleted {
+                id,
+                thread_id,
+                labels,
+            } => Py::new(
+                py,
+                MessageDeleted {
+                    kind: "message_deleted",
+                    state,
+                    index,
+                    id: id.0.clone(),
+                    thread_id: thread_id.as_ref().map(|t| t.0.clone()),
+                    labels: labels.as_ref().map(names),
+                },
+            )?
+            .into_any(),
+            Change::LabelDefinitionsChanged => Py::new(
+                py,
+                LabelDefinitionsChanged {
+                    kind: "label_definitions_changed",
+                    state,
+                    index,
+                },
+            )?
+            .into_any(),
+        })
+    }
+
+    /// Raw content of an imported message: where it is and its header facts.
+    #[pyclass(frozen, get_all)]
+    struct MessageContent {
+        /// The blob key (`{account}/{id}.eml` under the blob URL's prefix).
+        blob: String,
+        size: u64,
+        internal_date_ms: i64,
+        rfc822_message_id: Option<String>,
+        in_reply_to: Option<String>,
+        references: Vec<String>,
+        sender: Option<String>,
+        to: Vec<String>,
+        cc: Vec<String>,
+        subject: Option<String>,
+        snippet: Option<String>,
     }
 
     /// A message as the host should show it.
@@ -247,50 +461,41 @@ mod _core {
         unverified: bool,
         pending_actions: u32,
         blocked_actions: u32,
-        imported: bool,
-        size: Option<u64>,
-        internal_date_ms: Option<i64>,
-        rfc822_message_id: Option<String>,
-        in_reply_to: Option<String>,
-        references: Vec<String>,
-        sender: Option<String>,
-        to: Vec<String>,
-        cc: Vec<String>,
-        subject: Option<String>,
-        snippet: Option<String>,
+        /// `None` until the raw content is imported.
+        content: Option<Py<MessageContent>>,
     }
 
-    impl From<mailtide::mirror::MessageView> for MessageView {
-        fn from(view: mailtide::mirror::MessageView) -> Self {
-            let names =
-                |labels: &mailtide::labels::LabelSet| labels.iter().map(|l| l.0.clone()).collect();
-            let headers = view
-                .content
-                .as_ref()
-                .map(|c| c.headers.clone())
-                .unwrap_or_default();
-            Self {
-                labels: names(&view.labels),
-                observed_labels: names(&view.observed_labels),
-                id: view.id.0,
-                thread_id: view.thread_id.0,
-                checkpoint: view.checkpoint.map(|c| c.0),
-                unverified: view.unverified,
-                pending_actions: view.pending_actions,
-                blocked_actions: view.blocked_actions,
-                imported: view.content.is_some(),
-                size: view.content.as_ref().map(|c| c.size),
-                internal_date_ms: view.content.as_ref().map(|c| c.internal_date.0),
-                rfc822_message_id: headers.rfc822_message_id,
-                in_reply_to: headers.in_reply_to,
-                references: headers.references,
-                sender: headers.from,
-                to: headers.to,
-                cc: headers.cc,
-                subject: headers.subject,
-                snippet: headers.snippet,
-            }
-        }
+    fn message_view(py: Python<'_>, view: mailtide::mirror::MessageView) -> PyResult<MessageView> {
+        let content = match view.content {
+            None => None,
+            Some(stored) => Some(Py::new(
+                py,
+                MessageContent {
+                    blob: stored.blob.0,
+                    size: stored.size,
+                    internal_date_ms: stored.internal_date.0,
+                    rfc822_message_id: stored.headers.rfc822_message_id,
+                    in_reply_to: stored.headers.in_reply_to,
+                    references: stored.headers.references,
+                    sender: stored.headers.from,
+                    to: stored.headers.to,
+                    cc: stored.headers.cc,
+                    subject: stored.headers.subject,
+                    snippet: stored.headers.snippet,
+                },
+            )?),
+        };
+        Ok(MessageView {
+            labels: names(&view.labels),
+            observed_labels: names(&view.observed_labels),
+            id: view.id.0,
+            thread_id: view.thread_id.0,
+            checkpoint: view.checkpoint.map(|c| c.0),
+            unverified: view.unverified,
+            pending_actions: view.pending_actions,
+            blocked_actions: view.blocked_actions,
+            content,
+        })
     }
 
     fn parse_action(
@@ -767,6 +972,11 @@ mod _core {
         }
     }
 
+    fn parse_state(state: &str) -> PyResult<StateSeq> {
+        StateSeq::decode(&StateString(state.to_owned()))
+            .map_err(|_| PyValueError::new_err(format!("invalid state string {state:?}")))
+    }
+
     fn parse_since(since: Option<String>) -> PyResult<StateSeq> {
         match since {
             None => Ok(StateSeq(0)),
@@ -777,15 +987,10 @@ mod _core {
 
     fn change_page(page: &mailtide::revision::ChangePage) -> PyResult<ChangePage> {
         Python::attach(|py| {
-            let loads = py.import("json")?.getattr("loads")?;
             let changes = page
                 .changes
                 .iter()
-                .map(|change| {
-                    let text =
-                        serde_json::to_string(change).map_err(|e| error("encode change", e))?;
-                    Ok(loads.call1((text,))?.unbind())
-                })
+                .map(|entry| change_object(py, entry))
                 .collect::<PyResult<Vec<_>>>()?;
             Ok(ChangePage {
                 changes,
@@ -894,7 +1099,7 @@ mod _core {
                 .messages(&account, &ids)
                 .await
                 .map_err(store_error)?;
-            Ok(views.into_iter().map(MessageView::from).collect())
+            Python::attach(|py| views.into_iter().map(|v| message_view(py, v)).collect())
         }
 
         async fn changes(
@@ -902,14 +1107,52 @@ mod _core {
             account: AccountId,
             since: StateSeq,
             limit: u32,
-        ) -> PyResult<ChangePage> {
-            let page = self
+        ) -> PyResult<Py<PyAny>> {
+            let feed = self
                 .inner
                 .store()
                 .changes(&account, since, limit)
                 .await
                 .map_err(store_error)?;
-            change_page(&page)
+            match feed {
+                mailtide::revision::ChangeFeed::Page(page) => {
+                    let page = change_page(&page)?;
+                    Python::attach(|py| Ok(Py::new(py, page)?.into_any()))
+                }
+                mailtide::revision::ChangeFeed::TooOld { oldest } => Python::attach(|py| {
+                    Ok(Py::new(
+                        py,
+                        StateTooOld {
+                            kind: "too_old",
+                            oldest: oldest.encode().0,
+                        },
+                    )?
+                    .into_any())
+                }),
+            }
+        }
+
+        async fn compact(self: Arc<Self>, account: AccountId, through: StateSeq) -> PyResult<u64> {
+            self.inner
+                .store()
+                .compact(&account, through)
+                .await
+                .map_err(store_error)
+        }
+
+        async fn message_ids(
+            self: Arc<Self>,
+            account: AccountId,
+            after: Option<MessageId>,
+            limit: u32,
+        ) -> PyResult<Vec<String>> {
+            let ids = self
+                .inner
+                .store()
+                .message_ids(&account, after.as_ref(), limit)
+                .await
+                .map_err(store_error)?;
+            Ok(ids.into_iter().map(|id| id.0).collect())
         }
 
         async fn read_blob(
@@ -1090,6 +1333,36 @@ mod _core {
             )
         }
 
+        fn compact<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            through: &str,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                self.shared
+                    .clone()
+                    .compact(account_id(account)?, parse_state(through)?),
+            )
+        }
+
+        #[pyo3(signature = (account, after=None, limit=1000))]
+        fn message_ids<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            after: Option<String>,
+            limit: u32,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                self.shared
+                    .clone()
+                    .message_ids(account_id(account)?, after.map(MessageId), limit),
+            )
+        }
+
         fn read_blob<'py>(
             &self,
             py: Python<'py>,
@@ -1233,13 +1506,38 @@ mod _core {
             account: &str,
             since: Option<String>,
             limit: u32,
-        ) -> PyResult<ChangePage> {
+        ) -> PyResult<Py<PyAny>> {
             block(
                 py,
                 self.shared
                     .clone()
                     .changes(account_id(account)?, parse_since(since)?, limit),
             )
+        }
+
+        /// Drop feed entries at or before state string `through`.
+        fn compact(&self, py: Python<'_>, account: &str, through: &str) -> PyResult<u64> {
+            let fut = self
+                .shared
+                .clone()
+                .compact(account_id(account)?, parse_state(through)?);
+            block(py, fut)
+        }
+
+        /// Up to `limit` message ids after `after`, in id order.
+        #[pyo3(signature = (account, after=None, limit=1000))]
+        fn message_ids(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            after: Option<String>,
+            limit: u32,
+        ) -> PyResult<Vec<String>> {
+            let fut =
+                self.shared
+                    .clone()
+                    .message_ids(account_id(account)?, after.map(MessageId), limit);
+            block(py, fut)
         }
 
         /// The raw RFC 822 bytes of an imported message.

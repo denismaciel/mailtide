@@ -5,7 +5,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangePage, StateSeq};
+use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
 
@@ -65,8 +65,21 @@ impl Store for PostgresStore {
         account: &AccountId,
         since: StateSeq,
         limit: u32,
-    ) -> Result<ChangePage, StoreError> {
+    ) -> Result<ChangeFeed, StoreError> {
         self.inner.changes(account, since, limit).await
+    }
+
+    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
+        crate::Store::compact(&self.inner, account, through).await
+    }
+
+    async fn message_ids(
+        &self,
+        account: &AccountId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        crate::Store::message_ids(&self.inner, account, after, limit).await
     }
 
     async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {

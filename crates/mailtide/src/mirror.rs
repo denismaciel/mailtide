@@ -142,6 +142,8 @@ pub struct AccountRecord {
     pub cooldown: Option<Cooldown>,
     /// Seed for deterministic jitter.
     pub rng_seed: u64,
+    /// Change-feed entries at or before this state were compacted away.
+    pub log_floor: StateSeq,
 }
 
 impl AccountRecord {
@@ -157,6 +159,7 @@ impl AccountRecord {
             last_activity: None,
             cooldown: None,
             rng_seed: stable_hash(account.as_str().as_bytes()),
+            log_floor: StateSeq(0),
         }
     }
 }
@@ -537,6 +540,49 @@ pub fn finish(job: &Job, outcome: &JobOutcome) -> Option<Job> {
     }
 }
 
+/// What writing `record` over `previous` changes, for the feed (pure).
+#[must_use]
+pub fn row_changes(previous: Option<&MessageRecord>, record: &MessageRecord) -> Vec<Change> {
+    let mut changes = Vec::new();
+    match previous {
+        None => changes.push(Change::MessageDiscovered {
+            id: record.id.clone(),
+            thread_id: record.thread_id.clone(),
+            labels: record.labels.clone(),
+        }),
+        Some(previous) if previous.labels != record.labels => {
+            changes.push(Change::LabelsChanged {
+                id: record.id.clone(),
+                thread_id: record.thread_id.clone(),
+                added: record
+                    .labels
+                    .difference(&previous.labels)
+                    .cloned()
+                    .collect(),
+                removed: previous
+                    .labels
+                    .difference(&record.labels)
+                    .cloned()
+                    .collect(),
+            });
+        }
+        Some(_) => {}
+    }
+    let newly_imported = matches!(record.content, Content::Imported(_))
+        && !matches!(previous.map(|p| &p.content), Some(Content::Imported(_)));
+    if let (true, Content::Imported(stored)) = (newly_imported, &record.content) {
+        changes.push(Change::MessageImported {
+            id: record.id.clone(),
+            thread_id: record.thread_id.clone(),
+            labels: record.labels.clone(),
+            internal_date: stored.internal_date,
+            blob: stored.blob.clone(),
+            size: stored.size,
+        });
+    }
+    changes
+}
+
 // ------------------------------------------------------------ intent decisions
 
 /// The intents admitting `action` on a message adds, given its labels and
@@ -722,7 +768,7 @@ impl AccountMirror {
             match op {
                 LabelOp::ReplaceAll(labels) => {
                     self.labels.clone_from(labels);
-                    self.log.push((seq, Change::Labels));
+                    self.log.push((seq, Change::LabelDefinitionsChanged));
                 }
             }
         }
@@ -882,11 +928,8 @@ impl AccountMirror {
     fn settle(&mut self, op: &MessageOp, claim: Option<&JobClaim>, seq: StateSeq) {
         let id = match (op, claim) {
             (MessageOp::Tombstone { id, .. }, _) => {
-                let before = self.intents.len();
+                // The deletion itself is the change consumers see.
                 self.intents.retain(|(message, _), _| message != id);
-                if self.intents.len() != before {
-                    self.log.push((seq, Change::Message(id.clone())));
-                }
                 return;
             }
             (MessageOp::Observe(observation), Some(claim))
@@ -910,7 +953,23 @@ impl AccountMirror {
         self.intents
             .retain(|(message, _), intent| message != id || !settles(intent, attempt));
         if self.intents.len() != before {
-            self.log.push((seq, Change::Message(id.clone())));
+            self.log_overlay(id, seq);
+        }
+    }
+
+    /// Record how a message should look now that its intents changed.
+    fn log_overlay(&mut self, id: &MessageId, seq: StateSeq) {
+        if let Some(record) = self.messages.get(id) {
+            let labels = labels::effective(&record.labels, &self.intents_of(id));
+            let thread_id = record.thread_id.clone();
+            self.log.push((
+                seq,
+                Change::OverlayChanged {
+                    id: id.clone(),
+                    thread_id,
+                    labels,
+                },
+            ));
         }
     }
 
@@ -944,7 +1003,7 @@ impl AccountMirror {
                         self.intents
                             .insert((intent.message.clone(), intent.label.clone()), intent);
                     }
-                    self.log.push((seq, Change::Message(target.clone())));
+                    self.log_overlay(&target, seq);
                     self.enqueue_delivery(&target, plan);
                     admitted = true;
                 }
@@ -980,8 +1039,8 @@ impl AccountMirror {
                     if let Some(intent) = self.matching(delivery) {
                         intent.state = IntentState::Blocked(failure.clone());
                         any = true;
-                        self.log
-                            .push((seq, Change::Message(delivery.message.clone())));
+                        let message = delivery.message.clone();
+                        self.log_overlay(&message, seq);
                     }
                 }
                 any
@@ -1104,14 +1163,24 @@ impl AccountMirror {
             MessageEffect::Skip => false,
             MessageEffect::Keep => true,
             MessageEffect::Put(record) => {
-                self.log.push((seq, Change::Message(record.id.clone())));
+                let previous = self.messages.get(&record.id);
+                for change in row_changes(previous, &record) {
+                    self.log.push((seq, change));
+                }
                 self.messages.insert(record.id.clone(), record);
                 true
             }
             MessageEffect::Delete { id, checkpoint } => {
-                self.messages.remove(&id);
+                let previous = self.messages.remove(&id);
                 self.tombstones.insert(id.clone(), checkpoint);
-                self.log.push((seq, Change::MessageDeleted(id)));
+                self.log.push((
+                    seq,
+                    Change::MessageDeleted {
+                        id,
+                        thread_id: previous.as_ref().map(|r| r.thread_id.clone()),
+                        labels: previous.map(|r| r.labels),
+                    },
+                ));
                 true
             }
         };
@@ -1250,6 +1319,43 @@ impl AccountMirror {
     /// ends on a whole commit (a state string names a commit, so a page cut
     /// inside one would lose its remaining changes).
     #[must_use]
+    /// Drop change-feed entries at or before `through` (clamped to the
+    /// current state) once every consumer has processed them. Returns how
+    /// many were removed.
+    pub fn compact(&mut self, through: StateSeq) -> u64 {
+        let through = through.min(self.seq);
+        let before = self.log.len();
+        self.log.retain(|(seq, _)| *seq > through);
+        self.record.log_floor = self.record.log_floor.max(through);
+        (before - self.log.len()) as u64
+    }
+
+    /// Up to `limit` message ids after `after`, in id order (to rebuild a
+    /// consumer's copy, e.g. after `ChangeFeed::TooOld`).
+    #[must_use]
+    pub fn message_ids(&self, after: Option<&MessageId>, limit: u32) -> Vec<MessageId> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.messages
+            .keys()
+            .filter(|id| after.is_none_or(|after| *id > after))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// The feed after `since`, or `TooOld` if that was compacted away.
+    #[must_use]
+    pub fn feed(&self, since: StateSeq, limit: u32) -> crate::revision::ChangeFeed {
+        if since < self.record.log_floor {
+            return crate::revision::ChangeFeed::TooOld {
+                oldest: self.record.log_floor,
+            };
+        }
+        crate::revision::ChangeFeed::Page(self.changes(since, limit))
+    }
+
+    /// Changes after `since` (no compaction check; see [`Self::feed`]).
+    #[must_use]
     pub fn changes(&self, since: StateSeq, limit: u32) -> ChangePage {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX).max(1);
         let after: Vec<&(StateSeq, Change)> =
@@ -1261,8 +1367,24 @@ impl AccountMirror {
             }
         }
         let page = &after[..take];
+        // Pages hold whole commits, so an entry's index is its count within
+        // its state.
+        let mut changes = Vec::with_capacity(page.len());
+        let mut position: Option<(StateSeq, u32)> = None;
+        for (seq, change) in page {
+            let index = match position {
+                Some((current, index)) if current == *seq => index + 1,
+                Some(_) | None => 0,
+            };
+            position = Some((*seq, index));
+            changes.push(crate::revision::ChangeEntry {
+                state: *seq,
+                index,
+                change: change.clone(),
+            });
+        }
         ChangePage {
-            changes: page.iter().map(|(_, change)| change.clone()).collect(),
+            changes,
             next: page.last().map_or(since, |(seq, _)| *seq),
             has_more: after.len() > take,
         }
@@ -1569,7 +1691,12 @@ mod tests {
         assert_eq!(first.changes.len(), 2);
         assert!(first.has_more);
         let rest = mirror.changes(first.next, 10);
-        assert_eq!(rest.changes, vec![Change::Message(MessageId("c".into()))]);
+        let ids: Vec<_> = rest
+            .changes
+            .iter()
+            .filter_map(|e| e.change.message())
+            .collect();
+        assert_eq!(ids, vec![&MessageId("c".into())]);
         assert!(!rest.has_more);
     }
 }

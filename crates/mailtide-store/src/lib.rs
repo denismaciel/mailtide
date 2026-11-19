@@ -16,7 +16,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangePage, StateSeq};
+use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
 
@@ -71,13 +71,30 @@ pub trait Store: Send + Sync {
         attempt: AttemptId,
     ) -> impl Future<Output = Result<ClaimOutcome, StoreError>> + Send;
 
-    /// Changes after `since`, for consumers.
+    /// The change feed after `since`, or `TooOld` if it was compacted away.
     fn changes(
         &self,
         account: &AccountId,
         since: StateSeq,
         limit: u32,
-    ) -> impl Future<Output = Result<ChangePage, StoreError>> + Send;
+    ) -> impl Future<Output = Result<ChangeFeed, StoreError>> + Send;
+
+    /// Drop feed entries at or before `through` once every consumer has
+    /// processed them; later reads from before it get `TooOld`. Returns how
+    /// many were removed.
+    fn compact(
+        &self,
+        account: &AccountId,
+        through: StateSeq,
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
+
+    /// Up to `limit` message ids after `after`, in id order.
+    fn message_ids(
+        &self,
+        account: &AccountId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<MessageId>, StoreError>> + Send;
 
     /// Admit a user action without an engine (no epoch fence), atomically;
     /// the current engine delivers it. Returns how many messages got new

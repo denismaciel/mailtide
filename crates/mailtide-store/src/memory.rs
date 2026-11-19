@@ -9,7 +9,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangePage, StateSeq};
+use mailtide::revision::{ChangeFeed, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome};
 
@@ -92,8 +92,28 @@ impl Store for MemoryStore {
         account: &AccountId,
         since: StateSeq,
         limit: u32,
-    ) -> Result<ChangePage, StoreError> {
-        self.with_account(account, |mirror| mirror.changes(since, limit))
+    ) -> Result<ChangeFeed, StoreError> {
+        self.with_account(account, |mirror| mirror.feed(since, limit))
+    }
+
+    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
+        Ok(self
+            .lock()?
+            .get_mut(account)
+            .map_or(0, |mirror| mirror.compact(through)))
+    }
+
+    async fn message_ids(
+        &self,
+        account: &AccountId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        Ok(self
+            .lock()?
+            .get(account)
+            .map(|mirror| mirror.message_ids(after, limit))
+            .unwrap_or_default())
     }
 
     async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {

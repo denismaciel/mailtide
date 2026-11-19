@@ -77,6 +77,13 @@ where
         ("unverified labels wait for a fresh full observation", |s| {
             Box::pin(unverified(s))
         }),
+        ("the feed records what each commit changed", |s| {
+            Box::pin(feed_records_changes(s))
+        }),
+        (
+            "compaction makes older states too old; ids enumerate the mirror",
+            |s| Box::pin(compaction(s)),
+        ),
         ("change pages never split a commit", |s| {
             Box::pin(whole_commit_pages(s))
         }),
@@ -246,11 +253,13 @@ async fn cursor_fencing<S: Store>(store: &S) -> Result<(), String> {
     let page = store
         .changes(&account(), StateSeq(0), 100)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
     expect(
         !page
             .changes
-            .contains(&Change::Message(MessageId("a".into()))),
+            .iter()
+            .any(|entry| entry.change.message() == Some(&MessageId("a".into()))),
         "a rejected commit must not change anything",
     )?;
     let after = claim(store).await?;
@@ -375,7 +384,8 @@ async fn change_log<S: Store>(store: &S) -> Result<(), String> {
     let first = store
         .changes(&account(), StateSeq(0), 2)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
     expect(
         first.changes.len() == 2 && first.has_more,
         "the first page must hold two changes and more",
@@ -383,9 +393,15 @@ async fn change_log<S: Store>(store: &S) -> Result<(), String> {
     let rest = store
         .changes(&account(), first.next, 10)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
     expect(
-        rest.changes == vec![Change::Message(MessageId("c".into()))] && !rest.has_more,
+        rest.changes
+            .iter()
+            .filter_map(|e| e.change.message())
+            .collect::<Vec<_>>()
+            == vec![&MessageId("c".into())]
+            && !rest.has_more,
         "the second page must hold the rest",
     )
 }
@@ -631,7 +647,8 @@ async fn whole_commit_pages<S: Store>(store: &S) -> Result<(), String> {
         let page = store
             .changes(&account(), since, 2)
             .await
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| format!("{e:?}"))
+            .and_then(page)?;
         seen.extend(page.changes);
         since = page.next;
         if !page.has_more {
@@ -640,9 +657,13 @@ async fn whole_commit_pages<S: Store>(store: &S) -> Result<(), String> {
     }
     let ids: Vec<&str> = seen
         .iter()
-        .filter_map(|change| match change {
-            Change::Message(id) => Some(id.0.as_str()),
-            _ => None,
+        .filter_map(|entry| match &entry.change {
+            Change::MessageDiscovered { id, .. } => Some(id.0.as_str()),
+            Change::MessageImported { .. }
+            | Change::LabelsChanged { .. }
+            | Change::OverlayChanged { .. }
+            | Change::MessageDeleted { .. }
+            | Change::LabelDefinitionsChanged => None,
         })
         .collect();
     expect(
@@ -857,4 +878,108 @@ fn claimed(
         mailtide::jobs::ClaimOutcome::Claimed(jobs) => Ok(jobs),
         mailtide::jobs::ClaimOutcome::Rejected(reason) => Err(format!("claim refused: {reason:?}")),
     }
+}
+
+async fn feed_records_changes<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![observe("a", &["INBOX", "UNREAD"], 1)];
+    apply(store, &c).await?;
+    let mut patch = commit(&snapshot, 1);
+    patch.messages = vec![MessageOp::PatchLabels {
+        id: MessageId("a".into()),
+        add: set(["STARRED"]),
+        remove: set(["UNREAD"]),
+        checkpoint: HistoryId(2),
+    }];
+    apply(store, &patch).await?;
+    let mut deleted = commit(&snapshot, 2);
+    deleted.messages = vec![MessageOp::Tombstone {
+        id: MessageId("a".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(3) },
+    }];
+    apply(store, &deleted).await?;
+    let page = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let kinds: Vec<&Change> = page.changes.iter().map(|e| &e.change).collect();
+    expect(kinds.len() == 3, "one change per commit")?;
+    expect(
+        matches!(kinds[0], Change::MessageDiscovered { labels, .. } if *labels == set(["INBOX", "UNREAD"])),
+        "discovery carries the labels then",
+    )?;
+    expect(
+        matches!(kinds[1], Change::LabelsChanged { added, removed, .. }
+            if *added == set(["STARRED"]) && *removed == set(["UNREAD"])),
+        "label changes carry what was added and removed",
+    )?;
+    expect(
+        matches!(kinds[2], Change::MessageDeleted { thread_id: Some(_), labels: Some(labels), .. }
+            if *labels == set(["INBOX", "STARRED"])),
+        "deletion carries the last thread and labels",
+    )?;
+    expect(
+        page.changes.iter().all(|e| e.index == 0)
+            && page.changes.windows(2).all(|w| w[0].state < w[1].state),
+        "entries are identified by state and index",
+    )
+}
+
+/// The page of a feed read that must not be too old.
+fn page(feed: mailtide::revision::ChangeFeed) -> Result<mailtide::revision::ChangePage, String> {
+    match feed {
+        mailtide::revision::ChangeFeed::Page(page) => Ok(page),
+        mailtide::revision::ChangeFeed::TooOld { oldest } => {
+            Err(format!("too old (oldest {oldest:?})"))
+        }
+    }
+}
+
+async fn compaction<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    for (seq, id) in [(0, "a"), (1, "b"), (2, "c")] {
+        let mut c = commit(&snapshot, seq);
+        c.messages = vec![observe(id, &["INBOX"], seq + 1)];
+        apply(store, &c).await?;
+    }
+    let first = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let middle = first.changes[1].state;
+    let removed = store
+        .compact(&account(), middle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(removed == 2, "the first two commits' entries are removed")?;
+    expect(
+        store
+            .changes(&account(), StateSeq(0), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::revision::ChangeFeed::TooOld { oldest: middle },
+        "reading from before the floor is too old",
+    )?;
+    let rest = store
+        .changes(&account(), middle, 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(rest.changes.len() == 1, "the remaining entry is kept")?;
+    let ids = store
+        .message_ids(&account(), None, 2)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let more = store
+        .message_ids(&account(), ids.last(), 2)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        ids == vec![MessageId("a".into()), MessageId("b".into())]
+            && more == vec![MessageId("c".into())],
+        "ids page in order",
+    )
 }

@@ -18,6 +18,7 @@ from mailtide._core import (
     MessageView,
     ResumeResult,
     RunOutcome,
+    StateTooOld,
 )
 from mailtide.config import Config
 
@@ -141,9 +142,24 @@ class Runner:
         """How these messages should look; unknown ids are left out."""
         return await self._core.messages(account, message_ids)
 
-    async def changes(self, account: str, since: str | None = None, limit: int = 500) -> ChangePage:
-        """Mirror changes after state string ``since`` (``None``: from the start)."""
+    async def changes(
+        self, account: str, since: str | None = None, limit: int = 500
+    ) -> ChangePage | StateTooOld:
+        """Feed entries after state string ``since`` (``None``: from the start), or
+        ``StateTooOld`` if that state was compacted away."""
         return await self._core.changes(account, since, limit)
+
+    async def compact(self, account: str, through: str) -> int:
+        """Drop feed entries at or before state ``through`` once every consumer
+        processed them. Returns how many were removed."""
+        return await self._core.compact(account, through)
+
+    async def message_ids(
+        self, account: str, after: str | None = None, limit: int = 1000
+    ) -> list[str]:
+        """Up to ``limit`` message ids after ``after``, in id order (to rebuild a
+        consumer's copy)."""
+        return await self._core.message_ids(account, after, limit)
 
     async def read_blob(self, account: str, message_id: str) -> bytes:
         """The raw RFC 822 bytes of an imported message."""

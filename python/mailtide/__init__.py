@@ -18,14 +18,22 @@ from mailtide._core import (
     ForgetResult,
     Health,
     InvalidPush,
+    LabelDefinitionsChanged,
+    LabelsChanged,
     MailtideError,
+    MessageContent,
+    MessageDeleted,
+    MessageDiscovered,
+    MessageImported,
     MessageView,
     Notification,
     OutcomeUnknown,
+    OverlayChanged,
     ParsedMessage,
     QuotaGateError,
     ResumeResult,
     RunOutcome,
+    StateTooOld,
     Status,
     StoreUnavailable,
     Superseded,
@@ -36,11 +44,22 @@ from mailtide._core import (
 from mailtide._runner import Runner
 from mailtide.config import Config
 
+#: Every kind of feed entry; ``match`` on it with ``typing.assert_never``.
+Change = (
+    MessageDiscovered
+    | MessageImported
+    | LabelsChanged
+    | OverlayChanged
+    | MessageDeleted
+    | LabelDefinitionsChanged
+)
+
 __all__ = [
     "AccountStatus",
     "Attachment",
     "BlobUnavailable",
     "BlockingRunner",
+    "Change",
     "ChangePage",
     "Config",
     "CorruptState",
@@ -48,15 +67,23 @@ __all__ = [
     "ForgetResult",
     "Health",
     "InvalidPush",
+    "LabelDefinitionsChanged",
+    "LabelsChanged",
     "MailtideError",
+    "MessageContent",
+    "MessageDeleted",
+    "MessageDiscovered",
+    "MessageImported",
     "MessageView",
     "Notification",
     "OutcomeUnknown",
+    "OverlayChanged",
     "ParsedMessage",
     "QuotaGateError",
     "ResumeResult",
     "RunOutcome",
     "Runner",
+    "StateTooOld",
     "Status",
     "StoreUnavailable",
     "Superseded",

@@ -889,7 +889,10 @@ fn durable_gmail_history_checkpoints_delivers_label_notifications_independently_
     );
     // Clients learn of the label change before the body is imported…
     let changes = mirror.changes(consumed, 100);
-    assert_eq!(changes.changes, vec![Change::Message(m("t"))]);
+    assert!(matches!(
+        changes.changes.as_slice(),
+        [entry] if matches!(&entry.change, Change::LabelsChanged { id, .. } if *id == m("t"))
+    ));
     let view = mirror.view(&m("t")).expect("row");
     assert!(view.labels.contains(&LabelId("STARRED".into())));
     // …and acknowledging it leaves the import untouched.
@@ -954,13 +957,22 @@ fn durable_gmail_history_checkpoints_retains_a_newer_notification_when_an_earlie
     let start = mirror.seq;
     seed(&mut mirror, Priority::Live, vec![patch(12, "STARRED")]);
     let broadcast = mirror.changes(start, 100);
-    assert_eq!(broadcast.changes, vec![Change::Message(m("t"))]);
+    assert!(matches!(
+        broadcast.changes.as_slice(),
+        [entry] if matches!(&entry.change, Change::LabelsChanged { id, .. } if *id == m("t"))
+    ));
     seed(&mut mirror, Priority::Live, vec![patch(13, "IMPORTANT")]);
     // Acknowledging the earlier broadcast keeps the newer change.
     let after_ack = mirror.changes(broadcast.next, 100);
-    assert_eq!(after_ack.changes, vec![Change::Message(m("t"))]);
+    assert!(matches!(
+        after_ack.changes.as_slice(),
+        [entry] if matches!(&entry.change, Change::LabelsChanged { id, .. } if *id == m("t"))
+    ));
     assert!(after_ack.next > broadcast.next);
-    assert_eq!(mirror.changes(StateSeq(0), 100).changes.len(), 3);
+    // Three commits: the import (discovered + imported) and two label changes.
+    let all = mirror.changes(StateSeq(0), 100).changes;
+    let commits: std::collections::BTreeSet<_> = all.iter().map(|e| e.state).collect();
+    assert_eq!((all.len(), commits.len()), (4, 3));
 }
 
 /// Zero: mail-history-store > durable Gmail history checkpoints > picks the earliest due job within the highest priority and skips blocked work

@@ -1,6 +1,5 @@
 """BlockingRunner (reqwest, SQLite, blob store) against a fake Gmail over HTTP."""
 
-import json
 import sys
 import sysconfig
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +35,8 @@ def test_bootstrap_import_and_follow(gmail: tuple[Mailbox, str]) -> None:
     assert outcome.cursor_after == 3
     assert outcome.imported == 1
     later = runner.changes(ACCOUNT, since=page.next)
-    assert any("m3" in json.dumps(change) for change in later.changes)
+    imported = [c for c in later.changes if isinstance(c, mailtide.MessageImported)]
+    assert [c.id for c in imported] == ["m3"]
 
 
 def test_actions_overlay_deliver_and_settle(gmail: tuple[Mailbox, str]) -> None:
@@ -51,7 +51,7 @@ def test_actions_overlay_deliver_and_settle(gmail: tuple[Mailbox, str]) -> None:
     assert mailbox.messages["m1"]["labels"] == ["UNREAD"]
     [view] = runner.messages(ACCOUNT, ["m1"])
     assert view.labels == ["UNREAD"]
-    assert view.subject == "Message m1"
+    assert view.content is not None and view.content.subject == "Message m1"
 
     runner.act(ACCOUNT, "mark_read", thread_id="t-m1")
     assert mailbox.messages["m1"]["labels"] == []

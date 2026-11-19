@@ -22,7 +22,7 @@ use mailtide::mirror::{
 use mailtide::outbox::{ActionRequest, Intent, IntentOp, plan_delivery};
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
-use mailtide::revision::{Change, ChangePage, StateSeq};
+use mailtide::revision::{Change, ChangeEntry, ChangeFeed, ChangePage, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome};
 use sqlx::any::AnyRow;
@@ -73,7 +73,9 @@ const MIGRATIONS: &[&[&str]] = &[&[
     "CREATE TABLE IF NOT EXISTS mailtide_changes (
         account TEXT NOT NULL, seq BIGINT NOT NULL, idx BIGINT NOT NULL, change TEXT NOT NULL,
         PRIMARY KEY (account, seq, idx))",
-]];
+],
+// 2: change-feed compaction.
+&["ALTER TABLE mailtide_accounts ADD COLUMN log_floor BIGINT NOT NULL DEFAULT 0"]];
 
 /// A store in a SQL database.
 #[derive(Debug, Clone)]
@@ -324,7 +326,7 @@ impl SqlStore {
         lock: &'static str,
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
-            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq
+            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -357,6 +359,7 @@ impl SqlStore {
                 .map(|c| parse("cooldown", c))
                 .transpose()?,
             rng_seed: get_i("rng_seed")?.cast_unsigned(),
+            log_floor: StateSeq(uint(get_i("log_floor")?)),
         };
         Ok(Some((record, StateSeq(uint(get_i("seq")?)))))
     }
@@ -369,13 +372,13 @@ impl SqlStore {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO mailtide_accounts
-               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (account) DO UPDATE SET
                epoch = excluded.epoch, engine_version = excluded.engine_version, cursor = excluded.cursor,
                sync = excluded.sync, watch_expiration = excluded.watch_expiration,
                last_activity = excluded.last_activity, cooldown = excluded.cooldown,
-               rng_seed = excluded.rng_seed, seq = excluded.seq",
+               rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor",
         )
         .bind(account.as_str())
         .bind(int(record.epoch.0))
@@ -387,6 +390,7 @@ impl SqlStore {
         .bind(record.cooldown.as_ref().map(json).transpose()?)
         .bind(record.rng_seed.cast_signed())
         .bind(int(seq.0))
+        .bind(int(record.log_floor.0))
         .execute(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -814,6 +818,31 @@ impl SqlStore {
         account: &AccountId,
         since: StateSeq,
         limit: u32,
+    ) -> Result<ChangeFeed, StoreError> {
+        let floor = sqlx::query("SELECT log_floor FROM mailtide_accounts WHERE account = $1")
+            .bind(account.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?
+            .map(|row| {
+                row.try_get::<i64, _>("log_floor")
+                    .map_err(|e| corrupt("log_floor", e))
+            })
+            .transpose()?
+            .map_or(StateSeq(0), |f| StateSeq(uint(f)));
+        if since < floor {
+            return Ok(ChangeFeed::TooOld { oldest: floor });
+        }
+        self.change_page(account, since, limit)
+            .await
+            .map(ChangeFeed::Page)
+    }
+
+    async fn change_page(
+        &self,
+        account: &AccountId,
+        since: StateSeq,
+        limit: u32,
     ) -> Result<ChangePage, StoreError> {
         // A page ends on a whole commit: a state string names a commit, so a
         // page cut inside one would lose the rest of it.
@@ -835,7 +864,7 @@ impl SqlStore {
         };
         let cutoff: i64 = last.try_get("seq").map_err(|e| corrupt("seq", e))?;
         let rows = sqlx::query(
-            "SELECT seq, change FROM mailtide_changes WHERE account = $1 AND seq > $2 AND seq <= $3 ORDER BY seq, idx",
+            "SELECT seq, idx, change FROM mailtide_changes WHERE account = $1 AND seq > $2 AND seq <= $3 ORDER BY seq, idx",
         )
         .bind(account.as_str())
         .bind(int(since.0))
@@ -854,7 +883,13 @@ impl SqlStore {
         let mut changes = Vec::new();
         for row in rows {
             let change: String = row.try_get("change").map_err(|e| corrupt("change", e))?;
-            changes.push(parse::<Change>("change", &change)?);
+            let seq: i64 = row.try_get("seq").map_err(|e| corrupt("seq", e))?;
+            let idx: i64 = row.try_get("idx").map_err(|e| corrupt("idx", e))?;
+            changes.push(ChangeEntry {
+                state: StateSeq(uint(seq)),
+                index: u32::try_from(idx).map_err(|e| corrupt("idx", e))?,
+                change: parse::<Change>("change", &change)?,
+            });
         }
         let next = StateSeq(uint(cutoff));
         Ok(ChangePage {
@@ -1114,8 +1149,49 @@ impl crate::Store for SqlStore {
         account: &AccountId,
         since: StateSeq,
         limit: u32,
-    ) -> Result<ChangePage, StoreError> {
+    ) -> Result<ChangeFeed, StoreError> {
         Self::changes(self, account, since, limit).await
+    }
+
+    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
+        let mut tx = self.begin().await?;
+        let Some((mut record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Ok(0);
+        };
+        let through = through.min(seq);
+        let removed = sqlx::query("DELETE FROM mailtide_changes WHERE account = $1 AND seq <= $2")
+            .bind(account.as_str())
+            .bind(int(through.0))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+            .rows_affected();
+        record.log_floor = record.log_floor.max(through);
+        Self::write_account(&mut tx, account, &record, seq).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(removed)
+    }
+
+    async fn message_ids(
+        &self,
+        account: &AccountId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id FROM mailtide_messages WHERE account = $1 AND id > $2 ORDER BY id LIMIT $3",
+        )
+        .bind(account.as_str())
+        .bind(after.map_or("", |id| id.0.as_str()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| unavailable(&e))?;
+        rows.iter()
+            .map(|row| Ok(MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?)))
+            .collect()
     }
 
     async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {
@@ -1320,13 +1396,65 @@ impl crate::Store for SqlStore {
         account: &AccountId,
         ids: &[MessageId],
     ) -> Result<Vec<MessageView>, StoreError> {
-        let mut tx = self.begin().await?;
-        let mut mirror = AccountMirror::new(account.clone());
-        for id in ids {
-            self.load_message_rows(&mut tx, account, id, &mut mirror)
-                .await?;
+        // A view needs only the rows and their intents: two set-based
+        // queries per chunk, not a handful per message.
+        let mut records: BTreeMap<MessageId, MessageRecord> = BTreeMap::new();
+        let mut intents: BTreeMap<MessageId, Vec<Intent>> = BTreeMap::new();
+        for chunk in ids.chunks(VIEW_CHUNK) {
+            let placeholders = (2..chunk.len() + 2)
+                .map(|n| format!("${n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Only numbered placeholders are interpolated; ids are bound.
+            let sql = format!(
+                "SELECT id, thread_id, labels, checkpoint, unverified, content FROM mailtide_messages
+                 WHERE account = $1 AND id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?
+            {
+                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
+                let record = message_from_row(&id, &row)?;
+                records.insert(id, record);
+            }
+            let sql = format!(
+                "SELECT message, intent FROM mailtide_intents WHERE account = $1 AND message IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?
+            {
+                let message: String = row.try_get("message").map_err(|e| corrupt("message", e))?;
+                let text: String = row.try_get("intent").map_err(|e| corrupt("intent", e))?;
+                intents
+                    .entry(MessageId(message))
+                    .or_default()
+                    .push(parse::<Intent>("intent", &text)?);
+            }
         }
-        tx.rollback().await.map_err(|e| unavailable(&e))?;
-        Ok(ids.iter().filter_map(|id| mirror.view(id)).collect())
+        let none = Vec::new();
+        Ok(ids
+            .iter()
+            .filter_map(|id| {
+                records
+                    .get(id)
+                    .map(|record| record.view(intents.get(id).unwrap_or(&none)))
+            })
+            .collect())
     }
 }
+
+/// Ids per `IN (...)` query when reading views (well under every backend's
+/// bind-parameter limit).
+const VIEW_CHUNK: usize = 500;
