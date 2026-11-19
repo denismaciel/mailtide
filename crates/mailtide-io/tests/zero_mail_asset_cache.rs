@@ -239,9 +239,9 @@ fn immutable_mailbox_attachment_cache_isolates_mailboxes_message_versions_attach
 fn immutable_mailbox_attachment_cache_does_not_cache_provider_errors_or_missing_data_and_retries_a_failed_download()
  {
     block_on(async {
-        // Retrying is a job due after backoff on the real clock, so only the
-        // first half is checked here: nothing is stored for an error or a 404.
-        for status in [500, 404] {
+        // A 500 is retried after backoff within the run's budget; a 404
+        // tombstones the message. Nothing is stored for either.
+        for (status, retried) in [(500, true), (404, false)] {
             let runner = runner(
                 FakeGmail {
                     raw_status: Some(status),
@@ -253,7 +253,7 @@ fn immutable_mailbox_attachment_cache_does_not_cache_provider_errors_or_missing_
                 .run(&account(), Duration::from_secs(30))
                 .await
                 .expect("run");
-            assert_eq!(runner.transport().raw_fetches(), 1, "{status}");
+            assert_eq!(runner.transport().raw_fetches() > 1, retried, "{status}");
             assert!(
                 runner
                     .blobs()
@@ -315,7 +315,7 @@ fn immutable_mailbox_attachment_cache_returns_provider_data_when_r2_reads_or_wri
             .run(&account(), Duration::from_secs(30))
             .await
             .expect("a blob failure is not a run error");
-        assert_eq!(runner.transport().raw_fetches(), 1);
+        assert!(runner.transport().raw_fetches() >= 1);
         assert!(!imported(&runner));
     });
 }

@@ -6,7 +6,8 @@
 //! `logging.getLogger(<logger>)` with their fields under
 //! `extra={"mailtide": {...}}`, where the host's handlers and JSON
 //! formatters pick them up. A full queue drops events (counted and reported)
-//! rather than ever slowing a commit.
+//! rather than ever slowing a commit. Dependencies' events (sqlx, hyper) are
+//! not forwarded.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{FilterExt as _, LevelFilter, filter_fn};
 use tracing_subscriber::layer::{Context, SubscriberExt as _};
 use tracing_subscriber::registry::{LookupSpan, Registry};
 
@@ -205,5 +206,8 @@ pub fn dispatch(verbosity: Verbosity, logger: String) -> tracing::Dispatch {
             .spawn(move || drain(&records, &logger, &dropped));
         drop(spawned);
     }
-    tracing::Dispatch::new(Registry::default().with(layer.with_filter(filter)))
+    // Only mailtide's own events: its dependencies (sqlx, hyper) log every
+    // query and connection, which is noise for the host (and query text).
+    let ours = filter_fn(|meta| meta.target().starts_with("mailtide"));
+    tracing::Dispatch::new(Registry::default().with(layer.with_filter(filter.and(ours))))
 }

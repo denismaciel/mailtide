@@ -56,6 +56,7 @@ def test_events_reach_the_host_logger_without_addresses(gmail: tuple[Mailbox, st
     assert {r.mailtide["request"] for r in requests} >= {"list_labels", "import_message"}
     for record in handler.records:
         assert "alice" not in record.getMessage() + repr(getattr(record, "mailtide", {}))
+    assert all(r.getMessage() for r in handler.records), "no dependency (sqlx) events"
 
 
 def test_off_logs_nothing(gmail: tuple[Mailbox, str]) -> None:

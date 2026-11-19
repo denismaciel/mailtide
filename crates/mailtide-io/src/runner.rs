@@ -538,6 +538,31 @@ where
         Ok(Some(Engine::new(snapshot, config)))
     }
 
+    /// Queued work (jobs deferred by the quota gate or backing off, a
+    /// cooldown ending) due within the budget: the account isn't caught up,
+    /// so the run waits for it. Polls and watch renewals end the run; the
+    /// host schedules those. Only on the system clock: a host clock moves
+    /// when the host moves it.
+    fn due_soon(
+        &self,
+        timers: &BTreeMap<TimerKind, Timestamp>,
+        now: Timestamp,
+        deadline: Instant,
+    ) -> Option<Duration> {
+        if !self.clock.can_wait() {
+            return None;
+        }
+        timers
+            .iter()
+            .filter(|(timer, _)| match timer {
+                TimerKind::Jobs | TimerKind::CooldownOver => true,
+                TimerKind::Poll | TimerKind::WatchRenewal => false,
+            })
+            .map(|(_, at)| Duration::from_millis(u64::try_from(at.0 - now.0).unwrap_or(0)))
+            .min()
+            .filter(|wait| Instant::now() + *wait < deadline)
+    }
+
     async fn run_inner(
         &self,
         account: &AccountId,
@@ -619,6 +644,11 @@ where
                 .map(|(timer, _)| *timer)
                 .collect();
             if due.is_empty() {
+                if let Some(wait) = self.due_soon(&timers, clock, deadline) {
+                    pause(wait, progress, &report, started).await;
+                    reported = Instant::now();
+                    continue;
+                }
                 let stop = match engine.status().cooldown {
                     Some(cooldown) if cooldown.until > clock => StopReason::CoolingDown {
                         until: cooldown.until,
@@ -978,6 +1008,28 @@ fn stopped(engine: &Engine) -> Option<StopReason> {
         Stopped::Superseded(_) => StopReason::Superseded,
         Stopped::Blocked(reason) => StopReason::Blocked(reason.clone()),
     })
+}
+
+/// Sleep `wait`, reporting progress every second (heartbeats continue).
+async fn pause(
+    wait: Duration,
+    progress: Option<&(dyn Fn(&Progress) + Sync)>,
+    report: &SyncReport,
+    started: Instant,
+) {
+    let until = Instant::now() + wait;
+    while Instant::now() < until {
+        let step = PROGRESS_EVERY.min(until.saturating_duration_since(Instant::now()));
+        tokio::time::sleep(step).await;
+        if let Some(progress) = progress {
+            progress(&Progress {
+                commits: report.commits,
+                imported: report.imported,
+                gmail_requests: report.gmail_requests,
+                elapsed: started.elapsed(),
+            });
+        }
+    }
 }
 
 fn finish(mut report: SyncReport, engine: &Engine, stop: StopReason) -> RunOutcome {

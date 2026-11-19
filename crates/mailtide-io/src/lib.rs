@@ -43,6 +43,13 @@ impl Clock {
         Self(Some(std::sync::Arc::new(now)))
     }
 
+    /// Whether the runner may sleep on this clock: only the system clock
+    /// passes by itself; a host clock (tests) moves when the host moves it.
+    #[must_use]
+    pub fn can_wait(&self) -> bool {
+        self.0.is_none()
+    }
+
     /// The current time.
     #[must_use]
     pub fn now(&self) -> mailtide::Timestamp {
