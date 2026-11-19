@@ -1,0 +1,15 @@
+[package]
+name = "mailtide"
+description = "Sans-IO Gmail sync engine core"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

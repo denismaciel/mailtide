@@ -1,0 +1,27 @@
+[package]
+name = "mailtide-py"
+description = "Python bindings for the mailtide sync engine"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+mailtide = { path = "../mailtide", version = "0.1.0" }
+mailtide-gmail = { path = "../mailtide-gmail", version = "0.1.0" }
+mailtide-io = { path = "../mailtide-io", version = "0.1.0" }
+mailtide-mime = { path = "../mailtide-mime", version = "0.1.0" }
+mailtide-store = { path = "../mailtide-store", version = "0.1.0" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"] }
+
+[lints]
+workspace = true

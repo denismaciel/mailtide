@@ -1,0 +1,40 @@
+# cargo-deny: licenses, advisories, bans and sources for every dependency.
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # chrono and humantime are unmaintained with no fixed release; both arrive
+  # only through object_store (blob storage). Revisit when object_store moves
+  # off them.
+  { id = "RUSTSEC-2026-0543", reason = "transitive via object_store; no safe upgrade" },
+  { id = "RUSTSEC-2026-0542", reason = "transitive via object_store; no safe upgrade" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,16 @@
+[package]
+name = "mailtide-sim"
+description = "Deterministic Gmail simulator for testing the mailtide engine"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+mailtide = { path = "../mailtide", version = "0.1.0" }
+
+[lints]
+workspace = true

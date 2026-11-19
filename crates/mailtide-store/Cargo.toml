@@ -1,0 +1,22 @@
+[package]
+name = "mailtide-store"
+description = "Storage for mailtide: Store trait, memory/SQLite/Postgres stores, conformance suite"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mailtide = { path = "../mailtide", version = "0.1.0" }
+serde = "1"
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "postgres", "sqlite", "tls-rustls-ring-webpki"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pollster = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }

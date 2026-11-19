@@ -1,0 +1,614 @@
+{
+  "source": "https://github.com/Mail-0/Zero",
+  "license": "MIT",
+  "commit": "4b642dfd9890a1fdcb1b98a177fe74ca3142c445",
+  "tests": [
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "counts only unimported threads toward import progress, including blocked work but excluding verification duplicates and deletions"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "pauses backfill without blocking newly arrived live work or counting a quota denial as a failed request"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "rolls back both import jobs and the cursor when applying a history page fails"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "retains a notification arriving during a sync and coalesces duplicate thread jobs"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "does not delete a newly re-enqueued import when an older import finishes"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "resumes full reconciliation after restart and preserves signals received during it"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "does not let notification storms bypass a persisted retry cooldown"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "uses a longer polling interval when the mailbox is inactive"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "deduplicates browser cache misses without resetting a failed import cooldown"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "delivers label notifications independently of a backfill for the same thread"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "prioritizes live changes and opened threads ahead of historical imports"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "retains a newer notification when an earlier broadcast is acknowledged"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "picks the earliest due job within the highest priority and skips blocked work"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "reports the next due job or notification, delaying paused backfill"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints"
+      ],
+      "title": "uses a supplied thread count for import progress"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints",
+        "AI runs"
+      ],
+      "title": "dispatches only after the import lands, and survives a restart"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints",
+        "AI runs"
+      ],
+      "title": "re-dispatches a lost run when its lease expires"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints",
+        "AI runs"
+      ],
+      "title": "keeps the row when newer mail arrives during a run"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints",
+        "AI runs"
+      ],
+      "title": "retries with backoff, never repeats an attempted draft, and gives up"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-history-store.test.ts",
+      "path": [
+        "durable Gmail history checkpoints",
+        "AI runs"
+      ],
+      "title": "caps concurrent runs and waits for a lease instead of spinning"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "preserves app MUTE state without dispatching it as a Gmail label"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "preserves snooze through history refresh, restart and durable custom-label actions"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "migrates only recognized app state and never resurrects removed state from stale summaries"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "migrates synthetic labels from stored threads only once"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "keeps thread state across snapshot message replacement and clears it on final deletion"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "derives unread from every message and preserves pending intent across imports"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "does not clear a newer toggle when an older batch completes"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "coalesces toggles, survives store reconstruction, and respects retry times"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "rolls back local state and intent together on failure"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "applies provider changes per message without producing outbound writes"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "limits batches to 1000 messages and enforces a persisted mailbox cooldown"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "does not mutate drafts when marking a thread unread"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "avoids provider writes when the requested state is already observed"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "retains acknowledged intent until history confirms it, then accepts a later external edit"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "ignores history older than a fresh snapshot using numeric Gmail IDs"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "does not resurrect a deleted message from stale R2 contents"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "reconciles delivered intent against a fresh post-delivery snapshot"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "prunes messages absent from an authoritative snapshot after an expired history cursor"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "migrates legacy unread retries and delivered intents without losing their versions"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "coalesces archive, star and read intent into one compatible Gmail modification"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "preserves a newer spam-to-inbox restore while older trash delivery and history complete"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "queues an inbox restore after trash even before Gmail confirms implicit inbox removal"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "does not resend an already delivered custom-label intent when the same action is repeated"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "retries custom-label and importance intent independently without modifying drafts"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "protects a rapid unstar from an older star acknowledgment without losing archive intent"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "confirms archive and star independently, then accepts a Gmail-side restore"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "groups only messages with identical add/remove sets and deduplicates bulk IDs"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "rolls back an entire bulk action and its local summaries if any thread is missing"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "durable message label outbox"
+      ],
+      "title": "respects per-request Gmail label-array limits without losing remaining intent"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-store.test.ts",
+      "path": [
+        "app-kept thread labels"
+      ],
+      "title": "survive re-imports and provider deltas and are cleared with the thread"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-policy.test.ts",
+      "path": [
+        "durable label routing"
+      ],
+      "title": "splits snooze and unsnooze while retaining provider custom IDs and unknown names"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-policy.test.ts",
+      "path": [
+        "durable label routing"
+      ],
+      "title": "records Gmail implicit inbox removal without mutating caller arrays"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-policy.test.ts",
+      "path": [
+        "durable label routing"
+      ],
+      "title": "routes reversible system moves and custom-label combinations together"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-label-policy.test.ts",
+      "path": [
+        "durable label routing"
+      ],
+      "title": "keeps synthetic names, immutable labels and mixed operations out of the provider-ID outbox"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-schedule.test.ts",
+      "path": [
+        "mailbox continuation repair"
+      ],
+      "title": "coalesces repeated cron wakeups and replaces obsolete retry deadlines"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-schedule.test.ts",
+      "path": [
+        "mailbox continuation repair"
+      ],
+      "title": "keeps independent callback schedules and leaves executing callbacks alone"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-cleanup-store.test.ts",
+      "path": [
+        "durable spam cleanup"
+      ],
+      "title": "protects a real no-op restore after discovery and survives reconstruction"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-cleanup-store.test.ts",
+      "path": [
+        "durable spam cleanup"
+      ],
+      "title": "recovers admitted cleanup intent and fences partial-delivery retries against a newer restore"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-cleanup-store.test.ts",
+      "path": [
+        "durable spam cleanup"
+      ],
+      "title": "resumes discovery and delivery without changing the enumerated set"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-cleanup-store.test.ts",
+      "path": [
+        "durable spam cleanup"
+      ],
+      "title": "preserves newer user moves even after their provider acknowledgment and no-op restores"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-cleanup-store.test.ts",
+      "path": [
+        "durable spam cleanup"
+      ],
+      "title": "rolls back target removal alongside intent admission and persists deferrals"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-asset-cache.test.ts",
+      "path": [
+        "immutable mailbox attachment cache"
+      ],
+      "title": "coalesces downloads and reuses R2 bytes across cache reconstruction"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-asset-cache.test.ts",
+      "path": [
+        "immutable mailbox attachment cache"
+      ],
+      "title": "isolates mailboxes, message versions, attachment IDs and MIME metadata keys"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-asset-cache.test.ts",
+      "path": [
+        "immutable mailbox attachment cache"
+      ],
+      "title": "does not cache provider errors or missing data and retries a failed download"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-asset-cache.test.ts",
+      "path": [
+        "immutable mailbox attachment cache"
+      ],
+      "title": "returns provider data when R2 reads or writes fail"
+    },
+    {
+      "suite": "apps/server/src/lib/mail-asset-cache.test.ts",
+      "path": [
+        "immutable mailbox attachment cache"
+      ],
+      "title": "caches legitimate empty attachment bytes and empty MIME inventories"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-push.test.ts",
+      "path": [
+        "Gmail push admission"
+      ],
+      "title": "accepts wrapped and unwrapped notifications"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-push.test.ts",
+      "path": [
+        "Gmail push admission"
+      ],
+      "title": "rejects malformed history IDs and subscriptions from another project"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-push.test.ts",
+      "path": [
+        "Gmail push admission"
+      ],
+      "title": "accepts the numeric history IDs emitted in actual Gmail push messages"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-push-auth.test.ts",
+      "path": [
+        "signed Pub/Sub identity verification"
+      ],
+      "title": "accepts a correctly signed token for the configured audience and service account"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-push-auth.test.ts",
+      "path": [
+        "signed Pub/Sub identity verification"
+      ],
+      "title": "rejects an audience mismatch and unverified or different email identity"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-push-auth.test.ts",
+      "path": [
+        "signed Pub/Sub identity verification"
+      ],
+      "title": "rejects invalid signatures"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-auth.test.ts",
+      "path": [
+        "Gmail transport quota gate"
+      ],
+      "title": "releases in-flight capacity after a successful request"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-auth.test.ts",
+      "path": [
+        "Gmail transport quota gate"
+      ],
+      "title": "charges every SDK call with its method cost and ambient priority"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-auth.test.ts",
+      "path": [
+        "Gmail transport quota gate"
+      ],
+      "title": "does not send an HTTP request when shared capacity is exhausted"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-auth.test.ts",
+      "path": [
+        "Gmail transport quota gate"
+      ],
+      "title": "leaves People and OAuth requests outside the Gmail budget"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-auth.test.ts",
+      "path": [
+        "Gmail transport quota gate"
+      ],
+      "title": "keeps priority isolated between concurrent asynchronous requests"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-auth.test.ts",
+      "path": [
+        "Gmail transport quota gate"
+      ],
+      "title": "publishes provider Retry-After to a shared mailbox cooldown"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-client.test.ts",
+      "path": [
+        "Gmail request admission with persisted quota storage"
+      ],
+      "title": "defers saturated backfill without sending it, admits live and foreground work, then resumes"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-client.test.ts",
+      "path": [
+        "Gmail request admission with persisted quota storage"
+      ],
+      "title": "keeps live and foreground slots available during backfill and releases leases on failure"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-store.test.ts",
+      "path": [
+        "shared Gmail quota"
+      ],
+      "title": "bounds concurrent requests, reserves foreground slots and recovers leaked leases after eviction"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-store.test.ts",
+      "path": [
+        "shared Gmail quota"
+      ],
+      "title": "shares the project budget across mailbox instances without partially charging a denial"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-store.test.ts",
+      "path": [
+        "shared Gmail quota"
+      ],
+      "title": "isolates mailbox limits and rolls usage out conservatively at minute boundaries"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-store.test.ts",
+      "path": [
+        "shared Gmail quota"
+      ],
+      "title": "reserves headroom for live sync and user requests when backfill is full"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-store.test.ts",
+      "path": [
+        "shared Gmail quota"
+      ],
+      "title": "persists mailbox and project cooldowns and never shortens Retry-After"
+    },
+    {
+      "suite": "apps/server/src/lib/gmail-quota-store.test.ts",
+      "path": [
+        "shared Gmail quota"
+      ],
+      "title": "charges current documented method costs, including uploads and attachments"
+    }
+  ]
+}

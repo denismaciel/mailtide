@@ -1,0 +1,28 @@
+[package]
+name = "mailtide-io"
+description = "Async driver for mailtide: executes engine commands against Gmail, blobs and stores"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mailtide = { path = "../mailtide", version = "0.1.0" }
+mailtide-gmail = { path = "../mailtide-gmail", version = "0.1.0" }
+mailtide-store = { path = "../mailtide-store", version = "0.1.0" }
+bytes = "1"
+object_store = { version = "0.14", features = ["gcp", "aws", "fs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
+tracing = "0.1"
+url = "2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+base64 = "0.23"
+serde_json = "1"

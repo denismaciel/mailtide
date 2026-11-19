@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+repository = "https://github.com/denismaciel/mailtide"
+authors = ["Denis Maciel <denispmaciel@gmail.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+# Sync impls of async traits (memory store, test fakes) are intended.
+unused_async_trait_impl = "allow"

@@ -1,0 +1,42 @@
+[project]
+name = "mailtide"
+version = "0.1.0"
+description = "Watertight Gmail sync engine: sans-IO Rust core with Python bindings"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Denis Maciel", email = "denispmaciel@gmail.com" }]
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "crates/mailtide-py/Cargo.toml"
+module-name = "mailtide._core"
+python-packages = ["mailtide"]
+python-source = "python"
+
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "Cargo.lock" },
+  { file = "crates/**/*.rs" },
+  { file = "crates/**/Cargo.toml" },
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["docs/reviews"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

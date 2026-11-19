@@ -1,0 +1,167 @@
+name: Release
+
+# A v* tag on main builds, tests and publishes wheels to a GitHub release with
+# a flat package index (index.html), which uv and pip install from:
+#
+#   [[tool.uv.index]]
+#   name = "mailtide"
+#   url = "https://github.com/denismaciel/mailtide/releases/download/vX.Y.Z/index.html"
+#   format = "flat"
+#   explicit = true
+#
+# workflow_dispatch only builds and tests, to check the matrix.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require the tagged commit on the default branch
+        if: github.ref_type == 'tag'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor HEAD "refs/remotes/origin/$DEFAULT_BRANCH"
+      - name: Require the tag to match the Cargo and Python versions
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          python_version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          test "$cargo_version" = "$python_version" || { echo "Cargo $cargo_version != Python $python_version" >&2; exit 1; }
+          if [ -n "$TAG" ]; then
+            test "$TAG" = "v$cargo_version" || { echo "tag $TAG != v$cargo_version" >&2; exit 1; }
+          fi
+
+  checks:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  wheels:
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { os: macos-15, target: aarch64 }
+          - { os: macos-15-intel, target: x86_64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # One abi3 wheel per platform serves every CPython >= 3.12.
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test-wheels:
+    needs: wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e
+        with:
+          enable-cache: false
+          version: "0.12.4"
+          python-version: ${{ matrix.python }}
+      # Test the built wheel, not a source build: no Rust toolchain here.
+      - name: Install the wheel and run the Python tests
+        run: |
+          uv venv --python "${{ matrix.python }}" .wheel-test
+          uv pip install --python .wheel-test --no-index --find-links dist mailtide
+          uv pip install --python .wheel-test pytest
+          # The repo root has no importable mailtide: this tests the wheel.
+          .wheel-test/bin/python -m pytest -q tests -p no:cacheprovider
+
+  sdist:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  github-release:
+    if: github.repository == 'denismaciel/mailtide' && github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [checks, test-wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: sdist
+          path: dist
+      - name: Publish the release with a flat package index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum -- *.whl *.tar.gz > SHA256SUMS)
+          # A flat index lets uv pick the platform wheel and lock its hash.
+          {
+            printf '<!doctype html><html><body>\n'
+            while read -r checksum filename; do
+              printf '<a href="https://github.com/%s/releases/download/%s/%s#sha256=%s">%s</a><br>\n' \
+                "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$filename" "$checksum" "$filename"
+            done < dist/SHA256SUMS
+            printf '</body></html>\n'
+          } > dist/index.html
+          # Published artifacts are immutable: consumers pin their hashes.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; cut a new version" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
