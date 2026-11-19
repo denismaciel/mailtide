@@ -38,8 +38,6 @@ pub enum ReconcileReason {
     Bootstrap,
     /// History returned 404.
     HistoryExpired,
-    /// The profile's history id went backwards (mailbox restore).
-    HistoryRewound,
     /// An operator asked for it.
     Requested,
 }
@@ -63,11 +61,6 @@ pub enum ReconcileStep {
         /// The history id captured before listing.
         baseline: HistoryId,
     },
-    /// Enumeration finished; committing the baseline as the cursor.
-    Complete {
-        /// The history id captured before listing.
-        baseline: HistoryId,
-    },
 }
 
 impl ReconcileProgress {
@@ -85,9 +78,9 @@ impl ReconcileProgress {
     pub fn baseline(&self) -> Option<HistoryId> {
         match &self.step {
             ReconcileStep::CaptureBaseline => None,
-            ReconcileStep::Enumerating { baseline, .. }
-            | ReconcileStep::Verifying { baseline }
-            | ReconcileStep::Complete { baseline } => Some(*baseline),
+            ReconcileStep::Enumerating { baseline, .. } | ReconcileStep::Verifying { baseline } => {
+                Some(*baseline)
+            }
         }
     }
 
@@ -138,9 +131,7 @@ impl ReconcileProgress {
                     }
                 }
             }
-            step @ (ReconcileStep::CaptureBaseline
-            | ReconcileStep::Verifying { .. }
-            | ReconcileStep::Complete { .. }) => step,
+            step @ (ReconcileStep::CaptureBaseline | ReconcileStep::Verifying { .. }) => step,
         };
         Self { step, ..self }
     }
@@ -156,9 +147,7 @@ impl ReconcileProgress {
             } => labels_left
                 .first()
                 .map(|label| (label, page_token.as_ref())),
-            ReconcileStep::CaptureBaseline
-            | ReconcileStep::Verifying { .. }
-            | ReconcileStep::Complete { .. } => None,
+            ReconcileStep::CaptureBaseline | ReconcileStep::Verifying { .. } => None,
         }
     }
 }

@@ -524,7 +524,7 @@ pub fn enqueue(existing: Option<&Job>, new: &NewJob) -> Job {
 pub fn finish(job: &Job, outcome: &JobOutcome) -> Option<Job> {
     match outcome {
         JobOutcome::Done => None,
-        JobOutcome::Retry { due_at, .. } => Some(Job {
+        JobOutcome::Retry { due_at } => Some(Job {
             failed_attempts: job.failed_attempts.saturating_add(1),
             state: JobState::Ready { due_at: *due_at },
             ..job.clone()
@@ -633,7 +633,6 @@ pub fn settles(intent: &Intent, confirmation: AttemptId) -> bool {
     match intent.state {
         IntentState::Pending | IntentState::Blocked(_) => false,
         IntentState::Delivered { attempt, .. } => confirmation > attempt,
-        IntentState::Unresolved => true,
     }
 }
 
@@ -884,11 +883,7 @@ impl AccountMirror {
             // A delivered action waits for a fetch claimed after it.
             let awaiting = self.messages.contains_key(&id)
                 && self.intents.values().any(|intent| {
-                    intent.message == id
-                        && matches!(
-                            intent.state,
-                            IntentState::Delivered { .. } | IntentState::Unresolved
-                        )
+                    intent.message == id && matches!(intent.state, IntentState::Delivered { .. })
                 });
             let verify_queued = self.jobs.contains_key(&JobKind::Verify(id.clone()));
             let import_queued = self.jobs.contains_key(&JobKind::Import(id.clone()));

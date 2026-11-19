@@ -24,7 +24,7 @@ use mailtide::outbox::{
 };
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
-use mailtide::retry::{Cooldown, QuotaTarget, Retryable, RetryableFailure};
+use mailtide::retry::{Cooldown, QuotaTarget};
 use mailtide::schedule::TimerKind;
 use mailtide::state::StoreSnapshot;
 use mailtide::{Command, Engine, EngineConfig};
@@ -247,11 +247,6 @@ impl Mailbox {
         commit.jobs = vec![JobOp::Finish {
             claim: job.claim(),
             outcome: JobOutcome::Retry {
-                failure: RetryableFailure {
-                    class: Retryable::Transient,
-                    retry_after: None,
-                    detail: String::new(),
-                },
                 due_at: Timestamp(due_at),
             },
         }];

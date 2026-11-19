@@ -104,10 +104,7 @@ impl ActionCounts {
     pub fn add(&mut self, state: &crate::outbox::IntentState) {
         match state {
             crate::outbox::IntentState::Pending => self.pending += 1,
-            crate::outbox::IntentState::Delivered { .. }
-            | crate::outbox::IntentState::Unresolved => {
-                self.delivered += 1;
-            }
+            crate::outbox::IntentState::Delivered { .. } => self.delivered += 1,
             crate::outbox::IntentState::Blocked(_) => self.blocked += 1,
         }
     }

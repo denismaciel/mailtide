@@ -846,7 +846,6 @@ fn durable_gmail_history_checkpoints_deduplicates_browser_cache_misses_without_r
     );
     let kind = JobKind::Import(m("t"));
     let retry = JobOutcome::Retry {
-        failure: transient(),
         due_at: Timestamp(60_000),
     };
     let outcome = claim_finish(&mut mirror, &kind, 1, retry, Vec::new());

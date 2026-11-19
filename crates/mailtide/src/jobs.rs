@@ -10,7 +10,7 @@
 
 use crate::ids::{MessageId, Timestamp};
 use crate::quota::Priority;
-use crate::retry::{BlockingFailure, RetryableFailure};
+use crate::retry::BlockingFailure;
 
 /// What a job does.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -133,8 +133,6 @@ pub enum JobOutcome {
     Done,
     /// Failed; try again at `due_at` (counts a failed attempt).
     Retry {
-        /// The failure.
-        failure: RetryableFailure,
         /// When to try again.
         due_at: Timestamp,
     },

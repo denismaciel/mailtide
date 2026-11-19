@@ -304,10 +304,7 @@ impl Engine {
             import: self.state.sync.reconcile().map(|progress| ImportProgress {
                 discovered: self.discovered,
                 imported: self.imported,
-                discovery_complete: matches!(
-                    progress.step,
-                    ReconcileStep::Verifying { .. } | ReconcileStep::Complete { .. }
-                ),
+                discovery_complete: matches!(progress.step, ReconcileStep::Verifying { .. }),
             }),
         }
     }
@@ -550,12 +547,9 @@ impl Engine {
         let sync = match (reason, self.state.cursor) {
             (ReconcileReason::Bootstrap, None) => SyncState::Bootstrapping(progress),
             (ReconcileReason::Bootstrap, Some(_))
-            | (
-                ReconcileReason::HistoryExpired
-                | ReconcileReason::HistoryRewound
-                | ReconcileReason::Requested,
-                _,
-            ) => SyncState::Reconciling(progress),
+            | (ReconcileReason::HistoryExpired | ReconcileReason::Requested, _) => {
+                SyncState::Reconciling(progress)
+            }
         };
         self.change_sync(sync, now)
     }
@@ -603,9 +597,7 @@ impl Engine {
                 }
                 None => self.finish_reconcile(progress, now),
             },
-            ReconcileStep::Verifying { .. } | ReconcileStep::Complete { .. } => {
-                self.finish_reconcile(progress, now)
-            }
+            ReconcileStep::Verifying { .. } => self.finish_reconcile(progress, now),
         }
     }
 
@@ -1148,10 +1140,7 @@ impl Engine {
         match waiting {
             Waiting::Job(job) => {
                 let due_at = self.backoff.next(job.failed_attempts, failure, now, seed);
-                let outcome = JobOutcome::Retry {
-                    failure: failure.clone(),
-                    due_at,
-                };
+                let outcome = JobOutcome::Retry { due_at };
                 vec![
                     self.finish_job(&job, outcome, Vec::new(), now),
                     self.schedule_jobs(due_at),

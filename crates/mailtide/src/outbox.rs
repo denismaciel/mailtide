@@ -54,7 +54,7 @@ impl Intent {
     #[must_use]
     pub fn overlays(&self) -> bool {
         match self.state {
-            IntentState::Pending | IntentState::Delivered { .. } | IntentState::Unresolved => true,
+            IntentState::Pending | IntentState::Delivered { .. } => true,
             IntentState::Blocked(_) => false,
         }
     }
@@ -73,8 +73,6 @@ pub enum IntentState {
         /// The delivery's job claim.
         attempt: crate::jobs::AttemptId,
     },
-    /// Sent but the outcome is unknown (timeout); resolved by a `get`.
-    Unresolved,
     /// Gmail can't apply it until an operator acts.
     Blocked(crate::retry::BlockingFailure),
 }
