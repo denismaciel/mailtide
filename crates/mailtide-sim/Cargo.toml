@@ -10,7 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-mailtide = { path = "../mailtide", version = "0.2.0" }
+mailtide = { path = "../mailtide", version = "0.2.1" }
 
 [lints]
 workspace = true

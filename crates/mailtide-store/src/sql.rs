@@ -591,9 +591,6 @@ impl SqlStore {
                 }
             }
         }
-        for id in &ids {
-            self.load_message_rows(tx, account, id, &mut mirror).await?;
-        }
         if let Some(baseline) = finish_baseline {
             let rows = sqlx::query(
                 "SELECT id FROM mailtide_messages WHERE account = $1 AND (checkpoint IS NULL OR checkpoint < $2)
@@ -605,84 +602,102 @@ impl SqlStore {
             .await
             .map_err(|e| unavailable(&e))?;
             for row in rows {
-                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
-                if !ids.contains(&id) {
-                    self.load_message_rows(tx, account, &id, &mut mirror)
-                        .await?;
-                    ids.insert(id);
-                }
+                ids.insert(MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?));
             }
         }
+        let ids: Vec<MessageId> = ids.into_iter().collect();
+        Self::load_rows(tx, account, &ids, &mut mirror).await?;
         Ok(mirror)
     }
 
-    async fn load_message_rows(
-        &self,
+    /// Load the rows of `ids` into `mirror`: five set-based queries per chunk
+    /// of ids, not five per message (a mailbox's first reconcile touches every
+    /// message; per-row loading took longer than any timeout on large ones).
+    async fn load_rows(
         tx: &mut Transaction<'static, Any>,
         account: &AccountId,
-        id: &MessageId,
+        ids: &[MessageId],
         mirror: &mut AccountMirror,
     ) -> Result<(), StoreError> {
-        let message = sqlx::query(
-            "SELECT thread_id, labels, checkpoint, unverified, content FROM mailtide_messages WHERE account = $1 AND id = $2",
-        )
-        .bind(account.as_str())
-        .bind(id.0.as_str())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| unavailable(&e))?;
-        if let Some(row) = message {
-            mirror
-                .messages
-                .insert(id.clone(), message_from_row(id, &row)?);
-        }
-        let tombstone = sqlx::query(
-            "SELECT checkpoint FROM mailtide_tombstones WHERE account = $1 AND id = $2",
-        )
-        .bind(account.as_str())
-        .bind(id.0.as_str())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| unavailable(&e))?;
-        if let Some(row) = tombstone {
-            let checkpoint: i64 = row
-                .try_get("checkpoint")
-                .map_err(|e| corrupt("checkpoint", e))?;
-            mirror
-                .tombstones
-                .insert(id.clone(), HistoryId(uint("checkpoint", checkpoint)?));
-        }
-        let jobs = sqlx::query(
-            "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure
-             FROM mailtide_jobs WHERE account = $1 AND message = $2",
-        )
-        .bind(account.as_str())
-        .bind(id.0.as_str())
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|e| unavailable(&e))?;
-        for row in jobs {
-            let job = job_from_row(&row)?;
-            mirror.jobs.insert(job.kind.clone(), job);
-        }
-        for intent in load_intents(tx, account, id).await? {
-            mirror
-                .intents
-                .insert((intent.message.clone(), intent.label.clone()), intent);
-        }
-        let seen = sqlx::query("SELECT scope FROM mailtide_seen WHERE account = $1 AND id = $2")
-            .bind(account.as_str())
-            .bind(id.0.as_str())
+        for chunk in ids.chunks(VIEW_CHUNK) {
+            let placeholders = (2..chunk.len() + 2)
+                .map(|n| format!("${n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let fetch = |sql: String| {
+                let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+                for id in chunk {
+                    query = query.bind(id.0.as_str());
+                }
+                query
+            };
+            // Only numbered placeholders are interpolated; ids are bound.
+            for row in fetch(format!(
+                "SELECT id, thread_id, labels, checkpoint, unverified, content FROM mailtide_messages
+                 WHERE account = $1 AND id IN ({placeholders})"
+            ))
             .fetch_all(&mut **tx)
             .await
-            .map_err(|e| unavailable(&e))?;
-        for row in seen {
-            let scope: String = row.try_get("scope").map_err(|e| corrupt("scope", e))?;
-            mirror
-                .seen
-                .entry(id.clone())
-                .or_default()
-                .insert(scope_from(&scope)?);
+            .map_err(|e| unavailable(&e))?
+            {
+                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
+                let record = message_from_row(&id, &row)?;
+                mirror.messages.insert(id, record);
+            }
+            for row in fetch(format!(
+                "SELECT id, checkpoint FROM mailtide_tombstones WHERE account = $1 AND id IN ({placeholders})"
+            ))
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+            {
+                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
+                let checkpoint: i64 = row
+                    .try_get("checkpoint")
+                    .map_err(|e| corrupt("checkpoint", e))?;
+                mirror
+                    .tombstones
+                    .insert(id, HistoryId(uint("checkpoint", checkpoint)?));
+            }
+            for row in fetch(format!(
+                "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure
+                 FROM mailtide_jobs WHERE account = $1 AND message IN ({placeholders})"
+            ))
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+            {
+                let job = job_from_row(&row)?;
+                mirror.jobs.insert(job.kind.clone(), job);
+            }
+            for row in fetch(format!(
+                "SELECT intent FROM mailtide_intents WHERE account = $1 AND message IN ({placeholders})"
+            ))
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+            {
+                let text: String = row.try_get("intent").map_err(|e| corrupt("intent", e))?;
+                let intent = parse::<Intent>("intent", &text)?;
+                mirror
+                    .intents
+                    .insert((intent.message.clone(), intent.label.clone()), intent);
+            }
+            for row in fetch(format!(
+                "SELECT id, scope FROM mailtide_seen WHERE account = $1 AND id IN ({placeholders})"
+            ))
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+            {
+                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
+                let scope: String = row.try_get("scope").map_err(|e| corrupt("scope", e))?;
+                mirror
+                    .seen
+                    .entry(id)
+                    .or_default()
+                    .insert(scope_from(&scope)?);
+            }
         }
         Ok(())
     }
@@ -1284,12 +1299,31 @@ async fn write_seen(
         }
         removed.entry(id).or_default().extend(old.difference(new));
     }
+    // Finishing a reconcile clears every message's marks: delete them by
+    // scope in chunks, not one statement per row.
+    let mut by_scope: BTreeMap<String, Vec<&MessageId>> = BTreeMap::new();
     for (id, scopes) in removed {
         for scope in scopes {
-            sqlx::query("DELETE FROM mailtide_seen WHERE account = $1 AND id = $2 AND scope = $3")
+            by_scope.entry(scope_code(scope)).or_default().push(id);
+        }
+    }
+    for (scope, ids) in by_scope {
+        for chunk in ids.chunks(VIEW_CHUNK) {
+            let placeholders = (3..chunk.len() + 3)
+                .map(|n| format!("${n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Only numbered placeholders are interpolated; ids are bound.
+            let sql = format!(
+                "DELETE FROM mailtide_seen WHERE account = $1 AND scope = $2 AND id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql))
                 .bind(account)
-                .bind(id.0.as_str())
-                .bind(scope_code(scope))
+                .bind(scope.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            query
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| unavailable(&e))?;
