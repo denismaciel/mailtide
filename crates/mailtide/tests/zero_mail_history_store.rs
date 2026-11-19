@@ -159,7 +159,10 @@ mod common {
             )
             .expect("current epoch");
         assert_eq!(
-            claimed.iter().map(mailtide::jobs::ClaimedJob::kind).collect::<Vec<_>>(),
+            claimed
+                .iter()
+                .map(mailtide::jobs::ClaimedJob::kind)
+                .collect::<Vec<_>>(),
             vec![kind.clone()]
         );
         let claim = claimed[0].claim();
@@ -315,6 +318,7 @@ mod common {
                             .mirror
                             .claim_jobs(epoch, limit, now, attempt)
                             .unwrap_or_default(),
+                        next_due: self.mirror.next_due(),
                     }),
                     CommandKind::DeleteBlob { .. } => Some(EventKind::BlobDeleted { command: id }),
                     CommandKind::ReportStatus(_) => None,

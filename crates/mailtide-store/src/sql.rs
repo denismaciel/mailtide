@@ -928,10 +928,21 @@ impl SqlStore {
                 attempt,
             });
         }
+        let row = sqlx::query(
+            "SELECT MIN(due_at) AS due FROM mailtide_jobs WHERE account = $1 AND state = 'ready'",
+        )
+        .bind(account.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| unavailable(&e))?;
+        let next_due: Option<i64> = row.try_get("due").map_err(|e| corrupt("due_at", e))?;
         tx.commit()
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
-        Ok(ClaimOutcome::Claimed(claimed))
+        Ok(ClaimOutcome::Claimed {
+            jobs: claimed,
+            next_due: next_due.map(Timestamp),
+        })
     }
 
     pub(crate) async fn changes(

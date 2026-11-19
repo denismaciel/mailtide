@@ -6,7 +6,7 @@ from pathlib import Path
 import mailtide
 import pytest
 from conftest import make_config, tokens
-from mailtide.config import Blobs, Config, Database, Http
+from mailtide.config import Blobs, Config, Database, Engine, Http
 from mailtide.testing import FakeGmail, ManualClock
 
 ACCOUNT = "alice@example.com"
@@ -59,3 +59,29 @@ def test_a_manual_clock_reaches_confirmation_without_sleeping() -> None:
         runner.run(ACCOUNT, budget_s=30)
         [view] = runner.messages(ACCOUNT, ["m1"])
         assert view.pending_actions == 0 and view.labels == ["UNREAD"]
+
+
+def test_a_fresh_runner_wakes_for_a_pending_confirmation() -> None:
+    """A delivered action's confirmation is queued in the store; a new runner
+    (no timers of its own) must still ask to be woken for it, not at the
+    next poll."""
+    clock = ManualClock()
+    with FakeGmail() as gmail:
+        gmail.add("m1", ["INBOX"])
+        config = Config(
+            Database("sqlite::memory:"),
+            Blobs("memory:///"),
+            http=Http(gmail_origin=gmail.origin),
+            engine=Engine(confirm_timeout_s=5, poll_active_s=600, poll_idle_s=600),
+        )
+        runner = mailtide.BlockingRunner(config, tokens, clock=clock)
+        runner.migrate()
+        runner.run(ACCOUNT, budget_s=30)
+        delivered = runner.act(ACCOUNT, "archive", message_ids=["m1"])
+        assert delivered.stop == "idle"
+        start = clock()
+        assert delivered.next_run_at_ms is not None
+        assert delivered.next_run_at_ms <= start + 5_000
+        again = runner.run(ACCOUNT, budget_s=30)  # a new engine, same store
+        assert again.next_run_at_ms is not None
+        assert again.next_run_at_ms <= start + 5_000, again.next_run_at_ms - start

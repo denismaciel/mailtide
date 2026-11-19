@@ -103,6 +103,12 @@ where
             "blocking wraps the stored state, not the engine's view",
             |s| Box::pin(block_wraps_stored_state(s)),
         ),
+        ("claims follow priority, then due time, then kind", |s| {
+            Box::pin(claim_order(s))
+        }),
+        ("claims report when the next ready job is due", |s| {
+            Box::pin(claims_report_next_due(s))
+        }),
     ];
     let mut results = Vec::new();
     for (name, case) in cases {
@@ -876,7 +882,7 @@ fn claimed(
     outcome: mailtide::jobs::ClaimOutcome,
 ) -> Result<Vec<mailtide::jobs::ClaimedJob>, String> {
     match outcome {
-        mailtide::jobs::ClaimOutcome::Claimed(jobs) => Ok(jobs),
+        mailtide::jobs::ClaimOutcome::Claimed { jobs, .. } => Ok(jobs),
         mailtide::jobs::ClaimOutcome::Rejected(reason) => Err(format!("claim refused: {reason:?}")),
     }
 }
@@ -982,5 +988,81 @@ async fn compaction<S: Store>(store: &S) -> Result<(), String> {
         ids == vec![MessageId("a".into()), MessageId("b".into())]
             && more == vec![MessageId("c".into())],
         "ids page in order",
+    )
+}
+
+fn enqueue(kind: JobKind, priority: mailtide::quota::Priority, due_at: i64) -> JobOp {
+    JobOp::Enqueue(mailtide::jobs::NewJob {
+        kind,
+        priority,
+        due_at: Timestamp(due_at),
+    })
+}
+
+/// SQL orders claims in its query and memory in `pick_next`: pin the order
+/// so they can't drift.
+async fn claim_order<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::quota::Priority::{Backfill, Foreground, Live};
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    let m = |id: &str| MessageId(id.into());
+    c.jobs = vec![
+        enqueue(JobKind::Import(m("late")), Live, 5),
+        enqueue(JobKind::Import(m("early")), Live, 1),
+        enqueue(JobKind::Import(m("backfill")), Backfill, 0),
+        enqueue(JobKind::BlobCleanup(m("early")), Live, 1),
+        enqueue(JobKind::Verify(m("early")), Live, 1),
+        enqueue(JobKind::Import(m("user")), Foreground, 9),
+        enqueue(JobKind::Import(m("future")), Foreground, 100),
+    ];
+    apply(store, &c).await?;
+    let mut order = Vec::new();
+    for attempt in 1..=7 {
+        let jobs = store
+            .claim_jobs(
+                &account(),
+                snapshot.epoch,
+                1,
+                Timestamp(10),
+                AttemptId(attempt),
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .and_then(claimed)?;
+        order.extend(jobs.iter().map(mailtide::jobs::ClaimedJob::kind));
+    }
+    let expected = vec![
+        JobKind::Import(m("user")),
+        JobKind::Import(m("early")),
+        JobKind::Verify(m("early")),
+        JobKind::BlobCleanup(m("early")),
+        JobKind::Import(m("late")),
+        JobKind::Import(m("backfill")),
+    ];
+    expect(order == expected, &format!("claim order {order:?}"))
+}
+
+async fn claims_report_next_due<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::jobs::ClaimOutcome;
+    use mailtide::quota::Priority::Live;
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.jobs = vec![
+        enqueue(JobKind::Import(MessageId("now".into())), Live, 0),
+        enqueue(JobKind::Verify(MessageId("later".into())), Live, 60_000),
+        enqueue(JobKind::Verify(MessageId("latest".into())), Live, 90_000),
+    ];
+    apply(store, &c).await?;
+    let outcome = store
+        .claim_jobs(&account(), snapshot.epoch, 10, Timestamp(0), AttemptId(1))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let ClaimOutcome::Claimed { jobs, next_due } = outcome else {
+        return Err("the claim must succeed".into());
+    };
+    expect(jobs.len() == 1, "only the due job is claimed")?;
+    expect(
+        next_due == Some(Timestamp(60_000)),
+        &format!("the running job doesn't count; the next is at 60s, got {next_due:?}"),
     )
 }

@@ -106,6 +106,8 @@ pub enum EventKind {
         command: CommandId,
         /// The claimed jobs, each now held by the command's attempt.
         jobs: Vec<crate::jobs::ClaimedJob>,
+        /// When the earliest job left ready is due.
+        next_due: Option<crate::ids::Timestamp>,
     },
     /// The store refused the claim: another engine holds the account.
     JobsClaimRejected {

@@ -115,6 +115,7 @@ impl Host {
                         .mirror
                         .claim_jobs(epoch, limit, now, attempt)
                         .unwrap_or_default(),
+                    next_due: self.mirror.next_due(),
                 }),
                 CommandKind::DeleteBlob { .. } => Some(EventKind::BlobDeleted { command: id }),
                 CommandKind::ReportStatus(_) => None,

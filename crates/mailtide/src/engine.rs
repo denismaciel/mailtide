@@ -269,7 +269,11 @@ impl Engine {
             } => self.on_watch(command, expiration, now),
             EventKind::CommitApplied { commit } => self.on_applied(commit, now),
             EventKind::CommitRejected { commit, reason } => self.on_rejected(commit, reason, now),
-            EventKind::JobsClaimed { command, jobs } => self.on_claimed(command, jobs, now),
+            EventKind::JobsClaimed {
+                command,
+                jobs,
+                next_due,
+            } => self.on_claimed(command, jobs, next_due, now),
             EventKind::JobsClaimRejected { command, reason } => {
                 if self.waiting.remove(&command) != Some(Waiting::Claim) {
                     return Vec::new();
@@ -722,6 +726,7 @@ impl Engine {
         &mut self,
         command: CommandId,
         jobs: Vec<ClaimedJob>,
+        next_due: Option<Timestamp>,
         now: Timestamp,
     ) -> Vec<Command> {
         if self.waiting.remove(&command) != Some(Waiting::Claim) {
@@ -761,6 +766,12 @@ impl Engine {
                     });
                 }
             }
+        }
+        // Wake for queued future work this engine has no timer for (queued
+        // with a delay, or before a restart). Work already due but left by
+        // the claim limit is picked up as running jobs finish.
+        if let Some(due) = next_due.filter(|due| *due > now) {
+            out.push(self.schedule_jobs(due));
         }
         if out.is_empty() {
             return vec![self.status_command()];
@@ -1456,6 +1467,7 @@ mod tests {
         let commands = engine.handle(event(EventKind::JobsClaimed {
             command: claim,
             jobs: vec![job],
+            next_due: None,
         }));
         let import = commands
             .iter()

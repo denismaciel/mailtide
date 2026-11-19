@@ -1270,6 +1270,13 @@ impl AccountMirror {
         u32::try_from(admitted).unwrap_or(u32::MAX)
     }
 
+    /// When the earliest ready job is due (see [`crate::jobs::next_due`]).
+    #[must_use]
+    pub fn next_due(&self) -> Option<Timestamp> {
+        let jobs: Vec<Job> = self.jobs.values().cloned().collect();
+        crate::jobs::next_due(&jobs)
+    }
+
     /// Claim up to `limit` due jobs for `attempt`, for the engine of `epoch`.
     /// A claim from an older engine is refused, so its jobs can't be held by
     /// an engine that no longer exists.

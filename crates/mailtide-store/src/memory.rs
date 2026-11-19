@@ -81,7 +81,10 @@ impl Store for MemoryStore {
     ) -> Result<ClaimOutcome, StoreError> {
         self.with_account(account, |mirror| {
             match mirror.claim_jobs(epoch, limit, now, attempt) {
-                Ok(jobs) => ClaimOutcome::Claimed(jobs),
+                Ok(jobs) => ClaimOutcome::Claimed {
+                    jobs,
+                    next_due: mirror.next_due(),
+                },
                 Err(rejection) => ClaimOutcome::Rejected(rejection),
             }
         })

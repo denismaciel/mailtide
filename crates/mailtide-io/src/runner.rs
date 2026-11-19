@@ -549,9 +549,11 @@ where
                 .claim_jobs(&account, epoch, limit, now, attempt)
                 .await
             {
-                Ok(ClaimOutcome::Claimed(jobs)) => {
-                    Ok(Some(EventKind::JobsClaimed { command: id, jobs }))
-                }
+                Ok(ClaimOutcome::Claimed { jobs, next_due }) => Ok(Some(EventKind::JobsClaimed {
+                    command: id,
+                    jobs,
+                    next_due,
+                })),
                 Ok(ClaimOutcome::Rejected(reason)) => Ok(Some(EventKind::JobsClaimRejected {
                     command: id,
                     reason,

@@ -74,7 +74,12 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
     /// These jobs are now held by the claim's attempt (possibly none).
-    Claimed(Vec<ClaimedJob>),
+    Claimed {
+        /// The claimed jobs.
+        jobs: Vec<ClaimedJob>,
+        /// When the earliest job left ready becomes due (see [`next_due`]).
+        next_due: Option<Timestamp>,
+    },
     /// The store refused: another engine holds the account.
     Rejected(crate::commit::Rejection),
 }
@@ -249,6 +254,20 @@ pub fn pick_next(jobs: &[Job], now: Timestamp) -> Option<&Job> {
                 .then(a.kind.cmp(&b.kind))
         })
         .map(|(job, _)| job)
+}
+
+/// When the earliest ready job among `jobs` is due: the engine wakes then
+/// even if it has no timer of its own for it (after a restart, or for work
+/// queued with a delay, like a delivery's confirmation). Running and blocked
+/// jobs don't count.
+#[must_use]
+pub fn next_due(jobs: &[Job]) -> Option<Timestamp> {
+    jobs.iter()
+        .filter_map(|job| match job.state {
+            JobState::Ready { due_at } => Some(due_at),
+            JobState::Running(_) | JobState::Blocked(_) => None,
+        })
+        .min()
 }
 
 #[cfg(test)]
