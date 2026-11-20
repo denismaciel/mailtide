@@ -137,7 +137,8 @@ The store keeps, per account:
 - **thread** (derived at read time, never stored): Gmail's `threadId` groups
   messages; the empty id is never a thread. A thread's labels are the union of
   its non-draft messages' effective labels (trash and spam members included;
-  a draft contributes nothing), and it is unread if any non-draft message is
+  a draft contributes nothing, although Gmail's `threads.list` also lists a
+  thread under a label only its draft carries), and it is unread if any non-draft message is
   [Z]. Its messages are ordered by (`internal_date`, id), oldest first, with
   messages not yet imported (no date yet) after them, by id; its latest
   message is the newest *imported* non-draft one. Participants are `From`,

@@ -22,7 +22,9 @@ pub struct ThreadView {
     /// (`internal_date`, id), oldest first, then members awaiting import, by
     /// id.
     pub messages: Vec<MessageView>,
-    /// The union of the non-draft members' effective labels.
+    /// The union of the non-draft members' effective labels. Gmail's own
+    /// `threads.list` also lists a thread under a label only its draft
+    /// carries; a host wanting that adds the drafts' labels from `messages`.
     pub labels: LabelSet,
     /// Whether some non-draft member is effectively unread.
     pub unread: bool,

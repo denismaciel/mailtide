@@ -391,5 +391,7 @@ Unknowns (`scripts/features.py unknowns threads` prints the tests):
   internalDate; if wrong, only presentation differs.
 - `threads-label-union-matches-gmails-listing`: Gmail lists a thread under a
   label when any message carries it; if wrong, the host filters members.
+  Confirmed; a draft's labels count in Gmail's listing too, which `labels`
+  leaves out, so that is documented next to `labels` (Rust, Python, SPEC §4).
 - `threads-history-names-the-thread`: history and list entries always carry
   threadId; if wrong, the empty id is never grouped.

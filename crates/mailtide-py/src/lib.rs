@@ -593,7 +593,9 @@ mod _core {
         /// Every member, drafts included: imported ones oldest first by
         /// `internal_date_ms` then id, then those awaiting import, by id.
         messages: Vec<Py<MessageView>>,
-        /// The union of the non-draft members' labels, pending actions applied.
+        /// The union of the non-draft members' labels, pending actions applied
+        /// (Gmail's `threads.list` also counts a draft's labels; those are in
+        /// `messages`).
         labels: Vec<String>,
         /// Some non-draft member is unread.
         unread: bool,
