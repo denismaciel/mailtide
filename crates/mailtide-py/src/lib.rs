@@ -1803,7 +1803,11 @@ mod _core {
             // commit until the reader is through it.
             self.inner
                 .store()
-                .compact(&account, through.at.compactable())
+                .compact(
+                    &account,
+                    &mailtide::revision::Retention::new(Timestamp(0))
+                        .through(through.at.compactable()),
+                )
                 .await
                 .map_err(store_error)
         }

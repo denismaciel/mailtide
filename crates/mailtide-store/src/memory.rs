@@ -10,7 +10,10 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timest
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
+use mailtide::revision::{
+    AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
+    StateSeq,
+};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 use mailtide::thread::ThreadView;
@@ -154,10 +157,35 @@ impl Store for MemoryStore {
         self.on_account(account, untracked, |mirror| mirror.feed(since, limit))
     }
 
-    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
-        Ok(self.lock()?.get_mut(account).map_or(0, |mirror| {
-            mirror.compact(&mailtide::revision::Retention::new(Timestamp(0)).through(through))
-        }))
+    async fn compact(&self, account: &AccountId, retention: &Retention) -> Result<u64, StoreError> {
+        self.on_account(account, 0, |mirror| mirror.compact(retention))
+    }
+
+    async fn ack(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+        at: FeedPosition,
+        now: Timestamp,
+    ) -> Result<AckOutcome, StoreError> {
+        self.with_account(account, |mirror| mirror.ack(consumer, at, now))
+    }
+
+    async fn consumers(&self, account: &AccountId) -> Result<ConsumerList, StoreError> {
+        let untracked = ConsumerList {
+            generation: 0,
+            floor: StateSeq(0),
+            cursors: Vec::new(),
+        };
+        self.on_account(account, untracked, |mirror| mirror.consumer_list())
+    }
+
+    async fn drop_consumer(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+    ) -> Result<bool, StoreError> {
+        self.on_account(account, false, |mirror| mirror.drop_consumer(consumer))
     }
 
     async fn message_ids(

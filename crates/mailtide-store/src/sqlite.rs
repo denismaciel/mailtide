@@ -6,7 +6,9 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timest
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
+use mailtide::revision::{
+    AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
+};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 use mailtide::thread::ThreadView;
@@ -80,8 +82,30 @@ impl Store for SqliteStore {
         self.inner.changes(account, since, limit).await
     }
 
-    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
-        crate::Store::compact(&self.inner, account, through).await
+    async fn compact(&self, account: &AccountId, retention: &Retention) -> Result<u64, StoreError> {
+        crate::Store::compact(&self.inner, account, retention).await
+    }
+
+    async fn ack(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+        at: FeedPosition,
+        now: Timestamp,
+    ) -> Result<AckOutcome, StoreError> {
+        crate::Store::ack(&self.inner, account, consumer, at, now).await
+    }
+
+    async fn consumers(&self, account: &AccountId) -> Result<ConsumerList, StoreError> {
+        crate::Store::consumers(&self.inner, account).await
+    }
+
+    async fn drop_consumer(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+    ) -> Result<bool, StoreError> {
+        crate::Store::drop_consumer(&self.inner, account, consumer).await
     }
 
     async fn message_ids(
@@ -155,6 +179,7 @@ impl Store for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailtide::revision::StateSeq;
 
     #[tokio::test]
     async fn passes_the_conformance_suite() {
@@ -247,7 +272,22 @@ mod tests {
             "changes",
             store.changes(account, StateSeq(0).into(), 10).await.err(),
         );
-        refused("compact", store.compact(account, StateSeq(1)).await.err());
+        let retention = Retention::new(now).through(StateSeq(1));
+        refused("compact", store.compact(account, &retention).await.err());
+        let consumer = ConsumerName::parse("reader").expect("a valid name");
+        let position = FeedPosition {
+            generation: 1,
+            at: StateSeq(0).into(),
+        };
+        refused(
+            "ack",
+            store.ack(account, &consumer, position, now).await.err(),
+        );
+        refused("consumers", store.consumers(account).await.err());
+        refused(
+            "drop_consumer",
+            store.drop_consumer(account, &consumer).await.err(),
+        );
         refused(
             "message_ids",
             store.message_ids(account, None, 10).await.err(),
@@ -545,7 +585,7 @@ mod tests {
             .expect("store");
         store.migrate().await.expect("migrate");
         // The documented downgrade, after forgetting the later migrations
-        // (an index that migrating again keeps).
+        // (what they add, migrating again keeps).
         for statement in [
             "DELETE FROM mailtide_schema WHERE version > 5",
             "DELETE FROM mailtide_schema WHERE version = 5",
@@ -569,6 +609,100 @@ mod tests {
             SchemaState::Current {
                 version: SCHEMA_VERSION
             }
+        );
+    }
+
+    /// The consumers migration creates an empty table beside an existing
+    /// log: the log and its floor are kept, and no consumer is registered.
+    /// Reverting it (drop the table, forget the version) loses only the
+    /// cursors. Found by its statement: its number is assigned when it
+    /// lands.
+    #[tokio::test]
+    async fn the_consumers_migration_applies_to_an_existing_database() {
+        use crate::sql::{SchemaState, migrations};
+        let all = migrations();
+        let index = all
+            .iter()
+            .position(|m| {
+                m.statements
+                    .iter()
+                    .any(|s| s.contains("mailtide_consumers"))
+            })
+            .expect("the consumers migration");
+        let version = all[index].version;
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        let run = |statements: Vec<String>| {
+            let store = &store;
+            async move {
+                for statement in statements {
+                    store
+                        .inner
+                        .execute_for_tests(&statement)
+                        .await
+                        .expect("statement");
+                }
+            }
+        };
+        run(all[..index]
+            .iter()
+            .flat_map(|m| m.statements.clone())
+            .collect())
+        .await;
+        // An account at the previous version: commits 1 to 4, compacted
+        // through 2.
+        let change = serde_json::to_string(&mailtide::revision::Change::LabelDefinitionsChanged)
+            .expect("json");
+        run(vec![
+            "INSERT INTO mailtide_accounts
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity,
+                cooldown, rng_seed, seq, log_floor, generation)
+             VALUES ('a@example.com', 1, 1, 7, '\"Live\"', NULL, NULL, NULL, 0, 4, 2, 1)"
+                .to_owned(),
+            format!(
+                "INSERT INTO mailtide_changes (account, seq, idx, change)
+                 VALUES ('a@example.com', 3, 0, '{change}'), ('a@example.com', 4, 0, '{change}')"
+            ),
+        ])
+        .await;
+        run(all[index..]
+            .iter()
+            .flat_map(|m| m.statements.clone())
+            .collect())
+        .await;
+        let account = AccountId("a@example.com".into());
+        let list = store.consumers(&account).await.expect("consumers");
+        assert_eq!((list.generation, list.floor), (1, StateSeq(2)));
+        assert!(list.cursors.is_empty(), "no cursors");
+        match store
+            .changes(&account, StateSeq(2).into(), 10)
+            .await
+            .expect("changes")
+        {
+            ChangeFeed::Page(page) => assert_eq!(page.changes.len(), 2, "the log is kept"),
+            ChangeFeed::TooOld { .. } => panic!("the floor is kept, not raised"),
+        }
+        assert_eq!(
+            store.compact(&account, &Retention::new(Timestamp(0))).await,
+            Ok(0),
+            "no consumer and no bound: nothing"
+        );
+        // The documented downgrade, after the later migrations.
+        run(vec![
+            format!("DELETE FROM mailtide_schema WHERE version > {version}"),
+            "DROP TABLE mailtide_consumers".to_owned(),
+            format!("DELETE FROM mailtide_schema WHERE version = {version}"),
+        ])
+        .await;
+        assert!(matches!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind { applied, .. } if applied == version - 1
+        ));
+        store.migrate().await.expect("migrate again");
+        assert_eq!(
+            store.consumers(&account).await.map(|list| list.cursors),
+            Ok(Vec::new())
         );
     }
 
@@ -734,7 +868,13 @@ mod tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].message_count, 3);
         assert_eq!(read[1].labels.len(), 0, "the archive overlays");
+        // After forgetting the later migrations (what they add, migrating
+        // again keeps).
         for statement in [
+            format!(
+                "DELETE FROM mailtide_schema WHERE version > {}",
+                migration.version
+            ),
             "DROP INDEX mailtide_messages_thread".to_owned(),
             format!(
                 "DELETE FROM mailtide_schema WHERE version = {}",

@@ -6,7 +6,9 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timest
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
+use mailtide::revision::{
+    AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
+};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 use mailtide::thread::ThreadView;
@@ -80,8 +82,30 @@ impl Store for PostgresStore {
         self.inner.changes(account, since, limit).await
     }
 
-    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
-        crate::Store::compact(&self.inner, account, through).await
+    async fn compact(&self, account: &AccountId, retention: &Retention) -> Result<u64, StoreError> {
+        crate::Store::compact(&self.inner, account, retention).await
+    }
+
+    async fn ack(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+        at: FeedPosition,
+        now: Timestamp,
+    ) -> Result<AckOutcome, StoreError> {
+        crate::Store::ack(&self.inner, account, consumer, at, now).await
+    }
+
+    async fn consumers(&self, account: &AccountId) -> Result<ConsumerList, StoreError> {
+        crate::Store::consumers(&self.inner, account).await
+    }
+
+    async fn drop_consumer(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+    ) -> Result<bool, StoreError> {
+        crate::Store::drop_consumer(&self.inner, account, consumer).await
     }
 
     async fn message_ids(

@@ -19,7 +19,10 @@ use mailtide::labels::{LabelSet, set};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::{Action, ActionRequest, IntentOp, ReadState};
 use mailtide::quota::Priority;
-use mailtide::revision::{Change, ChangeEntry, FeedCursor, StateSeq};
+use mailtide::revision::{
+    AckOutcome, Change, ChangeEntry, ChangeFeed, ConsumerName, FeedCursor, FeedPosition, Retention,
+    StateSeq,
+};
 use mailtide::state::StoreSnapshot;
 use mailtide::thread::ThreadView;
 
@@ -129,6 +132,7 @@ where
     cases.extend(feed_page_cases());
     cases.extend(thread_cases());
     cases.extend(isolation_cases());
+    cases.extend(consumer_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -187,6 +191,43 @@ fn feed_page_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
         }),
         ("a page hydrates only its own imports", |s| {
             Box::pin(a_page_hydrates_only_its_own_imports(s))
+        }),
+    ]
+}
+
+/// The cases of consumer cursors and the compaction that waits for them.
+fn consumer_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        ("compaction waits for the slowest consumer", |s| {
+            Box::pin(compaction_waits_for_the_slowest_consumer(s))
+        }),
+        ("compaction without consumers is unchanged", |s| {
+            Box::pin(compaction_without_consumers_is_unchanged(s))
+        }),
+        ("an explicit bound cannot pass a live consumer", |s| {
+            Box::pin(an_explicit_bound_cannot_pass_a_live_consumer(s))
+        }),
+        ("an idle consumer is cut off after max_idle", |s| {
+            Box::pin(an_idle_consumer_is_cut_off_after_max_idle(s))
+        }),
+        ("a caught-up consumer survives a quiet period", |s| {
+            Box::pin(a_caught_up_consumer_survives_a_quiet_period(s))
+        }),
+        ("a lost consumer can start again", |s| {
+            Box::pin(a_lost_consumer_can_start_again(s))
+        }),
+        ("a dropped consumer stops holding the log", |s| {
+            Box::pin(a_dropped_consumer_stops_holding_the_log(s))
+        }),
+        ("acks are unfenced and never touch the mirror", |s| {
+            Box::pin(acks_are_unfenced_and_never_touch_the_mirror(s))
+        }),
+        (
+            "forget removes cursors; a new generation starts clean",
+            |s| Box::pin(forget_removes_cursors_and_a_new_generation_starts_clean(s)),
+        ),
+        ("a consumer inside a commit keeps it", |s| {
+            Box::pin(a_consumer_inside_a_commit_keeps_it(s))
         }),
     ]
 }
@@ -1317,7 +1358,7 @@ async fn compaction_keeps_a_commit_a_reader_is_inside<S: Store>(store: &S) -> Re
         "it holds the commit it is inside",
     )?;
     let removed = store
-        .compact(&account(), inside.compactable())
+        .compact(&account(), &bound(inside.compactable()))
         .await
         .map_err(|e| format!("{e:?}"))?;
     expect(removed == 1, "only the first commit is removed")?;
@@ -1327,7 +1368,7 @@ async fn compaction_keeps_a_commit_a_reader_is_inside<S: Store>(store: &S) -> Re
         "the reader continues where it was",
     )?;
     store
-        .compact(&account(), second)
+        .compact(&account(), &bound(second))
         .await
         .map_err(|e| format!("{e:?}"))?;
     expect(
@@ -1679,7 +1720,7 @@ async fn compaction<S: Store>(store: &S) -> Result<(), String> {
         .and_then(page)?;
     let middle = first.changes[1].state;
     let removed = store
-        .compact(&account(), middle)
+        .compact(&account(), &bound(middle))
         .await
         .map_err(|e| format!("{e:?}"))?;
     expect(removed == 2, "the first two commits' entries are removed")?;
@@ -2458,5 +2499,335 @@ async fn a_page_hydrates_only_its_own_imports<S: Store>(store: &S) -> Result<(),
             .filter(|entry| !matches!(entry.change, Change::MessageImported { .. }))
             .all(|entry| entry.content.is_none()),
         "other kinds carry no content",
+    )
+}
+
+// ------------------------------------------------------------ consumer cursors
+
+/// Compaction no further than `through`, as before consumers existed.
+fn bound(through: StateSeq) -> Retention {
+    Retention::new(Timestamp(0)).through(through)
+}
+
+/// The idle limit the consumer cases use.
+const MAX_IDLE: std::time::Duration = std::time::Duration::from_hours(1);
+const MAX_IDLE_MS: i64 = 3_600_000;
+
+/// Compaction at `now` with no bound and [`MAX_IDLE`].
+fn at(now: i64) -> Retention {
+    Retention {
+        through: None,
+        now: Timestamp(now),
+        max_idle: MAX_IDLE,
+    }
+}
+
+fn consumer(name: &str) -> ConsumerName {
+    ConsumerName::parse(name).unwrap_or_else(|_| unreachable!("a valid name"))
+}
+
+async fn ack<S: Store>(
+    store: &S,
+    name: &str,
+    at: impl Into<FeedCursor>,
+    now: i64,
+) -> Result<AckOutcome, String> {
+    store
+        .ack(
+            &account(),
+            &consumer(name),
+            FeedPosition {
+                generation: GENERATION,
+                at: at.into(),
+            },
+            Timestamp(now),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// An ack that must register or move the cursor.
+async fn acked<S: Store>(
+    store: &S,
+    name: &str,
+    at: impl Into<FeedCursor>,
+    now: i64,
+) -> Result<(), String> {
+    match ack(store, name, at, now).await? {
+        AckOutcome::Acked(_) => Ok(()),
+        other => Err(format!("ack of {name} refused: {other:?}")),
+    }
+}
+
+async fn compact<S: Store>(store: &S, retention: &Retention) -> Result<u64, String> {
+    store
+        .compact(&account(), retention)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+async fn feed<S: Store>(store: &S, since: impl Into<FeedCursor>) -> Result<ChangeFeed, String> {
+    store
+        .changes(&account(), since.into(), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Three commits discovering `a`, `b` and `c`; their states.
+async fn three_commits<S: Store>(store: &S) -> Result<[StateSeq; 3], String> {
+    let snapshot = claim(store).await?;
+    Ok([
+        discover(store, &snapshot, 0, &["a"]).await?,
+        discover(store, &snapshot, 1, &["b"]).await?,
+        discover(store, &snapshot, 2, &["c"]).await?,
+    ])
+}
+
+async fn compaction_waits_for_the_slowest_consumer<S: Store>(store: &S) -> Result<(), String> {
+    let [first, _, third] = three_commits(store).await?;
+    acked(store, "slow", first, 0).await?;
+    acked(store, "fast", third, 0).await?;
+    expect(
+        compact(store, &at(0)).await? == 1,
+        "only the first commit goes",
+    )?;
+    let rest = feed(store, first).await.and_then(page)?;
+    expect(
+        discovered(&rest.changes) == ["b", "c"],
+        "the slow consumer reads on",
+    )?;
+    acked(store, "slow", third, 1).await?;
+    expect(
+        compact(store, &at(1)).await? == 2,
+        "once it acks the head, the rest goes",
+    )
+}
+
+async fn compaction_without_consumers_is_unchanged<S: Store>(store: &S) -> Result<(), String> {
+    let [_, second, _] = three_commits(store).await?;
+    expect(
+        compact(store, &at(0)).await? == 0,
+        "no bound and no consumer: nothing",
+    )?;
+    expect(
+        compact(store, &bound(second)).await? == 2,
+        "an explicit bound: exactly through it",
+    )?;
+    expect(
+        feed(store, StateSeq(0)).await?
+            == ChangeFeed::TooOld {
+                generation: GENERATION,
+                oldest: second,
+            },
+        "the floor is the bound",
+    )
+}
+
+async fn an_explicit_bound_cannot_pass_a_live_consumer<S: Store>(store: &S) -> Result<(), String> {
+    let [first, _, third] = three_commits(store).await?;
+    acked(store, "reader", first, 0).await?;
+    let mut retention = at(0);
+    retention.through = Some(third);
+    expect(compact(store, &retention).await? == 1, "commit 1 only")?;
+    let rest = feed(store, first).await.and_then(page)?;
+    expect(
+        discovered(&rest.changes) == ["b", "c"],
+        "the consumer continues",
+    )
+}
+
+async fn an_idle_consumer_is_cut_off_after_max_idle<S: Store>(store: &S) -> Result<(), String> {
+    let [first, _, third] = three_commits(store).await?;
+    let t0 = 1_000;
+    acked(store, "idle", first, t0).await?;
+    expect(
+        compact(store, &at(t0 + MAX_IDLE_MS - 1)).await? == 1,
+        "still live: only what it acknowledged goes",
+    )?;
+    expect(
+        matches!(feed(store, first).await?, ChangeFeed::Page(_)),
+        "its entries are kept",
+    )?;
+    expect(
+        compact(store, &at(t0 + MAX_IDLE_MS + 1)).await? == 2,
+        "idle: its entries go",
+    )?;
+    let too_old = ChangeFeed::TooOld {
+        generation: GENERATION,
+        oldest: third,
+    };
+    expect(
+        feed(store, first).await? == too_old,
+        "its next read is too old",
+    )?;
+    let list = store
+        .consumers(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        list.cursors.len() == 1 && list.cursors[0].is_lost(list.floor),
+        "it is listed as lost",
+    )?;
+    expect(
+        ack(store, "idle", first, t0 + MAX_IDLE_MS + 2).await?
+            == AckOutcome::TooOld {
+                generation: GENERATION,
+                oldest: third,
+            },
+        "an ack at its old position is too old",
+    )
+}
+
+async fn a_caught_up_consumer_survives_a_quiet_period<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let head = discover(store, &snapshot, 0, &["a"]).await?;
+    acked(store, "reader", head, 0).await?;
+    // Compactions every half idle limit for three limits; no acks.
+    let mut now = 0;
+    for _ in 0..6 {
+        now += MAX_IDLE_MS / 2;
+        compact(store, &at(now)).await?;
+    }
+    discover(store, &snapshot, 1, &["b"]).await?;
+    discover(store, &snapshot, 2, &["c"]).await?;
+    now += MAX_IDLE_MS / 2;
+    compact(store, &at(now)).await?;
+    let rest = feed(store, head).await.and_then(page)?;
+    expect(
+        discovered(&rest.changes) == ["b", "c"],
+        "nothing after its position is removed",
+    )
+}
+
+async fn a_lost_consumer_can_start_again<S: Store>(store: &S) -> Result<(), String> {
+    let [first, _, third] = three_commits(store).await?;
+    acked(store, "reader", first, 0).await?;
+    compact(store, &at(MAX_IDLE_MS + 1)).await?;
+    expect(
+        matches!(feed(store, first).await?, ChangeFeed::TooOld { .. }),
+        "cut off",
+    )?;
+    // Rebuilt from the mirror, it registers again at the head.
+    acked(store, "reader", third, MAX_IDLE_MS + 2).await?;
+    let snapshot = claim(store).await?;
+    discover(store, &snapshot, 0, &["d"]).await?;
+    expect(
+        compact(store, &at(MAX_IDLE_MS + 3)).await? == 0,
+        "it holds the log from there",
+    )?;
+    let rest = feed(store, third).await.and_then(page)?;
+    expect(discovered(&rest.changes) == ["d"], "and reads on")
+}
+
+async fn a_dropped_consumer_stops_holding_the_log<S: Store>(store: &S) -> Result<(), String> {
+    let [first, _, third] = three_commits(store).await?;
+    acked(store, "slow", first, 0).await?;
+    acked(store, "fast", third, 0).await?;
+    let drop = || async {
+        store
+            .drop_consumer(&account(), &consumer("slow"))
+            .await
+            .map_err(|e| format!("{e:?}"))
+    };
+    expect(drop().await?, "dropped once")?;
+    expect(!drop().await?, "not twice")?;
+    expect(
+        compact(store, &at(0)).await? == 3,
+        "the next compaction no longer waits for it",
+    )
+}
+
+async fn acks_are_unfenced_and_never_touch_the_mirror<S: Store>(store: &S) -> Result<(), String> {
+    let old = claim(store).await?;
+    let mut c = commit(&old, 0);
+    c.messages = vec![import("a", &["INBOX"], 1)];
+    apply(store, &c).await?;
+    let head = state(store).await?;
+    let read = || async {
+        let status = store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("status")?;
+        let views = store
+            .messages(&account(), &[MessageId("a".into())])
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let log = feed(store, StateSeq(0)).await?;
+        Ok::<_, String>((
+            status.state,
+            status.messages,
+            status.jobs,
+            status.epoch,
+            views,
+            log,
+        ))
+    };
+    let before = read().await?;
+    acked(store, "reader", head, 0).await?;
+    expect(read().await? == before, "an ack changes nothing else")?;
+    // A newer engine claims the account: acks still land, and commits
+    // before and after one apply.
+    let new = claim(store).await?;
+    let mut next = commit(&new, 0);
+    next.messages = vec![observe("b", &["INBOX"], 2)];
+    expect(
+        matches!(apply(store, &next).await?, CommitOutcome::Applied { .. }),
+        "the engine's commit before the ack applies",
+    )?;
+    acked(store, "reader", state(store).await?, 1).await?;
+    let mut after = commit(&new, 1);
+    after.messages = vec![observe("c", &["INBOX"], 3)];
+    expect(
+        matches!(apply(store, &after).await?, CommitOutcome::Applied { .. }),
+        "and the one after it",
+    )
+}
+
+async fn forget_removes_cursors_and_a_new_generation_starts_clean<S: Store>(
+    store: &S,
+) -> Result<(), String> {
+    let [first, ..] = three_commits(store).await?;
+    acked(store, "reader", first, 0).await?;
+    store
+        .forget(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    store
+        .track(&account(), GENERATION + 1)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let list = store
+        .consumers(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        list.cursors.is_empty() && list.generation == GENERATION + 1,
+        "no cursors in the new generation",
+    )?;
+    let snapshot = store
+        .claim(&account(), ENGINE_VERSION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    discover(store, &snapshot, 0, &["a"]).await?;
+    expect(
+        compact(store, &at(MAX_IDLE_MS * 10)).await? == 0,
+        "no bound and no consumer: nothing is compacted",
+    )
+}
+
+async fn a_consumer_inside_a_commit_keeps_it<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let commit = discover(store, &snapshot, 0, &["a", "b", "c"]).await?;
+    let inside = FeedCursor {
+        seq: commit,
+        entry: Some(0),
+    };
+    acked(store, "reader", inside, 0).await?;
+    expect(compact(store, &at(0)).await? == 0, "the commit stays")?;
+    let rest = feed(store, inside).await.and_then(page)?;
+    expect(
+        discovered(&rest.changes) == ["b", "c"],
+        "the rest of the commit is read",
     )
 }

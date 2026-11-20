@@ -28,7 +28,8 @@ use mailtide::outbox::{ActionRequest, Intent, IntentOp, plan_delivery};
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
 use mailtide::revision::{
-    Change, ChangeEntry, ChangeFeed, ChangePage, FeedCursor, StateSeq, cut_page, page_window,
+    AckOutcome, Change, ChangeEntry, ChangeFeed, ChangePage, ConsumerCursor, ConsumerList,
+    ConsumerName, FeedCursor, FeedPosition, Retention, StateSeq, cut_page, page_window,
 };
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{
@@ -98,7 +99,12 @@ const MIGRATIONS: &[&[&str]] = &[&[
 // 6: thread lookups (thread views, thread action admission) read the
 // thread's rows, not every row of the account. Only an index: dropping it
 // makes them slow, never wrong.
-&["CREATE INDEX IF NOT EXISTS mailtide_messages_thread ON mailtide_messages (account, thread_id, id)"]];
+&["CREATE INDEX IF NOT EXISTS mailtide_messages_thread ON mailtide_messages (account, thread_id, id)"],
+// 7: consumer cursors. Older builds would compact past them, and `idx` set
+// is a position inside a commit, which they can't read.
+&["CREATE TABLE IF NOT EXISTS mailtide_consumers (
+    account TEXT NOT NULL, name TEXT NOT NULL, seq BIGINT NOT NULL, idx BIGINT,
+    seen_at BIGINT NOT NULL, PRIMARY KEY (account, name))"]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
@@ -463,6 +469,7 @@ impl SqlStore {
             "mailtide_labels",
             "mailtide_intents",
             "mailtide_changes",
+            "mailtide_consumers",
         ] {
             // Table names are constants, never input.
             sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
@@ -604,6 +611,25 @@ impl SqlStore {
         .await
         .map_err(|e| unavailable(&e))?;
         Ok(())
+    }
+
+    /// The account row, locked, with its consumer cursors: what acks and
+    /// compactions decide over. `None` for an unknown account.
+    async fn load_consumers(
+        &self,
+        tx: &mut Transaction<'static, Any>,
+        account: &AccountId,
+    ) -> Result<Option<AccountMirror>, StoreError> {
+        let Some((record, seq)) = self.load_account(tx, account).await? else {
+            return Ok(None);
+        };
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
+        mirror.record = record;
+        mirror.seq = seq;
+        for cursor in read_consumers(tx, account).await? {
+            mirror.consumers.insert(cursor.name.clone(), cursor);
+        }
+        Ok(Some(mirror))
     }
 
     // ------------------------------------------------------------ partial mirror
@@ -1463,6 +1489,79 @@ async fn write_seen(
     Ok(())
 }
 
+/// An account's consumer cursors, in name order.
+async fn read_consumers(
+    tx: &mut Transaction<'static, Any>,
+    account: &AccountId,
+) -> Result<Vec<ConsumerCursor>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT name, seq, idx, seen_at FROM mailtide_consumers WHERE account = $1 ORDER BY name",
+    )
+    .bind(account.as_str())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| unavailable(&e))?;
+    rows.iter()
+        .map(|row| {
+            let name: String = row.try_get("name").map_err(|e| corrupt("consumer", e))?;
+            let seq: i64 = row.try_get("seq").map_err(|e| corrupt("consumer seq", e))?;
+            let idx: Option<i64> = row.try_get("idx").map_err(|e| corrupt("consumer idx", e))?;
+            let seen_at: i64 = row
+                .try_get("seen_at")
+                .map_err(|e| corrupt("consumer seen_at", e))?;
+            Ok(ConsumerCursor {
+                name: ConsumerName::parse(&name)
+                    .map_err(|_| corrupt("consumer", format!("invalid name {name:?}")))?,
+                at: FeedCursor {
+                    seq: StateSeq(uint("consumer seq", seq)?),
+                    entry: idx
+                        .map(|idx| u32::try_from(idx).map_err(|e| corrupt("consumer idx", e)))
+                        .transpose()?,
+                },
+                seen_at: Timestamp(seen_at),
+            })
+        })
+        .collect()
+}
+
+/// Write the consumer cursors that differ between `before` and `after`.
+async fn write_consumers(
+    tx: &mut Transaction<'static, Any>,
+    before: &AccountMirror,
+    after: &AccountMirror,
+) -> Result<(), StoreError> {
+    let account = after.account.as_str();
+    for (name, cursor) in &after.consumers {
+        if before.consumers.get(name) == Some(cursor) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO mailtide_consumers (account, name, seq, idx, seen_at) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (account, name) DO UPDATE SET
+               seq = excluded.seq, idx = excluded.idx, seen_at = excluded.seen_at",
+        )
+        .bind(account)
+        .bind(name.as_str())
+        .bind(int("consumer seq", cursor.at.seq.0)?)
+        .bind(cursor.at.entry.map(i64::from))
+        .bind(cursor.seen_at.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| unavailable(&e))?;
+    }
+    for name in before.consumers.keys() {
+        if !after.consumers.contains_key(name) {
+            sqlx::query("DELETE FROM mailtide_consumers WHERE account = $1 AND name = $2")
+                .bind(account)
+                .bind(name.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| unavailable(&e))?;
+        }
+    }
+    Ok(())
+}
+
 impl crate::Store for SqlStore {
     async fn track(
         &self,
@@ -1505,13 +1604,17 @@ impl crate::Store for SqlStore {
         Self::changes(self, account, since, limit).await
     }
 
-    async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
+    async fn compact(&self, account: &AccountId, retention: &Retention) -> Result<u64, StoreError> {
         self.ensure_schema().await?;
         let mut tx = self.begin().await?;
-        let Some((mut record, seq)) = self.load_account(&mut tx, account).await? else {
+        let Some(mut mirror) = self.load_consumers(&mut tx, account).await? else {
             return Ok(0);
         };
-        let through = through.min(seq);
+        let before = mirror.clone();
+        let Some(through) = mirror.retain(retention) else {
+            // No bound and no consumer: nothing to drop, no cursor to see.
+            return Ok(0);
+        };
         let removed = sqlx::query("DELETE FROM mailtide_changes WHERE account = $1 AND seq <= $2")
             .bind(account.as_str())
             .bind(int("through", through.0)?)
@@ -1519,12 +1622,78 @@ impl crate::Store for SqlStore {
             .await
             .map_err(|e| unavailable(&e))?
             .rows_affected();
-        record.log_floor = record.log_floor.max(through);
-        Self::write_account(&mut tx, account, &record, seq).await?;
+        Self::write_account(&mut tx, account, &mirror.record, mirror.seq).await?;
+        write_consumers(&mut tx, &before, &mirror).await?;
         tx.commit()
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
         Ok(removed)
+    }
+
+    async fn ack(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+        at: FeedPosition,
+        now: Timestamp,
+    ) -> Result<AckOutcome, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let mut mirror = self
+            .load_consumers(&mut tx, account)
+            .await?
+            .ok_or(StoreError::NotTracked)?;
+        let before = mirror.clone();
+        let outcome = mirror.ack(consumer, at, now);
+        write_consumers(&mut tx, &before, &mirror).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(outcome)
+    }
+
+    async fn consumers(&self, account: &AccountId) -> Result<ConsumerList, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let Some((record, _)) = self.load_account_unlocked(&mut tx, account).await? else {
+            return Ok(ConsumerList {
+                generation: 0,
+                floor: StateSeq(0),
+                cursors: Vec::new(),
+            });
+        };
+        let cursors = read_consumers(&mut tx, account).await?;
+        tx.rollback().await.map_err(|e| unavailable(&e))?;
+        Ok(ConsumerList {
+            generation: record.generation,
+            floor: record.log_floor,
+            cursors,
+        })
+    }
+
+    async fn drop_consumer(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+    ) -> Result<bool, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        // The account row lock serializes this with acks and compactions.
+        if self.load_account(&mut tx, account).await?.is_none() {
+            return Ok(false);
+        }
+        let removed =
+            sqlx::query("DELETE FROM mailtide_consumers WHERE account = $1 AND name = $2")
+                .bind(account.as_str())
+                .bind(consumer.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| unavailable(&e))?
+                .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(removed > 0)
     }
 
     async fn message_ids(
@@ -1683,6 +1852,7 @@ impl crate::Store for SqlStore {
             "mailtide_labels",
             "mailtide_intents",
             "mailtide_changes",
+            "mailtide_consumers",
             "mailtide_accounts",
         ] {
             // Table names are constants, never input.

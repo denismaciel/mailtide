@@ -17,7 +17,9 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timest
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
+use mailtide::revision::{
+    AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
+};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 use mailtide::thread::ThreadView;
@@ -109,14 +111,44 @@ pub trait Store: Send + Sync {
         limit: u32,
     ) -> impl Future<Output = Result<ChangeFeed, StoreError>> + Send;
 
-    /// Drop feed entries at or before `through` once every consumer has
-    /// processed them; later reads from before it get `TooOld`. Returns how
-    /// many were removed.
+    /// Drop whole commits of the feed as `retention` allows, under the
+    /// account row lock: no further than its bound, nor past the slowest
+    /// live consumer (see [`mailtide::revision::compaction_target`]);
+    /// cursors at the head are seen at `retention.now` first. Later reads
+    /// from before the new floor get `TooOld`. Returns how many entries were
+    /// removed. Unfenced: no epoch is involved.
     fn compact(
         &self,
         account: &AccountId,
-        through: StateSeq,
+        retention: &Retention,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
+
+    /// Consumer `consumer` has processed the feed up to `at`: set its cursor
+    /// there at `now` (see [`mailtide::mirror::AccountMirror::ack`]), under
+    /// the account row lock. Unfenced, and never touches the mirror or the
+    /// feed. `NotTracked` for an unknown account.
+    fn ack(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+        at: FeedPosition,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<AckOutcome, StoreError>> + Send;
+
+    /// The account's registered consumers, in name order, with its
+    /// generation and floor (empty, generation 0, for an unknown account).
+    fn consumers(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<ConsumerList, StoreError>> + Send;
+
+    /// Forget consumer `consumer`: it no longer holds the log. Whether it
+    /// was registered.
+    fn drop_consumer(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
     /// Up to `limit` message ids after `after`, in id order.
     fn message_ids(
