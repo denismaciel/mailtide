@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use mailtide::commit::{Commit, CommitOutcome, LabelOp};
+use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{AccountMirror, FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -255,6 +255,27 @@ impl Store for MemoryStore {
         updates: &[FactsUpdate],
     ) -> Result<u32, StoreError> {
         self.on_account(account, 0, |mirror| mirror.refresh_facts(updates))
+    }
+
+    async fn record_deleted(
+        &self,
+        account: &AccountId,
+        deletions: &[(MessageId, DeletionEvidence)],
+        now: Timestamp,
+    ) -> Result<u32, StoreError> {
+        self.on_account(account, 0, |mirror| mirror.record_deleted(deletions, now))
+    }
+
+    async fn message_ids_labelled(
+        &self,
+        account: &AccountId,
+        label: &LabelId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        self.on_account(account, Vec::new(), |mirror| {
+            mirror.message_ids_labelled(label, after, limit)
+        })
     }
 
     async fn messages(

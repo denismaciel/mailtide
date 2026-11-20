@@ -434,7 +434,10 @@ pub fn mark_imported(
 }
 
 /// [`MessageOp::Tombstone`]. Content that is stored, or may be being written
-/// by a running import, gets a cleanup job.
+/// by a running import, gets a cleanup job. A message already tombstoned
+/// (no row, a tombstone) is skipped: deletion is final, and the sync that
+/// later reads the deletion a purge recorded logs no second
+/// `MessageDeleted`.
 #[must_use]
 pub fn tombstone(
     current: Option<&MessageRecord>,
@@ -444,6 +447,9 @@ pub fn tombstone(
     import_running: bool,
     plan: &JobPlan,
 ) -> Decision {
+    if current.is_none() && existing.is_some() {
+        return Decision::skip();
+    }
     let checkpoint = existing.map_or(evidence.checkpoint(), |t| t.max(evidence.checkpoint()));
     let has_content = matches!(current.map(|r| &r.content), Some(Content::Imported(_)));
     let mut decision = Decision::row(MessageEffect::Delete {
@@ -1653,6 +1659,67 @@ impl AccountMirror {
         u32::try_from(admitted).unwrap_or(u32::MAX)
     }
 
+    /// Record deletions a purge proved (a `messagesDeleted` history record,
+    /// or a single delete answered 404), outside any engine: like
+    /// [`Self::admit_action`] it is not fenced by an epoch. Each goes
+    /// through the same tombstone rule as a sync's: the row goes, the
+    /// tombstone stays, `MessageDeleted` is logged with the last thread and
+    /// labels, the message's jobs and intents are cancelled and its content
+    /// gets a cleanup after [`crate::engine::BLOB_GRACE`]. Applying a
+    /// deletion ahead of the cursor is sound because deletion is final
+    /// (I5): every later record about the id is skipped, and a repeated
+    /// tombstone logs nothing. Returns how many messages it deleted.
+    pub fn record_deleted(
+        &mut self,
+        deletions: &[(MessageId, DeletionEvidence)],
+        now: Timestamp,
+    ) -> u32 {
+        let plan = JobPlan {
+            priority: Priority::Live,
+            import_due_at: now,
+            draft_import_due_at: now,
+            verify_due_at: now,
+            cleanup_due_at: now.plus(crate::engine::BLOB_GRACE),
+            deliver_due_at: now,
+            confirm_due_at: now,
+        };
+        let seq = StateSeq(self.seq.0 + 1);
+        let mut deleted = 0;
+        for (id, evidence) in deletions {
+            let op = MessageOp::Tombstone {
+                id: id.clone(),
+                evidence: *evidence,
+            };
+            if self.apply_message(&op, &plan, seq) {
+                deleted += 1;
+                self.settle(&op, None, seq);
+            }
+        }
+        if deleted > 0 {
+            self.seq = seq;
+        }
+        deleted
+    }
+
+    /// Up to `limit` ids of messages whose observed labels hold `label`,
+    /// after `after`, in id order (what `empty` pages through).
+    #[must_use]
+    pub fn message_ids_labelled(
+        &self,
+        label: &crate::ids::LabelId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Vec<MessageId> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.messages
+            .values()
+            .filter(|record| after.is_none_or(|after| record.id > *after))
+            .filter(|record| record.labels.contains(label))
+            .take(limit)
+            .map(|record| record.id.clone())
+            .collect()
+    }
+
     /// Import jobs in the Foreground class, ready or running (what
     /// [`FOREGROUND_IMPORT_CAP`] bounds).
     #[must_use]
@@ -2250,6 +2317,110 @@ mod tests {
                 .jobs
                 .contains_key(&JobKind::BlobCleanup(MessageId("a".into())))
         );
+    }
+
+    /// A trashed message with a pending action, as a purge finds it.
+    fn trashed_with_an_action() -> AccountMirror {
+        let mut mirror = claimed();
+        let mut c = commit(&mirror);
+        c.messages = vec![MessageOp::Observe(MessageObservation {
+            thread_id: ThreadId("t-a".into()),
+            ..observation("a", &["TRASH", "Label_1"], 10)
+        })];
+        mirror.apply(&c);
+        mirror.admit_action(
+            &ActionRequest::Messages {
+                ids: vec![MessageId("a".into())],
+                action: crate::outbox::Action::SetStar(crate::outbox::StarState::Starred),
+            },
+            Timestamp(0),
+        );
+        mirror
+    }
+
+    #[test]
+    fn a_recorded_deletion_is_a_tombstone_like_any_other() {
+        let mut mirror = trashed_with_an_action();
+        let a = MessageId("a".into());
+        assert!(mirror.jobs.contains_key(&JobKind::Import(a.clone())));
+        assert!(mirror.jobs.contains_key(&JobKind::Deliver(a.clone())));
+        assert!(!mirror.intents_of(&a).is_empty());
+        // Recorded outside any engine: a newer epoch doesn't fence it.
+        mirror.claim(ENGINE_VERSION).expect("a newer engine");
+        let before = mirror.seq;
+        let deleted = mirror.record_deleted(
+            &[(a.clone(), DeletionEvidence::History { at: HistoryId(12) })],
+            Timestamp(5_000),
+        );
+        assert_eq!(deleted, 1);
+        assert!(!mirror.messages.contains_key(&a), "the row goes");
+        assert_eq!(mirror.tombstones.get(&a), Some(&HistoryId(12)));
+        assert!(mirror.intents_of(&a).is_empty(), "its intents go too");
+        assert!(!mirror.jobs.contains_key(&JobKind::Import(a.clone())));
+        assert!(!mirror.jobs.contains_key(&JobKind::Deliver(a.clone())));
+        assert_eq!(
+            mirror.jobs[&JobKind::BlobCleanup(a.clone())].state,
+            JobState::Ready {
+                due_at: Timestamp(5_000).plus(crate::engine::BLOB_GRACE)
+            },
+            "its content is cleaned up after the usual grace period"
+        );
+        assert_eq!(mirror.seq, StateSeq(before.0 + 1));
+        let logged: Vec<&Change> = mirror
+            .log
+            .iter()
+            .filter(|(seq, _)| *seq == mirror.seq)
+            .map(|(_, change)| change)
+            .collect();
+        assert_eq!(
+            logged,
+            [&Change::MessageDeleted {
+                id: a.clone(),
+                thread_id: Some(ThreadId("t-a".into())),
+                labels: Some(set(["Label_1", "TRASH"])),
+            }]
+        );
+        assert!(crate::invariants::check_state(&mirror).is_empty());
+        // An observation from before the deletion can't bring it back.
+        let mut late = commit(&mirror);
+        late.messages = vec![MessageOp::Observe(observation("a", &["TRASH"], 11))];
+        mirror.apply(&late);
+        assert!(!mirror.messages.contains_key(&a));
+    }
+
+    #[test]
+    fn history_replaying_a_recorded_deletion_logs_nothing() {
+        let mut mirror = trashed_with_an_action();
+        let a = MessageId("a".into());
+        mirror.record_deleted(
+            &[(a.clone(), DeletionEvidence::History { at: HistoryId(12) })],
+            Timestamp(0),
+        );
+        let entries = mirror.log.len();
+        let seq = mirror.seq;
+        // The sync reads the same messagesDeleted record later.
+        let mut sync = commit(&mirror);
+        sync.messages = vec![MessageOp::Tombstone {
+            id: a.clone(),
+            evidence: DeletionEvidence::History { at: HistoryId(12) },
+        }];
+        assert!(matches!(
+            mirror.apply(&sync),
+            CommitOutcome::Applied { skipped: 1, .. }
+        ));
+        assert_eq!(mirror.log.len(), entries, "no second MessageDeleted");
+        // Recording it again changes nothing either, not even the state.
+        let seq_after_sync = mirror.seq;
+        assert_eq!(seq_after_sync.0, seq.0 + 1, "only the sync's own commit");
+        assert_eq!(
+            mirror.record_deleted(
+                &[(a, DeletionEvidence::History { at: HistoryId(12) })],
+                Timestamp(0)
+            ),
+            0
+        );
+        assert_eq!(mirror.seq, seq_after_sync);
+        assert_eq!(mirror.log.len(), entries);
     }
 
     #[test]

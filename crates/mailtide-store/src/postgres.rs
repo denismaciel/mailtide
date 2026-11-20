@@ -1,8 +1,8 @@
 //! Postgres store: mailtide's tables inside the host database.
 
-use mailtide::commit::{Commit, CommitOutcome, LabelOp};
+use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -161,6 +161,25 @@ impl Store for PostgresStore {
         updates: &[FactsUpdate],
     ) -> Result<u32, StoreError> {
         crate::Store::refresh_facts(&self.inner, account, updates).await
+    }
+
+    async fn record_deleted(
+        &self,
+        account: &AccountId,
+        deletions: &[(MessageId, DeletionEvidence)],
+        now: Timestamp,
+    ) -> Result<u32, StoreError> {
+        crate::Store::record_deleted(&self.inner, account, deletions, now).await
+    }
+
+    async fn message_ids_labelled(
+        &self,
+        account: &AccountId,
+        label: &LabelId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        crate::Store::message_ids_labelled(&self.inner, account, label, after, limit).await
     }
 
     async fn messages(

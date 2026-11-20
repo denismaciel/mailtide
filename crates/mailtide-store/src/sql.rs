@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mailtide::commit::{Commit, CommitOutcome, LabelOp, MessageOp, Rejection};
+use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp, MessageOp, Rejection};
 use mailtide::gmail::{Label, LabelColor, LabelKind, LabelListVisibility, MessageListVisibility};
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
@@ -2228,6 +2228,82 @@ impl crate::Store for SqlStore {
         Ok(report)
     }
 
+    async fn record_deleted(
+        &self,
+        account: &AccountId,
+        deletions: &[(MessageId, DeletionEvidence)],
+        now: Timestamp,
+    ) -> Result<u32, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        // The account row lock serializes this with commits and claims; no
+        // epoch is checked (deletion is final, see the trait).
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Ok(0);
+        };
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
+        mirror.record = record;
+        mirror.seq = seq;
+        let ids: Vec<MessageId> = deletions
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self::load_rows(&mut tx, account, &ids, &mut mirror).await?;
+        let before = mirror.clone();
+        let deleted = mirror.record_deleted(deletions, now);
+        Self::write_diff(&mut tx, &before, &mirror).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(deleted)
+    }
+
+    async fn message_ids_labelled(
+        &self,
+        account: &AccountId,
+        label: &LabelId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        self.ensure_schema().await?;
+        // `labels` holds a JSON array of ids: match the label's JSON string
+        // as text, then confirm on the parsed set, reading on until `limit`
+        // rows hold it exactly (a text match is only a filter).
+        let pattern = format!("%{}%", like_escaped(&json(label)?));
+        let wanted = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut found = Vec::new();
+        let mut from = after.map_or_else(String::new, |id| id.0.clone());
+        while found.len() < wanted {
+            let rows = sqlx::query(
+                "SELECT id, labels FROM mailtide_messages
+                 WHERE account = $1 AND id > $2 AND labels LIKE $3 ESCAPE '\\'
+                 ORDER BY id LIMIT $4",
+            )
+            .bind(account.as_str())
+            .bind(from.as_str())
+            .bind(pattern.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+            let read = rows.len();
+            for row in rows {
+                let id: String = row.try_get("id").map_err(|e| corrupt("id", e))?;
+                let labels: String = row.try_get("labels").map_err(|e| corrupt("labels", e))?;
+                if parse::<LabelSet>("labels", &labels)?.contains(label) && found.len() < wanted {
+                    found.push(MessageId(id.clone()));
+                }
+                from = id;
+            }
+            if read < wanted {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     async fn messages(
         &self,
         account: &AccountId,
@@ -2520,6 +2596,19 @@ impl LabelAttrs {
             ..label
         })
     }
+}
+
+/// `text` with `LIKE`'s wildcards and the escape character escaped (for
+/// `ESCAPE '\'`).
+fn like_escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Ids per `IN (...)` query when reading views and feed content (well under

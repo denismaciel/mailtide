@@ -11,9 +11,9 @@
 
 use std::future::Future;
 
-use mailtide::commit::{Commit, CommitOutcome, LabelOp};
+use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -180,6 +180,31 @@ pub trait Store: Send + Sync {
         ids: &[MessageId],
         now: Timestamp,
     ) -> impl Future<Output = Result<Prioritised, StoreError>> + Send;
+
+    /// Record deletions a purge proved from Gmail's evidence (see
+    /// [`mailtide::mirror::AccountMirror::record_deleted`]), atomically with
+    /// their feed entries and without an engine (no epoch fence, like
+    /// `admit`): deletion is final, so applying it ahead of the cursor is
+    /// sound. Returns how many messages it deleted (a message already
+    /// tombstoned counts nothing and logs nothing); 0 for an untracked
+    /// account.
+    fn record_deleted(
+        &self,
+        account: &AccountId,
+        deletions: &[(MessageId, DeletionEvidence)],
+        now: Timestamp,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send;
+
+    /// Up to `limit` ids of messages whose observed labels hold exactly
+    /// `label`, after `after`, in id order (what emptying a bin pages
+    /// through). Empty for an untracked account.
+    fn message_ids_labelled(
+        &self,
+        account: &AccountId,
+        label: &LabelId,
+        after: Option<&MessageId>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<MessageId>, StoreError>> + Send;
 
     /// What the store holds about an account, read without claiming it (so
     /// it never preempts a running sync). `None` for an unknown account.

@@ -139,6 +139,7 @@ where
     cases.extend(search_cases());
     cases.extend(message_facts_cases());
     cases.extend(label_edit_cases());
+    cases.extend(purge_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -175,6 +176,14 @@ fn prioritise_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
             Box::pin(prioritise_leaves_the_feed_alone(s))
         }),
     ]
+}
+
+/// The cases of the store methods a purge uses.
+fn purge_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![(
+        "recorded deletions are unfenced tombstones; ids page by exact label",
+        |s| Box::pin(recorded_deletions_and_ids_by_label(s)),
+    )]
 }
 
 /// The cases of feed pages bounded by their limit.
@@ -1756,6 +1765,166 @@ async fn feed_records_changes<S: Store>(store: &S) -> Result<(), String> {
         page.changes.iter().all(|e| e.index == 0)
             && page.changes.windows(2).all(|w| w[0].state < w[1].state),
         "entries are identified by state and index",
+    )
+}
+
+async fn labelled<S: Store>(
+    store: &S,
+    label: &str,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Vec<String>, String> {
+    let after = after.map(|id| MessageId(id.into()));
+    let ids = store
+        .message_ids_labelled(&account(), &LabelId(label.into()), after.as_ref(), limit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(ids.into_iter().map(|id| id.0).collect())
+}
+
+async fn recorded_deletions_and_ids_by_label<S: Store>(store: &S) -> Result<(), String> {
+    ids_page_by_exact_label(store).await?;
+    deletions_are_recorded_unfenced(store).await?;
+    let evidence = DeletionEvidence::History { at: HistoryId(12) };
+    let untracked = store
+        .record_deleted(
+            &AccountId("nobody@example.com".into()),
+            &[(MessageId("a".into()), evidence)],
+            Timestamp(0),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(untracked == 0, "an untracked account records nothing")
+}
+
+/// Messages a, b in TRASH (a in thread `t-a` with `Label_1`), c, d and e
+/// with labels that hold the text or LIKE's wildcards but not TRASH.
+async fn ids_page_by_exact_label<S: Store>(store: &S) -> Result<(), String> {
+    let old = claim(store).await?;
+    let mut c = commit(&old, 0);
+    c.messages = vec![
+        observe_in("t-a", "a", &["TRASH", "Label_1"], 10),
+        observe("b", &["TRASH"], 10),
+        // Labels whose ids hold the text, or LIKE's wildcards, but not
+        // the label itself.
+        observe("c", &["INBOX", "Label_TRASH"], 10),
+        observe("d", &["TRASHED"], 10),
+        observe("e", &["SPAM", "LabelX1"], 10),
+    ];
+    apply(store, &c).await?;
+    expect(
+        labelled(store, "TRASH", None, 10).await? == ["a", "b"],
+        "ids carrying exactly TRASH",
+    )?;
+    expect(
+        labelled(store, "TRASH", None, 1).await? == ["a"]
+            && labelled(store, "TRASH", Some("a"), 1).await? == ["b"]
+            && labelled(store, "TRASH", Some("b"), 1).await?.is_empty(),
+        "ids page in id order after `after`",
+    )?;
+    expect(
+        labelled(store, "Label_1", None, 10).await? == ["a"],
+        "`_` matches only itself",
+    )?;
+    expect(
+        labelled(store, "SPAM", None, 10).await? == ["e"],
+        "spam pages too",
+    )
+}
+
+async fn deletions_are_recorded_unfenced<S: Store>(store: &S) -> Result<(), String> {
+    store
+        .admit(
+            &account(),
+            &ActionRequest::Messages {
+                ids: vec![MessageId("a".into())],
+                action: Action::SetRead(ReadState::Read),
+            },
+            Timestamp(0),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let before = state(store).await?;
+    // A newer engine holds the account: the purge's record is not fenced.
+    let new = claim(store).await?;
+    let evidence = DeletionEvidence::History { at: HistoryId(12) };
+    let deleted = store
+        .record_deleted(
+            &account(),
+            &[
+                (MessageId("a".into()), evidence),
+                (MessageId("b".into()), evidence),
+            ],
+            Timestamp(1_000),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(deleted == 2, "both deletions are recorded")?;
+    let views = store
+        .messages(&account(), &[MessageId("a".into()), MessageId("b".into())])
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(views.is_empty(), "the rows are gone")?;
+    let (entries, _) = read_all(store, before.into(), 100).await?;
+    expect(
+        entries.len() == 2 && entries.iter().all(|e| e.state == entries[0].state),
+        "two MessageDeleted entries, in one state",
+    )?;
+    expect(
+        matches!(&entries[0].change, Change::MessageDeleted { id, thread_id: Some(thread), labels: Some(labels) }
+            if id.0 == "a" && thread.0 == "t-a" && *labels == set(["TRASH", "Label_1"])),
+        "the entry carries the last thread and labels",
+    )?;
+    let after = state(store).await?;
+    let jobs = store
+        .claim_jobs(
+            &account(),
+            new.epoch,
+            100,
+            Timestamp(1_000).plus(mailtide::engine::BLOB_GRACE),
+            AttemptId(1),
+            Priority::Backfill,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
+    let kinds: Vec<JobKind> = jobs.iter().map(mailtide::jobs::ClaimedJob::kind).collect();
+    let a = MessageId("a".into());
+    expect(
+        !kinds.contains(&JobKind::Import(a.clone()))
+            && !kinds.contains(&JobKind::Deliver(a.clone())),
+        "the message's import and delivery are cancelled",
+    )?;
+    expect(
+        kinds.contains(&JobKind::BlobCleanup(a.clone()))
+            && kinds.contains(&JobKind::BlobCleanup(MessageId("b".into()))),
+        "their content is cleaned up after the grace period",
+    )?;
+    let again = store
+        .record_deleted(&account(), &[(a.clone(), evidence)], Timestamp(2_000))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(again == 0, "a repeated deletion records nothing")?;
+    expect(
+        state(store).await? == after,
+        "and logs nothing: the state stays",
+    )?;
+    // The sync later reads the same history: nothing comes back, nothing
+    // is logged twice.
+    let mut sync = commit(&new, 0);
+    sync.messages = vec![
+        MessageOp::Tombstone {
+            id: a.clone(),
+            evidence,
+        },
+        observe("a", &["INBOX"], 13),
+    ];
+    apply(store, &sync).await?;
+    let (entries, _) = read_all(store, after.into(), 100).await?;
+    expect(entries.is_empty(), "the replayed deletion logs nothing")?;
+    expect(
+        labelled(store, "TRASH", None, 10).await?.is_empty(),
+        "no row holds TRASH any more",
     )
 }
 
