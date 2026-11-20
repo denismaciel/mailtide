@@ -169,7 +169,7 @@ change = "modify"
 role = "Shared with label-edit and search: the three delete tests of himalaya's Gmail backend (the look-up before a delete, a 404, an unknown id)"
 
 [[file]]
-path = "crates/mailtide-io/tests/ref_himalaya_jmap_backend.rs"
+path = "crates/mailtide-io/tests/ref_himalaya_jmap_backend_purge.rs"
 change = "new"
 role = "A destroy applied in part, ported by behaviour"
 
@@ -379,7 +379,7 @@ note = "Email/set destroy: `the Email is removed from all Mailboxes` and gone fo
 [[suite]]
 impl = "himalaya"
 path = "src/jmap/backend.rs"
-target = "crates/mailtide-io/tests/ref_himalaya_jmap_backend.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_jmap_backend_purge.rs"
 # send and threads declare this suite too and list the other JMAP protocol
 # tests one by one; only the delete-scoping tests are claimed here.
 
