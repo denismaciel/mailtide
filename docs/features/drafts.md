@@ -312,7 +312,7 @@ the count and thread-summary suites (read projections), the suites
 `scripts/zero_tests.py` owns, and himalaya's `tests/send_outcome.rs` and
 JMAP tests (`send`).
 
-Our own 62 tests cover what no reference has: the request shapes and costs;
+Our own 63 tests cover what no reference has: the request shapes and costs;
 the index rules (stale rows, stale listings, the generation fence, the
 periodic refresh); every row of Appendix B, including a crash between
 Gmail's send and its record and the three send fences; drafts changed

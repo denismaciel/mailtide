@@ -1039,6 +1039,31 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_draft_whose_message_the_mirror_never_saw_is_verified() {
+        let mut mirror = mirror();
+        let mut c = commit(&mirror, 1);
+        c.messages = vec![observe("m1", "t1", &["DRAFT"], 5)];
+        apply(&mut mirror, &c);
+        mirror.jobs.clear();
+        reconcile(
+            &mut mirror,
+            vec![draft("r1", "m1", "t1"), draft("r2", "m2", "t2")],
+            2,
+        );
+        assert!(
+            mirror
+                .jobs
+                .contains_key(&JobKind::Verify(MessageId("m2".into())))
+        );
+        assert!(
+            !mirror
+                .jobs
+                .contains_key(&JobKind::Verify(MessageId("m1".into()))),
+            "a known message needs nothing"
+        );
+    }
+
+    #[test]
     fn a_draft_missing_from_a_listing_is_removed() {
         let mut mirror = mirror();
         save(&mut mirror, draft("r1", "m1", "t1"), 1);

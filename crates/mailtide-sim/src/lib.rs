@@ -2070,9 +2070,9 @@ impl Sim {
     /// Record a draft call's answer outside the engine, checking every
     /// invariant after it; `may_lose` lets the host crash first.
     fn record_draft(&mut self, write: &DraftWrite, may_lose: bool) -> DraftRecorded {
+        // The call's own process dies; the sync, elsewhere, goes on.
         if may_lose && self.rng.chance(self.faults.draft_record_lost) {
             self.note(&format!("draft record lost {write:?}"));
-            self.rebuild();
             return DraftRecorded::Done;
         }
         let outcome = self.mirror.record_draft(write, self.now);

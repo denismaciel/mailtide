@@ -1139,7 +1139,7 @@ impl AccountMirror {
         // After the jobs: a listing that may not apply lists again, after
         // its own job finished.
         for op in &commit.drafts {
-            if !self.apply_draft(op, commit.job_plan.draft_refresh_due_at, seq) {
+            if !self.apply_draft(op, &commit.job_plan, seq) {
                 skipped += 1;
             }
         }
@@ -1765,10 +1765,23 @@ impl AccountMirror {
     }
 
     /// Apply one draft operation; `false` if the listing was not applied
-    /// (another follows at `retry_at`).
-    fn apply_draft(&mut self, op: &DraftOp, retry_at: Timestamp, seq: StateSeq) -> bool {
+    /// (another follows at the plan's `draft_refresh_due_at`). A listed
+    /// draft whose message the mirror has never seen gets a verification,
+    /// as an unknown message in history does: listings are not snapshots,
+    /// and the draft list is one more place to learn of a message.
+    fn apply_draft(&mut self, op: &DraftOp, plan: &JobPlan, seq: StateSeq) -> bool {
+        let retry_at = plan.draft_refresh_due_at;
         match op {
             DraftOp::Reconcile(listing) => {
+                let unknown: Vec<MessageId> = listing
+                    .listed
+                    .iter()
+                    .map(|draft| &draft.message)
+                    .filter(|m| {
+                        !self.messages.contains_key(*m) && !self.tombstones.contains_key(*m)
+                    })
+                    .cloned()
+                    .collect();
                 let tombstones = &self.tombstones;
                 match drafts::reconcile(
                     &mut self.drafts,
@@ -1779,6 +1792,13 @@ impl AccountMirror {
                 ) {
                     Reconciled::Applied(effects) => {
                         self.draft_effects(effects, retry_at, seq);
+                        for message in unknown {
+                            self.enqueue(&NewJob {
+                                kind: JobKind::Verify(message),
+                                priority: Priority::Live,
+                                due_at: plan.verify_due_at,
+                            });
+                        }
                         true
                     }
                     Reconciled::Stale => {

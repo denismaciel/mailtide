@@ -630,6 +630,11 @@ covers = "drafts.list is not a snapshot: a row pointing at a message the mirror 
 
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
+name = "a_listed_draft_whose_message_the_mirror_never_saw_is_verified"
+covers = "Listings are not snapshots: a message a reconciliation's listing skipped can still be named by drafts.list, which then gets it a verification fetch (and so a row and an import), as an unknown id in history does. Found by the simulator"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
 name = "a_draft_missing_from_a_listing_is_removed"
 covers = "Deleted or sent elsewhere: the row goes and the feed gets DraftRemoved with its last message id"
 
