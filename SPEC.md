@@ -573,6 +573,8 @@ runner per process, after forking:
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
 - exceptions: `MailtideError` and its subclasses `StoreUnavailable`,
   `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`, `QuotaGateError`,
+  `QuotaDeferred` (a direct call, §8, that the quota gate would hold past
+  its budget; nothing was sent; `until_ms` says when it could run),
   `Superseded`, `InvalidPush`, and `DelegationRevoked` (raised by the token source
   to block an account; the block is committed, and later runs make no
   credential calls), `InvalidPush`.

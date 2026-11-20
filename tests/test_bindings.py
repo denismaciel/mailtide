@@ -56,3 +56,9 @@ def test_invalid_account_is_a_value_error() -> None:
     runner = mailtide.BlockingRunner(make_config(), tokens)
     with pytest.raises(ValueError):
         runner.run("not-an-address")
+
+
+def test_quota_deferred_is_a_mailtide_error() -> None:
+    """A direct call the quota gate would hold past its budget raises it."""
+    assert issubclass(mailtide.QuotaDeferred, mailtide.MailtideError)
+    assert "QuotaDeferred" in mailtide.__all__

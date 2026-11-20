@@ -92,6 +92,12 @@ mod _core {
     );
     create_exception!(
         _core,
+        QuotaDeferred,
+        MailtideError,
+        "The quota gate would make this call wait past its budget; nothing was sent. `until_ms`: when the gate would admit it, at the earliest."
+    );
+    create_exception!(
+        _core,
         SchemaOutOfDate,
         MailtideError,
         "The database's mailtide schema doesn't match this build: run migrations (or upgrade)."
@@ -132,6 +138,7 @@ mod _core {
         m.add("CorruptState", py.get_type::<CorruptState>())?;
         m.add("BlobUnavailable", py.get_type::<BlobUnavailable>())?;
         m.add("QuotaGateError", py.get_type::<QuotaGateError>())?;
+        m.add("QuotaDeferred", py.get_type::<QuotaDeferred>())?;
         m.add("Superseded", py.get_type::<Superseded>())?;
         m.add("SchemaOutOfDate", py.get_type::<SchemaOutOfDate>())?;
         m.add("ReadOnlyMode", py.get_type::<ReadOnlyMode>())?;
