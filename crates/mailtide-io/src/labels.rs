@@ -1,7 +1,8 @@
 //! Label definitions written through Gmail's labels API: create, rename,
 //! restyle and delete, with sublabels (SPEC §6.6, `docs/features/label-edit.md`).
 //!
-//! Each write is one direct call ([`Runner::call_gmail`]) through the quota
+//! Each write is one direct call (the crate's `direct_call`, what
+//! [`Runner::call_gmail`] does for reads) through the quota
 //! gate at Foreground, and Gmail's answer is recorded in the mirror at once
 //! by [`Store::record_label`], unfenced like an admission: the host gets
 //! Gmail's id back, `labels()` and the feed show the change before any sync,
@@ -219,7 +220,7 @@ where
         let deadline = Instant::now() + budget;
         let name = label.name.clone();
         match self
-            .call_gmail(
+            .direct_call(
                 account,
                 GmailRequest::CreateLabel(label),
                 Priority::Foreground,
@@ -367,7 +368,7 @@ where
                     .collect()
             };
             match self
-                .call_gmail(
+                .direct_call(
                     account,
                     GmailRequest::DeleteLabel { id: target.clone() },
                     Priority::Foreground,
@@ -405,7 +406,7 @@ where
     /// nothing about what it lacks: it is asked again later, never used.
     async fn list(&self, account: &AccountId, deadline: Instant) -> Result<Vec<Label>, LabelError> {
         let EventKind::LabelsListed { labels: listed, .. } = self
-            .call_gmail(
+            .direct_call(
                 account,
                 GmailRequest::ListLabels,
                 Priority::Foreground,
@@ -436,7 +437,7 @@ where
     ) -> Result<Label, LabelError> {
         let name = patch.name.clone();
         match self
-            .call_gmail(
+            .direct_call(
                 account,
                 GmailRequest::PatchLabel {
                     id: id.clone(),

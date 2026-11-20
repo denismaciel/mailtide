@@ -650,12 +650,10 @@ where
         Ok(checked)
     }
 
-    /// One Gmail request outside the engine: the shared path of every call
-    /// whose answer a host needs at once (drift checks, searches, draft,
-    /// label and settings writes, purges). It
+    /// One Gmail read outside the engine: the shared path of every call
+    /// whose answer a host needs at once (drift checks, searches; the
+    /// features' writes take the same path through `direct_call`). It
     ///
-    /// - refuses a request that changes the mailbox in read-only mode,
-    ///   before any credential or quota is spent;
     /// - admits the request through the quota gate at `priority` with its
     ///   declared cost ([`mailtide::quota::cost`]), waits out deferrals while
     ///   that ends before `deadline`, and otherwise returns
@@ -680,12 +678,36 @@ where
     /// the answer and the record loses nothing the next sync does not bring
     /// back.
     ///
-    /// It is for the driver's features, not a host API promise: it sends
-    /// what it is given, bypassing intents and the overlay (read-only mode
-    /// still applies).
+    /// It only reads: a request that changes the mailbox is refused
+    /// ([`CallError::Refused`]) before any credential or quota is spent, so
+    /// a host cannot bypass the checks of the features that write (label
+    /// edits, drafts, purges), which go through the crate's `direct_call`.
     ///
     /// [`AccountProblem::ApiAccessDenied`]: mailtide::retry::AccountProblem::ApiAccessDenied
     pub async fn call_gmail(
+        &self,
+        account: &AccountId,
+        request: GmailRequest,
+        priority: Priority,
+        deadline: Instant,
+    ) -> Result<EventKind, CallError> {
+        if changes_mailbox(&request) {
+            return Err(CallError::Refused(BlockingFailure {
+                class: Blocking::Permanent,
+                detail: format!(
+                    "Runner::call_gmail only reads: {} changes the mailbox",
+                    request_kind(&request)
+                ),
+            }));
+        }
+        self.direct_call(account, request, priority, deadline).await
+    }
+
+    /// [`Self::call_gmail`] for any request, writes included: the features
+    /// inside this crate send their writes through it, after their own
+    /// checks. Read-only mode still refuses a write before any credential
+    /// or quota is spent.
+    pub(crate) async fn direct_call(
         &self,
         account: &AccountId,
         request: GmailRequest,

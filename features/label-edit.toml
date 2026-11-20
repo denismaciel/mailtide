@@ -150,7 +150,7 @@ role = "Runner::create_label, update_label and delete_label; LabelError; sublabe
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "Perform and decode label requests (a 409 to a create or a patch is LabelNameTaken); read the label generation before labels.list; label writes change the mailbox, so read-only mode refuses them. The shared groundwork (Runner::call_gmail, PUT, PATCH and DELETE in http.rs and transport.rs) is on main and used as it is"
+role = "Perform and decode label requests (a 409 to a create or a patch is LabelNameTaken); read the label generation before labels.list; label writes change the mailbox, so read-only mode refuses them. The public Runner::call_gmail now only reads (refusing any mailbox-changing request before any token or quota); its body moves to pub(crate) direct_call, which the label writes use (ruling shared with drafts and purge)"
 
 [[file]]
 path = "crates/mailtide-io/src/lib.rs"
@@ -255,6 +255,11 @@ role = "The create, rename under the parent, delete lifecycle, against the fake 
 path = "crates/mailtide-io/tests/ref_zero_imap_sync.rs"
 change = "new"
 role = "Zero's folder-disappears test, as a label deleted elsewhere"
+
+[[file]]
+path = "crates/mailtide-io/tests/direct_calls.rs"
+change = "modify"
+role = "The public call refuses every write (a modify, and labels.create, patch and delete) before any token or quota; the tests that sent a modify through it send a read"
 
 [[file]]
 path = "crates/mailtide-io/tests/label_support/mod.rs"
@@ -721,6 +726,11 @@ covers = "Every store applies none of an empty or truncated listing: definitions
 target = "crates/mailtide/src/label_names.rs"
 name = "a_rename_into_its_own_subtree_is_refused"
 covers = "A to A/x is refused before anything moves, also half-way through such a rename; A to AB is not under A"
+
+[[test]]
+target = "crates/mailtide-io/tests/direct_calls.rs"
+name = "the_public_call_refuses_every_write_before_any_token_or_quota"
+covers = "Runner::call_gmail refuses a modify and labels.create, labels.patch and labels.delete, read-write and read-only, before any token, quota or request: label writes only go through Runner::create_label, update_label and delete_label"
 
 [[test]]
 target = "crates/mailtide-io/tests/label_edit.rs"

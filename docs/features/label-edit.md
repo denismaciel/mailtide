@@ -462,6 +462,13 @@ and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
 `WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
 method that raises them), PUT, PATCH and DELETE, and schema checks on every
 store read and write. A lost answer arrives as `CallError::OutcomeUnknown`.
+Ruling shared with `drafts` and `purge` (from `purge`'s review): the public
+`Runner::call_gmail` only reads, refusing any request that changes the
+mailbox before any token or quota, so a Rust host cannot send a label write
+past this feature's checks; the label writes go through the crate's
+`pub(crate) direct_call`, the same path. Whichever of the three lands first
+makes the change; this branch makes it, with
+`the_public_call_refuses_every_write_before_any_token_or_quota`.
 
 ## 7. Decisions
 

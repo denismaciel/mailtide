@@ -583,8 +583,12 @@ Per-call costs [G]:
   gate, with its declared cost and a priority the caller picks. A deferral
   is waited out while it ends within the call's budget; otherwise the call
   returns `QuotaDeferred { until }` and nothing is sent. A rate limit cools
-  the gate down as the engine would. Read-only mode refuses a request that
-  changes the mailbox before any credential or quota is spent. A direct
+  the gate down as the engine would. The public `call_gmail` only reads: a
+  request that changes the mailbox is refused before any credential or
+  quota is spent, so a host cannot bypass the checks of the features that
+  write (label edits, drafts, purges), which send their writes through the
+  same path inside `mailtide-io`. There, read-only mode refuses a write
+  before any credential or quota is spent. A direct
   call claims nothing, commits nothing and never moves the cursor (its
   command id has epoch 0, which no engine has). A refusal (a 400, a 403
   including a scope the token lacks, an account problem) is the caller's

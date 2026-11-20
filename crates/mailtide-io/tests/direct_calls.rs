@@ -1,6 +1,7 @@
 //! Direct calls: one Gmail request outside the engine, through the quota
-//! gate (`Runner::call_gmail`, the path drift checks and the planned draft,
-//! label, settings, search and purge calls share).
+//! gate. The public `Runner::call_gmail` only reads (drift checks,
+//! searches); the features' writes (label edits, drafts, purges) take the
+//! same path inside the crate, after their own checks.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -282,16 +283,43 @@ async fn a_call_claims_nothing_and_writes_nothing() {
     assert_eq!(before, after, "no claim, no commit, no epoch");
 }
 
+/// The public direct call only reads: a write is refused before any token
+/// or quota, read-write or read-only, so a host cannot bypass the checks of
+/// the features that write (they use the crate's `direct_call`).
 #[tokio::test]
-async fn read_only_mode_refuses_a_write_before_any_token_or_quota() {
-    let setup = Setup::new(Access::ReadOnly, Vec::new(), 0, Duration::ZERO);
-    assert_eq!(
-        setup.call(archive_m1(), BUDGET).await,
-        Err(CallError::ReadOnly)
-    );
-    assert!(setup.admitted().is_empty());
-    assert!(setup.sent().is_empty());
-    assert_eq!(setup.tokens.minted.load(Ordering::SeqCst), 0);
+async fn the_public_call_refuses_every_write_before_any_token_or_quota() {
+    use mailtide::gmail::{LabelListVisibility, LabelPatch, MessageListVisibility, NewLabel};
+    let label = LabelId("Label_1".into());
+    let writes = [
+        archive_m1(),
+        GmailRequest::CreateLabel(NewLabel {
+            name: "Work".into(),
+            list_visibility: LabelListVisibility::Show,
+            message_visibility: MessageListVisibility::Show,
+            color: None,
+        }),
+        GmailRequest::PatchLabel {
+            id: label.clone(),
+            patch: LabelPatch {
+                name: Some("Job".into()),
+                ..LabelPatch::default()
+            },
+        },
+        GmailRequest::DeleteLabel { id: label },
+    ];
+    for access in [Access::ReadWrite, Access::ReadOnly] {
+        let setup = Setup::new(access, Vec::new(), 0, Duration::ZERO);
+        for write in writes.clone() {
+            let refused = setup.call(write.clone(), BUDGET).await;
+            assert!(
+                matches!(&refused, Err(CallError::Refused(f)) if f.class == Blocking::Permanent),
+                "{write:?}: {refused:?}"
+            );
+        }
+        assert!(setup.admitted().is_empty());
+        assert!(setup.sent().is_empty());
+        assert_eq!(setup.tokens.minted.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -305,7 +333,7 @@ async fn a_deferral_past_the_budget_sends_nothing_and_says_when() {
     let setup = Setup::new(Access::ReadWrite, Vec::new(), 1, Duration::from_mins(1));
     let before = mailtide_io::now();
     let error = setup
-        .call(archive_m1(), Duration::from_secs(1))
+        .call(get_m1(), Duration::from_secs(1))
         .await
         .expect_err("deferred");
     let CallError::Deferred(QuotaDeferred { until }) = error else {
@@ -334,7 +362,7 @@ async fn a_deferral_within_the_budget_is_waited_out() {
 #[tokio::test]
 async fn a_missing_scope_is_refused_without_blocking_the_account() {
     let setup = Setup::answering(vec![Ok(refusal(403, "insufficientPermissions"))]);
-    let error = setup.call(archive_m1(), BUDGET).await.expect_err("refused");
+    let error = setup.call(get_m1(), BUDGET).await.expect_err("refused");
     let CallError::Refused(refusal) = &error else {
         panic!("{error:?}");
     };
@@ -384,10 +412,10 @@ async fn a_lost_answer_is_an_unknown_outcome_and_an_unsent_request_is_retryable(
         Err(TransportError::NotSent("refused".into())),
     ]);
     assert_eq!(
-        setup.call(archive_m1(), BUDGET).await,
+        setup.call(get_m1(), BUDGET).await,
         Err(CallError::OutcomeUnknown("timed out".into()))
     );
-    let unsent = setup.call(archive_m1(), BUDGET).await;
+    let unsent = setup.call(get_m1(), BUDGET).await;
     assert!(
         matches!(&unsent, Err(CallError::Retryable(f)) if f.class == Retryable::Transient),
         "{unsent:?}"
