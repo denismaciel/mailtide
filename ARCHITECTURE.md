@@ -11,11 +11,12 @@ pure, and I/O lives in one driver crate.
                    │ mailtide-io (async, tokio): runner, HTTP, quota gate,  │
                    │        │      blobs, token source                       │
                    │        ├──▶ mailtide-gmail  (pure wire layer)          │
+                   │        ├──▶ mailtide-mime   (facts at import, parts)   │
                    │        ├──▶ mailtide-store  (memory/SQLite/Postgres)   │
                    │        └──▶ mailtide        (pure sans-IO engine)      │
                    │                                                         │
                    │ mailtide-sim   (Gmail simulator, tests only)            │
-                   │ mailtide-mime  (optional parsing and composition)       │
+                   │ mailtide-mime  (facts, part ranges and composition)     │
                    └─────────────────────────────────────────────────────────┘
 ```
 
@@ -26,8 +27,8 @@ pure, and I/O lives in one driver crate.
 | `mailtide` | yes | The engine: events in, commands out. Sync rules, state, rehydration, invariants, retry classes, quota ledger | §3–§9 | `MAILBOX_SYNC.md`, `mail-history-store`, `mail-label-store`, `mail-label-policy`, `mail-schedule`, `gmail-quota-cost`, `gmail-rate-limit` |
 | `mailtide-gmail` | yes | Gmail wire layer: typed responses, request builders, decoders, error classification, push JWT verification | §5 | `driver/google.ts`, `gmail-push.ts`, `gmail-quota-error.ts` |
 | `mailtide-store` | no | `Store` trait; memory, SQLite and Postgres stores with migrations; conformance suite | §4, §10.3 | the Durable Object SQLite stores |
-| `mailtide-io` | no | Async driver: executes commands over HTTP, enforces the quota gate, writes blobs, applies commits, runs the loop | §3, §6.2, §8 | `routes/agent/index.ts`, `gmail-quota-store/client`, `mail-asset-cache` |
-| `mailtide-mime` | yes | Optional MIME: parsing stored raw messages, composing outgoing ones (`compose`, the `X-Mailtide-Id` tracking id) | §5.5 | `imap/parser.ts`, `driver/outgoing-mime.ts` |
+| `mailtide-io` | no | Async driver: executes commands over HTTP, enforces the quota gate, writes blobs and extracts their facts at import, applies commits, runs the loop; reads one part with a ranged (or streamed) blob read; refreshes older facts | §3, §6.2, §8 | `routes/agent/index.ts`, `gmail-quota-store/client`, `mail-asset-cache` |
+| `mailtide-mime` | yes | MIME: the facts the driver stores at import, every part of a stored message with its byte range, chunked decoding of one part; composing outgoing messages (`compose`, the `X-Mailtide-Id` tracking id) | §4, §5.5 | `imap/parser.ts`, `driver/outgoing-mime.ts` |
 | `mailtide-sim` | yes | Deterministic Gmail simulator with fault injection, invariant checking, seeded replay | §12 | `imap/testing/memory-server.ts` |
 | `mailtide-py` | — | PyO3 bindings: `mailtide._core` | §11 | — |
 

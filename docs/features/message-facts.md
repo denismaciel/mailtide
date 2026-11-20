@@ -1,6 +1,6 @@
 # Message facts: more envelope headers, an attachment summary, and reading one part
 
-Plan: `features/message-facts.toml` (roadmap R2, R3, R8). Status: in progress.
+Plan: `features/message-facts.toml` (roadmap R2, R3, R8). Status: done.
 
 ## 1. Goal and scope
 
@@ -267,12 +267,17 @@ database. The pass-through alternative costs 60 units for the part list plus
 - **Backfill.** `refresh_facts` is a host-scheduled maintenance call, like
   `drift` and `compact`. It pages `message_ids` from `after`, reads the
   views, and for each imported row whose facts are missing or older than
-  `FACTS_VERSION` reads the blob (8 at a time), extracts, and hands batches
-  of 50 to `Store::refresh_facts`. That store call is **not fenced by an
+  `FACTS_VERSION`, or whose blob is not the length the row holds (an empty
+  ranged read answers the length; where the store serves ranges that is a
+  metadata call, not a read), reads the blob (8 at a time), extracts, and
+  hands batches of 50 to `Store::refresh_facts`. That store call is **not fenced by an
   epoch**, like `admit`: it must neither supersede a running sync nor be
   rejected by one. It is conditional per row instead: applied only while the
-  row exists, is imported, has the same blob, and holds older facts; then the
-  row's size is set to the blob's length. One batch is one transaction and
+  row exists, is imported, has the same blob and the size the refresher read,
+  and holds older facts (or its blob's length differs from that size); then
+  the row's size is set to the blob's length. The simulator checks each
+  refresh with `invariants::check_refresh` (nothing but facts and sizes
+  change). One batch is one transaction and
   one feed state. The call stops between batches when `limit` rows were
   examined or `budget` ran out and returns `next`; `None` means the pass is
   complete. It is idempotent: a second pass reads no blob. Cost: one blob

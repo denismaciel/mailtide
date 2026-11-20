@@ -2,7 +2,7 @@ id = "message-facts"
 title = "Message facts: more envelope headers, an attachment summary, and reading one part"
 summary = "At import the driver parses the raw message once and stores, inside the content record a message row already has, ten more envelope facts and a bounded attachment summary whose entries carry a byte range into the stored blob; one part is then read, or streamed, with a ranged blob read and no Gmail call, and rows imported earlier are brought up to date by a host-scheduled refresh that costs no quota."
 roadmap = ["R2", "R3", "R8"]
-status = "in_progress"
+status = "done"
 design = "docs/features/message-facts.md"
 # No hard dependency.
 #   threads (R7) reads From/To/Cc from the existing header facts, which this plan leaves as they are.

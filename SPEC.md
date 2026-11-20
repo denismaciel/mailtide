@@ -57,8 +57,8 @@ inform the design. No code is copied from them.
   (`search`, §11): the host's query string goes to Gmail untouched, Gmail
   decides what matches, and the hits come back as ids marked with what the
   mirror holds. mailtide parses no query and keeps no results.
-- Message parsing inside the sync core. Parsing is a separate optional crate
-  (§5.5).
+- Message parsing inside the sync core. Parsing is a separate crate the
+  driver uses at import (§5.5).
 - Sending mail, draft authoring, label creation/rename/delete. These come
   later; the design leaves room for them.
 - A JMAP server.
@@ -159,7 +159,12 @@ The store keeps, per account:
     (the paperclip) is `attached > 0`. It deliberately differs from Gmail's
     `has:attachment` operator, which matches any non-body part (inline
     images and signatures included): `attached + inline + protocol > 0`
-    reproduces that.
+    reproduces that. Each listed part carries a **part reference**,
+    `offset.length.encoding.size.total`: the byte range of its body in the
+    stored blob, its transfer encoding (upper case when malformed for it),
+    its decoded size, and the blob's length. Reading a part (§11) is one
+    ranged blob read and a decode; a reference refuses a blob of another
+    length. A part inside a transfer-encoded attached message has none.
   - Read, starred, archived, spam, trash, draft and important are **never
     separate columns**. They are views of `label_ids`. JMAP keywords map as
     `$seen = ¬UNREAD`, `$flagged = STARRED` and `$draft = DRAFT`; mailbox
@@ -192,9 +197,11 @@ The store keeps, per account:
   commit larger than the page's limit is split, and `next` inside it is the
   three-field form. An import
   entry is read together with the envelope its message row holds (header
-  facts and blob) instead of keeping a copy in the log: a message's content
-  never changes in Gmail, so the row matches the entry, and older entries
-  carry it too.
+  facts, message facts and blob) instead of keeping a copy in the log: a
+  message's content never changes in Gmail, so the row matches the entry,
+  and older entries carry it too. A facts refresh (§10.3) logs a
+  `FactsRefreshed` entry read the same way, and an earlier import entry then
+  shows the refreshed facts as well.
 - **consumer cursor**: `(account, name, position, seen_at)`, at most 16 per
   account, names of 1 to 64 `[A-Za-z0-9._-]`. A consumer `ack`s the
   position it has durably processed (either form of state string; the
@@ -242,12 +249,20 @@ Facts are from **[G]** unless marked otherwise.
 9. `messages.batchModify`: up to 1,000 ids; label add/remove arrays up to 100
    ids each [Z].
 
-### 5.5 Parsing and composition (separate crate, optional)
+### 5.5 Parsing and composition (separate crate)
 
-`mailtide-mime` wraps Stalwart `mail-parser` (Apache-2.0/MIT) to extract
-headers, text, HTML and attachments from stored raw content. The sync core
-depends only on the headers listed in §4, which it extracts with a minimal
-header parse.
+`mailtide-mime` wraps Stalwart `mail-parser` (Apache-2.0/MIT, with depth and
+part limits) to extract headers, text, HTML and attachments from stored raw
+content. The driver uses it at import: it extracts the message facts (§4)
+from the bytes it has just stored, on the blocking pool, and reports them
+with the import (they are event input; the core parses nothing and stays
+deterministic). An extractor that gives up leaves the message imported
+without facts and logs a warning: an import never fails because of a
+message's shape. The engine's own header facts come from a minimal header
+parse in `mailtide-gmail`, as written. `mailtide-mime` also lists every leaf
+part with its reference (`parts`), decodes one part in chunks with exactly
+the parser's output (`PartDecoder`), and decodes encoded words
+(`decode_header`); the facts take the tracking id from `tracking_id(raw)`.
 
 It also composes: `compose(message, options)` writes RFC 5322 bytes (what
 Gmail takes as `raw`) from a flat, JMAP-shaped `OutgoingMessage` through
@@ -619,9 +634,9 @@ engine's epoch, so results meant for a dead engine are ignored).
   the page is its first `limit` entries and `next` the last of them. An
   empty page returns `since`; `has_more` says whether more follow. `TooOld` when `since` is behind the
   floor or inside the floor commit (compaction removes whole commits).
-  `content` is the stored content of a `MessageImported` entry's message,
-  loaded for the page's imports in chunks of ids, `None` once it is
-  deleted. `compact(account, retention)` removes whole commits under the
+  `content` is the stored content of a `MessageImported` or
+  `FactsRefreshed` entry's message, loaded for the page's entries in chunks
+  of ids, `None` once it is deleted. `compact(account, retention)` removes whole commits under the
   account row lock: `Retention { through, now, max_idle }` gives an optional
   bound (a reader inside commit `S` passes `FeedCursor::compactable()`,
   `S - 1`), and the target is `compaction_target` over the account's
@@ -651,7 +666,29 @@ engine's epoch, so results meant for a dead engine are ignored).
   missing) or ahead of it (a newer mailtide migrated it). It asks once: after
   it has seen the schema current, it and its clones do not ask again.
 
-The conformance suite (`mailtide_store::conformance`, 54 cases) runs against
+
+- `refresh_facts(account, updates)`: bring stored message facts up to date
+  in one transaction. Not fenced by an epoch (like `admit`: it neither
+  supersedes a running sync nor is rejected by one) but conditional per row:
+  an update applies only while the row exists, is imported, has the same
+  blob and the size the refresher read, and its facts are missing or older
+  (or the blob's length differs from that size); the row's facts and size
+  are set, nothing else. Applied updates log `FactsRefreshed` under one new
+  state.
+
+Facts refresh (`Runner::refresh_facts(account, after, limit, budget)`) is
+a host-scheduled maintenance call, like `drift` and `compact`, with no Gmail
+call: it pages the messages from `after` in batches of 50, reads the blob (8
+at a time) of each imported row whose facts are missing or older than
+`FACTS_VERSION`, or whose blob is not the length the row holds (learnt from
+an empty ranged read, so a current row costs no blob read), extracts, and
+writes each batch with `Store::refresh_facts`. It stops between batches at
+`limit` messages or when `budget` is spent and returns `FactsRefresh {
+examined, refreshed, unreadable, next }`; `next == None` ends the pass. A
+missing blob is named in `unreadable`; a store failure rolls the batch back
+(call again from the same `after`).
+
+The conformance suite (`mailtide_store::conformance`, 58 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -751,7 +788,8 @@ runner per process, after forking:
   blob, and `content`: the `MessageContent` `messages` returns, so a message
   list needs no second call; `None` once the message is deleted),
   `LabelsChanged` (added/removed), `OverlayChanged`,
-  `MessageDeleted` (last thread and labels), `LabelDefinitionsChanged`;
+  `MessageDeleted` (last thread and labels), `LabelDefinitionsChanged`,
+  `FactsRefreshed` (with `content`, as for an import);
   `await compact(account, through=None, max_idle_s=604_800.0)` (whole
   commits, no further than `through` when given, where a `through` inside a
   commit keeps that commit, nor past the slowest registered consumer heard
@@ -764,7 +802,29 @@ runner per process, after forking:
   `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
-- `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
+- message facts on `MessageContent` (§4): `facts_version` (0 when not
+  extracted), `bcc`, `reply_to`, `sent_at_ms` and `sent_at_offset_min`,
+  `sender_name`, `sender_email`, `list_id`, `list_unsubscribe`,
+  `one_click_unsubscribe`, `auto_submitted`, `precedence`, `tracking_id`,
+  and the attachment summary: `attachments: list[AttachmentInfo]` (`part`,
+  `filename`, `content_type`, `size`, `inline`, `disposition`,
+  `content_id`), `attachment_count`, `inline_count`, `protocol_count`,
+  `has_attachment`, all `None` when not extracted, so unknown is never
+  shown as none. Filenames are the sender's: treat them as untrusted;
+- parts, with no Gmail call: `await parts(account, id) -> list[PartInfo]`
+  (every leaf, nested messages included: reference, role, type, filename,
+  size, Content-ID, charset, container and depth; the blob is parsed in
+  Rust); `await read_part(account, id, part, max_bytes=25 MiB) -> bytes`
+  (one ranged read; `PartTooLarge` before any read above `max_bytes`);
+  `await open_part(account, id, part, chunk_size=256 KiB) -> PartStream`
+  (decoded chunks of at most `chunk_size` from a streamed ranged read; an
+  async and a plain iterator and a context manager; leaving it or
+  cancelling the task inside it drops the read; a failure ends it with an
+  exception, never a short part); `await refresh_facts(account, after=None,
+  limit=1000, budget_s=60) -> FactsRefresh` (§10.3);
+- `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`
+  (each attachment also carries its `part`); `decode_header(value)` decodes
+  a `subject` as the header facts keep it;
 - composition (§5.5), pure: `compose_message(message, *, purpose="send",
   max_bytes=None) -> ComposedMessage` (`raw`, `message_id`, `tracking_id`,
   `recipients`) over a frozen `OutgoingMessage` (`from_`, `to`, `cc`, `bcc`,
@@ -788,7 +848,9 @@ runner per process, after forking:
   `GmailUnavailable`, `AccountBlocked`,
   `Superseded`, `InvalidPush`, and `DelegationRevoked` (raised by the token source
   to block an account; the block is committed, and later runs make no
-  credential calls), `InvalidPush`.
+  credential calls), `InvalidPush`, `BlobNotFound`, `PartNotFound` (a
+  reference that names no part of the message: unreadable, outside it, or
+  made for other content) and `PartTooLarge`.
 
 Async methods run on one process-wide Tokio runtime and work with
 `asyncio.create_task`, `TaskGroup` and `asyncio.timeout`. **Cancelling** an
@@ -919,8 +981,9 @@ Wheels: abi3 for CPython ≥ 3.12, plus free-threaded 3.14t and 3.15t.
 Status: unit tests per rule; the simulator (`mailtide-sim`) runs the real
 engine and the shared mirror rules against a fake Gmail with swarm-sampled
 faults, including users acting through the engine, users opening messages
-whose bodies are still queued (`prioritise`, §6.4), and label definitions
-created, renamed and deleted in Gmail, and checks invariants after every
+whose bodies are still queued (`prioritise`, §6.4), label definitions
+created, renamed and deleted in Gmail, and facts refreshes run beside the
+engine (checked to change nothing but facts), and checks invariants after every
 commit and every open (also that no job's class goes down outside a claim's
 finish) and convergence after healing (message sets, labels, thread ids and
 thread views), label definitions within the refresh

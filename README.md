@@ -61,6 +61,9 @@ views = await runner.messages("alice@example.com", ["18c…"])  # effective labe
 labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
 threads = await runner.threads("alice@example.com", ["18c…"])  # thread views, in one call
 hits = await runner.search("alice@example.com", "from:bob has:attachment")  # Gmail's own search
+content = views[0].content  # sender, dates, list headers, an attachment summary
+pdf = await runner.read_part("alice@example.com", "18c…", content.attachments[0].part)
+await runner.refresh_facts("alice@example.com")  # facts for mail imported before them
 ```
 
 A thread view (`ThreadView`) is folded from the mirror on every read: its
@@ -73,7 +76,8 @@ out).
 
 Invalid configuration raises `ValueError` naming the field. Failures are typed:
 `StoreUnavailable`, `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`,
-`QuotaGateError`, `Superseded` (all `MailtideError`). A blocked account
+`QuotaGateError`, `Superseded`, `BlobNotFound`, `PartNotFound`, `PartTooLarge`
+(all `MailtideError`). A blocked account
 (`DelegationRevoked` from the token source) stays blocked until
 `await runner.resume(account)`; `forget(account)` deletes its rows and blobs.
 
@@ -89,7 +93,7 @@ No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
 | `crates/mailtide-gmail` | Gmail wire layer (pure) |
 | `crates/mailtide-store` | Store trait; memory, SQLite, Postgres stores; conformance suite |
 | `crates/mailtide-io` | Async driver: HTTP, quota gate, blobs, runner |
-| `crates/mailtide-mime` | Optional MIME: parsing, and composing messages to send or save as drafts |
+| `crates/mailtide-mime` | MIME: message facts, part ranges and chunked decoding; composing messages to send or save as drafts |
 | `python/mailtide` | Thin Python shell: re-exports and type stubs |
 | `scripts/zero_tests.py` | Tracks Zero's sync tests ported by name (see below) |
 
