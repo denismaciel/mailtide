@@ -82,6 +82,22 @@ Invalid configuration raises `ValueError` naming the field. Failures are typed:
 (`DelegationRevoked` from the token source) stays blocked until
 `await runner.resume(account)`; `forget(account)` deletes its rows and blobs.
 
+Deleting mail for good is off unless you switch it on, and only reaches what
+is in trash or spam by default:
+
+```python
+config = Config(database=..., blobs=..., purge="trash_and_spam")  # default "off"
+outcome = await runner.purge("alice@example.com", message_ids=["18c…"])
+outcome.purged, outcome.sent, outcome.refused  # evidence-backed, unconfirmed, why not
+await runner.empty("alice@example.com", "trash")  # what the mirror holds in the trash
+```
+
+A purge checks Gmail's history since the mirror's cursor first (a message
+restored elsewhere a moment ago is refused), deletes by message id only,
+never repeats a delete, and records a deletion only when Gmail's history
+shows it. It needs a token with `https://mail.google.com/`
+(`PurgeScopeRequired` otherwise; nothing is trashed instead).
+
 No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
 
 ## Layout

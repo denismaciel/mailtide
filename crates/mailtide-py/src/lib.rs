@@ -42,6 +42,7 @@ mod _core {
     use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
     use mailtide_io::labels::{LabelError, SublabelDeletion, Sublabels};
     use mailtide_io::parts::PartError;
+    use mailtide_io::purge::{PurgeError, Stale};
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
     use mailtide_io::search::{self as runner_search, SearchError};
@@ -224,6 +225,30 @@ mod _core {
         MailtideError,
         "Gmail refused the label write for good (another 400, or a 403 such as a scope the token lacks): the caller's error; nothing was recorded and the account is not blocked."
     );
+    create_exception!(
+        _core,
+        PurgeDisabled,
+        MailtideError,
+        "Permanent deletion is off (Config.purge=\"off\", the default), or the call asked for anywhere=True and Config.purge is not \"anywhere\". Nothing was read or sent."
+    );
+    create_exception!(
+        _core,
+        PurgeScopeRequired,
+        MailtideError,
+        "The token lacks https://mail.google.com/, the only scope Gmail's deletes accept. Nothing was deleted, nothing was trashed instead, and the account keeps syncing."
+    );
+    create_exception!(
+        _core,
+        MirrorStale,
+        MailtideError,
+        "The mirror can't vouch for a purge (no cursor, not live, history lost, or too far behind): run the account, then call again. Nothing was sent."
+    );
+    create_exception!(
+        _core,
+        TooManyMessages,
+        PyValueError,
+        "A purge names at most 1,000 messages (a thread at most 1,000 members): split the set. Nothing was sent."
+    );
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -257,6 +282,10 @@ mod _core {
         m.add("InvalidLabel", py.get_type::<InvalidLabel>())?;
         m.add("LabelHasSublabels", py.get_type::<LabelHasSublabels>())?;
         m.add("LabelRefused", py.get_type::<LabelRefused>())?;
+        m.add("PurgeDisabled", py.get_type::<PurgeDisabled>())?;
+        m.add("PurgeScopeRequired", py.get_type::<PurgeScopeRequired>())?;
+        m.add("MirrorStale", py.get_type::<MirrorStale>())?;
+        m.add("TooManyMessages", py.get_type::<TooManyMessages>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -584,6 +613,42 @@ mod _core {
             other => Err(PyValueError::new_err(format!(
                 "sublabels must be refuse or delete, not {other:?}"
             ))),
+        }
+    }
+
+    fn purge_error(error: PurgeError) -> PyErr {
+        match error {
+            PurgeError::ReadOnly => run_error(RunError::ReadOnly),
+            PurgeError::Disabled => PurgeDisabled::new_err(
+                "permanent deletion is off: set Config.purge to \"trash_and_spam\" or \"anywhere\"",
+            ),
+            PurgeError::AnywhereNotAllowed => {
+                PurgeDisabled::new_err("anywhere=True needs Config.purge=\"anywhere\"")
+            }
+            PurgeError::TooMany { limit, given } => TooManyMessages::new_err(format!(
+                "a purge takes at most {limit} messages, got {given}"
+            )),
+            PurgeError::MirrorStale(stale) => MirrorStale::new_err(match stale {
+                Stale::NoCursor => "the account has not finished its first sync: run it first",
+                Stale::NotLive => "the account is reconciling: run it until it is live",
+                Stale::HistoryExpired => {
+                    "Gmail no longer has history from the mirror's cursor: run the account first"
+                }
+                Stale::TooFarBehind => "the mirror is too far behind Gmail: run the account first",
+            }),
+            PurgeError::ScopeRequired => PurgeScopeRequired::new_err(format!(
+                "Gmail refused the delete: the token lacks {}; nothing was deleted",
+                mailtide_gmail::purge::FULL_SCOPE
+            )),
+            PurgeError::Deferred(deferred) => quota_deferred(deferred),
+            PurgeError::Retryable(failure) => GmailUnavailable::new_err(failure.detail),
+            PurgeError::Refused(refusal) => MailtideError::new_err(format!(
+                "Gmail refused the history read: {}",
+                describe(&refusal)
+            )),
+            PurgeError::AccountBlocked(reason) => AccountBlocked::new_err(describe(&reason)),
+            PurgeError::NotTracked => store_error(StoreError::NotTracked),
+            PurgeError::Run(error) => run_error(error),
         }
     }
 
@@ -1914,6 +1979,7 @@ mod _core {
     #[derive(FromPyObject)]
     struct ConfigArg {
         access: String,
+        purge: String,
         database: DatabaseArg,
         blobs: BlobsArg,
         watch: WatchArg,
@@ -1928,6 +1994,7 @@ mod _core {
         fn from(c: ConfigArg) -> Self {
             Self {
                 access: c.access,
+                purge: c.purge,
                 database: crate::settings::RawDatabase {
                     url: c.database.url,
                     max_connections: c.database.max_connections,
@@ -2019,7 +2086,8 @@ mod _core {
                 watch: settings.watch,
                 log_accounts: settings.log_accounts,
             },
-        );
+        )
+        .with_purge(settings.purge);
         let dispatch = crate::logbridge::dispatch(settings.log_verbosity, settings.logger);
         let inner = match clock {
             None => inner,
@@ -2393,6 +2461,89 @@ mod _core {
         }
     }
 
+    /// What `purge` did, per message id (each distinct id in one list).
+    #[pyclass(frozen, get_all)]
+    struct PurgeOutcome {
+        /// Deleted for good, with Gmail's evidence: the tombstone is written
+        /// and `MessageDeleted` is in the feed.
+        purged: Vec<String>,
+        /// Sent, not yet shown by Gmail's history (or the answer was lost):
+        /// the row stays until a sync sees the deletion. Never resent.
+        sent: Vec<String>,
+        /// Not sent, by id: `not_in_mirror`, `draft`, `unverified`,
+        /// `not_in_trash_or_spam` or `gmail_refused`.
+        refused: std::collections::BTreeMap<String, &'static str>,
+        /// Not reached: the budget, a quota deferral or a failing Gmail
+        /// ended the call first.
+        unsent: Vec<String>,
+    }
+
+    impl From<mailtide::purge::PurgeOutcome> for PurgeOutcome {
+        fn from(outcome: mailtide::purge::PurgeOutcome) -> Self {
+            let strings = |ids: Vec<MessageId>| ids.into_iter().map(|id| id.0).collect();
+            Self {
+                purged: strings(outcome.purged),
+                sent: strings(outcome.sent),
+                refused: outcome
+                    .refused
+                    .into_iter()
+                    .map(|(id, refusal)| (id.0, refusal.code()))
+                    .collect(),
+                unsent: strings(outcome.unsent),
+            }
+        }
+    }
+
+    /// What `empty` did, in counts.
+    #[pyclass(frozen, get_all)]
+    struct EmptyOutcome {
+        /// Deleted for good, with Gmail's evidence recorded.
+        purged: u64,
+        /// Sent, not yet shown by history.
+        sent: u64,
+        /// In the bin as the mirror held it, but not deleted (restored
+        /// since, drafts, unverified, refused by Gmail).
+        skipped: u64,
+        /// Not reached: call again.
+        remaining: u64,
+    }
+
+    impl From<mailtide::purge::EmptyOutcome> for EmptyOutcome {
+        fn from(outcome: mailtide::purge::EmptyOutcome) -> Self {
+            Self {
+                purged: outcome.purged,
+                sent: outcome.sent,
+                skipped: outcome.skipped,
+                remaining: outcome.remaining,
+            }
+        }
+    }
+
+    fn purge_target(
+        message_ids: Option<Vec<String>>,
+        thread_id: Option<String>,
+    ) -> PyResult<mailtide::purge::PurgeTarget> {
+        match (message_ids, thread_id) {
+            (Some(ids), None) => Ok(mailtide::purge::PurgeTarget::Messages(
+                ids.into_iter().map(MessageId).collect(),
+            )),
+            (None, Some(thread)) => Ok(mailtide::purge::PurgeTarget::Thread(ThreadId(thread))),
+            _ => Err(PyValueError::new_err(
+                "pass exactly one of message_ids or thread_id",
+            )),
+        }
+    }
+
+    fn bin(name: &str) -> PyResult<mailtide::purge::Bin> {
+        match name {
+            "trash" => Ok(mailtide::purge::Bin::Trash),
+            "spam" => Ok(mailtide::purge::Bin::Spam),
+            other => Err(PyValueError::new_err(format!(
+                "bin must be \"trash\" or \"spam\", not {other:?}"
+            ))),
+        }
+    }
+
     /// What `forget` removed.
     #[pyclass(frozen, get_all)]
     struct ForgetResult {
@@ -2722,6 +2873,33 @@ mod _core {
                 .await
                 .map(ThreadSearchPage::from)
                 .map_err(search_error)
+        }
+
+        async fn purge(
+            self: Arc<Self>,
+            account: AccountId,
+            target: mailtide::purge::PurgeTarget,
+            anywhere: bool,
+            budget: Duration,
+        ) -> PyResult<PurgeOutcome> {
+            self.inner
+                .purge(&account, &target, anywhere, budget)
+                .await
+                .map(PurgeOutcome::from)
+                .map_err(purge_error)
+        }
+
+        async fn empty(
+            self: Arc<Self>,
+            account: AccountId,
+            bin: mailtide::purge::Bin,
+            budget: Duration,
+        ) -> PyResult<EmptyOutcome> {
+            self.inner
+                .empty(&account, bin, budget)
+                .await
+                .map(EmptyOutcome::from)
+                .map_err(purge_error)
         }
 
         async fn labels(self: Arc<Self>, account: AccountId) -> PyResult<Vec<Label>> {
@@ -3330,6 +3508,49 @@ mod _core {
             )
         }
 
+        #[pyo3(signature = (account, *, message_ids=None, thread_id=None, anywhere=false, budget_s=30.0))]
+        fn purge<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_ids: Option<Vec<String>>,
+            thread_id: Option<String>,
+            anywhere: bool,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let target = purge_target(message_ids, thread_id)?;
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().purge(
+                    account_id(account)?,
+                    target,
+                    anywhere,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, bin, *, budget_s=60.0))]
+        fn empty<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            bin: &str,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let bin = self::bin(bin)?;
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().empty(
+                    account_id(account)?,
+                    bin,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
         fn labels<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
@@ -3873,6 +4094,52 @@ mod _core {
                 self.shared
                     .clone()
                     .search_threads(account_id(account)?, query, budget),
+            )
+        }
+
+        /// Permanently delete messages; see `mailtide.Runner.purge`.
+        #[pyo3(signature = (account, *, message_ids=None, thread_id=None, anywhere=false, budget_s=30.0))]
+        fn purge(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_ids: Option<Vec<String>>,
+            thread_id: Option<String>,
+            anywhere: bool,
+            budget_s: f64,
+        ) -> PyResult<PurgeOutcome> {
+            let target = purge_target(message_ids, thread_id)?;
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().purge(
+                    account_id(account)?,
+                    target,
+                    anywhere,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        /// Permanently delete what the mirror holds in trash or spam; see
+        /// `mailtide.Runner.empty`.
+        #[pyo3(signature = (account, bin, *, budget_s=60.0))]
+        fn empty(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            bin: &str,
+            budget_s: f64,
+        ) -> PyResult<EmptyOutcome> {
+            let bin = self::bin(bin)?;
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().empty(
+                    account_id(account)?,
+                    bin,
+                    seconds(budget_s, "budget_s")?,
+                ),
             )
         }
 

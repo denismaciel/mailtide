@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use mailtide::EngineConfig;
+use mailtide::purge::PurgePolicy;
 use mailtide::quota::Budget;
 use mailtide_io::runner::{Access, LogAccounts, WatchMode};
 use mailtide_io::transport::HttpConfig;
@@ -78,6 +79,7 @@ pub struct RawLog {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawConfig {
     pub access: String,
+    pub purge: String,
     pub database: RawDatabase,
     pub blobs_url: String,
     pub blobs_options: std::collections::BTreeMap<String, String>,
@@ -93,6 +95,7 @@ pub struct RawConfig {
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub access: Access,
+    pub purge: PurgePolicy,
     pub database_url: DatabaseUrl,
     pub pool: PoolConfig,
     pub blobs_url: String,
@@ -316,10 +319,23 @@ pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
             ));
         }
     };
+    // Off unless switched on: the one operation that destroys mail.
+    let purge = match raw.purge.as_str() {
+        "off" => PurgePolicy::Off,
+        "trash_and_spam" => PurgePolicy::TrashAndSpam,
+        "anywhere" => PurgePolicy::Anywhere,
+        other => {
+            return Err(invalid(
+                "purge",
+                format!("{other:?} is not \"off\", \"trash_and_spam\" or \"anywhere\""),
+            ));
+        }
+    };
     let watch = watch(raw.watch)?;
     let engine = engine(&raw.engine, &watch)?;
     Ok(Settings {
         access,
+        purge,
         database_url,
         pool,
         blobs_url: raw.blobs_url,
@@ -342,6 +358,7 @@ mod tests {
     fn defaults() -> RawConfig {
         RawConfig {
             access: "read_write".into(),
+            purge: "off".into(),
             database: RawDatabase {
                 url: "postgres:///app?host=/cloudsql/p:r:i".into(),
                 max_connections: 2,
@@ -395,6 +412,7 @@ mod tests {
         assert_eq!(settings.pool.max_connections(), 2);
         assert_eq!(settings.watch, WatchMode::Disabled);
         assert!(settings.http.user_agent.starts_with("mailtide/"));
+        assert_eq!(settings.purge, PurgePolicy::Off, "purge is off by default");
     }
 
     #[test]
@@ -444,6 +462,10 @@ mod tests {
             validate(raw).map(|_| ()).unwrap_err().field,
             "http.gmail_origin"
         );
+
+        let mut raw = defaults();
+        raw.purge = "everything".into();
+        assert_eq!(validate(raw).map(|_| ()).unwrap_err().field, "purge");
 
         let mut raw = defaults();
         raw.quota.account_per_minute = 50;

@@ -32,6 +32,10 @@ class GmailUnavailable(MailtideError): ...
 class AccountBlocked(MailtideError): ...
 class PartNotFound(MailtideError): ...
 class PartTooLarge(MailtideError): ...
+class PurgeDisabled(MailtideError): ...
+class PurgeScopeRequired(MailtideError): ...
+class MirrorStale(MailtideError): ...
+class TooManyMessages(ValueError): ...
 
 class ComposeError(ValueError):
     """compose_message refused its input; the message never holds the value."""
@@ -494,6 +498,27 @@ class PrioritiseResult:
     over_limit: list[str]
 
 @final
+class PurgeOutcome:
+    """What ``purge`` did: each distinct id in one of the four."""
+
+    purged: list[str]
+    sent: list[str]
+    refused: dict[
+        str,
+        Literal["not_in_mirror", "draft", "unverified", "not_in_trash_or_spam", "gmail_refused"],
+    ]
+    unsent: list[str]
+
+@final
+class EmptyOutcome:
+    """What ``empty`` did, in counts."""
+
+    purged: int
+    sent: int
+    skipped: int
+    remaining: int
+
+@final
 class SearchHit:
     """A message Gmail's search matched, and what the mirror holds for it."""
 
@@ -621,6 +646,18 @@ class Runner:
         priority: Priority = "foreground",
         budget_s: float = 10.0,
     ) -> Awaitable[ThreadSearchPage]: ...
+    def purge(
+        self,
+        account: str,
+        *,
+        message_ids: list[str] | None = None,
+        thread_id: str | None = None,
+        anywhere: bool = False,
+        budget_s: float = 30.0,
+    ) -> Awaitable[PurgeOutcome]: ...
+    def empty(
+        self, account: str, bin: Literal["trash", "spam"], *, budget_s: float = 60.0
+    ) -> Awaitable[EmptyOutcome]: ...
     def labels(self, account: str) -> Awaitable[list[Label]]: ...
     def create_label(
         self,
@@ -755,6 +792,18 @@ class BlockingRunner:
         priority: Priority = "foreground",
         budget_s: float = 10.0,
     ) -> ThreadSearchPage: ...
+    def purge(
+        self,
+        account: str,
+        *,
+        message_ids: list[str] | None = None,
+        thread_id: str | None = None,
+        anywhere: bool = False,
+        budget_s: float = 30.0,
+    ) -> PurgeOutcome: ...
+    def empty(
+        self, account: str, bin: Literal["trash", "spam"], *, budget_s: float = 60.0
+    ) -> EmptyOutcome: ...
     def labels(self, account: str) -> list[Label]: ...
     def create_label(
         self,

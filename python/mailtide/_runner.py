@@ -18,6 +18,7 @@ from mailtide._core import (
     ChangePage,
     ConsumerCursor,
     DriftResult,
+    EmptyOutcome,
     FactsRefresh,
     ForgetResult,
     Health,
@@ -31,6 +32,7 @@ from mailtide._core import (
     PartStream,
     PrioritiseResult,
     Progress,
+    PurgeOutcome,
     ResumeResult,
     RunOutcome,
     SchemaStatus,
@@ -309,6 +311,47 @@ class Runner:
             priority=priority,
             budget_s=budget_s,
         )
+
+    async def purge(
+        self,
+        account: str,
+        *,
+        message_ids: list[str] | None = None,
+        thread_id: str | None = None,
+        anywhere: bool = False,
+        budget_s: float = 30.0,
+    ) -> PurgeOutcome:
+        """Delete messages for good: ``message_ids`` (at most 1,000) or the
+        non-draft messages the mirror holds for ``thread_id``. Off unless
+        ``Config.purge`` switches it on; only what is in trash or spam as of
+        the call, unless ``anywhere=True`` under ``Config.purge="anywhere"``.
+
+        Gmail's history since the mirror's cursor is read first, so a message
+        restored elsewhere a moment ago is refused. Each delete is sent once
+        and never repeated by mailtide; a message counts as ``purged`` (and
+        its ``MessageDeleted`` is in the feed) only once Gmail's history shows
+        the deletion; one sent but not shown yet is ``sent``. Needs a token
+        with ``https://mail.google.com/``. Raises ``PurgeDisabled``,
+        ``ReadOnlyMode``, ``TooManyMessages``, ``MirrorStale`` (run the
+        account first), ``PurgeScopeRequired`` (nothing deleted, nothing
+        trashed instead, the account keeps syncing), ``QuotaDeferred``,
+        ``GmailUnavailable``, ``AccountBlocked`` or ``AccountNotTracked``."""
+        return await self._core.purge(
+            account,
+            message_ids=message_ids,
+            thread_id=thread_id,
+            anywhere=anywhere,
+            budget_s=budget_s,
+        )
+
+    async def empty(
+        self, account: str, bin: Literal["trash", "spam"], *, budget_s: float = 60.0
+    ) -> EmptyOutcome:
+        """Delete for good what the mirror holds in the trash (or spam),
+        1,000 at a time, until ``budget_s`` ends. Messages that left the bin
+        meanwhile, drafts and messages trashed elsewhere since the last sync
+        are left. ``remaining`` > 0: call again. Raises as ``purge``."""
+        return await self._core.empty(account, bin, budget_s=budget_s)
 
     async def labels(self, account: str) -> list[Label]:
         """``account``'s label definitions as the mirror last synced them, in id

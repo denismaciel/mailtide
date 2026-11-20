@@ -36,6 +36,10 @@ class Mailbox:
         self.searches: list[dict[str, list[str]]] = []  # each search's parameters
         self.withheld: set[str] = set()  # raw fetches of these ids answer 503
         self.next_label = 0
+        # Whether the token holds https://mail.google.com/, the only scope
+        # messages.delete and batchDelete accept; without it they answer 403.
+        self.full_scope = True
+        self.deletes: list[list[str]] = []  # the ids of each delete call Gmail applied
 
     def add(
         self,
@@ -72,6 +76,10 @@ class Mailbox:
         self.history_id += 1
         ref = {"id": mid, "threadId": m["thread"]}
         self.history.append({"id": str(self.history_id), "messagesDeleted": [{"message": ref}]})
+
+    def restore(self, mid: str) -> None:
+        """Another client restores the message from the trash to the inbox."""
+        self.modify(mid, ["INBOX"], ["TRASH"])
 
     def label(self, lid: str, name: str, kind: str = "user", **attrs: object) -> None:
         """Create a label definition, or rename it (no history record, as in Gmail).
@@ -230,8 +238,36 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                     label["color"] = body["color"]
             return self.reply(200, label)
 
+        def no_content(self) -> None:
+            self.send_response(204)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def scope_refused(self) -> bool:
+            """Answer a delete as Gmail does a token without the full scope."""
+            if mailbox.full_scope:
+                return False
+            error = {
+                "code": 403,
+                "message": "Request had insufficient authentication scopes.",
+                "errors": [{"reason": "insufficientPermissions"}],
+                "status": "PERMISSION_DENIED",
+                "details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}],
+            }
+            self.reply(403, {"error": error})
+            return True
+
         def _delete(self) -> None:
             assert self.headers["authorization"] == "Bearer test-token"
+            parts = urlparse(self.path).path.removeprefix(PREFIX).split("/")
+            if len(parts) == 2 and parts[0] == "messages":
+                if self.scope_refused():
+                    return None
+                if parts[1] not in mailbox.messages:
+                    return self.reply(404, {"error": {"code": 404, "message": "not found"}})
+                mailbox.delete(parts[1])
+                mailbox.deletes.append([parts[1]])
+                return self.no_content()
             lid = self.label_id()
             if lid is None or lid not in mailbox.labels:
                 return self.reply(404, {"error": {"code": 404, "message": "not found"}})
@@ -313,6 +349,15 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                     return self.refuse(400, "invalidArgument", "labelId not found")
                 mailbox.modify(parts[1], add, remove)
                 return self.reply(200, {"id": parts[1]})
+            if parts == ["messages", "batchDelete"]:
+                if self.scope_refused():
+                    return None
+                # Deletes the ids that exist; the answer names none.
+                for mid in body["ids"]:
+                    if mid in mailbox.messages:
+                        mailbox.delete(mid)
+                mailbox.deletes.append(list(body["ids"]))
+                return self.no_content()
             if parts == ["labels"]:
                 if mailbox.holder(body.get("name", "")):
                     return self.refuse(409, "aborted", "Label name exists or conflicts")
@@ -341,7 +386,10 @@ class FakeGmail:
     configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``delete``,
     ``label``, ``create_label``, ``rename_label``, ``delete_label``,
     ``expire_history``, ``refuse``, ``delay_s``, ``requests``, ``withheld``,
-    and for searches ``search_results``, ``search_refusal``, ``searches``).
+    ``restore``, and for searches ``search_results``, ``search_refusal``,
+    ``searches``; for permanent deletion ``deletes``, the ids of each delete
+    call applied, and ``full_scope = False``, a token without
+    ``https://mail.google.com/``, which deletes answer with 403).
     It serves the labels API as Gmail does: a name another label holds, in
     any case, is a 409; a modify adding a label it lacks is a 400 for the
     whole request.

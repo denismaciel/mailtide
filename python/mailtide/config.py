@@ -129,6 +129,11 @@ class Config:
     #: (``act``/``admit`` raise ``ReadOnlyMode``; works with the
     #: ``gmail.readonly`` scope).
     access: Literal["read_write", "read_only"] = "read_write"
+    #: Permanent deletion (``purge``, ``empty``): ``off`` refuses it,
+    #: ``trash_and_spam`` allows it for what is in trash or spam, and
+    #: ``anywhere`` also lets a call ask (``anywhere=True``) to delete mail
+    #: wherever it is. It cannot be undone, so it is off unless switched on.
+    purge: Literal["off", "trash_and_spam", "anywhere"] = "off"
     watch: Poll | Topic = Poll()
     http: Http = Http()
     engine: Engine = Engine()
