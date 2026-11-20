@@ -193,6 +193,16 @@ change = "new"
 role = "Driver tests against a fake Gmail: mirror state of hits, quota, errors, read-only, blocked accounts"
 
 [[file]]
+path = "crates/mailtide-io/tests/search_logs.rs"
+change = "new"
+role = "The log test, in a process of its own: tracing caches callsite interest globally, so a scoped subscriber misses events other test threads register at the same time"
+
+[[file]]
+path = "crates/mailtide-io/tests/search_support/mod.rs"
+change = "new"
+role = "The fake Gmail (sync endpoints from a mailbox, scripted search answers) and the runner fixture the driver and reference tests share"
+
+[[file]]
 path = "tests/test_search.py"
 change = "new"
 role = "Python tests of the Runner search API against FakeGmail"
@@ -778,7 +788,7 @@ covers = "429 or userRateLimitExceeded: Retryable is returned and the gate defer
 [[test]]
 target = "crates/mailtide-io/tests/search.rs"
 name = "a_refused_search_does_not_block_the_account"
-covers = "400 on a first page (a label id Gmail rejects) and 403 (gmail.metadata scope) are Refused: the caller's error; the account's sync state is unchanged"
+covers = "400 on a first page (a query Gmail rejects) and 403 (gmail.metadata scope) are Refused: the caller's error; the account's sync state is unchanged and the next run syncs"
 
 [[test]]
 target = "crates/mailtide-io/tests/search.rs"
@@ -801,7 +811,7 @@ name = "search_on_an_untracked_account_is_refused"
 covers = "NotTracked: search never starts mirroring an account"
 
 [[test]]
-target = "crates/mailtide-io/tests/search.rs"
+target = "crates/mailtide-io/tests/search_logs.rs"
 name = "the_query_never_reaches_the_logs"
 covers = "Log events carry the request kind, cost and duration; never q, label ids, message ids or Gmail's error text"
 
@@ -809,6 +819,21 @@ covers = "Log events carry the request kind, cost and duration; never q, label i
 target = "crates/mailtide-io/tests/search.rs"
 name = "thread_search_returns_thread_ids_with_gmails_history_ids"
 covers = "threads.list: thread id and Gmail's historyId per hit, the page's cursor to compare it with; no mirror state (threads feature)"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_label_id_the_mirror_does_not_hold_is_refused_before_gmail_is_called"
+covers = "search-unknown-label-id was refuted (Gmail answers an unknown labelIds value with an empty page), so a label id missing from the mirror's definitions is UnknownLabel with no Gmail call; before the first label listing every id is; known ids go out sorted"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_lost_answer_is_retryable"
+covers = "A timeout or dropped connection (the call's OutcomeUnknown) is Retryable: a search is a read"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "label_ids_the_mirror_does_not_hold_are_named"
+covers = "unknown_label names the first filter id the mirror's definitions lack; with no definitions, every id"
 
 [[test]]
 target = "crates/mailtide-io/tests/search.rs"

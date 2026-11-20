@@ -14,6 +14,7 @@ pub mod auth;
 pub mod blobs;
 pub mod quota_gate;
 pub mod runner;
+pub mod search;
 pub mod transport;
 
 /// The host's clock, as the engine's time type.
