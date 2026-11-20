@@ -146,10 +146,12 @@ row lock, so it is serialized with commits and claims: a finish that removes
 the job first makes the id `imported`; a prioritise that lands first is
 simply overwritten by the job's removal.
 
-SQL, one transaction, no schema change: lock the account row; select
-`id, content IS NOT NULL` for the ids and their rows in `mailtide_jobs`
-(`kind = import`), one `IN` query each (at most 100 ids); count Foreground
-imports; update the raised rows. The existing index
+SQL, one transaction, no schema change: lock the account row; load the
+ids' rows and jobs into a partial mirror with the set-based loader a commit
+uses (`load_rows`, one `IN` query per table for at most 100 ids); count
+Foreground imports; apply the shared rule
+(`AccountMirror::prioritise_counted`) and write the raised rows. The
+existing index
 `(account, state, priority, due_at)` already serves the claim that follows.
 An untracked account answers every id as `unknown`.
 

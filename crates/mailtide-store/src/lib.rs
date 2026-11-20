@@ -14,7 +14,7 @@ use std::future::Future;
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
-use mailtide::jobs::{AttemptId, ClaimOutcome};
+use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
@@ -119,6 +119,19 @@ pub trait Store: Send + Sync {
         request: &ActionRequest,
         now: Timestamp,
     ) -> impl Future<Output = Result<u32, StoreError>> + Send;
+
+    /// A user opened these messages: raise their queued body imports to the
+    /// Foreground class (see [`mailtide::mirror::AccountMirror::prioritise`]),
+    /// atomically and without an engine (no epoch fence, like `admit`): the
+    /// change only ever raises a class, so it is safe beside any engine.
+    /// Creates no row, job or feed entry. An untracked account answers every
+    /// id as unknown.
+    fn prioritise(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Prioritised, StoreError>> + Send;
 
     /// What the store holds about an account, read without claiming it (so
     /// it never preempts a running sync). `None` for an unknown account.

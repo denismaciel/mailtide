@@ -14,7 +14,7 @@ use mailtide::ids::{
     AccountId, BlobRef, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId,
     ThreadId, Timestamp,
 };
-use mailtide::jobs::{AttemptId, JobKind, JobOp, JobOutcome};
+use mailtide::jobs::{AttemptId, FOREGROUND_IMPORT_CAP, JobKind, JobOp, JobOutcome, Prioritised};
 use mailtide::labels::{LabelSet, set};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::{Action, ActionRequest, IntentOp, ReadState};
@@ -43,7 +43,7 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<S, StoreError>>,
 {
-    let cases: Vec<(&'static str, CaseFn<S>)> = vec![
+    let mut cases: Vec<(&'static str, CaseFn<S>)> = vec![
         ("claims bump the epoch and fence older writers", |s| {
             Box::pin(epoch_fencing(s))
         }),
@@ -130,6 +130,7 @@ where
             Box::pin(large_import_commits(s))
         }),
     ];
+    cases.extend(prioritise_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -139,6 +140,33 @@ where
         results.push(CaseResult { name, failure });
     }
     results
+}
+
+/// The cases of `Store::prioritise`.
+fn prioritise_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        ("prioritise raises queued imports to Foreground", |s| {
+            Box::pin(prioritise_raises_queued_imports(s))
+        }),
+        ("prioritise needs no epoch", |s| {
+            Box::pin(prioritise_is_unfenced(s))
+        }),
+        ("prioritise reports the ids it could not raise", |s| {
+            Box::pin(prioritise_reports_what_it_could_not_raise(s))
+        }),
+        ("prioritise keeps a failed import's backoff", |s| {
+            Box::pin(prioritise_keeps_a_failed_imports_backoff(s))
+        }),
+        ("a running claim finishes after prioritise", |s| {
+            Box::pin(prioritise_survives_a_running_claim(s))
+        }),
+        ("prioritise stops at the Foreground import cap", |s| {
+            Box::pin(prioritise_respects_the_foreground_cap(s))
+        }),
+        ("prioritise writes nothing to the feed", |s| {
+            Box::pin(prioritise_leaves_the_feed_alone(s))
+        }),
+    ]
 }
 
 fn account() -> AccountId {
@@ -1468,4 +1496,310 @@ async fn large_import_commits<S: Store>(store: &S) -> Result<(), String> {
         }),
         "every import carries its own envelope",
     )
+}
+
+fn ids(ids: &[&str]) -> Vec<MessageId> {
+    ids.iter().map(|id| MessageId((*id).into())).collect()
+}
+
+/// Discover `names` with their imports queued at Backfill, due at once.
+async fn pending_backfill<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    seq: u64,
+    names: &[&str],
+) -> Result<(), String> {
+    let mut c = commit(snapshot, seq);
+    c.job_plan.priority = Priority::Backfill;
+    c.messages = names.iter().map(|id| observe(id, &["INBOX"], 1)).collect();
+    let outcome = apply(store, &c).await?;
+    expect(
+        matches!(outcome, CommitOutcome::Applied { .. }),
+        "the discovery must apply",
+    )
+}
+
+async fn prioritise<S: Store>(
+    store: &S,
+    account: &AccountId,
+    names: &[&str],
+    now: i64,
+) -> Result<Prioritised, String> {
+    store
+        .prioritise(account, &ids(names), Timestamp(now))
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Claim up to `limit` jobs of at least `floor` due at `now`.
+async fn claim_at<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    limit: u32,
+    now: i64,
+    attempt: u64,
+    floor: Priority,
+) -> Result<Vec<mailtide::jobs::ClaimedJob>, String> {
+    store
+        .claim_jobs(
+            &account(),
+            snapshot.epoch,
+            limit,
+            Timestamp(now),
+            AttemptId(attempt),
+            floor,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)
+}
+
+/// The claimed jobs as (message, class).
+fn classes(jobs: &[mailtide::jobs::ClaimedJob]) -> Vec<(String, Priority)> {
+    jobs.iter()
+        .map(|job| (job.kind().message().0.clone(), job.priority))
+        .collect()
+}
+
+async fn prioritise_raises_queued_imports<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    pending_backfill(store, &snapshot, 0, &["a", "b", "c"]).await?;
+    let report = prioritise(store, &account(), &["b"], 0).await?;
+    expect(report.queued == ids(&["b"]), &format!("{report:?}"))?;
+    let first = claim_at(store, &snapshot, 1, 0, 1, Priority::Backfill).await?;
+    expect(
+        classes(&first) == vec![("b".to_owned(), Priority::Foreground)],
+        &format!("the opened message is claimed first, got {first:?}"),
+    )?;
+    let rest = claim_at(store, &snapshot, 10, 0, 2, Priority::Backfill).await?;
+    expect(
+        classes(&rest)
+            == vec![
+                ("a".to_owned(), Priority::Backfill),
+                ("c".to_owned(), Priority::Backfill),
+            ],
+        &format!("the others keep their class, got {rest:?}"),
+    )
+}
+
+async fn prioritise_is_unfenced<S: Store>(store: &S) -> Result<(), String> {
+    let first = claim(store).await?;
+    pending_backfill(store, &first, 0, &["a"]).await?;
+    let held = claim_at(store, &first, 10, 0, 1, Priority::Backfill).await?;
+    expect(held.len() == 1, "engine 1 holds the import")?;
+    let second = claim(store).await?;
+    let report = prioritise(store, &account(), &["a"], 0).await?;
+    expect(
+        report.queued == ids(&["a"]),
+        "prioritise needs no epoch, and a released job is still queued",
+    )?;
+    let jobs = claim_at(store, &second, 10, 0, 2, Priority::Backfill).await?;
+    expect(
+        classes(&jobs) == vec![("a".to_owned(), Priority::Foreground)],
+        &format!("engine 2 runs it in the Foreground class, got {jobs:?}"),
+    )?;
+    let stale = store
+        .claim_jobs(
+            &account(),
+            first.epoch,
+            10,
+            Timestamp(0),
+            AttemptId(3),
+            Priority::Backfill,
+        )
+        .await;
+    expect(
+        stale
+            == Ok(mailtide::jobs::ClaimOutcome::Rejected(
+                Rejection::StaleEpoch,
+            )),
+        "engine 1's claims are still refused",
+    )
+}
+
+async fn prioritise_reports_what_it_could_not_raise<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![
+        import("done", &["INBOX"], 1),
+        observe("gone", &["INBOX"], 1),
+        observe("stuck", &["INBOX"], 1),
+    ];
+    apply(store, &c).await?;
+    let mut deleted = commit(&snapshot, 1);
+    deleted.messages = vec![MessageOp::Tombstone {
+        id: MessageId("gone".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(2) },
+    }];
+    apply(store, &deleted).await?;
+    let stuck = claim_all(store, &snapshot, 1)
+        .await?
+        .into_iter()
+        .find(|job| job.kind() == JobKind::Import(MessageId("stuck".into())))
+        .ok_or("the import of stuck is claimable")?;
+    let mut block = commit(&snapshot, 2);
+    block.claim = Some(stuck.claim());
+    block.jobs = vec![JobOp::Finish {
+        claim: stuck.claim(),
+        outcome: JobOutcome::Block(mailtide::retry::BlockingFailure {
+            class: mailtide::retry::Blocking::Permanent,
+            detail: "malformed".into(),
+        }),
+    }];
+    apply(store, &block).await?;
+    let jobs = |status: Option<mailtide::status::AccountStatus>| status.map(|s| s.jobs);
+    let before = jobs(
+        store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    );
+    let report = prioritise(store, &account(), &["done", "never", "gone", "stuck"], 0).await?;
+    expect(
+        report
+            == Prioritised {
+                imported: ids(&["done"]),
+                unknown: ids(&["never", "gone"]),
+                blocked: ids(&["stuck"]),
+                ..Prioritised::default()
+            },
+        &format!("{report:?}"),
+    )?;
+    let after = jobs(
+        store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    );
+    expect(before == after, "no job is created, removed or unblocked")
+}
+
+async fn prioritise_keeps_a_failed_imports_backoff<S: Store>(store: &S) -> Result<(), String> {
+    const BACKOFF: i64 = 60_000;
+    let snapshot = claim(store).await?;
+    pending_backfill(store, &snapshot, 0, &["a"]).await?;
+    let [job] = <[_; 1]>::try_from(claim_all(store, &snapshot, 1).await?)
+        .map_err(|jobs| format!("one job, got {jobs:?}"))?;
+    let mut failed = commit(&snapshot, 1);
+    failed.claim = Some(job.claim());
+    failed.jobs = vec![JobOp::Finish {
+        claim: job.claim(),
+        outcome: JobOutcome::Retry {
+            due_at: Timestamp(BACKOFF),
+        },
+    }];
+    apply(store, &failed).await?;
+    let report = prioritise(store, &account(), &["a"], 1_000).await?;
+    expect(
+        report.queued == ids(&["a"]),
+        "a backing-off import is raised",
+    )?;
+    let early = claim_at(store, &snapshot, 10, BACKOFF - 1, 2, Priority::Backfill).await?;
+    expect(early.is_empty(), "the backoff stands")?;
+    let due = claim_at(store, &snapshot, 10, BACKOFF, 3, Priority::Backfill).await?;
+    expect(
+        classes(&due) == vec![("a".to_owned(), Priority::Foreground)]
+            && due.first().map(|job| job.failed_attempts) == Some(1),
+        &format!("raised, with its failed attempt counted, got {due:?}"),
+    )
+}
+
+async fn prioritise_survives_a_running_claim<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    pending_backfill(store, &snapshot, 0, &["a", "b"]).await?;
+    let running = claim_all(store, &snapshot, 1).await?;
+    let report = prioritise(store, &account(), &["a", "b"], 0).await?;
+    expect(
+        report.queued == ids(&["a", "b"]),
+        "running imports are raised for their next attempt",
+    )?;
+    for (seq, job) in (1..).zip(&running) {
+        let outcome = if job.kind() == JobKind::Import(MessageId("a".into())) {
+            JobOutcome::Done
+        } else {
+            JobOutcome::Retry {
+                due_at: Timestamp(0),
+            }
+        };
+        let mut finish = commit(&snapshot, seq);
+        finish.claim = Some(job.claim());
+        finish.jobs = vec![JobOp::Finish {
+            claim: job.claim(),
+            outcome,
+        }];
+        let applied = apply(store, &finish).await?;
+        expect(
+            matches!(applied, CommitOutcome::Applied { skipped: 0, .. }),
+            "the claim still holds after prioritise",
+        )?;
+    }
+    let next = claim_all(store, &snapshot, 2).await?;
+    expect(
+        classes(&next) == vec![("b".to_owned(), Priority::Foreground)],
+        &format!("the finished job is gone, the retried one is Foreground, got {next:?}"),
+    )
+}
+
+async fn prioritise_respects_the_foreground_cap<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let names: Vec<String> = (0..FOREGROUND_IMPORT_CAP + 5)
+        .map(|n| format!("m{n:02}"))
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    pending_backfill(store, &snapshot, 0, &names).await?;
+    let report = prioritise(store, &account(), &names, 0).await?;
+    expect(
+        report.queued == ids(&names[..FOREGROUND_IMPORT_CAP])
+            && report.over_limit == ids(&names[FOREGROUND_IMPORT_CAP..]),
+        &format!("the first {FOREGROUND_IMPORT_CAP} are raised, got {report:?}"),
+    )?;
+    let raised = claim_at(store, &snapshot, 100, 0, 1, Priority::Foreground).await?;
+    expect(
+        raised.len() == FOREGROUND_IMPORT_CAP,
+        &format!(
+            "{FOREGROUND_IMPORT_CAP} Foreground imports, got {}",
+            raised.len()
+        ),
+    )?;
+    let rest = claim_at(store, &snapshot, 100, 0, 2, Priority::Backfill).await?;
+    expect(
+        rest.len() == 5 && rest.iter().all(|job| job.priority == Priority::Backfill),
+        &format!("the rest stay in their class, got {rest:?}"),
+    )?;
+    let stranger = AccountId("stranger@example.com".into());
+    let report = prioritise(store, &stranger, &["a", "a", "b"], 0).await?;
+    expect(
+        report == Prioritised::unknown(&ids(&["a", "b"])),
+        "an untracked account answers every id as unknown",
+    )
+}
+
+async fn prioritise_leaves_the_feed_alone<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    pending_backfill(store, &snapshot, 0, &["a", "b"]).await?;
+    let state = |status: Option<mailtide::status::AccountStatus>| status.map(|s| s.state);
+    let before = state(
+        store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    );
+    let feed_before = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let report = prioritise(store, &account(), &["a"], 0).await?;
+    expect(report.queued == ids(&["a"]), "raised")?;
+    let after = state(
+        store
+            .status(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    );
+    let feed_after = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(before == after, "the state string does not move")?;
+    expect(feed_before == feed_after, "no feed entry is written")
 }

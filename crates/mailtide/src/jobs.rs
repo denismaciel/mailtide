@@ -292,6 +292,18 @@ pub struct Prioritised {
     pub over_limit: Vec<MessageId>,
 }
 
+impl Prioritised {
+    /// Every distinct id of `ids` unknown (what an untracked account answers).
+    #[must_use]
+    pub fn unknown(ids: &[MessageId]) -> Self {
+        let mut seen = std::collections::BTreeSet::new();
+        Self {
+            unknown: ids.iter().filter(|id| seen.insert(*id)).cloned().collect(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Raise `job` to the Foreground class because a user is waiting for it
 /// (pure). A ready job that is delayed without ever failing (a quota
 /// deferral, a draft's settle delay) becomes due `now`; one backing off

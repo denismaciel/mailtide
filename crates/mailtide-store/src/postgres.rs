@@ -3,7 +3,7 @@
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
-use mailtide::jobs::{AttemptId, ClaimOutcome};
+use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
@@ -119,6 +119,15 @@ impl Store for PostgresStore {
         now: Timestamp,
     ) -> Result<u32, StoreError> {
         crate::Store::admit(&self.inner, account, request, now).await
+    }
+
+    async fn prioritise(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+        now: Timestamp,
+    ) -> Result<Prioritised, StoreError> {
+        crate::Store::prioritise(&self.inner, account, ids, now).await
     }
 
     async fn messages(

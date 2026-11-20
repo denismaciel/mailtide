@@ -15,7 +15,9 @@ use mailtide::gmail::{Label, LabelKind};
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
-use mailtide::jobs::{AttemptId, ClaimOutcome, ClaimedJob, ClaimedWork, Job, JobKind, JobState};
+use mailtide::jobs::{
+    AttemptId, ClaimOutcome, ClaimedJob, ClaimedWork, Job, JobKind, JobState, Prioritised,
+};
 use mailtide::labels::LabelSet;
 use mailtide::mirror::{
     AccountMirror, AccountRecord, Content, MessageRecord, MessageView, StoredContent,
@@ -1687,6 +1689,48 @@ impl crate::Store for SqlStore {
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
         Ok(admitted)
+    }
+
+    async fn prioritise(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+        now: Timestamp,
+    ) -> Result<Prioritised, StoreError> {
+        let mut tx = self.begin().await?;
+        // The account row lock serializes this with commits and claims.
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Ok(Prioritised::unknown(ids));
+        };
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
+        mirror.record = record;
+        mirror.seq = seq;
+        let distinct: Vec<MessageId> = ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect();
+        Self::load_rows(&mut tx, account, &distinct, &mut mirror).await?;
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM mailtide_jobs WHERE account = $1 AND kind = $2
+             AND priority = $3 AND state IN ('ready', 'running')",
+        )
+        .bind(account.as_str())
+        .bind(kind_code(&JobKind::Import(MessageId(String::new()))).0)
+        .bind(priority_code(Priority::Foreground))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| unavailable(&e))?;
+        let foreground: i64 = row.try_get("n").map_err(|e| corrupt("count", e))?;
+        let before = mirror.clone();
+        let report =
+            mirror.prioritise_counted(ids, now, usize::try_from(foreground).unwrap_or(usize::MAX));
+        Self::write_diff(&mut tx, &before, &mirror).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(report)
     }
 
     async fn messages(

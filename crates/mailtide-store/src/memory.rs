@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
-use mailtide::jobs::{AttemptId, ClaimOutcome};
+use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, StateSeq};
@@ -208,6 +208,17 @@ impl Store for MemoryStore {
         now: Timestamp,
     ) -> Result<u32, StoreError> {
         self.on_account(account, 0, |mirror| mirror.admit_action(request, now))
+    }
+
+    async fn prioritise(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+        now: Timestamp,
+    ) -> Result<Prioritised, StoreError> {
+        self.on_account(account, Prioritised::unknown(ids), |mirror| {
+            mirror.prioritise(ids, now)
+        })
     }
 
     async fn messages(
