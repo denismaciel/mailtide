@@ -253,12 +253,13 @@ on 50,000 rows carrying the label (release build, Apple-silicon builder):
 | Store | Round trip | `record_label(Remove)`, 50,000 rows | A listing removing 4 labels, 25,000 rows |
 |---|---|---|---|
 | `SQLite` (memory) | 0.04 ms | 1.6 s | 0.8 s |
+| Postgres on the same machine | 0.14 ms | 1.2 s | 0.6 s |
 | Postgres over a 35-40 ms link | 40 ms | 11.7 s | 5.8 s |
 
 About 330 statements make up a 50,000-row removal (one candidate scan,
 rows loaded 2,000 ids at a time, rows and feed entries written 500 a
-statement), so on Postgres it is round trips: at a host's usual sub-ms
-link it is about the `SQLite` figure. Written one row and one entry per
+statement), so on Postgres it is round trips: on a sub-ms link it is
+about the `SQLite` figure. Written one row and one entry per
 statement, as the first version was, it took 1.5 s on `SQLite` and some
 100,000 round trips on Postgres (over an hour on that link; the run was
 stopped). The removal runs inside the host's `delete_label` call after

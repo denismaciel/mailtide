@@ -480,7 +480,8 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   refuses while sublabels exist unless asked to delete them, deepest
   first. Recording a deletion rewrites every row that carried the label and
   logs an entry each, in one transaction after Gmail answered (about 1.6 s
-  for 50,000 rows on `SQLite`; on Postgres a few hundred round trips): the
+  for 50,000 rows on `SQLite`, 1.2 s on a local Postgres: a few hundred
+  statements): the
   call's budget bounds its Gmail requests, not this. Names are compared
   as Gmail compares them (case-insensitively,
   surrounding space ignored); colours are checked against Gmail's palette
