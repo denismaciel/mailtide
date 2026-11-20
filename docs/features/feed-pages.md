@@ -1,6 +1,6 @@
 # Feed pages bounded by `limit`, also inside a commit
 
-Plan: `features/feed-pages.toml` (roadmap R6). Status: planned.
+Plan: `features/feed-pages.toml` (roadmap R6). Status: done.
 
 ## 1. Goal and scope
 

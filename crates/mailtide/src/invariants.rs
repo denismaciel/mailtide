@@ -64,6 +64,14 @@ pub enum Violation {
         /// What differs.
         difference: String,
     },
+    /// The change feed read in pages of random limits differs from the log
+    /// it pages through, or a page held more than its limit.
+    FeedPagesDiverged {
+        /// How many entries the reader had read.
+        read: u64,
+        /// What differs.
+        difference: String,
+    },
     /// A rejected commit changed something.
     RejectedCommitChangedState,
     /// The stored lifecycle and cursor no longer form a valid snapshot.

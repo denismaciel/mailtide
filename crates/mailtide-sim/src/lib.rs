@@ -8,9 +8,10 @@
 //! expiry, dropped and duplicated pushes, lost commit acknowledgements and
 //! crashes (the engine is rebuilt from the store; results meant for the dead
 //! engine still arrive). Label definitions are created, renamed and deleted
-//! while the account is live. Invariants are checked after every commit. Then
-//! all faults heal and the mirror must converge to Gmail, its label
-//! definitions within the refresh interval.
+//! while the account is live. Invariants are checked after every commit. A
+//! feed reader takes one page of a random limit between steps and must end
+//! with the whole change log. Then all faults heal and the mirror must
+//! converge to Gmail, its label definitions within the refresh interval.
 //!
 //! Zero counterpart, by role: `lib/imap/testing/memory-server.ts`.
 
@@ -40,6 +41,7 @@ use mailtide::outbox::{
 };
 use mailtide::reconcile::ListScope;
 use mailtide::retry::{Failure, Retryable, RetryableFailure};
+use mailtide::revision::{Change, FeedCursor, StateSeq};
 use mailtide::schedule::TimerKind;
 
 // ------------------------------------------------------------ randomness
@@ -267,6 +269,8 @@ pub struct Stats {
     pub opens: u64,
     /// Imports those opens raised to the Foreground class.
     pub raised: u64,
+    /// Feed pages the reader took that ended inside a commit.
+    pub feed_pages_split: u64,
 }
 
 /// The outcome of one run.
@@ -674,6 +678,100 @@ impl Gmail {
     }
 }
 
+// ------------------------------------------------------------ the feed reader
+
+/// A consumer of the change feed: between steps it takes one page of a
+/// random limit from where it stopped, as a host's pipeline would, and at
+/// the end its entries must be the log's, entry for entry. It draws from its
+/// own generator, so runs take the same steps as without it.
+struct FeedReader {
+    rng: Rng,
+    at: FeedCursor,
+    read: Vec<(StateSeq, u32, Change)>,
+}
+
+impl FeedReader {
+    fn new(rng: &Rng) -> Self {
+        Self {
+            rng: Rng(splitmix64(rng.0 ^ 0x0fee_d0fe_ed00_f00d)),
+            at: StateSeq(0).into(),
+            read: Vec::new(),
+        }
+    }
+
+    /// Take one page: whether more are waiting. A page above its limit is
+    /// a divergence.
+    fn take_page(&mut self, mirror: &AccountMirror, stats: &mut Stats) -> Result<bool, Violation> {
+        let limit = u32::try_from(self.rng.below(8) + 1).unwrap_or(1);
+        let page = mirror.changes(self.at, limit);
+        if page.changes.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
+            return Err(self.diverged(format!(
+                "a page of {} entries above its limit {limit}",
+                page.changes.len()
+            )));
+        }
+        if page.next.entry.is_some() {
+            stats.feed_pages_split += 1;
+        }
+        self.read.extend(
+            page.changes
+                .into_iter()
+                .map(|entry| (entry.state, entry.index, entry.change)),
+        );
+        self.at = page.next;
+        Ok(page.has_more)
+    }
+
+    /// Read to the end, then compare with the log, entries numbered within
+    /// their commit.
+    fn finish(&mut self, mirror: &AccountMirror, stats: &mut Stats) -> Option<Violation> {
+        loop {
+            match self.take_page(mirror, stats) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(violation) => return Some(violation),
+            }
+        }
+        let mut logged = Vec::with_capacity(mirror.log.len());
+        let mut position: Option<(StateSeq, u32)> = None;
+        for (seq, change) in &mirror.log {
+            let index = match position {
+                Some((current, index)) if current == *seq => index + 1,
+                Some(_) | None => 0,
+            };
+            position = Some((*seq, index));
+            logged.push((*seq, index, change));
+        }
+        let read: Vec<_> = self
+            .read
+            .iter()
+            .map(|(seq, index, change)| (*seq, *index, change))
+            .collect();
+        if read == logged {
+            return None;
+        }
+        let at = read
+            .iter()
+            .zip(&logged)
+            .position(|(a, b)| a != b)
+            .unwrap_or(read.len().min(logged.len()));
+        Some(self.diverged(format!(
+            "read {} entries, the log holds {}; first difference at {at}: {:?} != {:?}",
+            read.len(),
+            logged.len(),
+            read.get(at),
+            logged.get(at)
+        )))
+    }
+
+    fn diverged(&self, difference: String) -> Violation {
+        Violation::FeedPagesDiverged {
+            read: u64::try_from(self.read.len()).unwrap_or(u64::MAX),
+            difference,
+        }
+    }
+}
+
 // ------------------------------------------------------------ the simulated host
 
 struct Sim {
@@ -691,6 +789,7 @@ struct Sim {
     blobs: BTreeSet<MessageId>,
     violations: Vec<ObservedViolation>,
     stats: Stats,
+    reader: FeedReader,
     step: u64,
     trace: std::collections::VecDeque<String>,
     /// Debugging: every line containing this text is kept in `matched`.
@@ -723,6 +822,7 @@ impl Sim {
                 thread: (n % 2 == 0).then_some(0),
             });
         }
+        let reader = FeedReader::new(&rng);
         Self {
             rng,
             faults,
@@ -738,6 +838,7 @@ impl Sim {
             blobs: BTreeSet::new(),
             violations: Vec::new(),
             stats: Stats::default(),
+            reader,
             step: 0,
             trace: std::collections::VecDeque::new(),
             grep: None,
@@ -759,6 +860,12 @@ impl Sim {
         let fault_steps = self.step;
         let faults = std::mem::replace(&mut self.faults, Faults::none());
         let convergence = self.heal();
+        if let Some(violation) = self.reader.finish(&self.mirror, &mut self.stats) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
         self.stats.messages = u64::try_from(self.gmail.messages.len()).unwrap_or(u64::MAX);
         let result = RunResult {
             seed,
@@ -785,6 +892,17 @@ impl Sim {
             self.rebuild();
         }
         self.advance();
+        self.read_feed();
+    }
+
+    /// The feed reader takes its page for this step.
+    fn read_feed(&mut self) {
+        if let Err(violation) = self.reader.take_page(&self.mirror, &mut self.stats) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
     }
 
     fn user_op(&mut self) {
@@ -1198,6 +1316,7 @@ impl Sim {
                 }
             }
             self.advance();
+            self.read_feed();
         }
         Convergence::NotReached {
             difference,
@@ -1398,6 +1517,39 @@ mod tests {
             others <= JOB_CONCURRENCY as usize,
             "{others} other imports completed first"
         );
+    }
+
+    #[test]
+    fn a_feed_reader_with_random_limits_sees_the_whole_log() {
+        let results: Vec<RunResult> = (0..100).map(|seed| run(seed, 400)).collect();
+        let diverged: Vec<_> = results
+            .iter()
+            .flat_map(|result| &result.violations)
+            .filter(|v| matches!(v.violation, Violation::FeedPagesDiverged { .. }))
+            .collect();
+        assert!(diverged.is_empty(), "{diverged:#?}");
+        let split = results
+            .iter()
+            .filter(|r| r.stats.feed_pages_split > 0)
+            .count();
+        assert!(
+            split > results.len() / 2,
+            "most runs' readers page inside commits ({split} did)"
+        );
+        // A scripted run with crashes, rebuilds and admissions too.
+        let script: Vec<UserOp> = (0..40)
+            .map(|n| match n % 4 {
+                0 | 1 => UserOp::Receive { thread: None },
+                2 => UserOp::HostAction {
+                    pick: n,
+                    action: Action::Archive,
+                    whole_thread: false,
+                },
+                _ => UserOp::Delete { pick: n },
+            })
+            .collect();
+        let result = replay(3, &script);
+        assert!(result.passed(), "{result:#?}");
     }
 
     #[test]

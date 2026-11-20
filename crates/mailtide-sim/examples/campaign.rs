@@ -20,6 +20,7 @@ fn main() {
         totals.label_listings += result.stats.label_listings;
         totals.opens += result.stats.opens;
         totals.raised += result.stats.raised;
+        totals.feed_pages_split += result.stats.feed_pages_split;
         if !result.passed() {
             failed += 1;
             println!(

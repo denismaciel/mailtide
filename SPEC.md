@@ -687,7 +687,10 @@ whose bodies are still queued (`prioritise`, §6.4), and label definitions
 created, renamed and deleted in Gmail, and checks invariants after every
 commit and every open (also that no job's class goes down outside a claim's
 finish) and convergence after healing, label definitions within the refresh
-interval (CI: 500 seeds × 1,000 steps; locally 3,000 seeds). Zero's suites
+interval; a feed reader takes one page of a random limit (1 to 8) between
+steps and must end with the whole change log, entry for entry
+(`FeedPagesDiverged` otherwise) (CI: 500 seeds × 1,000 steps; locally 3,000
+seeds). Zero's suites
 are ported by name and tracked by `scripts/zero_tests.py`. Python tests drive
 the real `Runner` against a fake Gmail over HTTP.
 

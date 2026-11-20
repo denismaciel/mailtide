@@ -1,8 +1,8 @@
 id = "feed-pages"
 title = "Feed pages bounded by `limit`, also inside a commit"
-summary = "A feed position can name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`), so `changes(account, since, limit)` never returns more than `limit` entries; state strings already persisted keep their meaning, and no schema changes."
+summary = "A feed position can name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`), so `changes(account, since, limit)` never returns more than `limit` entries; state strings already persisted keep their meaning; no table or column changes, only a version-only migration."
 roadmap = ["R6"]
-status = "in_progress"
+status = "done"
 design = "docs/features/feed-pages.md"
 depends_on = []
 
@@ -78,6 +78,11 @@ role = "ChangePage and changes() docstrings: `limit` is a bound, `next` may poin
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
 role = "A feed reader that pages with random limits between steps and is compared with the mirror's log"
+
+[[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "Totals include the reader's pages that ended inside a commit"
 
 [[file]]
 path = "tests/test_migrations_clock.py"
