@@ -2,7 +2,7 @@ id = "delivery-retries"
 title = "Retry and failure classes of Gmail writes and batches"
 summary = "No new feature: test coverage for behaviour the engine already has. Two reference suites test how a failed Gmail write is classified and retried (a quota deferral, a rate limit with Retry-After, revoked credentials, network and server errors, an invalid request, throttled parts of a batch); this plan maps each onto an existing mailtide test, plans the missing delivery-level tests, and marks the HTTP batch tests not applicable."
 roadmap = []
-status = "approved"
+status = "in_progress"
 design = "docs/features/delivery-retries.md"
 # Nothing to build first: every path tested here exists on `main`.
 depends_on = []
@@ -19,6 +19,11 @@ role = "The two tests of Zero's delivery-failure suite that no existing test cov
 path = "crates/mailtide/tests/delivery_retries.rs"
 change = "new"
 role = "Our own engine-level tests of a throttled delivery: the whole group is retried after the cooldown, and there is no attempt cap"
+
+[[file]]
+path = "crates/mailtide/tests/delivery_host/mod.rs"
+change = "new"
+role = "The engine host both engine test files share: store commands applied to an AccountMirror at once, Gmail calls and timers left to the test"
 
 [[file]]
 path = "crates/mailtide-io/tests/end_to_end.rs"
@@ -66,7 +71,7 @@ note = "The half that applies: a revoked delegation (unauthorized_client) or a d
 [[suite.test]]
 name = "Gmail durable retry classification > retries network and server failures, but blocks invalid requests"
 test = "a_delivery_retries_a_network_failure_and_a_503_and_a_400_blocks_only_its_intents"
-note = "The classes exist (not_found_and_server_errors in crates/mailtide-gmail/src/errors.rs: 503 transient, 400 blocking; the driver reports a transport error as transient). No engine test applies them to a Deliver job: a retry with backoff for the first two, and for the 400 the intents sent are blocked and the job finished while the account keeps syncing (SPEC §7.3)."
+note = "The classes exist (not_found_and_server_errors in crates/mailtide-gmail/src/errors.rs: 503 transient, 400 blocking; the driver reports a transport failure to the engine as transient, whether the request was not sent or its answer was lost: a lost answer is `OutcomeUnknown` only on a direct call, and a delivery may resend because label changes are absolute). No engine test applies them to a Deliver job: a retry with backoff for the first two, and for the 400 the intents sent are blocked and the job finished while the account keeps syncing (SPEC §7.3)."
 
 # `search` declares this suite and defers these two here.
 [[suite]]
@@ -75,7 +80,7 @@ path = "src/gmail/backend.rs"
 
 [[suite.test]]
 name = "a_batch_retries_only_the_throttled_parts"
-na = "mailtide sends no HTTP batch request: crates/mailtide-gmail/src/batch.rs can encode one, but nothing in the driver uses it. A delivery is one messages.modify per message or one batchModify (crates/mailtide-gmail/src/request.rs), each answered whole, so there are no parts to retry singly. The nearest behaviour is our own a_throttled_modify_retries_the_whole_delivery_after_the_cooldown"
+na = "mailtide sends no HTTP batch request: crates/mailtide-gmail/src/batch.rs can encode one, but nothing in the driver uses it. A Deliver job carries one message's pending changes and sends them as one messages.modify, answered whole (crates/mailtide-gmail/src/request.rs builds a batchModify only for a group of ten or more messages, which delivery never forms), so there are no parts to retry singly. The nearest behaviour is our own a_throttled_modify_retries_the_whole_delivery_after_the_cooldown"
 
 [[suite.test]]
 name = "a_part_throttled_after_the_retries_is_rate_limited"
@@ -86,7 +91,7 @@ na = "No batch parts and no retry cap inside a call: a throttled delivery goes b
 [[test]]
 target = "crates/mailtide/tests/delivery_retries.rs"
 name = "a_throttled_modify_retries_the_whole_delivery_after_the_cooldown"
-covers = "429, or 403 userRateLimitExceeded, on messages.modify or batchModify: the account cools down for at least Retry-After, the Deliver job is retried in full, and the versions already delivered are not acknowledged twice (I8); resending a change Gmail already applied is harmless because changes are absolute"
+covers = "429, or 403 userRateLimitExceeded, on a delivery's messages.modify: the account cools down for at least Retry-After, the Deliver job is retried in full, and the versions already delivered are not acknowledged twice (I8); resending a change Gmail already applied is harmless because changes are absolute"
 
 [[test]]
 target = "crates/mailtide/tests/delivery_retries.rs"

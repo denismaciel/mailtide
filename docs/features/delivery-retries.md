@@ -35,7 +35,7 @@ Nothing is designed; this is what exists.
 |---|---|---|
 | Quota gate says not yet | a deferral, no failed attempt; due again when the gate says | `Engine::on_deferred` |
 | 429, 403 `userRateLimitExceeded` | account cooldown of at least `Retry-After`; the job retries in full | `errors.rs`, `Engine::cool_down` |
-| Network error, 5xx | transient; retry with backoff, no attempt cap | driver, `retry.rs` |
+| Network error (not sent, or the answer lost), 5xx | transient; retry with backoff, no attempt cap | driver, `retry.rs` |
 | 400, other permanent 4xx | the intents sent are blocked and stop overlaying; the job finishes; the account keeps syncing | `Engine::on_failed` |
 | 401 | the cached token is dropped, the request is transient | driver |
 | Revoked delegation, deleted user | the account is blocked, by the token source or the classification | `errors.rs`, `auth.rs` |
@@ -43,11 +43,20 @@ Nothing is designed; this is what exists.
 
 Two differences from the references, both deliberate. A 401 does not block:
 an access token can expire between minting and use, and the token source is
-the authority on a revoked grant. And there is no HTTP batch: a delivery is
-one `messages.modify` per message or one `batchModify`, answered whole, so a
-throttled write retries its whole group, which is harmless because label
-changes are absolute. `crates/mailtide-gmail/src/batch.rs` can encode a
-batch, but nothing in the driver uses it.
+the authority on a revoked grant. And there is no HTTP batch: a `Deliver`
+job carries one message's pending changes and sends them as one
+`messages.modify`, answered whole, so a throttled write retries its whole
+change, which is harmless because label changes are absolute.
+`crates/mailtide-gmail/src/request.rs` builds a `batchModify` only for a
+group of ten or more messages, which delivery never forms, and
+`crates/mailtide-gmail/src/batch.rs` can encode an HTTP batch that nothing in
+the driver uses.
+
+The transport tells a request that was never sent (`NotSent`) from one whose
+answer was lost after it went out (`OutcomeUnknown`). Only a direct call
+(`Runner::call_gmail`) reports the second as such; to the engine both are a
+transient failure, and a delivery is sent again, which is safe for the same
+reason.
 
 No public API, schema, Gmail call or quota cost changes; nothing new is
 persisted.
@@ -59,7 +68,7 @@ persisted.
 - **Port Zero's classifier as one function:** mailtide splits classification
   (wire crate) from consequence (engine); the tests follow that split.
 - **Use the batch encoder for deliveries so himalaya's tests apply:** a new
-  behaviour, and `batchModify` already does the job in one call.
+  behaviour, and one `messages.modify` per message already answers whole.
 
 ## 5. Tests
 
@@ -74,6 +83,10 @@ persisted.
 - Own tests (3): a throttled modify retries the whole delivery after the
   cooldown; a delivery throttled again and again keeps backing off; a 401
   drops the token and retries.
+- The engine tests share one host (`crates/mailtide/tests/delivery_host/mod.rs`):
+  store commands go to an `AccountMirror` at once; Gmail calls and timers are
+  the test's to answer. The 401 test runs the real runner on a host clock, so
+  the retry waits for the next run instead of a sleep.
 
 ## 6. Slices
 
@@ -95,7 +108,7 @@ Each is test-only and can land at any time.
 3. **The 401 difference is kept and pinned by a test**, not aligned with
    Zero. *Would change it:* evidence of a host whose token source cannot
    report a revoked grant.
-4. **The batch tests are `na`, not ported onto `batchModify`.** They test
+4. **The batch tests are `na`, not ported onto a whole delivery.** They test
    per-part retry, which has no counterpart. *Would change it:* the driver
    starting to send HTTP batches.
 
