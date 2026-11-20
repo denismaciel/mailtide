@@ -10,8 +10,14 @@
 //! engine still arrive). Label definitions are created, renamed and deleted
 //! while the account is live. Drafts are saved, edited, deleted and sent
 //! elsewhere and through the host's draft calls (recorded outside the
-//! engine, the record sometimes lost to a crash after Gmail acted).
-//! Invariants are checked after every commit and every draft record. Two
+//! engine, the record sometimes lost to a crash after Gmail acted). A host
+//! draft call is not one step: Gmail may act up to the request timeout
+//! later (a send applied late), and its answer may be recorded many steps
+//! later, or never; a send's request may also be lost before Gmail.
+//! Invariants are checked after every commit and every draft record,
+//! including two of drafts: mailtide never issues a send of a draft while
+//! an earlier one of it was or may still be applied, and every `DraftSent`
+//! and `DraftRemoved` of the feed is true of Gmail. Two
 //! named feed readers take one page of a random limit between steps and
 //! acknowledge it, while the log is compacted at random steps: the steady
 //! one must never be cut off and must end with the whole change log; the
@@ -150,6 +156,9 @@ pub struct Faults {
     /// A host draft call reaches Gmail but the host crashes before it
     /// records the answer.
     pub draft_record_lost: Probability,
+    /// A host draft call is not atomic: Gmail acts later (a send, within
+    /// its request timeout) and the answer is recorded steps later.
+    pub draft_late: Probability,
 }
 
 impl Faults {
@@ -168,6 +177,7 @@ impl Faults {
             facts_refresh: Probability::NEVER,
             bad_listing: Probability::NEVER,
             draft_record_lost: Probability::NEVER,
+            draft_late: Probability::NEVER,
         }
     }
 
@@ -186,6 +196,7 @@ impl Faults {
             facts_refresh: rng.probability(0.05),
             bad_listing: rng.probability(0.2),
             draft_record_lost: rng.probability(0.3),
+            draft_late: rng.probability(0.5),
         }
     }
 }
@@ -512,6 +523,8 @@ struct Gmail {
     next_draft: u64,
     /// The `X-Mailtide-Id` of messages mailtide saved, kept through a send.
     tracking: BTreeMap<MessageId, String>,
+    /// The draft each sent message was sent from (by any client).
+    sent_from: BTreeMap<MessageId, DraftId>,
     /// User label definitions: id to name.
     user_labels: BTreeMap<LabelId, String>,
     next_label: u64,
@@ -529,6 +542,7 @@ impl Default for Gmail {
             drafts: BTreeMap::new(),
             next_draft: 0,
             tracking: BTreeMap::new(),
+            sent_from: BTreeMap::new(),
             user_labels: BTreeMap::from([(LabelId("Label_1".into()), "Label_1".into())]),
             next_label: 1,
         }
@@ -679,6 +693,7 @@ impl Gmail {
         if let Some(tracking) = tracking {
             self.tracking.insert(sent.clone(), tracking);
         }
+        self.sent_from.insert(sent.clone(), draft.clone());
         Some((sent, thread))
     }
 
@@ -1216,6 +1231,26 @@ struct Sim {
     /// Debugging: every line containing this text is kept in `matched`.
     grep: Option<String>,
     matched: Vec<String>,
+    /// Host sends issued whose Gmail action is still to come.
+    sends: Vec<InFlightSend>,
+    /// Draft answers to record after this many more steps.
+    records: Vec<(u64, DraftWrite)>,
+    /// Drafts mailtide's own sends were applied to.
+    sent_by_host: BTreeSet<DraftId>,
+    /// The feed's draft entries are checked up to here.
+    feed_checked: StateSeq,
+}
+
+/// A `drafts.send` the host issued, which Gmail applies at `act_at` (never
+/// after the request timeout and the late-apply margin), or never.
+#[derive(Debug, Clone)]
+struct InFlightSend {
+    draft: DraftId,
+    started: Timestamp,
+    retry: bool,
+    act_at: Timestamp,
+    /// The request was lost before Gmail: nothing happens, no answer.
+    reaches_gmail: bool,
 }
 
 const TRACE: usize = 40;
@@ -1231,6 +1266,10 @@ fn direct_only(command: CommandId) -> EventKind {
         }),
     }
 }
+
+/// A send's request timeout and late-apply margin, as the driver's
+/// (`send-late-apply`: never applied later than this after it was issued).
+const SEND_WINDOW: Duration = Duration::from_secs(65);
 
 impl Sim {
     fn note(&mut self, line: &str) {
@@ -1283,6 +1322,10 @@ impl Sim {
             trace: std::collections::VecDeque::new(),
             grep: None,
             matched: Vec::new(),
+            sends: Vec::new(),
+            records: Vec::new(),
+            sent_by_host: BTreeSet::new(),
+            feed_checked: StateSeq(0),
         }
     }
 
@@ -1325,6 +1368,7 @@ impl Sim {
     }
 
     fn fault_step(&mut self) {
+        self.host_tick();
         if self.rng.chance(self.faults.user_activity) {
             self.user_op();
         }
@@ -2023,16 +2067,140 @@ impl Sim {
             _ => None,
         };
         if let Some(write) = write {
+            self.answer(write);
+        }
+    }
+
+    /// Record a host call's answer now, or (not atomic) some steps later;
+    /// either way the host may crash first.
+    fn answer(&mut self, write: DraftWrite) {
+        if self.rng.chance(self.faults.draft_late) {
+            let after = 1 + u64::try_from(self.rng.below(30)).unwrap_or(0);
+            self.records.push((self.step + after, write));
+        } else {
             self.record_draft(&write, true);
         }
     }
 
-    /// `send_draft`: mark the row, read the draft first on a retry, send,
-    /// record how it ended (unless the host crashes after Gmail sent).
+    /// What the host's draft calls in flight do this step: Gmail applies
+    /// the sends due, then the answers due are recorded.
+    fn host_tick(&mut self) {
+        let now = self.now;
+        let due: Vec<InFlightSend> = self
+            .sends
+            .extract_if(.., |send| send.act_at <= now)
+            .collect();
+        for send in due {
+            self.apply_send(&send);
+        }
+        let step = self.step;
+        let due: Vec<DraftWrite> = self
+            .records
+            .extract_if(.., |(at, _)| *at <= step)
+            .map(|(_, write)| write)
+            .collect();
+        for write in due {
+            self.record_draft(&write, true);
+        }
+    }
+
+    /// Issue `drafts.send`: Gmail applies it now or, not atomic, later
+    /// within the window; its request may also be lost on the way.
+    fn issue_send(&mut self, draft: &DraftId, started: Timestamp, retry: bool) {
+        // A draft is sent at most once by mailtide: never a second send
+        // while an earlier one was applied or may still be (Gmail's own
+        // 404 for a consumed draft is not relied on).
+        if self.sent_by_host.contains(draft) || self.sends.iter().any(|s| &s.draft == draft) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation: Violation::DraftSentTwice {
+                    draft: draft.clone(),
+                },
+            });
+        }
+        self.stats.draft_writes += 1;
+        let late = self.rng.chance(self.faults.draft_late);
+        let send = InFlightSend {
+            draft: draft.clone(),
+            started,
+            retry,
+            act_at: if late {
+                let window = u64::try_from(SEND_WINDOW.as_millis()).unwrap_or(0);
+                let delay = self.rng.below(usize::try_from(window).unwrap_or(1));
+                self.now
+                    .plus(Duration::from_millis(u64::try_from(delay).unwrap_or(0)))
+            } else {
+                self.now
+            },
+            reaches_gmail: !(late && self.rng.below(5) == 0),
+        };
+        if send.act_at <= self.now {
+            self.apply_send(&send);
+        } else {
+            self.sends.push(send);
+        }
+    }
+
+    /// Gmail acts on a send (if it reached Gmail) and the host learns the
+    /// answer (unless it was lost: the sync settles it).
+    fn apply_send(&mut self, send: &InFlightSend) {
+        if !send.reaches_gmail {
+            self.note(&format!("send of {} lost before Gmail", send.draft.0));
+            return;
+        }
+        let end = |end: SendEnd| DraftWrite::EndSend {
+            draft: send.draft.clone(),
+            started: send.started,
+            end,
+        };
+        let write = match self.gmail.send_draft(&send.draft) {
+            Some((message, thread_id)) => {
+                self.stats.drafts_sent += 1;
+                self.sent_by_host.insert(send.draft.clone());
+                end(SendEnd::Sent { message, thread_id })
+            }
+            None if send.retry => end(SendEnd::Unconfirmed),
+            None => end(SendEnd::Gone),
+        };
+        self.answer(write);
+    }
+
+    /// Every draft entry of the feed since the last check is true of Gmail:
+    /// `DraftSent` names a message sent from that draft, and `DraftRemoved`
+    /// a draft Gmail no longer has (draft ids never come back).
+    fn check_draft_feed(&mut self) {
+        let from = self.feed_checked;
+        let mut untrue = Vec::new();
+        for (seq, change) in self.mirror.log.iter().filter(|(seq, _)| *seq > from) {
+            let true_of_gmail = match change {
+                Change::DraftSent {
+                    draft_id,
+                    message_id,
+                    ..
+                } => self.gmail.sent_from.get(message_id) == Some(draft_id),
+                Change::DraftRemoved { draft_id, .. } => !self.gmail.drafts.contains_key(draft_id),
+                _ => true,
+            };
+            if !true_of_gmail {
+                untrue.push(format!("{seq:?} {change:?}"));
+            }
+        }
+        self.feed_checked = self.mirror.seq;
+        for entry in untrue {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation: Violation::DraftFeedUntrue { entry },
+            });
+        }
+    }
+
+    /// `send_draft`: mark the row, read the draft first on a retry, issue
+    /// the send, record how it ended (unless the host crashes after Gmail
+    /// sent, or the answer is lost).
     fn host_send(&mut self, row: &DraftRecord) {
         let begin = DraftWrite::BeginSend {
             draft: row.id.clone(),
-            retry_at: self.now.plus(Duration::from_mins(1)),
+            retry_at: self.now.plus(SEND_WINDOW),
         };
         let DraftRecorded::Started { draft, retry, .. } = self.record_draft(&begin, false) else {
             return;
@@ -2052,19 +2220,12 @@ impl Sim {
                 let thread_id = self.gmail.messages[&message].thread.clone();
                 end(SendEnd::Changed { message, thread_id })
             }
-            (_, current) => {
-                self.stats.draft_writes += 1;
-                match self.gmail.send_draft(&draft.id) {
-                    Some((message, thread_id)) => {
-                        self.stats.drafts_sent += 1;
-                        end(SendEnd::Sent { message, thread_id })
-                    }
-                    None if current.is_none() && !retry => end(SendEnd::Gone),
-                    None => end(SendEnd::Unconfirmed),
-                }
+            _ => {
+                self.issue_send(&draft.id, started, retry);
+                return;
             }
         };
-        self.record_draft(&write, true);
+        self.answer(write);
     }
 
     /// Record a draft call's answer outside the engine, checking every
@@ -2083,6 +2244,7 @@ impl Sim {
                 violation,
             });
         }
+        self.check_draft_feed();
         outcome
     }
 
@@ -2299,6 +2461,7 @@ impl Sim {
                     });
                 }
                 self.check_tombstones();
+                self.check_draft_feed();
                 match &outcome {
                     CommitOutcome::Applied { .. } => self.stats.commits += 1,
                     CommitOutcome::Rejected(_) => self.stats.rejections += 1,
@@ -2532,7 +2695,12 @@ impl Sim {
                     trace: self.trace.iter().cloned().collect(),
                 };
             }
-            if self.pending.is_empty() && self.deliveries.is_empty() {
+            self.host_tick();
+            if self.pending.is_empty()
+                && self.deliveries.is_empty()
+                && self.sends.is_empty()
+                && self.records.is_empty()
+            {
                 match self.difference() {
                     None => {
                         return Convergence::Reached {
@@ -3220,6 +3388,12 @@ mod tests {
                 .any(|r| r.faults.draft_record_lost != Probability::NEVER),
             "records were lost to crashes"
         );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.faults.draft_late != Probability::NEVER),
+            "draft calls were not atomic"
+        );
     }
 
     #[test]
@@ -3233,6 +3407,93 @@ mod tests {
             "{} failing seeds, first: {:#?}",
             failures.len(),
             failures.first()
+        );
+    }
+
+    /// A sim with one draft the host saved and began sending, its answers
+    /// always lost (the host crashes after every call).
+    fn sending_draft() -> (Sim, DraftRecord, Timestamp) {
+        let faults = Faults {
+            draft_record_lost: Probability::new(1.0).expect("valid"),
+            ..Faults::none()
+        };
+        let mut sim = Sim::new(Rng(1), Faults::none(), Some(Vec::new()));
+        sim.host_draft(&UserOp::HostSaveDraft { pick: None });
+        sim.faults = faults;
+        let row = sim.mirror.drafts.values().next().cloned().expect("a row");
+        let begin = DraftWrite::BeginSend {
+            draft: row.id.clone(),
+            retry_at: sim.now.plus(SEND_WINDOW),
+        };
+        let DraftRecorded::Started { draft, .. } = sim.record_draft(&begin, false) else {
+            panic!("started");
+        };
+        let started = draft.state.attempt().expect("an attempt").started;
+        (sim, row, started)
+    }
+
+    #[test]
+    fn a_send_applied_late_within_its_window_is_not_sent_again() {
+        let (mut sim, row, started) = sending_draft();
+        // Gmail applies it as late as the window allows; its answer is lost.
+        sim.sends.push(InFlightSend {
+            draft: row.id.clone(),
+            started,
+            retry: false,
+            act_at: sim.now.plus(SEND_WINDOW).minus(Duration::from_millis(1)),
+            reaches_gmail: true,
+        });
+        sim.now = sim.now.plus(SEND_WINDOW);
+        sim.host_tick();
+        // The retry reads the draft first: gone, so nothing is sent.
+        sim.host_send(&row);
+        assert!(sim.violations.is_empty(), "{:?}", sim.violations);
+        assert_eq!(sim.gmail.sent_from.len(), 1, "sent once");
+    }
+
+    /// The invariant itself: were a send applied after the window (a fence
+    /// too short), a retry would send the draft again, and it is caught.
+    #[test]
+    fn a_send_issued_while_an_earlier_one_may_apply_is_caught() {
+        let (mut sim, row, started) = sending_draft();
+        sim.sends.push(InFlightSend {
+            draft: row.id.clone(),
+            started,
+            retry: false,
+            act_at: sim.now.plus(SEND_WINDOW * 2),
+            reaches_gmail: true,
+        });
+        sim.now = sim.now.plus(SEND_WINDOW);
+        sim.host_tick();
+        sim.host_send(&row);
+        assert!(
+            sim.violations.iter().any(|v| v.violation
+                == Violation::DraftSentTwice {
+                    draft: row.id.clone()
+                }),
+            "{:?}",
+            sim.violations
+        );
+    }
+
+    #[test]
+    fn a_draft_entry_untrue_of_gmail_is_caught() {
+        let mut sim = Sim::new(Rng(1), Faults::none(), Some(Vec::new()));
+        sim.host_draft(&UserOp::HostSaveDraft { pick: None });
+        let row = sim.mirror.drafts.values().next().cloned().expect("a row");
+        assert!(sim.violations.is_empty(), "{:?}", sim.violations);
+        // A removal recorded for a draft Gmail still has.
+        let untrue = DraftWrite::Removed {
+            draft: row.id,
+            reason: RemovedReason::Deleted,
+        };
+        sim.record_draft(&untrue, false);
+        assert!(
+            sim.violations
+                .iter()
+                .any(|v| matches!(v.violation, Violation::DraftFeedUntrue { .. })),
+            "{:?}",
+            sim.violations
         );
     }
 }

@@ -369,13 +369,15 @@ the count and thread-summary suites (read projections), the suites
 `scripts/zero_tests.py` owns, and himalaya's `tests/send_outcome.rs` and
 JMAP tests (`send`).
 
-Our own 89 tests cover what no reference has: the request shapes and costs;
+Our own 92 tests cover what no reference has: the request shapes and costs;
 the index rules (stale rows, stale listings, the generation fence, the
 periodic refresh); every row of Appendix B, including a crash between
 Gmail's send and its record and the three send fences (the issue deadline,
 the compare-and-set raced on every store, late records of a superseded
 attempt); drafts changed elsewhere; two writers; history expiry; read-only
-mode; a simulator campaign with the draft invariants; and the Python API.
+mode; a simulator campaign whose host draft calls are not atomic, with the
+draft invariants (no draft sent twice by mailtide, every `DraftSent` and
+`DraftRemoved` true of Gmail); and the Python API.
 
 ## 6. Slices
 
@@ -470,7 +472,10 @@ e.g. as a `RunnerConfig` field.
   still applied within about a second, never later), backs the second:
   the request is issued by its deadline or never, and `retry_at` adds the
   request timeout and a 5 s margin (`LATE_APPLY_MARGIN`) to it, so once it
-  has passed, reading the draft tells whether it was consumed.
+  has passed, reading the draft tells whether it was consumed. The
+  simulator checks it with sends Gmail applies late within that window and
+  answers recorded steps later or never: no draft is sent twice by
+  mailtide, and every `DraftSent` and `DraftRemoved` is true of Gmail.
 - **D9. A periodic refresh, at most every 15 minutes while live.** The index
   heals whatever Gmail's consistency turns out to be, for 5 units. Both
   history unknowns and `drafts-list-consistent` are confirmed; it stays,

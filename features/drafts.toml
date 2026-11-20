@@ -79,7 +79,7 @@ role = "StoreSnapshot carries when the draft index was last refreshed"
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
 change = "modify"
-role = "Draft invariants: one row per draft, one draft per message, a quiet mirror's index equals Gmail's"
+role = "Draft invariants: one row per draft, one draft per message, a quiet mirror's index equals Gmail's; the simulator's two (no draft sent twice by mailtide, every DraftSent and DraftRemoved true of Gmail)"
 
 # ------------------------------------------------------------------ wire layer
 
@@ -185,7 +185,7 @@ role = "Export tracking_headers"
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
-role = "Drafts in the fake Gmail (saved, replaced, deleted, sent, here and elsewhere) and the draft invariants"
+role = "Drafts in the fake Gmail (saved, replaced, deleted, sent, here and elsewhere) and the draft invariants; host draft calls are not atomic (Gmail applies a send up to its window later, an answer is recorded steps later or never, a send may be lost before Gmail)"
 
 # -------------------------------------------------------------------- bindings
 
@@ -1069,6 +1069,21 @@ covers = "if_message_id naming Gmail's current message succeeds though the index
 target = "crates/mailtide-io/tests/drafts.rs"
 name = "late_ends_of_an_attempt_a_retry_took_over_are_ignored"
 covers = "Changed, Unconfirmed and Unsent recorded for an attempt a retry took over are Superseded; the retry's attempt holds and sends"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_send_applied_late_within_its_window_is_not_sent_again"
+covers = "A send Gmail applies at the end of its window, its answer lost: the retry from retry_at reads the draft gone and sends nothing"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_send_issued_while_an_earlier_one_may_apply_is_caught"
+covers = "The no-double-send invariant catches a send issued while an earlier one may still apply (a fence too short)"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_draft_entry_untrue_of_gmail_is_caught"
+covers = "The feed invariant catches a DraftRemoved for a draft Gmail still has"
 
 # ------------------------------------------------------------------- unknowns
 # Gmail behaviour the design assumes without proof. Paths are relative to

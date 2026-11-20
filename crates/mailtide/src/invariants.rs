@@ -148,6 +148,20 @@ pub enum Violation {
         /// The key.
         draft: DraftId,
     },
+    /// A send of a draft was issued while an earlier send of it had been,
+    /// or could still be, applied (checked by the simulator, which does not
+    /// rely on Gmail refusing a second send).
+    DraftSentTwice {
+        /// The draft.
+        draft: DraftId,
+    },
+    /// A draft entry of the feed is not true of Gmail: a `DraftSent` naming
+    /// a message not sent from that draft, or a `DraftRemoved` for a draft
+    /// Gmail still has (checked by the simulator).
+    DraftFeedUntrue {
+        /// The entry.
+        entry: String,
+    },
     /// A rejected commit changed something.
     RejectedCommitChangedState,
     /// A facts refresh changed more than a message's facts and raw size, or
