@@ -1,6 +1,6 @@
 # Label editing: create, rename, delete, colour, visibility and nesting
 
-Plan: `features/label-edit.toml` (roadmap W2). Status: planned.
+Plan: `features/label-edit.toml` (roadmap W2). Status: in progress.
 
 ## 1. Goal and scope
 
@@ -102,7 +102,9 @@ Rust (`mailtide_io::Runner`); each write takes a `budget`:
 `Label { id, name, kind, list_visibility, message_visibility, color }`. The
 three new fields are `Option`: Gmail omits them on most system labels, and
 rows written before this feature have none until the next refresh.
-`LabelColor { text, background }` is built only from Google's palette.
+`LabelColor { text, background }` is Gmail's pair as decoded; a colour the
+caller gives is checked against Google's palette
+(`mailtide_gmail::labels::palette_color`) and sent lower-cased.
 `LabelPatch` fields are optional; `color` is `Keep`, `Set(c)` or `Clear`.
 `update_label(.., sublabels)` is `Follow` (default) or `Leave`;
 `delete_label(.., sublabels)` is `Refuse` (default) or `Delete`.
@@ -121,13 +123,17 @@ its parent: the longest other label name that is a prefix ending at a `/`
 Python `Runner` and `BlockingRunner`: `create_label(account, name, *,
 list_visibility="show", message_visibility="show", color=None)`,
 `update_label(account, label_id, *, name=None, list_visibility=None,
-message_visibility=None, color=KEEP, sublabels="follow")`,
-`delete_label(account, label_id, *, sublabels="refuse")`. `Label` gains
-`list_visibility` (`"show" | "show_if_unread" | "hide" | None`),
+message_visibility=None, color="keep", sublabels="follow")` (`color=None`
+clears it; a string default keeps the signature typed without a sentinel
+object), `delete_label(account, label_id, *, sublabels="refuse")`. `Label`
+gains `list_visibility` (`"show" | "show_if_unread" | "hide" | None`),
 `message_visibility` (`"show" | "hide" | None`), `color: LabelColor | None`
-and `parent_id: str | None`. Exceptions: `LabelNotFound`, `LabelNameTaken`,
-`InvalidLabel`, `LabelHasSublabels`, plus the shared `QuotaDeferred` (`until_ms`),
-`WriteOutcomeUnknown` and `ReadOnlyMode`.
+and `parent_id: str | None`. Exceptions: `LabelNotFound`, `LabelNameTaken`
+(`existing`), `InvalidLabel`, `LabelHasSublabels` (`ids`), `LabelRefused`
+(Gmail's other 400 or 403), plus the shared `QuotaDeferred` (`until_ms`),
+`WriteOutcomeUnknown`, `GmailUnavailable` (a 5xx or a rate limit) and
+`ReadOnlyMode`. A `Partial` failure raises its cause's exception with
+`done`, the ids already changed.
 
 ### Gmail calls and quota
 
@@ -136,22 +142,36 @@ and `parent_id: str | None`. Exceptions: `LabelNotFound`, `LabelNameTaken`,
 | `labels.create` | 5 | `create_label` | foreground |
 | `labels.patch` | 5 (declared; see Decisions) | `update_label`, once per label renamed | foreground |
 | `labels.delete` | 5 | `delete_label`, once per label deleted | foreground |
-| `labels.list` | 1 | before a write that touches sublabels; after a 409 | foreground |
+| `labels.list` | 1 | before a rename that moves sublabels and before every delete; after a 409 | foreground |
 
 Renaming a label with n sublabels costs 1 + 5(n + 1) units. A deferral waits
 within `budget`, then returns `Deferred`: nothing sent, nothing recorded.
 
-- **Create** always sends both visibilities. On 409 it lists labels once and
-  returns `NameTaken` with the label that holds the name, so a host retrying
-  after a lost answer can adopt it.
-- **Update** sends only the fields that change, through `labels.patch`.
+- **Create** always sends both visibilities. On 409 (Gmail's `Label name
+  exists or conflicts`, also for a name differing only in case or by a
+  trailing space) it lists labels once and returns `NameTaken` with the
+  label that holds the name, so a host retrying after a lost answer can
+  adopt it.
+- **Update** sends only the fields that change, through `labels.patch`; a
+  colour is always sent as the pair, and `Clear` sends `color: null`, which
+  Gmail answers by dropping the colour and keeping the rest
+  (`label-edit-color-rules`). Colours are sent lower-cased: Gmail matches
+  palette values case-sensitively.
 - **Rename with sublabels:** list labels, compute `<old>/x → <new>/x`, refuse
-  with `NameTaken` if any target is held by another label, then patch the
-  sublabels and the label last. A failure returns `Partial`; the same call
-  again finds the rest still under the old prefix and finishes.
-- **Delete:** system labels are refused from the definitions. With sublabels
-  and `Refuse`, `HasSublabels`; with `Delete`, deepest first, the label last.
-  A 404 is `already_gone` and is recorded as a removal.
+  with `NameTaken` if any target is held by another label (compared as Gmail
+  does: case-insensitively, surrounding space ignored; a label may take a
+  case variant of its own name), then patch the sublabels and the label
+  last. Gmail's API renames only the label it is asked to
+  (`label-edit-rename-parent`), so the sublabels are mailtide's to move. A
+  failure returns `Partial`; the same call again finds the rest still under
+  the old prefix and finishes. A 409 to a patch is `NameTaken` too.
+- **Delete:** system labels are refused from the mirror's definitions before
+  any call. Then the labels are listed once: a label the listing lacks is
+  `already_gone` (one listing is proof, `label-edit-list-consistency`) and
+  is recorded as a removal without a write. With sublabels and `Refuse`,
+  `HasSublabels`; with `Delete`, deepest first, the label last. Gmail's
+  `labels.delete` removes only the label it names
+  (`label-edit-delete-parent`). A 404 is `already_gone` too.
 
 ### Store
 
@@ -207,12 +227,14 @@ reconciliation's last commit.
 
 Rules in `mirror.rs`, shared by every store:
 
-- `LabelOp::Upsert` and `LabelOp::Remove` apply local writes.
+- `LabelOp::Upsert` and `LabelOp::Remove { id, at }` apply local writes.
   `LabelOp::ReplaceAll` applies a listing. On `main` it already replaces the
   definitions only when the listing differs from them and logs
   `LabelDefinitionsChanged` only then; here it becomes
-  `ReplaceAll { labels, generation }`, and a label the listing lacks is
-  removed by the same rule as `Remove`, messages included.
+  `ReplaceAll { labels, generation, at }`, and a label the listing lacks is
+  removed by the same rule as `Remove`, messages included. `at` is when the
+  listing was made (a commit carries no clock): a removal is remembered
+  from then, and the deleted memory is pruned against it.
 - **Generation fence.** The driver reads the generation before sending
   `labels.list` and reports it with `LabelsListed`; the engine copies it into
   `ReplaceAll`, for reconciliation's listing and for the §6.6 refresh alike;
@@ -235,11 +257,30 @@ definitions differ; `LabelsChanged { removed }` per message a removal
 touches; `OverlayChanged` where an intent was dropped. A consumer that
 replays the feed needs no new rule.
 
-One engine change: **a 404 answering a delivery is verified before the
-message is tombstoned.** Today `messages.modify` → 404 tombstones the
-message. If Gmail ever answers 404 because a *label* in the request is gone,
-that would delete a live message from the mirror for good. The delivery now
-enqueues a `Verify`; only that fetch's own 404 tombstones.
+One engine change: **a delivery refused for an added label blocks only
+that add.** Gmail refuses a `messages.modify` (and a `batchModify`) whose
+`addLabelIds` names a deleted or never-created label with 400 `labelId not
+found`, and refuses it whole: a valid label in the same request is not
+applied either (`label-edit-modify-deleted-label`). A delivery carries all
+of one message's pending changes, so today one dead label would block the
+message's other changes (a star, an archive) for good. Now a delivery
+refused for good whose group adds a label that is not one of Gmail's fixed
+system labels *beside other changes* blocks only those adds; the other
+intents stay pending, and finishing the job enqueues their delivery, alone.
+If that is refused too, it has no such add left and blocks as before, so
+nothing loops. The engine also asks for a label refresh for the blocked
+ids (the usual throttled one), whose listing removes a deleted label and,
+with it, the blocked intent. Removing a deleted label is not refused at
+all: Gmail answers 200 and changes nothing, so such an intent is delivered
+and settles on its confirmation fetch like any other.
+
+The approved plan also verified a 404 answering a delivery before
+tombstoning the message, in case Gmail answered 404 for a deleted label.
+Gmail never did (it answers 400 for an add and 200 for a remove, and
+`messages.get` found the message afterwards), so the change was dropped: a
+404 to a modify names the message, the same evidence as a `get`'s 404,
+which tombstones already, and verifying it would have added a delivery and
+a verification racing each other for no case Gmail produces.
 
 ### Failure and retry
 
@@ -327,16 +368,16 @@ cases); jmap-client and the Stalwart server (no tests for this).
 Our own 46 tests add what no reference has: request shapes and the palette;
 the removal, filter and fence rules; the store cases (including `Label_1`
 versus `Label_10`); lost answers and resumable sublabel renames; labels
-changed elsewhere **with and without** history records; the verified 404; a
-simulator campaign; the Python API.
+changed elsewhere **with and without** history records; a delivery refused
+for an added label; a simulator campaign; the Python API.
 
 ## 6. Slices
 
 1. **Attributes.** `Label` fields, decoding, the migration, `labels()` and
    Python `Label`. Useful alone: SPEC §4 becomes true.
 2. **Safe removal.** `ReplaceAll` removals reach messages, strip,
-   deleted-label memory, filter, dropped intents, the verified 404;
-   simulator labels and invariants. No public API yet; fixes labels deleted
+   deleted-label memory, filter, dropped intents, a delivery refused for
+   an added label; simulator labels and invariants. No public API yet; fixes labels deleted
    elsewhere.
 3. **Writes.** Requests, PATCH and DELETE, costs, `record_label`, the
    generation fence, `create_label`, `update_label`, `delete_label` for one
@@ -373,10 +414,14 @@ store read and write. A lost answer arrives as `CallError::OutcomeUnknown`.
    small and idempotent. Would change if hosts needed label writes queued
    while offline.
 2. **Strip on proof and remember the id, whatever history does.** A message
-   keeping a dead id forever is the failure to avoid, and Gmail's history
-   behaviour is unproven. Would simplify to "history only" if
-   `label-edit-delete-history` is confirmed *and* replayed history is shown
-   never to carry a dead id.
+   keeping a dead id forever is the failure to avoid.
+   `label-edit-delete-history` came back confirmed (one `labelsRemoved`
+   record per message, at once), so while history is available the records
+   agree with the strip and change nothing more. The strip is still needed
+   when history is not: a cursor that expires across a deletion skips those
+   records, and reconciliation verifies rows but would keep a dead id on a
+   row a listing never names again. Would simplify to "history only" if
+   replayed history were shown never to carry a dead id.
 3. **One listing without the id is proof of deletion** (fenced by the
    generation). Two listings would be safer against a Gmail inconsistency
    and slower; see `label-edit-list-consistency`.
@@ -395,19 +440,39 @@ store read and write. A lost answer arrives as `CallError::OutcomeUnknown`.
    and reserved names are left to Gmail's 400, reported as `Refused`.
 9. **Colours are Gmail's palette values, unmapped.** Theming is the host's.
 10. **The deleted memory lasts 30 days**: longer than Gmail keeps history,
-    so nothing replayed can carry the id after that.
-11. **The delivery 404 change is part of this plan**, not a separate fix:
-    label deletion is what makes the case reachable.
+    so nothing replayed can carry the id after that. Kept although history
+    does record a deletion (`label-edit-delete-history`): a fetch or an
+    import in flight across the deletion, or a history page read from a
+    cursor behind it, still names the id, and without the memory the row
+    would carry it until the matching `labelsRemoved` record arrives, or
+    for good if history expired in between. Its cost is a JSON column read
+    with the account row every commit loads anyway.
+11. **A delivery refused for an added label blocks only that add**
+    (`label-edit-modify-deleted-label`, refuted in one half): Gmail refuses
+    the whole modify with 400, so blocking the whole group would block a
+    message's unrelated changes for good. Which add caused the 400 is not
+    in Gmail's answer, so every non-system add of the group is blocked and
+    the rest goes again alone. The planned "verify a delivery's 404" was
+    dropped: Gmail never answers 404 for a label, and a 404 for the message
+    is the same proof a `get`'s 404 is.
 
-Unknowns (`features/label-edit.toml`, each with its test):
+Unknowns (`features/label-edit.toml`, each with its test and result):
 
-- `label-edit-delete-history`: does deleting a label emit `labelsRemoved`
-  per message? Assumed yes; the design is correct either way.
-- `label-edit-list-consistency`: is `labels.list` never stale or partial?
-- `label-edit-duplicate-name`: 409 on a taken name, for create and patch;
-  case rules.
-- `label-edit-rename-parent`: does the API rename sublabels itself?
-- `label-edit-delete-parent`: does the API delete sublabels itself?
-- `label-edit-color-rules`: any palette pair accepted; `color: null` clears.
-- `label-edit-modify-deleted-label`: 400 or 404 for a modify naming a
-  deleted label.
+- `label-edit-delete-history`: confirmed. One `labelsRemoved` record per
+  message, readable at once; the design is correct either way.
+- `label-edit-list-consistency`: confirmed. One listing sent after a write
+  returned always reflects it; one page. One listing is proof (Decision 3).
+- `label-edit-duplicate-name`: confirmed. 409 `ABORTED` `Label name exists
+  or conflicts` for create, patch and update, also for another case or a
+  trailing space; a label may take a case variant of its own name.
+- `label-edit-rename-parent`: confirmed. The API renames one label;
+  sublabels keep their names, so mailtide moves them.
+- `label-edit-delete-parent`: confirmed. Only the named label goes;
+  sublabels and their uses stay.
+- `label-edit-color-rules`: confirmed, with one more rule: palette values
+  are matched case-sensitively (`#FFFFFF` is a 400), so mailtide sends them
+  lower-cased; `color: null` clears and keeps the rest.
+- `label-edit-modify-deleted-label`: refuted in one half. An add of a
+  deleted or unknown label is a 400 (`labelId not found`) that refuses the
+  whole request; a remove of one is a 200 that changes nothing; nothing
+  answers 404. Decision 11 follows from it.

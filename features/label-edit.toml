@@ -2,7 +2,7 @@ id = "label-edit"
 title = "Label editing: create, rename, delete, colour, visibility and nesting"
 summary = "Label definitions gain visibility and colour in the mirror; create, rename, restyle and delete are quota-gated calls to Gmail's labels API whose answers are recorded at once; a deleted label, deleted here or elsewhere, leaves every mirrored message and cannot come back from a stale observation."
 roadmap = ["W2"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/label-edit.md"
 # No dependency on another plan. It builds on what `main` has: Store::labels /
 # Runner.labels() and the label refresh of SPEC §6.6 (EngineConfig::label_refresh,
@@ -29,7 +29,7 @@ role = "Export label_names"
 [[file]]
 path = "crates/mailtide/src/commit.rs"
 change = "modify"
-role = "LabelOp::Upsert and LabelOp::Remove; LabelOp::ReplaceAll (today a plain list, applied only when it differs from the stored definitions) also carries the label generation its listing was sent under"
+role = "LabelOp::Upsert and LabelOp::Remove { id, at }; LabelOp::ReplaceAll (today a plain list, applied only when it differs from the stored definitions) becomes ReplaceAll { labels, generation, at }: the label generation its listing was sent under, and the listing's time (a removal is remembered from it, and the deleted memory is pruned against it)"
 
 [[file]]
 path = "crates/mailtide/src/mirror.rs"
@@ -44,7 +44,7 @@ role = "GmailRequest::CreateLabel, PatchLabel and DeleteLabel (issued by the dri
 [[file]]
 path = "crates/mailtide/src/event.rs"
 change = "modify"
-role = "LabelsListed carries the generation read before the request; LabelSaved and LabelDeleted results"
+role = "LabelsListed carries the generation read before the request; LabelSaved, LabelDeleted and LabelNameTaken (a 409 to a create or a patch) results"
 
 [[file]]
 path = "crates/mailtide/src/quota.rs"
@@ -54,7 +54,12 @@ role = "Costs of labels.create, labels.patch and labels.delete"
 [[file]]
 path = "crates/mailtide/src/engine.rs"
 change = "modify"
-role = "Pass the listing's generation into ReplaceAll, for reconciliation's listing and for the §6.6 refresh alike (on_labels, on_label_refresh); a 404 answering a delivery is verified with a get before the message is tombstoned"
+role = "Pass the listing's generation and time into ReplaceAll, for reconciliation's listing and for the §6.6 refresh alike (on_labels, on_label_refresh); a delivery refused for good that adds a non-system label beside other changes blocks only those adds, the rest stays pending and goes again, and a label refresh is asked for them"
+
+[[file]]
+path = "crates/mailtide/src/labels.rs"
+change = "modify"
+role = "system::is_system: the fixed system label ids (and CATEGORY_*), which a modify can never be refused for as an unknown label"
 
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
@@ -167,7 +172,7 @@ role = "FakeGmail labels endpoints (create, patch, delete, 409 on a taken name) 
 [[file]]
 path = "SPEC.md"
 change = "modify"
-role = "§1 non-goals, §4 label row, §6.6 label removal and the deleted-label memory, §7 a delivery's 404 is verified, §8 costs, §10-11 interfaces"
+role = "§1 non-goals, §4 label row, §6.6 label removal and the deleted-label memory, §7 a delivery refused for an added user label, §8 costs, §10-11 interfaces, the migration's rollback"
 
 # ----------------------------------------------------------------------- tests
 
@@ -533,7 +538,7 @@ covers = "DELETE /labels/{id}, no body"
 [[test]]
 target = "crates/mailtide-gmail/src/labels.rs"
 name = "a_colour_outside_the_palette_is_refused_before_any_request"
-covers = "LabelColor::new accepts only Google's palette values, lower-cased, text and background both required"
+covers = "labels::palette_color accepts only Google's palette values (text and background both required) and lower-cases them: Gmail matches them case-sensitively and refuses `#FFFFFF` (label-edit-color-rules)"
 
 [[test]]
 target = "crates/mailtide-gmail/src/labels.rs"
@@ -555,7 +560,7 @@ covers = "A/B/C nests under A/B if it exists, else under A, else at the top; A/S
 [[test]]
 target = "crates/mailtide/src/label_names.rs"
 name = "sublabel_renames_never_collide_with_an_existing_name"
-covers = "The planned names of a rename are checked against every other definition before anything is sent"
+covers = "The planned names of a rename are checked against every other definition before anything is sent, as Gmail compares them: a name differing only in case or by surrounding space is taken, and a label may take a case variant of its own name (label-edit-duplicate-name)"
 
 [[test]]
 target = "crates/mailtide/src/mirror.rs"
@@ -599,8 +604,8 @@ covers = "Recording an answer the mirror already shows bumps the generation but 
 
 [[test]]
 target = "crates/mailtide/src/engine.rs"
-name = "a_delivery_answered_404_is_verified_before_the_message_is_tombstoned"
-covers = "A 404 to messages.modify enqueues a Verify instead of a tombstone, so a 404 about a label could never delete a live message from the mirror"
+name = "a_refused_add_of_a_user_label_blocks_it_alone_and_the_rest_is_delivered"
+covers = "Gmail refuses a whole modify with 400 `labelId not found` when an add names a deleted label (label-edit-modify-deleted-label): the add of the user label is blocked, the message's other changes stay pending and are delivered next, on their own"
 
 [[test]]
 target = "crates/mailtide/src/invariants.rs"
@@ -652,7 +657,7 @@ covers = "Sublabels move before the parent; after a failure mid-way the same cal
 [[test]]
 target = "crates/mailtide-io/tests/label_edit.rs"
 name = "a_rename_onto_a_taken_name_changes_nothing"
-covers = "NameTaken before the first write when the target or a sublabel target is held by another label"
+covers = "NameTaken before the first write when the target or a sublabel target is held by another label, also in another case; Gmail's own 409 to a patch is NameTaken too"
 
 [[test]]
 target = "crates/mailtide-io/tests/label_edit.rs"
