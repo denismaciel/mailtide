@@ -505,11 +505,7 @@ fn durable_spam_cleanup_resumes_discovery_and_delivery_without_changing_the_enum
         next_page_token: next.map(|t| PageToken(t.into())),
     };
     let command = call(&mut host);
-    host.handle(EventKind::LabelsListed {
-        command,
-        labels: Vec::new(),
-        generation: 0,
-    });
+    answer_core_labels(&mut host, command);
     let command = call(&mut host);
     host.handle(EventKind::ProfileFetched {
         command,
@@ -535,6 +531,23 @@ fn durable_spam_cleanup_resumes_discovery_and_delivery_without_changing_the_enum
         command: resumed[0].0,
         page: listed(&["b", "c"], None),
     });
+    for id in ["INBOX", "UNREAD"] {
+        let (command, request) = host.take_gmail().remove(0);
+        assert_eq!(
+            request,
+            GmailRequest::ListMessages {
+                scope: ListScope::Label(mailtide::ids::LabelId(id.into())),
+                page_token: None,
+            }
+        );
+        host.handle(EventKind::MessagesListed {
+            command,
+            page: ListPage {
+                messages: Vec::new(),
+                next_page_token: None,
+            },
+        });
+    }
     assert_eq!(host.mirror.record.cursor, Some(HistoryId(100)));
     assert_eq!(host.mirror.messages.len(), 3);
     let imports = |host: &mut Host| -> Vec<(CommandId, MessageId)> {
@@ -576,6 +589,24 @@ fn durable_spam_cleanup_resumes_discovery_and_delivery_without_changing_the_enum
         rest.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
         vec![m("b"), m("c")]
     );
+}
+
+fn answer_core_labels(host: &mut Host, command: CommandId) {
+    host.handle(EventKind::LabelsListed {
+        command,
+        labels: ["INBOX", "UNREAD"]
+            .into_iter()
+            .map(|id| {
+                mailtide::gmail::Label::plain(
+                    mailtide::ids::LabelId(id.into()),
+                    id,
+                    mailtide::gmail::LabelKind::System,
+                )
+            })
+            .collect(),
+        generation: 0,
+        stored_user_labels: set([]),
+    });
 }
 
 /// Zero: mail-cleanup-store > durable spam cleanup > preserves newer user moves even after their provider acknowledgment and no-op restores

@@ -205,8 +205,8 @@ pub struct AccountRecord {
     pub drafts_refreshed_at: Option<Timestamp>,
 }
 
-/// How long a deleted label's id is remembered: longer than Gmail keeps
-/// history, so no replayed record can carry it after that (SPEC §6.6).
+/// How long to filter a deleted label from late observations and replayed
+/// history. Older history can still replay the matching removal (SPEC §6.6).
 pub const DELETED_LABEL_MEMORY: std::time::Duration = std::time::Duration::from_hours(30 * 24);
 
 impl AccountRecord {
@@ -817,7 +817,8 @@ fn without_deleted(op: &MessageOp, deleted: &BTreeMap<LabelId, Timestamp>) -> Me
 
 /// Whether `label` is one of Gmail's own: listed as a system label, or one
 /// of the fixed system ids. Never forgotten, whatever a listing says.
-fn is_system_label(label: &Label) -> bool {
+#[must_use]
+pub fn is_system_label(label: &Label) -> bool {
     label.kind == LabelKind::System || labels::system::is_system(&label.id.0)
 }
 
@@ -832,7 +833,7 @@ pub fn removed_labels(stored: &[Label], generation: u64, op: &LabelOp) -> Vec<La
             labels,
             generation: listed_under,
             ..
-        } if *listed_under == generation && complete_listing(stored, labels) => stored
+        } if *listed_under == generation && complete_listing(labels) => stored
             .iter()
             .filter(|label| {
                 !is_system_label(label) && labels.iter().all(|listed| listed.id != label.id)
@@ -851,18 +852,13 @@ pub fn removed_labels(stored: &[Label], generation: u64, op: &LabelOp) -> Vec<La
     }
 }
 
-/// Whether `listed` can be a whole `labels.list` answer given the stored
-/// definitions: it names `INBOX` and every system label stored (a mailbox
-/// always lists them). An empty or truncated answer is not proof that the
-/// labels it lacks were deleted; it changes nothing.
+/// Whether a listing names the core labels the engine uses for its inbox
+/// and unread views. Other system labels can disappear from the catalogue.
 #[must_use]
-pub fn complete_listing(stored: &[Label], listed: &[Label]) -> bool {
-    let named = |id: &LabelId| listed.iter().any(|label| &label.id == id);
-    named(&LabelId(labels::system::INBOX.to_owned()))
-        && stored
-            .iter()
-            .filter(|label| is_system_label(label))
-            .all(|label| named(&label.id))
+pub fn complete_listing(listed: &[Label]) -> bool {
+    [labels::system::INBOX, labels::system::UNREAD]
+        .into_iter()
+        .all(|id| listed.iter().any(|label| label.id.0 == id))
 }
 
 /// Put label definitions in the order stores return them: by id, byte-wise
@@ -1175,9 +1171,7 @@ impl AccountMirror {
                 // A local write since the listing was sent: it is stale. A
                 // listing without Gmail's system labels is no listing at
                 // all (a mailbox always lists them): it proves nothing.
-                if *generation != self.record.label_generation
-                    || !complete_listing(&self.labels, labels)
-                {
+                if *generation != self.record.label_generation || !complete_listing(labels) {
                     return;
                 }
                 let cutoff = at.minus(DELETED_LABEL_MEMORY);
@@ -3841,7 +3835,7 @@ mod tests {
     #[test]
     fn a_removed_label_leaves_every_message_and_logs_each_change() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         applied(
             &mut mirror,
             vec![
@@ -3878,7 +3872,10 @@ mod tests {
             entries(&mirror),
             vec![Change::LabelDefinitionsChanged, removed("a"), removed("b")]
         );
-        assert_eq!(mirror.label_definitions(), vec![defined("INBOX", "INBOX")]);
+        assert_eq!(
+            mirror.label_definitions(),
+            vec![defined("INBOX", "INBOX"), defined("UNREAD", "UNREAD")]
+        );
         assert_eq!(
             mirror.record.deleted_labels,
             BTreeMap::from([(LabelId("Label_1".into()), Timestamp(100))])
@@ -3899,7 +3896,7 @@ mod tests {
     #[test]
     fn a_removed_label_drops_its_intents() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "STARRED", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "STARRED", "Label_1"], 0);
         applied(
             &mut mirror,
             vec![
@@ -3932,7 +3929,7 @@ mod tests {
                 class: crate::retry::Blocking::Permanent,
                 detail: String::new(),
             });
-        listed(&mut mirror, &["INBOX", "STARRED"], 5);
+        listed(&mut mirror, &["INBOX", "UNREAD", "STARRED"], 5);
         assert_eq!(
             mirror
                 .intents
@@ -3972,7 +3969,7 @@ mod tests {
     #[test]
     fn an_observation_naming_a_deleted_label_is_stored_without_it() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         applied(
             &mut mirror,
             vec![MessageOp::Observe(observation("a", &["INBOX"], 10))],
@@ -4010,16 +4007,20 @@ mod tests {
     #[test]
     fn a_listing_that_names_a_deleted_label_restores_it() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         mirror.record_label(&LabelOp::Remove {
             id: LabelId("Label_1".into()),
             at: Timestamp(100),
         });
-        listed(&mut mirror, &["INBOX", "Label_1"], 200);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 200);
         assert!(mirror.record.deleted_labels.is_empty());
         assert_eq!(
             mirror.label_definitions(),
-            vec![defined("INBOX", "INBOX"), defined("Label_1", "Label_1")]
+            vec![
+                defined("INBOX", "INBOX"),
+                defined("Label_1", "Label_1"),
+                defined("UNREAD", "UNREAD")
+            ]
         );
         applied(
             &mut mirror,
@@ -4031,12 +4032,12 @@ mod tests {
     #[test]
     fn the_deleted_memory_is_pruned_after_thirty_days() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         mirror.record_label(&LabelOp::Remove {
             id: LabelId("Label_1".into()),
             at: Timestamp(DAY),
         });
-        listed(&mut mirror, &["INBOX"], 30 * DAY);
+        listed(&mut mirror, &["INBOX", "UNREAD"], 30 * DAY);
         assert!(
             mirror
                 .record
@@ -4044,14 +4045,14 @@ mod tests {
                 .contains_key(&LabelId("Label_1".into())),
             "29 days on"
         );
-        listed(&mut mirror, &["INBOX"], 31 * DAY + 1);
+        listed(&mut mirror, &["INBOX", "UNREAD"], 31 * DAY + 1);
         assert!(mirror.record.deleted_labels.is_empty(), "past 30 days");
     }
 
     #[test]
     fn a_listing_sent_before_a_local_label_write_is_not_applied() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_3"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_3"], 0);
         let sent_under = mirror.record.label_generation;
         mirror.record_label(&LabelOp::Upsert(defined("Label_2", "New")));
         mirror.record_label(&LabelOp::Remove {
@@ -4060,7 +4061,11 @@ mod tests {
         });
         let mut stale = commit(&mirror);
         stale.labels = vec![LabelOp::ReplaceAll {
-            labels: vec![defined("INBOX", "INBOX"), defined("Label_3", "Label_3")],
+            labels: vec![
+                defined("INBOX", "INBOX"),
+                defined("Label_3", "Label_3"),
+                defined("UNREAD", "UNREAD"),
+            ],
             generation: sent_under,
             at: Timestamp(20),
         }];
@@ -4071,7 +4076,11 @@ mod tests {
         assert!(entries(&mirror).is_empty());
         assert_eq!(
             mirror.label_definitions(),
-            vec![defined("INBOX", "INBOX"), defined("Label_2", "New")],
+            vec![
+                defined("INBOX", "INBOX"),
+                defined("Label_2", "New"),
+                defined("UNREAD", "UNREAD")
+            ],
             "the label just created stays, the one just deleted does not return"
         );
         assert!(
@@ -4080,10 +4089,14 @@ mod tests {
                 .deleted_labels
                 .contains_key(&LabelId("Label_3".into()))
         );
-        listed(&mut mirror, &["INBOX", "Label_2"], 30);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_2"], 30);
         assert_eq!(
             mirror.label_definitions(),
-            vec![defined("INBOX", "INBOX"), defined("Label_2", "Label_2")],
+            vec![
+                defined("INBOX", "INBOX"),
+                defined("Label_2", "Label_2"),
+                defined("UNREAD", "UNREAD")
+            ],
             "a listing sent after the writes applies"
         );
     }
@@ -4091,7 +4104,7 @@ mod tests {
     #[test]
     fn a_rename_changes_no_message_row() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         applied(
             &mut mirror,
             vec![MessageOp::Observe(observation("a", &["Label_1"], 10))],
@@ -4102,14 +4115,18 @@ mod tests {
         assert_eq!(mirror.messages, before);
         assert_eq!(
             mirror.label_definitions(),
-            vec![defined("INBOX", "INBOX"), defined("Label_1", "Renamed")]
+            vec![
+                defined("INBOX", "INBOX"),
+                defined("Label_1", "Renamed"),
+                defined("UNREAD", "UNREAD")
+            ]
         );
     }
 
     #[test]
     fn an_upsert_equal_to_the_stored_label_logs_nothing() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         let generation = mirror.record.label_generation;
         mirror.record_label(&LabelOp::Upsert(defined("Label_1", "Label_1")));
         assert!(entries(&mirror).is_empty());
@@ -4149,8 +4166,11 @@ mod tests {
             );
             assert!(mirror.record.deleted_labels.is_empty(), "{listing:?}");
         }
-        assert!(complete_listing(&[], &[defined("INBOX", "INBOX")]));
-        assert!(!complete_listing(&[], &[defined("Label_1", "Label_1")]));
+        assert!(complete_listing(&[
+            defined("INBOX", "INBOX"),
+            defined("UNREAD", "UNREAD")
+        ]));
+        assert!(!complete_listing(&[defined("Label_1", "Label_1")]));
     }
 
     #[test]
@@ -4161,6 +4181,7 @@ mod tests {
         c.labels = vec![LabelOp::ReplaceAll {
             labels: vec![
                 defined("INBOX", "INBOX"),
+                defined("UNREAD", "UNREAD"),
                 defined("YELLOW_STAR", "YELLOW_STAR"),
                 defined("Label_1", "Label_1"),
             ],
@@ -4183,7 +4204,7 @@ mod tests {
             });
         }
         // A complete listing lacking it: still Gmail's own.
-        listed(&mut mirror, &["INBOX", "Label_1"], 2);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 2);
         assert_eq!(
             labels_of(&mirror, "a"),
             set(["IMPORTANT", "INBOX", "YELLOW_STAR"])
@@ -4194,7 +4215,7 @@ mod tests {
     #[test]
     fn a_late_upsert_does_not_bring_a_deleted_label_back() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         // A patch answered 200, a concurrent delete recorded first, then
         // the patch's answer lands.
         mirror.record_label(&LabelOp::Remove {
@@ -4203,7 +4224,10 @@ mod tests {
         });
         mirror.record_label(&LabelOp::Upsert(defined("Label_1", "Renamed")));
         assert!(entries(&mirror).is_empty());
-        assert_eq!(mirror.label_definitions(), vec![defined("INBOX", "INBOX")]);
+        assert_eq!(
+            mirror.label_definitions(),
+            vec![defined("INBOX", "INBOX"), defined("UNREAD", "UNREAD")]
+        );
         assert!(
             mirror
                 .record
@@ -4211,14 +4235,14 @@ mod tests {
                 .contains_key(&LabelId("Label_1".into()))
         );
         // Only a listing restores it.
-        listed(&mut mirror, &["INBOX", "Label_1"], 20);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 20);
         assert!(mirror.record.deleted_labels.is_empty());
     }
 
     #[test]
     fn a_finishing_reconciliation_lists_no_deleted_label() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "UNREAD", "Label_1"], 0);
         // A row the listing created: its labels come from the scopes it was
         // listed in, one of them a label deleted before the finish.
         let listing = |scope: ListScope| MessageOp::Listed {

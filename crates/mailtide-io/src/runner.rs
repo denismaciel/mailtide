@@ -5,19 +5,21 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tracing::Instrument as _;
 
 use mailtide::command::{Command, CommandKind, GmailCall, GmailRequest};
 use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
-use mailtide::engine::Stopped;
+use mailtide::engine::{LabelConfirmation, Stopped};
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{ImportedMessage, Label, MessageFacts};
 use mailtide::ids::{
-    AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, ThreadId, Timestamp,
+    AccountId, CommandId, ENGINE_VERSION, Epoch, HistoryId, MessageId, ThreadId, Timestamp,
 };
 use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
+use mailtide::labels::LabelSet;
 use mailtide::outbox::ActionRequest;
 use mailtide::purge::PurgePolicy;
 use mailtide::quota::{Admission, Priority};
@@ -193,6 +195,7 @@ pub struct Runner<S, B, T, Q, A> {
     pub(crate) clock: crate::Clock,
     extract: fn(&[u8]) -> MessageFacts,
     purge: PurgePolicy,
+    label_confirmations: Mutex<BTreeMap<AccountId, (Epoch, Option<LabelConfirmation>)>>,
 }
 
 /// What one run did.
@@ -642,6 +645,7 @@ where
             clock: crate::Clock::system(),
             extract: mailtide_mime::facts,
             purge: PurgePolicy::Off,
+            label_confirmations: Mutex::default(),
         }
     }
 
@@ -1232,7 +1236,23 @@ where
             watch: self.config.watch.policy(),
             ..self.config.engine.clone()
         };
-        Ok(Some(Engine::new(snapshot, config)))
+        let mut engine = Engine::new(snapshot, config);
+        {
+            let mut confirmations = self
+                .label_confirmations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let (epoch, pending) = confirmations
+                .entry(account.clone())
+                .or_insert((engine.epoch(), None));
+            if *epoch <= engine.epoch() {
+                *epoch = engine.epoch();
+                if let Some(confirmation) = pending.take() {
+                    engine.restore_label_confirmation(confirmation);
+                }
+            }
+        }
+        Ok(Some(engine))
     }
 
     /// Queued work (jobs deferred by the quota gate or backing off, a
@@ -1299,10 +1319,10 @@ where
                         (StopReason::Blocked(_), Some(_)) => StopReason::Superseded,
                         (stop, _) => stop,
                     };
-                    return Ok(finish(report, &engine, stop));
+                    return Ok(self.finish(account, report, &engine, stop));
                 }
                 if Instant::now() > deadline {
-                    return Ok(finish(report, &engine, StopReason::BudgetExhausted));
+                    return Ok(self.finish(account, report, &engine, StopReason::BudgetExhausted));
                 }
                 if let Some(progress) = progress
                     && reported.elapsed() >= PROGRESS_EVERY
@@ -1335,7 +1355,7 @@ where
                 }
             }
             if let Some(stop) = stopped(&engine) {
-                return Ok(finish(report, &engine, stop));
+                return Ok(self.finish(account, report, &engine, stop));
             }
             let clock = self.clock.now();
             let due: Vec<TimerKind> = timers
@@ -1357,7 +1377,7 @@ where
                         next: timers.values().min().copied(),
                     },
                 };
-                return Ok(finish(report, &engine, stop));
+                return Ok(self.finish(account, report, &engine, stop));
             }
             for timer in due {
                 timers.remove(&timer);
@@ -1367,6 +1387,36 @@ where
                 }));
             }
         }
+    }
+
+    fn finish(
+        &self,
+        account: &AccountId,
+        report: SyncReport,
+        engine: &Engine,
+        stop: StopReason,
+    ) -> RunOutcome {
+        let mut confirmations = self
+            .label_confirmations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if confirmations
+            .get(account)
+            .is_some_and(|(epoch, _)| *epoch == engine.epoch())
+        {
+            match engine
+                .label_confirmation()
+                .filter(|_| engine.stopped().is_none())
+            {
+                Some(confirmation) => {
+                    confirmations.insert(account.clone(), (engine.epoch(), Some(confirmation)));
+                }
+                None => {
+                    confirmations.remove(account);
+                }
+            }
+        }
+        finish(report, engine, stop)
     }
 
     /// Apply the queued commits of a stopped engine; drop everything else.
@@ -1512,6 +1562,30 @@ where
         }
     }
 
+    /// The stored catalogue and its generation before sending a listing.
+    /// A local write racing either read makes the eventual listing stale.
+    async fn label_listing_context(&self, call: &GmailCall) -> Result<(u64, LabelSet), RunError> {
+        if call.request != GmailRequest::ListLabels {
+            return Ok((0, LabelSet::new()));
+        }
+        let generation = self
+            .store
+            .label_generation(&call.account)
+            .await
+            .map_err(RunError::Store)?;
+        let stored = self
+            .store
+            .labels(&call.account)
+            .await
+            .map_err(RunError::Store)?;
+        let users = stored
+            .into_iter()
+            .filter(|label| !mailtide::mirror::is_system_label(label))
+            .map(|label| label.id)
+            .collect();
+        Ok((generation, users))
+    }
+
     /// Admit `call` through the quota gate and, if granted, send it; the
     /// lease is released (or given back if this future is dropped). Shared
     /// by the engine's commands and direct calls.
@@ -1531,17 +1605,7 @@ where
             (_, WatchMode::Topic(topic)) => topic.clone(),
             (_, WatchMode::Disabled) => String::new(),
         };
-        // A listing reports the label generation read before it is sent:
-        // a local label write after this read makes it stale (SPEC §6.6).
-        let generation = match call.request {
-            GmailRequest::ListLabels => self
-                .store
-                .label_generation(&call.account)
-                .await
-                .map_err(RunError::Store)?,
-            _ => 0,
-        };
-        let budget = send_before.map(|deadline| deadline.budget);
+        let label_context = self.label_listing_context(call).await?;
         let Some(admission) = before_budget(
             budget,
             self.quota
@@ -1573,7 +1637,7 @@ where
         };
         let sent = Instant::now();
         let outcome = self
-            .perform(call, command, &topic, generation, report, send_before)
+            .perform(call, command, &topic, label_context, report, send_before)
             .await;
         let duration_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &outcome {
@@ -1628,7 +1692,7 @@ where
         call: &GmailCall,
         command: CommandId,
         topic: &str,
-        generation: u64,
+        label_context: (u64, LabelSet),
         report: &mut SyncReport,
         send_before: Option<DispatchDeadline>,
     ) -> Outcome {
@@ -1720,7 +1784,8 @@ where
                 decode::labels_list(body).map(|labels| EventKind::LabelsListed {
                     command,
                     labels,
-                    generation,
+                    generation: label_context.0,
+                    stored_user_labels: label_context.1,
                 })
             }
             GmailRequest::Watch => decode::watch(body).map(|expiration| EventKind::WatchRenewed {
@@ -1756,15 +1821,9 @@ where
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
-            // A label listing without labels is a glitch, not a mailbox
-            // (one always lists its system labels): asked again, never
-            // applied.
-            Err(error @ decode::DecodeError::MissingField("labels"))
-                if matches!(gmail_request, GmailRequest::ListLabels) =>
-            {
-                Outcome::Failed(transient(format!(
-                    "label listing without labels: {error:?}"
-                )))
+            // An unusable catalogue can heal on the next listing.
+            Err(error) if matches!(gmail_request, GmailRequest::ListLabels) => {
+                Outcome::Failed(transient(format!("unusable label listing: {error:?}")))
             }
             // A success whose answer does not decode may still have changed
             // the mailbox: never report it as refused.
@@ -2058,6 +2117,10 @@ async fn pause(
 
 fn finish(mut report: SyncReport, engine: &Engine, stop: StopReason) -> RunOutcome {
     let status = engine.status();
+    report.failed_requests += status.label_listing_failures;
+    if status.label_listing_failures > 0 && report.last_failure.is_none() {
+        report.last_failure = Some("transient");
+    }
     report.cursor_after = status.cursor;
     report.status = Some(status);
     RunOutcome { report, stop }

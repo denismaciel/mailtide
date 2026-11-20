@@ -1,6 +1,6 @@
 //! How long a label removal takes on a large mailbox:
 //! `cargo run --release -p mailtide-store --example label_removal -- URL ROWS`
-//! with a `sqlite::memory:` or Postgres URL (its tables are reset first).
+//! with a `sqlite::memory:` or a Postgres URL. Each run uses a fresh account.
 //!
 //! It mirrors `ROWS` messages carrying `Label_1` (half of them also
 //! `Label_2` .. `Label_5`), then times `record_label(Remove Label_1)` (what
@@ -71,7 +71,7 @@ async fn main() {
     store.track(&account, 1).await.expect("track");
     let snapshot = store.claim(&account, ENGINE_VERSION).await.expect("claim");
     let defined = [
-        "INBOX", "Label_1", "Label_2", "Label_3", "Label_4", "Label_5",
+        "INBOX", "UNREAD", "Label_1", "Label_2", "Label_3", "Label_4", "Label_5",
     ];
     let mut first = commit(&account, snapshot.epoch, 0);
     first.labels = vec![LabelOp::ReplaceAll {
@@ -135,7 +135,7 @@ async fn main() {
     let generation = store.label_generation(&account).await.expect("generation");
     let mut listing = commit(&account, snapshot.epoch, 1_000_000);
     listing.labels = vec![LabelOp::ReplaceAll {
-        labels: vec![label("INBOX")],
+        labels: vec![label("INBOX"), label("UNREAD")],
         generation,
         at: Timestamp(2),
     }];

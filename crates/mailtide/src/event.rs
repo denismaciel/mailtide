@@ -92,6 +92,10 @@ pub enum EventKind {
         /// request was sent (`Store::label_generation`): the listing is
         /// applied only if no local label write happened since.
         generation: u64,
+        /// Non-system definitions in the store, read after the generation
+        /// and before sending the request. A write racing either read is
+        /// covered by the generation fence.
+        stored_user_labels: crate::labels::LabelSet,
     },
     /// `users.watch` succeeded.
     WatchRenewed {

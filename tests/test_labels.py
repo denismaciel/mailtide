@@ -35,6 +35,7 @@ def test_labels_name_the_ids_on_messages_and_follow_renames(gmail: tuple[Mailbox
             ("INBOX", "INBOX", "system"),
             ("Label_12", "Receipts", "user"),
             ("SENT", "SENT", "system"),
+            ("UNREAD", "UNREAD", "system"),
         ]
         names = {label.id: label.name for label in labels}
         [view] = await r.messages(ACCOUNT, ["m1"])
@@ -116,6 +117,7 @@ def test_blocking_labels(gmail: tuple[Mailbox, str]) -> None:
     assert described(runner.labels(ACCOUNT)) == [
         ("INBOX", "INBOX", "system"),
         ("Label_1", "Travel", "user"),
+        ("UNREAD", "UNREAD", "system"),
     ]
     with pytest.raises(ValueError, match="invalid account"):
         runner.labels("not an account")
@@ -154,4 +156,5 @@ def test_labels_carry_colour_visibility_and_parent(gmail: tuple[Mailbox, str]) -
         "Label_3": "Label_2",
         "Label_4": "Label_1",
         "Label_5": None,
+        "UNREAD": None,
     }

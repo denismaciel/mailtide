@@ -292,6 +292,8 @@ pub enum UserOp {
     /// 31 days pass: past the deleted-label memory, and past Gmail's
     /// history (a cursor from before reads 404).
     MonthPasses,
+    /// 31 days pass without expiring Gmail history.
+    MonthPassesKeepHistory,
     /// The user acts in the host's UI on the n-th mirrored message (or
     /// its whole thread); the engine delivers it to Gmail.
     HostAction {
@@ -772,6 +774,7 @@ impl Gmail {
             | UserOp::HostPurge { .. }
             | UserOp::HostEmpty { .. }
             | UserOp::MonthPasses
+            | UserOp::MonthPassesKeepHistory
             | UserOp::HostSaveDraft { .. }
             | UserOp::HostDeleteDraft { .. }
             | UserOp::HostSendDraft { .. } => {}
@@ -1214,6 +1217,7 @@ struct Sim {
     engine: Engine,
     now: Timestamp,
     pending: Vec<Command>,
+    listing_cut_short: bool,
     deliveries: Vec<Event>,
     timers: BTreeMap<TimerKind, Timestamp>,
     blobs: BTreeSet<MessageId>,
@@ -1308,6 +1312,7 @@ impl Sim {
             engine,
             now: Timestamp(1_000_000),
             pending: Vec::new(),
+            listing_cut_short: false,
             deliveries: Vec::new(),
             timers: BTreeMap::new(),
             blobs: BTreeSet::new(),
@@ -1537,12 +1542,12 @@ impl Sim {
             self.host_empty(spam);
             return;
         }
-        if op == UserOp::MonthPasses {
+        if matches!(op, UserOp::MonthPasses | UserOp::MonthPassesKeepHistory) {
             self.now = self.now.plus(Duration::from_hours(31 * 24));
-            // Gmail keeps history about a week: nothing from before is
-            // available any more.
-            self.gmail.expired_before = self.gmail.last_history;
-            self.stats.expiries += 1;
+            if op == UserOp::MonthPasses {
+                self.gmail.expired_before = self.gmail.last_history;
+                self.stats.expiries += 1;
+            }
             return;
         }
         let op = match op {
@@ -2535,13 +2540,35 @@ impl Sim {
                     }),
                 };
             }
-            // Cut short: what it lacks was not deleted.
-            labels.truncate(self.rng.below(labels.len()));
+            // A transient cut can keep every system label. The next
+            // listing is whole; two identical omissions would vote for
+            // deletion even with confirmation.
+            let users: Vec<_> = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, label)| !mailtide::mirror::is_system_label(label))
+                .map(|(index, _)| index)
+                .collect();
+            if !self.listing_cut_short && !users.is_empty() {
+                labels.remove(users[self.rng.below(users.len())]);
+                self.listing_cut_short = true;
+            } else {
+                self.listing_cut_short = false;
+            }
+        } else {
+            self.listing_cut_short = false;
         }
         EventKind::LabelsListed {
             command,
             labels,
             generation: self.mirror.record.label_generation,
+            stored_user_labels: self
+                .mirror
+                .labels
+                .iter()
+                .filter(|label| !mailtide::mirror::is_system_label(label))
+                .map(|label| label.id.clone())
+                .collect(),
         }
     }
 
@@ -2683,7 +2710,7 @@ impl Sim {
         let labels_by = self
             .now
             .plus(EngineConfig::default().label_refresh)
-            .plus(Duration::from_mins(2));
+            .plus(Duration::from_mins(5));
         let mut difference = String::from("never idle");
         for healing_step in 0..BUDGET {
             self.step += 1;
@@ -3394,6 +3421,58 @@ mod tests {
                 .any(|r| r.faults.draft_late != Probability::NEVER),
             "draft calls were not atomic"
         );
+    }
+
+    #[test]
+    fn retained_history_replays_the_removal_after_deleted_label_memory_expires() {
+        let mut sim = Sim::new(
+            Rng(11),
+            Faults::none(),
+            Some(vec![UserOp::MonthPassesKeepHistory]),
+        );
+        sim.gmail.apply(&UserOp::CreateLabel);
+        let start = sim.engine.start(sim.now);
+        sim.pending.extend(start);
+        assert!(matches!(sim.heal(), Convergence::Reached { .. }));
+        let cursor = sim.mirror.record.cursor.expect("live");
+        let message = sim.gmail.messages.keys().next().expect("message").clone();
+        let label = sim.gmail.user_label(0).expect("label");
+        sim.gmail.modify(&ModifyGroup {
+            messages: vec![message.clone()],
+            add: vec![label.clone()],
+            remove: Vec::new(),
+            versions: Vec::new(),
+        });
+        sim.gmail.delete_label(&label, true);
+        sim.record_label(&LabelOp::Remove {
+            id: label.clone(),
+            at: sim.now,
+        });
+        sim.user_op();
+        sim.pending.extend(sim.engine.handle(Event {
+            now: sim.now,
+            kind: EventKind::TimerFired {
+                timer: TimerKind::Labels,
+            },
+        }));
+        for _ in 0..100 {
+            if !sim.mirror.record.deleted_labels.contains_key(&label) {
+                break;
+            }
+            sim.advance();
+        }
+        assert!(!sim.mirror.record.deleted_labels.contains_key(&label));
+        assert_eq!(sim.mirror.record.cursor, Some(cursor));
+        assert!(sim.gmail.history_page(cursor, None).is_some());
+        sim.pending.extend(sim.engine.handle(Event {
+            now: sim.now,
+            kind: EventKind::TimerFired {
+                timer: TimerKind::Poll,
+            },
+        }));
+        assert!(matches!(sim.heal(), Convergence::Reached { .. }));
+        assert_eq!(sim.mirror.record.cursor, Some(sim.gmail.current()));
+        assert!(!sim.mirror.messages[&message].labels.contains(&label));
     }
 
     #[test]

@@ -332,6 +332,7 @@ fn a_refresh_is_due_from_the_persisted_refresh_time_across_restarts() {
         command: call,
         labels: renamed.clone(),
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     assert_eq!(host.mirror.label_definitions(), {
         let mut sorted = renamed;
@@ -366,6 +367,7 @@ fn a_long_running_engine_refreshes_when_its_timer_fires() {
         command: call,
         labels: stored_labels(),
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     assert_eq!(host.mirror.record.labels_refreshed_at, Some(due));
 }
@@ -382,6 +384,7 @@ fn an_unchanged_listing_adds_no_feed_entry() {
         command: call,
         labels: reordered,
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     assert_eq!(
         host.mirror.log.len(),
@@ -416,6 +419,7 @@ fn reconciliation_listing_unchanged_labels_adds_no_feed_entry_either() {
         command: call,
         labels: stored_labels(),
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     assert_eq!(host.definitions_changes(), before);
     assert_eq!(
@@ -490,6 +494,7 @@ fn unknown_label_ids_coalesce_into_one_throttled_refresh() {
         command: call,
         labels: listed,
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     assert_eq!(
         host.timers.get(&TimerKind::Labels),
@@ -528,6 +533,7 @@ fn unknown_label_ids_coalesce_into_one_throttled_refresh() {
         command: call,
         labels: listed,
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     host.at(LISTED + 11 * MINUTE)
         .handle(EventKind::PushReceived {
@@ -647,6 +653,7 @@ fn a_failed_refresh_neither_blocks_sync_nor_moves_the_cursor() {
         command: labels,
         labels: stored_labels(),
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     // No label commit ever touched the cursor.
     for commit in &host.commits {
@@ -691,6 +698,7 @@ fn an_unknown_label_seen_during_a_listing_is_asked_about_once_more() {
         command: labels,
         labels: stored_labels(),
         generation: 0,
+        stored_user_labels: set(["Label_1"]),
     });
     let again = Timestamp(start).plus(UNKNOWN_LABEL_GAP);
     assert_eq!(host.timers.get(&TimerKind::Labels), Some(&again));
@@ -712,4 +720,81 @@ fn a_cooldown_holds_the_refresh_until_it_ends() {
     assert!(host.label_calls().is_empty(), "Gmail asked us to slow down");
     host.at(until.0).fire(TimerKind::CooldownOver);
     host.take_label_call();
+}
+
+#[test]
+fn three_inconsistent_omissions_fail_without_changing_definitions() {
+    let start = LISTED + INTERVAL;
+    let mut mirror = live_mirror();
+    for id in ["Label_2", "Label_3"] {
+        mirror.record_label(&LabelOp::Upsert(label(id, id)));
+    }
+    let before = mirror.label_definitions();
+    let generation = mirror.record.label_generation;
+    let mut host = Host::new(mirror, start);
+    let stored = set(["Label_1", "Label_2", "Label_3"]);
+    for round in 0..3 {
+        if round > 0 {
+            host.at(start + round * MINUTE).fire(TimerKind::Labels);
+        }
+        let (command, _) = host.take_label_call();
+        let mut labels = stored_labels();
+        labels.pop();
+        for other in (0..3).filter(|other| *other != round) {
+            let id = format!("Label_{}", other + 1);
+            labels.push(label(&id, &id));
+        }
+        host.handle(EventKind::LabelsListed {
+            command,
+            labels,
+            generation,
+            stored_user_labels: stored.clone(),
+        });
+        assert_eq!(
+            host.mirror.record.labels_refreshed_at,
+            Some(Timestamp(LISTED))
+        );
+        assert_eq!(host.mirror.label_definitions(), before);
+    }
+    assert_eq!(host.engine.status().label_listing_failures, 1);
+    assert!(host.timers[&TimerKind::Labels] > host.now);
+}
+
+#[test]
+fn reconciliation_waits_for_confirmation_before_capturing_the_baseline() {
+    let start = LISTED + MINUTE;
+    let mut host = Host::new(live_mirror(), start);
+    let pass = host.take_history_call();
+    host.handle(EventKind::HistoryExpired { command: pass });
+    let mut cut = stored_labels();
+    cut.pop();
+    for round in 0..2 {
+        let (command, _) = host.take_label_call();
+        host.handle(EventKind::LabelsListed {
+            command,
+            labels: cut.clone(),
+            generation: 0,
+            stored_user_labels: set(["Label_1"]),
+        });
+        if round == 0 {
+            assert!(
+                !host
+                    .gmail
+                    .iter()
+                    .any(|(_, call)| call.request == GmailRequest::GetProfile)
+            );
+            host.at(start + MINUTE).fire(TimerKind::Poll);
+        }
+    }
+    assert!(
+        host.gmail
+            .iter()
+            .any(|(_, call)| call.request == GmailRequest::GetProfile)
+    );
+    assert!(
+        host.mirror
+            .record
+            .deleted_labels
+            .contains_key(&LabelId("Label_1".into()))
+    );
 }

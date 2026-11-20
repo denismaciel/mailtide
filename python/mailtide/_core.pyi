@@ -86,6 +86,7 @@ class Status:
     cursor: int | None
     cursor_advanced_at_ms: int | None
     cooldown_until_ms: int | None
+    label_listing_failures: int
     discovered: int | None
     imported: int | None
     discovery_complete: bool | None

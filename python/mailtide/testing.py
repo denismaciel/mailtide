@@ -29,7 +29,9 @@ class Mailbox:
         self.drafts: dict[str, str] = {}  # draft id -> its current message id
         self.next_id = 0
         self.history: list[dict] = []
-        self.labels: dict[str, dict] = {"INBOX": {"id": "INBOX", "name": "INBOX", "type": "system"}}
+        self.labels: dict[str, dict] = {
+            lid: {"id": lid, "name": lid, "type": "system"} for lid in ("INBOX", "UNREAD")
+        }
         # Search results by query, as message ids in Gmail's order. Like
         # Gmail's index they are not derived from the mailbox, and the fake
         # interprets no query: a query nobody scripted matches nothing.

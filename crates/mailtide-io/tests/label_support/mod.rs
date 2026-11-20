@@ -349,6 +349,13 @@ impl Mailbox {
                 ok(&json!({ "labels": labels }))
             }
             (Method::Post, ["labels"]) => self.create(&body),
+            (Method::Get, ["labels", id]) => {
+                let id = decoded(id);
+                self.labels.get(&id).map_or_else(
+                    || refusal(404, "notFound", "label not found"),
+                    |label| ok(&label.json(&id)),
+                )
+            }
             (Method::Patch, ["labels", id]) => self.patch(&decoded(id), &body),
             (Method::Delete, ["labels", id]) => self.delete(&decoded(id)),
             (Method::Get, ["history"]) => {

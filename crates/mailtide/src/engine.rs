@@ -169,6 +169,10 @@ struct LabelRefresh {
     not_before: Option<Timestamp>,
     /// Refreshes that failed in a row.
     failures: u32,
+    /// When the latest request was sent, to throttle rechecks after a refusal.
+    last_sent: Option<Timestamp>,
+    /// A listing that lacked stored user labels and needs confirmation.
+    confirmation: Option<LabelConfirmation>,
     /// Ids the definitions lack, seen since the last listing was sent.
     unknown: LabelSet,
     /// Unknown ids the listing in flight was sent for.
@@ -177,6 +181,16 @@ struct LabelRefresh {
     /// ask for no further refresh (the periodic one still runs), so an id
     /// Gmail never lists can't make the engine list labels over and over.
     unlisted: LabelSet,
+}
+
+/// A pending label confirmation that can be carried between short runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelConfirmation {
+    generation: u64,
+    lacking: LabelSet,
+    rounds: u8,
+    at: Timestamp,
+    reconciling: bool,
 }
 
 /// Why the engine stopped accepting events.
@@ -209,9 +223,10 @@ pub struct Engine {
     /// have, held (their claim kept) until a label listing sent after the
     /// refusal has been applied; `true` once that listing is sent.
     parked: Vec<(ClaimedJob, bool)>,
-    /// Messages whose refused delivery was already retried after a
-    /// listing: a refusal now blocks.
-    relisted: std::collections::BTreeSet<MessageId>,
+    /// Intent versions whose refused delivery was given a listing. A new
+    /// intent on the same message can wait for a listing of its own.
+    relisted: BTreeMap<MessageId, Vec<crate::outbox::Delivery>>,
+    label_listing_failures: u32,
     /// When the periodic draft listing is due; `None` until known.
     drafts_due: Option<Timestamp>,
     /// The pages of the draft listing in flight, by its claim.
@@ -260,7 +275,8 @@ impl Engine {
             label_ids: Vec::new(),
             labels: LabelRefresh::default(),
             parked: Vec::new(),
-            relisted: std::collections::BTreeSet::new(),
+            relisted: BTreeMap::new(),
+            label_listing_failures: 0,
             drafts_due: None,
             drafts_listing: None,
             notified: None,
@@ -283,6 +299,28 @@ impl Engine {
     #[must_use]
     pub fn stopped(&self) -> Option<&Stopped> {
         self.stopped.as_ref()
+    }
+
+    /// The epoch this engine claimed.
+    #[must_use]
+    pub fn epoch(&self) -> crate::ids::Epoch {
+        self.state.epoch
+    }
+
+    /// In-memory continuation for hosts that run the engine in short slices.
+    #[must_use]
+    pub fn label_confirmation(&self) -> Option<LabelConfirmation> {
+        self.labels.confirmation.clone()
+    }
+
+    /// Restore a pending label confirmation before calling `start`.
+    pub fn restore_label_confirmation(&mut self, confirmation: LabelConfirmation) {
+        if confirmation.reconciling == self.capturing_baseline() {
+            if confirmation.reconciling {
+                self.reconcile_not_before = Some(confirmation.at);
+            }
+            self.labels.confirmation = Some(confirmation);
+        }
     }
 
     /// The first commands after start: schedule timers, resume any
@@ -310,11 +348,21 @@ impl Engine {
         out.extend(self.resume_sync(now));
         // On start: the definitions are due if they were listed `label_refresh`
         // ago or never (a reconciliation that lists them anyway counts).
-        self.labels.due = Some(schedule::label_refresh_due(
-            self.state.labels_refreshed_at,
-            now,
-            self.config.label_refresh,
+        self.labels.due = Some(self.labels.confirmation.as_ref().map_or_else(
+            || {
+                schedule::label_refresh_due(
+                    self.state.labels_refreshed_at,
+                    now,
+                    self.config.label_refresh,
+                )
+            },
+            |confirmation| confirmation.at,
         ));
+        self.labels.not_before = self
+            .labels
+            .confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.at);
         out.extend(self.pump_labels(now));
         self.drafts_due = Some(schedule::draft_refresh_due(
             self.state.drafts_refreshed_at,
@@ -363,9 +411,11 @@ impl Engine {
                 command,
                 labels,
                 generation,
+                stored_user_labels,
             } => match self.waiting.remove(&command) {
-                Some(Waiting::Labels) => self.on_labels(labels, generation, now),
-                Some(Waiting::LabelRefresh) => self.on_label_refresh(labels, generation, now),
+                Some(waiting @ (Waiting::Labels | Waiting::LabelRefresh)) => {
+                    self.on_labels_listed(waiting, labels, generation, stored_user_labels, now)
+                }
                 Some(_) | None => Vec::new(),
             },
             EventKind::WatchRenewed {
@@ -390,7 +440,7 @@ impl Engine {
             }
             EventKind::BlobDeleted { command } => self.on_blob_deleted(command, now),
             EventKind::RequestFailed { command, failure } => self.on_failed(command, &failure, now),
-            EventKind::RequestDeferred { command, until } => self.on_deferred(command, until),
+            EventKind::RequestDeferred { command, until } => self.on_deferred(command, until, now),
             EventKind::ActionRequested { action } => self.on_action(action, now),
             EventKind::LabelsModified { command } => self.on_modified(command, now),
             EventKind::DraftsListed { command, page } => self.on_drafts_listed(command, page, now),
@@ -425,6 +475,7 @@ impl Engine {
             cursor: self.state.cursor,
             cursor_advanced_at: self.cursor_advanced_at,
             cooldown: self.state.cooldown.clone(),
+            label_listing_failures: self.label_listing_failures,
             import: self.state.sync.reconcile().map(|progress| ImportProgress {
                 discovered: self.discovered,
                 imported: self.imported,
@@ -682,6 +733,7 @@ impl Engine {
     }
 
     fn begin_reconcile(&mut self, reason: ReconcileReason, now: Timestamp) -> Vec<Command> {
+        self.labels.confirmation = None;
         let progress = ReconcileProgress::begin(reason);
         let sync = match (reason, self.state.cursor) {
             (ReconcileReason::Bootstrap, None) => SyncState::Bootstrapping(progress),
@@ -720,7 +772,7 @@ impl Engine {
         }
         match &progress.step {
             ReconcileStep::CaptureBaseline => {
-                vec![self.list_labels(Priority::Backfill, Waiting::Labels)]
+                vec![self.list_labels(Priority::Backfill, Waiting::Labels, now)]
             }
             ReconcileStep::Enumerating { .. } => match progress.listing() {
                 Some((scope, page_token)) => {
@@ -734,6 +786,73 @@ impl Engine {
             },
             ReconcileStep::Verifying { .. } => self.finish_reconcile(progress, now),
         }
+    }
+
+    /// Only commit user-label removals confirmed by a second complete
+    /// listing under the same generation. A new omission starts a new
+    /// comparison, up to three listings per attempt.
+    fn on_labels_listed(
+        &mut self,
+        waiting: Waiting,
+        labels: Vec<Label>,
+        generation: u64,
+        mut lacking: LabelSet,
+        now: Timestamp,
+    ) -> Vec<Command> {
+        if !crate::mirror::complete_listing(&labels) {
+            return self.invalid_label_listing(waiting, now);
+        }
+        for label in &labels {
+            lacking.remove(&label.id);
+        }
+        let previous = self.labels.confirmation.take();
+        let confirmed = lacking.is_empty()
+            || previous.as_ref().is_some_and(|first| {
+                first.generation == generation && lacking.is_subset(&first.lacking)
+            });
+        if confirmed {
+            return if waiting == Waiting::Labels {
+                self.on_labels(labels, generation, now)
+            } else {
+                self.on_label_refresh(labels, generation, now)
+            };
+        }
+        let rounds = previous.map_or(1, |first| first.rounds + 1);
+        if rounds >= 3 {
+            return self.invalid_label_listing(waiting, now);
+        }
+        let at = if self.parked.is_empty() {
+            now.plus(schedule::UNKNOWN_LABEL_GAP)
+        } else {
+            now
+        };
+        self.labels.confirmation = Some(LabelConfirmation {
+            generation,
+            lacking,
+            rounds,
+            at,
+            reconciling: waiting == Waiting::Labels,
+        });
+        if waiting == Waiting::Labels {
+            self.reconcile_not_before = Some(at);
+            self.resume_sync(now)
+        } else {
+            self.labels.not_before = Some(at);
+            self.labels.due = Some(at);
+            self.pump_labels(now)
+        }
+    }
+
+    fn invalid_label_listing(&mut self, waiting: Waiting, now: Timestamp) -> Vec<Command> {
+        self.label_listing_failures += 1;
+        let failure = RetryableFailure {
+            class: Retryable::Transient,
+            retry_after: None,
+            detail: "incomplete label listing or inconsistent removals".into(),
+        };
+        let mut out = self.retry(waiting, &failure, now);
+        out.extend(self.listing_ended(now));
+        out
     }
 
     /// Reconciliation listed the labels: store them, then fix the baseline.
@@ -840,19 +959,31 @@ impl Engine {
         self.pump_labels(now)
     }
 
-    /// Labels a delivery was refused for, which may be deleted: list the
-    /// definitions now (as for an unknown id), even though they hold them.
+    /// Labels a delivery was refused for, which may be deleted. A held job
+    /// needs a prompt answer. Other rechecks share the unknown-label gap.
     fn recheck_labels(&mut self, ids: LabelSet, now: Timestamp) -> Vec<Command> {
         if ids.is_empty() {
             return Vec::new();
         }
         self.labels.unlisted.retain(|id| !ids.contains(id));
         self.labels.unknown.extend(ids);
-        // At once (unless backing off): a delivery waits for it.
+        let parked = !self.parked.is_empty();
+        if parked && self.labels.confirmation.is_some() {
+            self.labels.not_before = None;
+            if self.capturing_baseline() {
+                self.reconcile_not_before = None;
+                return self.resume_sync(now);
+            }
+        }
+        let requested = if parked {
+            now
+        } else {
+            schedule::label_refresh_due(self.labels.last_sent, now, schedule::UNKNOWN_LABEL_GAP)
+        };
         let at = self
             .labels
             .not_before
-            .map_or(now, |not_before| now.max(not_before));
+            .map_or(requested, |not_before| requested.max(not_before));
         self.labels.due = Some(self.labels.due.map_or(at, |due| due.min(at)));
         self.pump_labels(now)
     }
@@ -864,12 +995,13 @@ impl Engine {
             .values()
             .any(|w| matches!(w, Waiting::Labels | Waiting::LabelRefresh));
         // A listing in flight plans the next one when it returns.
-        if listing {
+        if listing || self.capturing_baseline() {
             return Vec::new();
         }
         let Some(due) = self.labels.due else {
             return Vec::new();
         };
+        let due = self.labels.not_before.map_or(due, |at| due.max(at));
         if due > now {
             return vec![self.schedule(TimerKind::Labels, due)];
         }
@@ -878,11 +1010,19 @@ impl Engine {
             return Vec::new();
         }
         self.labels.due = None;
-        vec![self.list_labels(Priority::Live, Waiting::LabelRefresh)]
+        vec![self.list_labels(Priority::Live, Waiting::LabelRefresh, now)]
+    }
+
+    fn capturing_baseline(&self) -> bool {
+        self.state
+            .sync
+            .reconcile()
+            .is_some_and(|progress| progress.step == ReconcileStep::CaptureBaseline)
     }
 
     /// `labels.list`, remembering which unknown ids it is sent for.
-    fn list_labels(&mut self, priority: Priority, waiting: Waiting) -> Command {
+    fn list_labels(&mut self, priority: Priority, waiting: Waiting, now: Timestamp) -> Command {
+        self.labels.last_sent = Some(now);
         let unknown = std::mem::take(&mut self.labels.unknown);
         self.labels.asking.extend(unknown);
         // Reconciliation's listing replaces a refresh in flight: two
@@ -921,6 +1061,7 @@ impl Engine {
 
     /// A listing didn't happen: the ids it was sent for are unknown again.
     fn label_listing_failed(&mut self) {
+        self.labels.confirmation = None;
         let asked = std::mem::take(&mut self.labels.asking);
         self.labels.unknown.extend(asked);
     }
@@ -935,6 +1076,7 @@ impl Engine {
     /// Gmail refused a refresh for good: mail sync goes on, and the next
     /// periodic refresh tries again. The ids it was sent for ask no more.
     fn label_refresh_refused(&mut self, now: Timestamp) -> Vec<Command> {
+        self.labels.confirmation = None;
         let asked = std::mem::take(&mut self.labels.asking);
         self.labels.unlisted.extend(asked);
         vec![self.retry_labels_at(now.plus(self.config.label_refresh))]
@@ -992,7 +1134,7 @@ impl Engine {
 
     fn finish_reconcile(&mut self, progress: &ReconcileProgress, now: Timestamp) -> Vec<Command> {
         let Some(baseline) = progress.baseline() else {
-            return vec![self.list_labels(Priority::Backfill, Waiting::Labels)];
+            return vec![self.list_labels(Priority::Backfill, Waiting::Labels, now)];
         };
         let to = self
             .state
@@ -1060,6 +1202,12 @@ impl Engine {
             return Vec::new();
         }
         self.claiming = false;
+        // A listing can drop every intent from a held delivery. Once the
+        // store has no more work for us, any remaining retry versions are
+        // obsolete even if no settled delivery was claimed to clear them.
+        if jobs.is_empty() && next_due.is_none() && self.running_jobs == 0 {
+            self.relisted.clear();
+        }
         let mut out = Vec::new();
         for job in jobs {
             self.running_jobs += 1;
@@ -1077,7 +1225,8 @@ impl Engine {
                     let request = GmailRequest::Modify(group.clone());
                     out.push(self.gmail(request, priority, Waiting::Job(job)));
                 }
-                ClaimedWork::Deliver(_, Delivery::Settled) => {
+                ClaimedWork::Deliver(message, Delivery::Settled) => {
+                    self.relisted.remove(message);
                     out.push(self.finish_job(&job, JobOutcome::Done, Vec::new(), now));
                 }
                 ClaimedWork::RefreshDrafts { .. } => {
@@ -1340,6 +1489,7 @@ impl Engine {
         let Some(job) = self.take_job(command, answers) else {
             return Vec::new();
         };
+        self.relisted.remove(&id);
         let ops = vec![MessageOp::Tombstone {
             id,
             evidence: DeletionEvidence::VerifiedMissing {
@@ -1443,7 +1593,12 @@ impl Engine {
         ]
     }
 
-    fn on_deferred(&mut self, command: CommandId, until: Timestamp) -> Vec<Command> {
+    fn on_deferred(
+        &mut self,
+        command: CommandId,
+        until: Timestamp,
+        now: Timestamp,
+    ) -> Vec<Command> {
         match self.waiting.remove(&command) {
             Some(Waiting::Job(job)) => {
                 // This class and every lower one wait until the gate reopens.
@@ -1468,18 +1623,19 @@ impl Engine {
                 | Waiting::Baseline
                 | Waiting::Listing),
             ) => {
-                self.label_listing_failed();
                 self.pass = None;
                 let mut out = vec![self.schedule(TimerKind::Poll, until)];
                 if waiting == Waiting::Labels {
-                    out.extend(self.listing_ended(until));
+                    self.label_listing_failed();
+                    self.reconcile_not_before = Some(until);
+                    out.extend(self.listing_ended(now));
                 }
                 out
             }
             Some(Waiting::LabelRefresh) => {
                 self.label_listing_failed();
                 let mut out = vec![self.retry_labels_at(until)];
-                out.extend(self.listing_ended(until));
+                out.extend(self.listing_ended(now));
                 out
             }
             Some(Waiting::Watch) => vec![self.schedule(TimerKind::WatchRenewal, until)],
@@ -1537,15 +1693,21 @@ impl Engine {
                 // is left), and the rest, still pending, goes on its own.
                 JobKind::Deliver(message) => {
                     let doubtful = job.group().map(doubtful_adds).unwrap_or_default();
-                    if !doubtful.is_empty() && self.relisted.insert(message) {
-                        self.parked.push((job, false));
-                        return self.recheck_labels(doubtful, now);
-                    }
                     let (adds, rest): (Vec<_>, Vec<_>) = job
                         .delivery_versions()
                         .into_iter()
                         .partition(|delivery| doubtful.contains(&delivery.label));
+                    if !adds.is_empty()
+                        && self.relisted.get(&message).is_none_or(|previous| {
+                            adds.iter().all(|version| !previous.contains(version))
+                        })
+                    {
+                        self.relisted.insert(message, adds);
+                        self.parked.push((job, false));
+                        return self.recheck_labels(doubtful, now);
+                    }
                     let versions = if adds.is_empty() || rest.is_empty() {
+                        self.relisted.remove(&message);
                         adds.into_iter().chain(rest).collect()
                     } else {
                         adds
@@ -1664,10 +1826,13 @@ impl Engine {
                 vec![self.schedule_jobs(at)]
             }
             Waiting::History | Waiting::Labels | Waiting::Baseline | Waiting::Listing => {
-                self.label_listing_failed();
                 self.pass = None;
                 self.sync_failures += 1;
                 let at = self.backoff.next(self.sync_failures, failure, now, seed);
+                if waiting == Waiting::Labels {
+                    self.label_listing_failed();
+                    self.reconcile_not_before = Some(at);
+                }
                 vec![self.schedule(TimerKind::Poll, at)]
             }
             Waiting::LabelRefresh => {
@@ -2328,6 +2493,13 @@ mod tests {
 
         /// Gmail answers the listing asked for with `listed`.
         fn list(&mut self, listed: &[&str]) {
+            self.answer_labels(listed.iter().copied().chain(["UNREAD"]));
+            if self.has(&GmailRequest::ListLabels) {
+                self.answer_labels(listed.iter().copied().chain(["UNREAD"]));
+            }
+        }
+
+        fn answer_labels<'a>(&mut self, listed: impl IntoIterator<Item = &'a str>) {
             use crate::gmail::{Label, LabelKind};
             let at = self
                 .requests
@@ -2336,20 +2508,27 @@ mod tests {
                 .expect("a listing");
             let (command, _) = self.requests.remove(at);
             let labels = listed
-                .iter()
+                .into_iter()
                 .map(|id| {
                     let kind = if id.starts_with("Label_") {
                         LabelKind::User
                     } else {
                         LabelKind::System
                     };
-                    Label::plain(LabelId((*id).into()), *id, kind)
+                    Label::plain(LabelId(id.into()), id, kind)
                 })
                 .collect();
             let answer = self.engine.handle(event(EventKind::LabelsListed {
                 command,
                 labels,
                 generation: self.mirror.record.label_generation,
+                stored_user_labels: self
+                    .mirror
+                    .labels
+                    .iter()
+                    .filter(|label| !crate::mirror::is_system_label(label))
+                    .map(|label| label.id.clone())
+                    .collect(),
             }));
             self.settle(answer);
         }
@@ -2465,6 +2644,7 @@ mod tests {
         driven.list(&["INBOX", "STARRED", "Label_ok"]);
         let (add, _) = driven.refuse();
         assert_eq!(add, ids(&["Label_ok", "STARRED"]));
+        assert!(!driven.has(&GmailRequest::ListLabels), "nothing is parked");
         assert_eq!(driven.intents(), [("Label_ok", true), ("STARRED", false)]);
         let (add, _) = driven.refuse();
         assert_eq!(add, ids(&["STARRED"]));
@@ -2476,6 +2656,49 @@ mod tests {
                 .any(|(_, r)| matches!(r, GmailRequest::Modify(_))),
             "nothing more is sent"
         );
+    }
+
+    #[test]
+    fn a_new_intent_can_wait_after_the_previous_adds_were_removed_or_blocked() {
+        for remove in [false, true] {
+            let mut driven = Driven::new(
+                &["INBOX", "Label_dead", "Label_other"],
+                vec![add_labels(&["Label_dead"])],
+            );
+            driven.refuse();
+            if remove {
+                driven.list(&["INBOX", "Label_other"]);
+            } else {
+                driven.list(&["INBOX", "Label_dead", "Label_other"]);
+                driven.refuse();
+            }
+            assert!(
+                !driven
+                    .requests
+                    .iter()
+                    .any(|(_, r)| matches!(r, GmailRequest::Modify(_)))
+            );
+            assert!(driven.engine.relisted.is_empty());
+            let answer = driven.engine.handle(event(EventKind::ActionRequested {
+                action: ActionRequest::Messages {
+                    ids: vec![MessageId("m".into())],
+                    action: add_labels(&["Label_other"]),
+                },
+            }));
+            driven.settle(answer);
+            driven.refuse();
+            assert!(driven.has(&GmailRequest::ListLabels));
+        }
+    }
+
+    #[test]
+    fn an_incomplete_listing_releases_a_held_delivery_unchanged() {
+        let mut driven = Driven::new(&["INBOX", "Label_ok"], vec![add_labels(&["Label_ok"])]);
+        driven.refuse();
+        driven.answer_labels(["INBOX"]);
+        assert_eq!(driven.engine.status().label_listing_failures, 1);
+        assert_eq!(driven.refuse().0, ids(&["Label_ok"]));
+        assert_eq!(driven.intents(), [("Label_ok", true)]);
     }
 
     /// A delivery held for a listing goes again with what the store holds
@@ -2931,19 +3154,21 @@ mod tests {
         };
         let late = engine.handle(event(EventKind::LabelsListed {
             command: refresh,
-            labels: defined(&["INBOX", "OLD"]),
+            labels: defined(&["INBOX", "UNREAD", "OLD"]),
             generation: 0,
+            stored_user_labels: LabelSet::new(),
         }));
         assert!(first_commit(late).is_none(), "the older listing is ignored");
         let applied = first_commit(engine.handle(event(EventKind::LabelsListed {
             command: reconcile,
-            labels: defined(&["INBOX"]),
+            labels: defined(&["INBOX", "UNREAD"]),
             generation: 0,
+            stored_user_labels: LabelSet::new(),
         })))
         .expect("the reconciliation's listing applies");
         assert!(matches!(
             applied.labels.as_slice(),
-            [LabelOp::ReplaceAll { labels, .. }] if *labels == defined(&["INBOX"])
+            [LabelOp::ReplaceAll { labels, .. }] if *labels == defined(&["INBOX", "UNREAD"])
         ));
     }
 

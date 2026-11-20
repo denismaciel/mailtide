@@ -525,6 +525,9 @@ async fn a_label_deleted_elsewhere_without_history_records_still_leaves_every_me
     runner.transport().mailbox().delete_label("Label_1", false);
     runner.advance(REFRESH);
     sync(&runner).await;
+    assert_eq!(view(&runner, "m1").await.labels, set(["INBOX", "Label_1"]));
+    runner.advance(mailtide::schedule::UNKNOWN_LABEL_GAP);
+    sync(&runner).await;
     assert_eq!(view(&runner, "m1").await.labels, set(["INBOX"]));
     assert!(user_names(&runner).await.is_empty());
 }
@@ -578,7 +581,11 @@ async fn a_pending_action_on_a_label_deleted_elsewhere_is_dropped_not_blocked() 
         (shown.labels, shown.pending_actions, shown.blocked_actions),
         (set(["INBOX"]), 0, 0)
     );
-    assert!(writes(&runner).is_empty(), "nothing was sent for it");
+    assert_eq!(
+        writes(&runner),
+        ["POST messages/m1/modify"],
+        "the first refusal prompted confirmation"
+    );
 }
 
 #[tokio::test]
@@ -898,6 +905,99 @@ async fn an_empty_or_truncated_listing_strips_no_label() {
     assert_eq!(
         view(&runner, "m1").await.labels,
         set(["INBOX", "Label_1", "UNREAD"])
+    );
+}
+
+#[tokio::test]
+async fn delete_checks_an_omission_even_when_all_system_labels_are_listed() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        let kept = mailbox.create_label("Kept");
+        mailbox.add("m1", &[&kept]);
+    })
+    .await;
+    runner
+        .transport()
+        .mailbox()
+        .fail_next("GET labels", Fault::Body(CORE_LABELS));
+    let result = runner
+        .delete_label(&account(), &id("Label_1"), SublabelDeletion::Refuse, BUDGET)
+        .await;
+    assert!(matches!(result, Err(LabelError::Retryable(_))));
+    assert!(
+        runner
+            .transport()
+            .mailbox()
+            .requests
+            .iter()
+            .any(|request| request == "GET labels/Label_1")
+    );
+    assert!(writes(&runner).is_empty());
+    assert_eq!(view(&runner, "m1").await.labels, set(["Label_1"]));
+}
+
+const CORE_LABELS: &str = r#"{"labels":[{"id":"INBOX","name":"INBOX","type":"system"},{"id":"UNREAD","name":"UNREAD","type":"system"},{"id":"STARRED","name":"STARRED","type":"system"}]}"#;
+
+#[tokio::test]
+async fn a_single_cut_that_contains_every_system_label_keeps_live_uses() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        let label = mailbox.create_label("Kept");
+        mailbox.add("m1", &[&label]);
+    })
+    .await;
+    let before = head(&runner).await;
+    runner
+        .transport()
+        .mailbox()
+        .fail_next("GET labels", Fault::Body(CORE_LABELS));
+    runner.advance(REFRESH);
+    sync(&runner).await;
+    assert_eq!(view(&runner, "m1").await.labels, set(["Label_1"]));
+    runner.advance(mailtide::schedule::UNKNOWN_LABEL_GAP);
+    sync(&runner).await;
+    assert_eq!(user_names(&runner).await["Label_1"], "Kept");
+    assert!(feed_since(&runner, before).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_retired_system_definition_allows_refresh_and_missing_core_is_reported() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        mailbox.system_label("YELLOW_STAR");
+        let label = mailbox.create_label("Old");
+        mailbox.add("m1", &[&label, "YELLOW_STAR"]);
+    })
+    .await;
+    runner.transport().mailbox().labels.remove("YELLOW_STAR");
+    runner.transport().mailbox().rename_label("Label_1", "New");
+    runner.advance(REFRESH);
+    sync(&runner).await;
+    assert_eq!(user_names(&runner).await["Label_1"], "New");
+    assert!(
+        view(&runner, "m1")
+            .await
+            .labels
+            .contains(&id("YELLOW_STAR"))
+    );
+    let refreshed = runner
+        .store()
+        .mirror(&account())
+        .unwrap()
+        .record
+        .labels_refreshed_at;
+    runner.transport().mailbox().fail_next(
+        "GET labels",
+        Fault::Body(r#"{"labels":[{"id":"INBOX","name":"INBOX","type":"system"}]}"#),
+    );
+    runner.advance(REFRESH);
+    let outcome = sync(&runner).await;
+    assert_eq!(outcome.report.failed_requests, 1);
+    assert_eq!(
+        runner
+            .store()
+            .mirror(&account())
+            .unwrap()
+            .record
+            .labels_refreshed_at,
+        refreshed
     );
 }
 

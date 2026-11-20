@@ -2212,6 +2212,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
         label("Label_2", "Receipts", LabelKind::User),
         label("INBOX", "INBOX", LabelKind::System),
         label("Label_1", "Travel", LabelKind::User),
+        label("UNREAD", "UNREAD", LabelKind::System),
     ])];
     apply(store, &first).await?;
     expect(
@@ -2220,6 +2221,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
                 label("INBOX", "INBOX", LabelKind::System),
                 label("Label_1", "Travel", LabelKind::User),
                 label("Label_2", "Receipts", LabelKind::User),
+                label("UNREAD", "UNREAD", LabelKind::System),
             ],
         "labels round-trip in id order",
     )?;
@@ -2227,6 +2229,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
     refresh.labels = vec![listing(vec![
         label("INBOX", "INBOX", LabelKind::System),
         label("Label_2", "Invoices", LabelKind::User),
+        label("UNREAD", "UNREAD", LabelKind::System),
     ])];
     apply(store, &refresh).await?;
     expect(
@@ -2234,6 +2237,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
             == vec![
                 label("INBOX", "INBOX", LabelKind::System),
                 label("Label_2", "Invoices", LabelKind::User),
+                label("UNREAD", "UNREAD", LabelKind::System),
             ],
         "a refresh replaces the definitions: renames show, removed labels go",
     )?;
@@ -2267,6 +2271,7 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
     let listed = vec![
         label("INBOX", "INBOX", LabelKind::System),
         label("Label_1", "Travel", LabelKind::User),
+        label("UNREAD", "UNREAD", LabelKind::System),
     ];
     let mut first = commit(&snapshot, 0);
     first.labels = vec![listing(listed.clone())];
@@ -2280,7 +2285,7 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
         "the refresh time survives a hand-over",
     )?;
     expect(
-        snapshot.label_ids == set(["INBOX", "Label_1"]),
+        snapshot.label_ids == set(["INBOX", "Label_1", "UNREAD"]),
         "the next engine knows the defined ids",
     )?;
     let mut same = commit(&snapshot, 0);
@@ -3434,21 +3439,19 @@ async fn label_attributes_and_writes<S: Store>(store: &S) -> Result<(), String> 
         message_visibility: Some(MessageListVisibility::Show),
         ..label("INBOX", "INBOX", LabelKind::System)
     };
-    let mut first = commit(&snapshot, 0);
-    first.labels = vec![listing(vec![
+    let unread = label("UNREAD", "UNREAD", LabelKind::System);
+    let initial = vec![
         inbox.clone(),
         styled("Label_1", "Travel"),
         label("Label_2", "Receipts", LabelKind::User),
-    ])];
+        unread.clone(),
+    ];
+    let mut first = commit(&snapshot, 0);
+    first.labels = vec![listing(initial.clone())];
     first.messages = vec![observe("a", &["INBOX", "Label_2"], 1)];
     apply(store, &first).await?;
     expect(
-        labels(store, &account()).await?
-            == vec![
-                inbox.clone(),
-                styled("Label_1", "Travel"),
-                label("Label_2", "Receipts", LabelKind::User),
-            ],
+        labels(store, &account()).await? == initial,
         "visibility and colour round-trip; none reads as none",
     )?;
     let generation = label_generation(store, &account()).await?;
@@ -3479,9 +3482,10 @@ async fn label_attributes_and_writes<S: Store>(store: &S) -> Result<(), String> 
     stale.labels = vec![listing(vec![
         inbox.clone(),
         label("Label_2", "Receipts", LabelKind::User),
+        unread.clone(),
     ])];
     apply(store, &stale).await?;
-    let current = vec![inbox.clone(), styled("Label_1", "Travel"), created.clone()];
+    let current = vec![inbox, styled("Label_1", "Travel"), created, unread];
     expect(
         labels(store, &account()).await? == current,
         "a stale listing neither removes a new label nor restores a deleted one",
@@ -3554,10 +3558,12 @@ async fn removing_a_label_finds_exactly_the_rows_that_carry_it<S: Store>(
     let snapshot = claim(store).await?;
     let mut first = commit(&snapshot, 0);
     first.labels = vec![listing(
-        ["INBOX", "Label_1", "Label_10", "LabelX1", "label_1"]
-            .into_iter()
-            .map(|id| label(id, id, LabelKind::User))
-            .collect(),
+        [
+            "INBOX", "UNREAD", "Label_1", "Label_10", "LabelX1", "label_1",
+        ]
+        .into_iter()
+        .map(|id| label(id, id, LabelKind::User))
+        .collect(),
     )];
     first.messages = vec![
         observe("a", &["Label_1"], 1),
@@ -3621,7 +3627,7 @@ async fn removing_a_label_finds_exactly_the_rows_that_carry_it<S: Store>(
     // same way.
     let mut later = commit(&snapshot, 1);
     later.labels = vec![LabelOp::ReplaceAll {
-        labels: ["INBOX", "LabelX1", "label_1"]
+        labels: ["INBOX", "UNREAD", "LabelX1", "label_1"]
             .into_iter()
             .map(|id| label(id, id, LabelKind::User))
             .collect(),

@@ -743,8 +743,18 @@ fn durable_gmail_history_checkpoints_resumes_full_reconciliation_after_restart_a
     let labels = host.only_call(&GmailRequest::ListLabels);
     host.handle(EventKind::LabelsListed {
         command: labels,
-        labels: Vec::new(),
+        labels: ["INBOX", "UNREAD"]
+            .into_iter()
+            .map(|id| {
+                mailtide::gmail::Label::plain(
+                    mailtide::ids::LabelId(id.into()),
+                    id,
+                    mailtide::gmail::LabelKind::System,
+                )
+            })
+            .collect(),
         generation: 0,
+        stored_user_labels: set([]),
     });
     let profile = host.only_call(&GmailRequest::GetProfile);
     host.handle(EventKind::ProfileFetched {
@@ -782,6 +792,23 @@ fn durable_gmail_history_checkpoints_resumes_full_reconciliation_after_restart_a
             next_page_token: None,
         },
     });
+    for id in ["INBOX", "UNREAD"] {
+        let (command, request) = host.take_gmail().remove(0);
+        assert_eq!(
+            request,
+            GmailRequest::ListMessages {
+                scope: ListScope::Label(mailtide::ids::LabelId(id.into())),
+                page_token: None,
+            }
+        );
+        host.handle(EventKind::MessagesListed {
+            command,
+            page: ListPage {
+                messages: Vec::new(),
+                next_page_token: None,
+            },
+        });
+    }
     assert_eq!(host.mirror.record.cursor, Some(HistoryId(100)));
     // Unlisted messages are verified, not deleted.
     assert_eq!(

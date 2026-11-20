@@ -19,6 +19,8 @@ pub struct Status {
     pub cursor_advanced_at: Option<Timestamp>,
     /// Active cooldown.
     pub cooldown: Option<Cooldown>,
+    /// Incomplete or inconsistent label listings that failed this run.
+    pub label_listing_failures: u32,
     /// Import progress while bootstrapping or reconciling.
     pub import: Option<ImportProgress>,
 }

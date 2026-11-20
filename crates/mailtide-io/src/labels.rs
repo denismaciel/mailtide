@@ -175,6 +175,14 @@ fn store_error(error: mailtide_store::StoreError) -> LabelError {
     LabelError::Run(RunError::Store(error))
 }
 
+fn short_listing() -> LabelError {
+    LabelError::Retryable(RetryableFailure {
+        class: Retryable::Transient,
+        retry_after: None,
+        detail: "a label listing omitted a live label or a core system label".into(),
+    })
+}
+
 fn unexpected() -> LabelError {
     LabelError::Run(RunError::Invariant("unexpected answer to a label request"))
 }
@@ -316,8 +324,8 @@ where
 
     /// Delete label `id` and record it: it leaves every mirrored message at
     /// once. The labels are listed first: a label the listing lacks is
-    /// already gone (one listing is proof) and is recorded without a write,
-    /// as is one whose delete answers 404. With sublabels, refused unless
+    /// checked with a get. Its 404 records the removal without a write, as
+    /// does a 404 from the delete. With sublabels, refused unless
     /// `sublabels` is [`SublabelDeletion::Delete`], which deletes them
     /// deepest first and the label last.
     pub async fn delete_label(
@@ -345,6 +353,20 @@ where
                 .any(|label| &label.id == id);
             if !known {
                 return Err(LabelError::NotFound);
+            }
+            match self
+                .direct_call(
+                    account,
+                    GmailRequest::GetLabel { id: id.clone() },
+                    Priority::Foreground,
+                    deadline,
+                )
+                .await
+            {
+                Err(CallError::NotFound) => {}
+                Ok(EventKind::LabelFetched { .. }) => return Err(short_listing()),
+                Ok(_) => return Err(unexpected()),
+                Err(error) => return Err(error.into()),
             }
             self.removed(account, id).await?;
             deletion.already_gone.push(id.clone());
@@ -416,13 +438,8 @@ where
         else {
             return Err(unexpected());
         };
-        let stored = self.store().labels(account).await.map_err(store_error)?;
-        if !mailtide::mirror::complete_listing(&stored, &listed) {
-            return Err(LabelError::Retryable(RetryableFailure {
-                class: Retryable::Transient,
-                retry_after: None,
-                detail: "a label listing without Gmail's system labels".into(),
-            }));
+        if !mailtide::mirror::complete_listing(&listed) {
+            return Err(short_listing());
         }
         Ok(listed)
     }

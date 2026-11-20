@@ -124,9 +124,9 @@ impl GmailTransport for FakeGmail {
         let path = request.path.trim_start_matches("/gmail/v1/users/me/");
         Ok(match path.split('/').collect::<Vec<_>>().as_slice() {
             ["profile"] => ok(&json!({"emailAddress": "user@example.com", "historyId": "10"})),
-            ["labels"] => {
-                ok(&json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}))
-            }
+            ["labels"] => ok(
+                &json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}, {"id": "UNREAD", "name": "UNREAD", "type": "system"}]}),
+            ),
             ["history"] => ok(&json!({"historyId": "10"})),
             // A reconciliation ends by listing the drafts.
             ["drafts"] => ok(&json!({"resultSizeEstimate": 0})),

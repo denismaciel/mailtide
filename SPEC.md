@@ -451,29 +451,26 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   refusal or a 404 doesn't block the account, and the next periodic listing
   tries again.
 - Store label ids, never names, on messages. Renames are a label-table update.
-- **A label that goes leaves every message.** When the mirror learns a
-  label is gone (a listing lacks a stored id, or the host's own delete was
-  answered, or answered 404) it strips the id from every row, trusted or
-  unverified, without moving a checkpoint (Gmail's own `labelsRemoved`
-  records, one per message, then change nothing), drops the intents on it
-  in every state, and logs `LabelDefinitionsChanged` and one
-  `LabelsChanged` per row, in one commit. One whole listing is proof:
-  Gmail's listing reflects every create and delete that returned before
-  it. Only a whole one: a listing must name `INBOX` and every system label
-  the definitions hold, an empty one, a paged one or one with an id twice
-  does not decode (an empty one is asked again), and one that falls short
-  changes nothing. Gmail's own labels are never forgotten. When
-  reconciliation lists the labels, a refresh in flight is dropped. A
-  label's ids the definitions never held are left to Gmail's
-  `labelsRemoved` records, which it writes for every message of a deleted
-  label.
-- **A deleted id cannot come back.** It is remembered as deleted for 30
-  days (longer than Gmail keeps history), pruned at an applied listing:
-  observations, history deltas, imports, a finishing reconciliation's
-  scopes, new admissions and a write's late answer are stored without it,
-  so a fetch in flight across the deletion, or history read from a cursor
-  behind it, cannot put it back on a row. A listing that names it again
-  restores it.
+- **A label that goes leaves every message.** A listing that lacks
+  stored user labels must be followed by a complete listing under the same
+  label generation that lacks a subset of those ids. A new omission
+  permits one more comparison, then the attempt fails with backoff. The
+  engine asks for confirmation after one minute, or immediately for a held
+  delivery. A whole listing names `INBOX` and `UNREAD`. A missing core
+  label is reported as a failed request and leaves the refresh time
+  unchanged. Empty, paged and duplicate-id listings fail to decode.
+  The driver confirms a known id missing from its own pre-delete listing
+  with `labels.get`. Only a 404 records that removal. A confirmed deletion
+  strips the id from every row without moving checkpoints, drops its intents,
+  and logs `LabelDefinitionsChanged` and one `LabelsChanged` per row in
+  the same commit. System labels are never stripped by this rule. When
+  reconciliation lists the labels, it takes over from an in-flight refresh.
+- **A deleted id has a 30-day filter.** An applied listing prunes its
+  memory. Observations, history deltas, imports, reconciliation scopes,
+  new admissions and late write answers omit remembered ids. After
+  expiry, history that replays a pre-deletion add also replays the
+  corresponding `labelsRemoved`, or a 404 triggers reconciliation. A
+  listing that names a remembered id restores it.
 - **Local label writes** (`Runner.create_label`, `update_label`,
   `delete_label`) are direct calls (§8) whose answer the driver records at
   once with `Store::record_label`, unfenced like an admission: the
