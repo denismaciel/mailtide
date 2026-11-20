@@ -2,7 +2,7 @@ id = "blob-dedupe"
 title = "Blob dedupe across accounts: decided against"
 summary = "Keep one blob per (account, message). Two mailboxes' copies of a message are expected to differ in their delivery headers, so hashing whole messages would share almost nothing, and sharing blobs would cost per-account deletion, `forget` by prefix and crash-safe cleanup. The plan records the decision, the two Gmail facts it rests on as unknowns to test, and tests that pin the isolation being kept."
 roadmap = ["A3"]
-status = "approved"
+status = "done"
 design = "docs/features/blob-dedupe.md"
 depends_on = []
 

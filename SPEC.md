@@ -105,7 +105,12 @@ inform the design. No code is copied from them.
   the driver fetches it once (`format=raw`), writes it to blob storage at a
   deterministic key (`{account}/{message}.eml`) **before** reporting the
   import, and the mirror keeps the reference. Any `object_store` backend
-  works (GCS, S3, local disk, memory).
+  works (GCS, S3, local disk, memory). Keys are per account on purpose:
+  the same message in two mirrored mailboxes is two objects (delivered
+  copies differ in their trace headers, so content addressing would share
+  little), and deleting one account's content, a message after its grace
+  period or the whole `{account}/` prefix in `forget`, never involves
+  another account (`docs/features/blob-dedupe.md`).
 - **Quota** (Q5). Every Gmail command carries its declared cost and priority
   (§8). The driver admits each one through a quota gate over the core's pure
   `Ledger`.
@@ -582,7 +587,7 @@ engine's epoch, so results meant for a dead engine are ignored).
   missing) or ahead of it (a newer mailtide migrated it). It asks once: after
   it has seen the schema current, it and its clones do not ask again.
 
-The conformance suite (`mailtide_store::conformance`, 42 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 43 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -850,6 +855,7 @@ Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4
 | — | Thread model: Gmail `threadId` only; conversations across mailboxes (RFC headers) are left to hosts | **Yes** |
 | — | Threads are derived at read time and read by thread ids (`threads`, one index); listing, sorting, paging and per-label counts stay in the host's read model, fed by the change feed (`docs/features/threads.md`) | **Yes** |
 | — | Body retention and deletion: blobs of tombstoned messages are deleted after a 24 h grace period | **Yes** |
+| — | Blobs are not shared across accounts (no content addressing). Reopened only if two mailboxes' copies of a message prove byte-identical and a host measures duplicate bytes worth the reference counting, say above a tenth of what it stores (`docs/features/blob-dedupe.md`) | **Yes** |
 | — | Open source: public under `denismaciel`, wheels on GitHub Releases | **Yes** |
 | — | License: MIT OR Apache-2.0 (dual) | **Yes** |
 | — | Does the engine also own `watch` provisioning, or only renewal? | Open |

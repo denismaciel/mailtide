@@ -1,6 +1,6 @@
 # Blob dedupe across accounts: decided against
 
-Plan: `features/blob-dedupe.toml` (roadmap A3). Status: planned.
+Plan: `features/blob-dedupe.toml` (roadmap A3). Status: done.
 The plan is a decision, two facts to test, and six tests of what is kept.
 
 ## 1. Goal and scope
