@@ -23,6 +23,8 @@ pub enum TimerKind {
     CooldownOver,
     /// Refresh the label definitions (SPEC §6.6).
     Labels,
+    /// Enqueue the periodic draft listing (SPEC §7a).
+    Drafts,
 }
 
 /// How soon after a listing a label id the definitions lack may list them
@@ -39,6 +41,18 @@ pub fn label_refresh_due(
     interval: Duration,
 ) -> Timestamp {
     refreshed_at.map_or(now, |at| at.plus(interval).max(now))
+}
+
+/// When the drafts are due for their periodic listing: by the rule of
+/// [`label_refresh_due`], `interval` after the last listing, or now if they
+/// were never listed.
+#[must_use]
+pub fn draft_refresh_due(
+    refreshed_at: Option<Timestamp>,
+    now: Timestamp,
+    interval: Duration,
+) -> Timestamp {
+    label_refresh_due(refreshed_at, now, interval)
 }
 
 /// When an unknown label id may refresh the definitions: now, unless they

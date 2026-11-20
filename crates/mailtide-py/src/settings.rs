@@ -47,6 +47,10 @@ pub struct RawEngine {
     pub draft_settle_s: f64,
     pub confirm_timeout_s: f64,
     pub label_refresh_s: f64,
+    pub draft_refresh_delay_s: f64,
+    pub draft_refresh_every_s: f64,
+    pub draft_send_grace_s: f64,
+    pub draft_inline_limit: i64,
 }
 
 /// `mailtide.config.Quota`.
@@ -103,6 +107,7 @@ pub struct Settings {
     pub watch: WatchMode,
     pub http: HttpConfig,
     pub engine: EngineConfig,
+    pub drafts: mailtide_io::drafts::DraftSettings,
     pub budget: Budget,
     pub token_cache_margin: Duration,
     pub log_verbosity: crate::logbridge::Verbosity,
@@ -232,6 +237,9 @@ fn engine(raw: &RawEngine, watch: &WatchMode) -> Result<EngineConfig, Invalid> {
         draft_settle: duration("engine.draft_settle_s", raw.draft_settle_s)?,
         confirm_timeout: duration("engine.confirm_timeout_s", raw.confirm_timeout_s)?,
         label_refresh: positive("engine.label_refresh_s", raw.label_refresh_s)?,
+        draft_refresh_delay: duration("engine.draft_refresh_delay_s", raw.draft_refresh_delay_s)?,
+        draft_refresh_every: positive("engine.draft_refresh_every_s", raw.draft_refresh_every_s)?,
+        draft_send_grace: duration("engine.draft_send_grace_s", raw.draft_send_grace_s)?,
     };
     if engine.poll_active > engine.poll_idle {
         return Err(invalid(
@@ -333,6 +341,13 @@ pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
     };
     let watch = watch(raw.watch)?;
     let engine = engine(&raw.engine, &watch)?;
+    let http = http(raw.http)?;
+    // A send retry waits out the request timeout the transport applies.
+    let drafts = mailtide_io::drafts::DraftSettings {
+        inline_limit: positive_u64("engine.draft_inline_limit", raw.engine.draft_inline_limit)
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))?,
+        request_timeout: http.request_timeout,
+    };
     Ok(Settings {
         access,
         purge,
@@ -341,8 +356,9 @@ pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
         blobs_url: raw.blobs_url,
         blobs_options: raw.blobs_options,
         watch,
-        http: http(raw.http)?,
+        http,
         engine,
+        drafts,
         budget: budget(&raw.quota)?,
         token_cache_margin: duration("token_cache_margin_s", raw.token_cache_margin_s)?,
         log_verbosity,
@@ -388,6 +404,10 @@ mod tests {
                 draft_settle_s: 120.0,
                 confirm_timeout_s: 60.0,
                 label_refresh_s: 900.0,
+                draft_refresh_delay_s: 10.0,
+                draft_refresh_every_s: 900.0,
+                draft_send_grace_s: 3600.0,
+                draft_inline_limit: 3 * 1024 * 1024,
             },
             quota: RawQuota {
                 account_per_minute: 4_800,

@@ -897,6 +897,43 @@ mod _core {
         content: Option<Py<MessageContent>>,
     }
 
+    /// A draft was created or now holds another message.
+    #[pyclass(frozen, get_all)]
+    struct DraftSaved {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        draft_id: String,
+        message_id: String,
+        thread_id: String,
+        /// `local` (saved through mailtide) or `remote` (another client).
+        origin: &'static str,
+    }
+
+    /// A draft left the index.
+    #[pyclass(frozen, get_all)]
+    struct DraftRemoved {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        draft_id: String,
+        last_message_id: String,
+        /// `deleted` (through mailtide), `gone` (deleted or sent elsewhere)
+        /// or `send_unconfirmed` (a lost send no sent message confirmed).
+        reason: &'static str,
+    }
+
+    /// A draft was sent: the message that left (a new id).
+    #[pyclass(frozen, get_all)]
+    struct DraftSent {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        draft_id: String,
+        message_id: String,
+        thread_id: String,
+    }
+
     /// One feed entry as its Python class (exhaustive: a new change kind is a
     /// compile error here).
     #[allow(clippy::too_many_lines)] // one flat arm per change kind
@@ -1024,6 +1061,63 @@ mod _core {
                         .clone()
                         .map(|stored| message_content(py, stored))
                         .transpose()?,
+                },
+            )?
+            .into_any(),
+            Change::DraftSaved {
+                draft_id,
+                message_id,
+                thread_id,
+                origin,
+            } => Py::new(
+                py,
+                DraftSaved {
+                    kind: "draft_saved",
+                    state,
+                    index,
+                    draft_id: draft_id.0.clone(),
+                    message_id: message_id.0.clone(),
+                    thread_id: thread_id.0.clone(),
+                    origin: match origin {
+                        mailtide::drafts::DraftOrigin::Local => "local",
+                        mailtide::drafts::DraftOrigin::Remote => "remote",
+                    },
+                },
+            )?
+            .into_any(),
+            Change::DraftRemoved {
+                draft_id,
+                last_message_id,
+                reason,
+            } => Py::new(
+                py,
+                DraftRemoved {
+                    kind: "draft_removed",
+                    state,
+                    index,
+                    draft_id: draft_id.0.clone(),
+                    last_message_id: last_message_id.0.clone(),
+                    reason: match reason {
+                        mailtide::drafts::RemovedReason::Deleted => "deleted",
+                        mailtide::drafts::RemovedReason::Gone => "gone",
+                        mailtide::drafts::RemovedReason::SendUnconfirmed => "send_unconfirmed",
+                    },
+                },
+            )?
+            .into_any(),
+            Change::DraftSent {
+                draft_id,
+                message_id,
+                thread_id,
+            } => Py::new(
+                py,
+                DraftSent {
+                    kind: "draft_sent",
+                    state,
+                    index,
+                    draft_id: draft_id.0.clone(),
+                    message_id: message_id.0.clone(),
+                    thread_id: thread_id.0.clone(),
                 },
             )?
             .into_any(),
@@ -1956,6 +2050,10 @@ mod _core {
         draft_settle_s: f64,
         confirm_timeout_s: f64,
         label_refresh_s: f64,
+        draft_refresh_delay_s: f64,
+        draft_refresh_every_s: f64,
+        draft_send_grace_s: f64,
+        draft_inline_limit: i64,
     }
 
     #[derive(FromPyObject)]
@@ -2024,6 +2122,10 @@ mod _core {
                     draft_settle_s: c.engine.draft_settle_s,
                     confirm_timeout_s: c.engine.confirm_timeout_s,
                     label_refresh_s: c.engine.label_refresh_s,
+                    draft_refresh_delay_s: c.engine.draft_refresh_delay_s,
+                    draft_refresh_every_s: c.engine.draft_refresh_every_s,
+                    draft_send_grace_s: c.engine.draft_send_grace_s,
+                    draft_inline_limit: c.engine.draft_inline_limit,
                 },
                 quota: crate::settings::RawQuota {
                     account_per_minute: c.quota.account_per_minute,
@@ -2085,6 +2187,7 @@ mod _core {
                 engine: settings.engine,
                 watch: settings.watch,
                 log_accounts: settings.log_accounts,
+                drafts: settings.drafts,
             },
         )
         .with_purge(settings.purge);

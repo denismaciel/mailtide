@@ -40,12 +40,13 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
         GmailRequest::ListHistory { .. } => 2,
         // labels.patch is not in Google's table: declared as labels.update.
         GmailRequest::ListMessages { .. }
+        | GmailRequest::ListDrafts { .. }
         | GmailRequest::CreateLabel(_)
         | GmailRequest::PatchLabel { .. }
         | GmailRequest::DeleteLabel { .. } => 5,
         GmailRequest::GetMessage { .. } => 20,
         GmailRequest::ImportMessage { .. } => 60,
-        GmailRequest::Watch => 100,
+        GmailRequest::Watch | GmailRequest::SendDraft { .. } => 100,
         GmailRequest::Modify(group) => match u32::try_from(group.messages.len()) {
             Ok(n) if n < BATCH_MODIFY_THRESHOLD => 5 * n,
             _ => 50,
@@ -54,16 +55,15 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
             SearchScope::Messages => 5,
             SearchScope::Threads => 10,
         },
-        GmailRequest::DeleteMessage { .. } => 10,
+        GmailRequest::DeleteMessage { .. }
+        | GmailRequest::CreateDraft { .. }
+        | GmailRequest::DeleteDraft { .. } => 10,
         GmailRequest::BatchDeleteMessages { .. } => 50,
-        GmailRequest::ListDrafts { .. } => 5,
         GmailRequest::GetDraft { format, .. } => match format {
             DraftFormat::Minimal => 20,
             DraftFormat::Raw => 60,
         },
-        GmailRequest::CreateDraft { .. } | GmailRequest::DeleteDraft { .. } => 10,
         GmailRequest::UpdateDraft { .. } => 15,
-        GmailRequest::SendDraft { .. } => 100,
     })
 }
 

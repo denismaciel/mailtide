@@ -9,6 +9,7 @@
 //! jobs in the same transaction (review #1), so every message's next step is
 //! durable (I6).
 
+use crate::drafts::DraftOp;
 use crate::gmail::{HeaderFacts, Label, MessageFacts, MessageObservation};
 use crate::ids::{
     AccountId, BlobRef, CommitId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, Timestamp,
@@ -52,6 +53,8 @@ pub struct Commit {
     pub jobs: Vec<JobOp>,
     /// Intent changes (phase 6).
     pub intents: Vec<IntentOp>,
+    /// Draft index changes.
+    pub drafts: Vec<DraftOp>,
 }
 
 /// A conditional cursor advance.
@@ -81,6 +84,8 @@ pub struct JobPlan {
     /// When to verify a delivered change with a `get` if history hasn't
     /// confirmed it.
     pub confirm_due_at: Timestamp,
+    /// When a draft index refresh a message operation asks for becomes due.
+    pub draft_refresh_due_at: Timestamp,
 }
 
 /// An account-level change other than the lifecycle and the cursor.
@@ -98,6 +103,9 @@ pub enum AccountOp {
     /// The label definitions were listed at this time (SPEC §6.6). Never
     /// moves backwards.
     SetLabelsRefreshedAt(Timestamp),
+    /// The drafts were listed at this time (SPEC §7a). Never moves
+    /// backwards.
+    SetDraftsRefreshedAt(Timestamp),
     /// Block the account until an operator acts. The store wraps the state
     /// it holds at apply time (not the engine's view, which may be behind a
     /// commit still in flight), so the stored state stays valid.

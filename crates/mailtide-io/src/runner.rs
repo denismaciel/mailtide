@@ -81,6 +81,8 @@ pub struct RunnerConfig {
     pub watch: WatchMode,
     /// How accounts appear in logs.
     pub log_accounts: LogAccounts,
+    /// Draft calls: the inline size limit and the request timeout.
+    pub drafts: crate::drafts::DraftSettings,
 }
 
 /// How accounts (email addresses) appear in log events.
@@ -162,8 +164,8 @@ pub struct Runner<S, B, T, Q, A> {
     transport: T,
     quota: Q,
     tokens: A,
-    config: RunnerConfig,
-    clock: crate::Clock,
+    pub(crate) config: RunnerConfig,
+    pub(crate) clock: crate::Clock,
     extract: fn(&[u8]) -> MessageFacts,
     purge: PurgePolicy,
 }
@@ -518,6 +520,7 @@ mod direct_call_tests {
                 engine: EngineConfig::default(),
                 watch: WatchMode::Disabled,
                 log_accounts: LogAccounts::default(),
+                drafts: crate::drafts::DraftSettings::default(),
             },
         )
         .direct_call_with_cleanup(
@@ -1225,7 +1228,10 @@ where
             .iter()
             .filter(|(timer, _)| match timer {
                 TimerKind::Jobs | TimerKind::CooldownOver => true,
-                TimerKind::Poll | TimerKind::WatchRenewal | TimerKind::Labels => false,
+                TimerKind::Poll
+                | TimerKind::WatchRenewal
+                | TimerKind::Labels
+                | TimerKind::Drafts => false,
             })
             .map(|(_, at)| Duration::from_millis(u64::try_from(at.0 - now.0).unwrap_or(0)))
             .min()
@@ -1713,38 +1719,15 @@ where
                     ids: mailtide::purge::request_ids(gmail_request),
                 })
             }
-            GmailRequest::ListDrafts { .. } => mailtide_gmail::drafts::list_page(body)
-                .map(|page| EventKind::DraftsListed { command, page }),
-            GmailRequest::GetDraft { id, .. } => match mailtide_gmail::drafts::fetched(body) {
-                // Asked for one draft, answered with another: never take it.
-                Ok(Some(draft)) if draft.draft.id != *id => {
-                    return Outcome::Failed(transient(format!(
-                        "response for draft {} answered request for {}",
-                        draft.draft.id.0, id.0
-                    )));
-                }
-                Ok(Some(draft)) => Ok(EventKind::DraftFetched { command, draft }),
-                // Not a draft (drafts-id-namespace): as Gmail's own 404.
-                Ok(None) => Ok(EventKind::DraftNotFound {
-                    command,
-                    id: id.clone(),
-                }),
-                Err(error) => Err(error),
+            GmailRequest::ListDrafts { .. }
+            | GmailRequest::GetDraft { .. }
+            | GmailRequest::CreateDraft { .. }
+            | GmailRequest::UpdateDraft { .. }
+            | GmailRequest::DeleteDraft { .. }
+            | GmailRequest::SendDraft { .. } => match decode_draft(command, gmail_request, body) {
+                Ok(decoded) => decoded,
+                Err(failure) => return Outcome::Failed(failure),
             },
-            GmailRequest::CreateDraft { .. } | GmailRequest::UpdateDraft { .. } => {
-                mailtide_gmail::drafts::written(body)
-                    .map(|draft| EventKind::DraftSaved { command, draft })
-            }
-            GmailRequest::DeleteDraft { .. } => Ok(EventKind::DraftDeleted { command }),
-            GmailRequest::SendDraft { .. } => {
-                mailtide_gmail::drafts::sent(body).map(|(message, thread_id)| {
-                    EventKind::DraftSent {
-                        command,
-                        message,
-                        thread_id,
-                    }
-                })
-            }
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
@@ -1808,6 +1791,64 @@ where
         }
         extracted.ok().map(Box::new)
     }
+}
+
+/// A draft request's answer, decoded; `Err` for an answer naming another
+/// draft than the one asked for (retried, never taken).
+fn decode_draft(
+    command: CommandId,
+    request: &GmailRequest,
+    body: &[u8],
+) -> Result<Result<EventKind, decode::DecodeError>, Failure> {
+    Ok(match request {
+        GmailRequest::ListDrafts { .. } => mailtide_gmail::drafts::list_page(body)
+            .map(|page| EventKind::DraftsListed { command, page }),
+        GmailRequest::GetDraft { id, .. } => match mailtide_gmail::drafts::fetched(body) {
+            // Asked for one draft, answered with another: never take it.
+            Ok(Some(draft)) if draft.draft.id != *id => {
+                return Err(transient(format!(
+                    "response for draft {} answered request for {}",
+                    draft.draft.id.0, id.0
+                )));
+            }
+            Ok(Some(draft)) => Ok(EventKind::DraftFetched { command, draft }),
+            // Not a draft (drafts-id-namespace): as Gmail's own 404.
+            Ok(None) => Ok(EventKind::DraftNotFound {
+                command,
+                id: id.clone(),
+            }),
+            Err(error) => Err(error),
+        },
+        GmailRequest::CreateDraft { .. } | GmailRequest::UpdateDraft { .. } => {
+            mailtide_gmail::drafts::written(body)
+                .map(|draft| EventKind::DraftSaved { command, draft })
+        }
+        GmailRequest::DeleteDraft { .. } => Ok(EventKind::DraftDeleted { command }),
+        GmailRequest::SendDraft { .. } => {
+            mailtide_gmail::drafts::sent(body).map(|(message, thread_id)| EventKind::DraftSent {
+                command,
+                message,
+                thread_id,
+            })
+        }
+        GmailRequest::GetProfile
+        | GmailRequest::ListHistory { .. }
+        | GmailRequest::ListMessages { .. }
+        | GmailRequest::GetMessage { .. }
+        | GmailRequest::ImportMessage { .. }
+        | GmailRequest::ListLabels
+        | GmailRequest::Watch
+        | GmailRequest::Modify(_)
+        | GmailRequest::Search(_)
+        | GmailRequest::GetLabel { .. }
+        | GmailRequest::CreateLabel(_)
+        | GmailRequest::PatchLabel { .. }
+        | GmailRequest::DeleteLabel { .. }
+        | GmailRequest::DeleteMessage { .. }
+        | GmailRequest::BatchDeleteMessages { .. } => Err(decode::DecodeError::InvalidJson(
+            "not a draft request".into(),
+        )),
+    })
 }
 
 /// Gives a quota lease back if the request holding it is abandoned.
@@ -2035,6 +2076,7 @@ mod tests {
                 engine: EngineConfig::default(),
                 watch: WatchMode::Disabled,
                 log_accounts: LogAccounts::default(),
+                drafts: crate::drafts::DraftSettings::default(),
             },
         )
     }

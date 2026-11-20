@@ -73,6 +73,7 @@ mod common {
             cleanup_due_at: now,
             deliver_due_at: now,
             confirm_due_at: now,
+            draft_refresh_due_at: now,
         }
     }
 
@@ -95,6 +96,7 @@ mod common {
             job_plan: plan(Priority::Live, 0),
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 
@@ -117,7 +119,11 @@ mod common {
             expected: None,
             to: HistoryId(cursor),
         });
-        c.account_ops = vec![AccountOp::SetLabelsRefreshedAt(Timestamp(0))];
+        // Listed at 0: no periodic label or draft listing during the test.
+        c.account_ops = vec![
+            AccountOp::SetLabelsRefreshedAt(Timestamp(0)),
+            AccountOp::SetDraftsRefreshedAt(Timestamp(0)),
+        ];
         apply(&mut mirror, &c);
         mirror
     }
@@ -183,7 +189,10 @@ mod common {
             .keys()
             .filter_map(|kind| match kind {
                 JobKind::Import(id) => Some(id.clone()),
-                JobKind::Verify(_) | JobKind::BlobCleanup(_) | JobKind::Deliver(_) => None,
+                JobKind::Verify(_)
+                | JobKind::BlobCleanup(_)
+                | JobKind::Deliver(_)
+                | JobKind::RefreshDrafts => None,
             })
             .collect()
     }

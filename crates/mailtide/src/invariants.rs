@@ -5,8 +5,10 @@
 //! commit. Convergence (I9) is checked by the simulator against its own
 //! ground truth.
 
+use std::collections::BTreeMap;
+
 use crate::commit::{Commit, CommitOutcome};
-use crate::ids::{HistoryId, LabelId, MessageId};
+use crate::ids::{DraftId, HistoryId, LabelId, MessageId};
 use crate::jobs::{JobKind, JobOp, JobState};
 use crate::mirror::{AccountMirror, Content};
 use crate::quota::Priority;
@@ -132,6 +134,19 @@ pub enum Violation {
         message: MessageId,
         /// The label.
         label: LabelId,
+    },
+    /// Two draft rows name the same message (a message belongs to at
+    /// most one draft).
+    MessageInTwoDrafts {
+        /// The message.
+        message: MessageId,
+        /// The drafts naming it.
+        drafts: Vec<DraftId>,
+    },
+    /// A draft row's key and its id differ.
+    DraftKeyMismatch {
+        /// The key.
+        draft: DraftId,
     },
     /// A rejected commit changed something.
     RejectedCommitChangedState,
@@ -349,6 +364,7 @@ pub fn check_state(mirror: &AccountMirror) -> Vec<Violation> {
             });
         }
     }
+    violations.extend(check_drafts(mirror));
     for (id, record) in &mirror.messages {
         if record.content == Content::Pending {
             let has_job = mirror
@@ -402,9 +418,36 @@ fn check_labels(mirror: &AccountMirror) -> Vec<Violation> {
     violations
 }
 
+/// The draft index's own invariants: one row per draft id, and no message
+/// named by two drafts.
+#[must_use]
+pub fn check_drafts(mirror: &AccountMirror) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut by_message: BTreeMap<&MessageId, Vec<DraftId>> = BTreeMap::new();
+    for (key, record) in &mirror.drafts {
+        if key != &record.id {
+            violations.push(Violation::DraftKeyMismatch { draft: key.clone() });
+        }
+        by_message
+            .entry(&record.message)
+            .or_default()
+            .push(record.id.clone());
+    }
+    for (message, drafts) in by_message {
+        if drafts.len() > 1 {
+            violations.push(Violation::MessageInTwoDrafts {
+                message: message.clone(),
+                drafts,
+            });
+        }
+    }
+    violations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drafts::{DraftRecord, DraftState};
     use crate::gmail::{HeaderFacts, Label, LabelKind};
     use crate::ids::{AccountId, BlobRef, ThreadId, Timestamp};
     use crate::labels::set;
@@ -476,5 +519,45 @@ mod tests {
             record.labels.remove(&gone);
         }
         assert!(check_state(&mirror).is_empty());
+    }
+
+    fn row(id: &str, message: &str) -> DraftRecord {
+        DraftRecord {
+            id: DraftId(id.into()),
+            message: MessageId(message.into()),
+            thread_id: ThreadId("t".into()),
+            tracking_id: None,
+            state: DraftState::Saved,
+            since: Timestamp(0),
+        }
+    }
+
+    #[test]
+    fn one_message_belongs_to_at_most_one_draft() {
+        let mut mirror = AccountMirror::new(AccountId("a@example.com".into()), 1);
+        for record in [row("r1", "m1"), row("r2", "m2")] {
+            mirror.drafts.insert(record.id.clone(), record);
+        }
+        assert_eq!(check_drafts(&mirror), Vec::new());
+        mirror.drafts.insert(DraftId("r3".into()), row("r3", "m1"));
+        assert_eq!(
+            check_drafts(&mirror),
+            vec![Violation::MessageInTwoDrafts {
+                message: MessageId("m1".into()),
+                drafts: vec![DraftId("r1".into()), DraftId("r3".into())],
+            }]
+        );
+        assert!(
+            check_state(&mirror).contains(&Violation::MessageInTwoDrafts {
+                message: MessageId("m1".into()),
+                drafts: vec![DraftId("r1".into()), DraftId("r3".into())],
+            })
+        );
+        mirror.drafts.insert(DraftId("r4".into()), row("r5", "m5"));
+        assert!(
+            check_drafts(&mirror).contains(&Violation::DraftKeyMismatch {
+                draft: DraftId("r4".into())
+            })
+        );
     }
 }

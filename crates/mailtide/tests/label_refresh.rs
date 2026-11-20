@@ -82,9 +82,11 @@ fn commit(mirror: &AccountMirror) -> Commit {
             cleanup_due_at: now,
             deliver_due_at: now,
             confirm_due_at: now,
+            draft_refresh_due_at: now,
         },
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     }
 }
 

@@ -81,11 +81,6 @@ path = "crates/mailtide/src/invariants.rs"
 change = "modify"
 role = "Draft invariants: one row per draft, one draft per message, a quiet mirror's index equals Gmail's"
 
-[[file]]
-path = "crates/mailtide/src/gmail.rs"
-change = "modify"
-role = "HeaderFacts.tracking_id: the X-Mailtide-Id an imported message carries. The minimum of message-facts' tracking_id fact that drafts needs (a SENT import settles a lost send by it); the rebase takes message-facts' field in its place"
-
 # ------------------------------------------------------------------ wire layer
 
 [[file]]
@@ -868,7 +863,7 @@ covers = "A reconcile whose listing equals the index writes only the refresh tim
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
 name = "a_lost_send_is_matched_by_tracking_id_in_any_thread"
-covers = "Confirmation does not assume the sent message stayed in the draft's thread; DraftSent carries the imported message's own thread id"
+covers = "Confirmation does not assume the sent message stayed in the draft's thread; DraftSent carries the imported message's own thread id. The token is read from the import's facts (message-facts' tracking_id); an import without facts settles nothing and the send ends unconfirmed after the grace period"
 
 # Added when drafts-message-id-kept was refuted: a draft is identified by
 # X-Mailtide-Id, never by its Message-ID (docs/features/README.md).

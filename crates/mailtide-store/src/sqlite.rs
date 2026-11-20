@@ -1,8 +1,11 @@
 //! `SQLite` store: the reference store for open-source users and tests.
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
+use mailtide::drafts::{DraftRecorded, DraftView, DraftWrite};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{
+    AccountId, DraftId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp,
+};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -217,6 +220,32 @@ impl Store for SqliteStore {
     async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
         crate::Store::label_generation(&self.inner, account).await
     }
+
+    async fn record_draft(
+        &self,
+        account: &AccountId,
+        write: &DraftWrite,
+        now: Timestamp,
+    ) -> Result<DraftRecorded, StoreError> {
+        crate::Store::record_draft(&self.inner, account, write, now).await
+    }
+
+    async fn drafts(
+        &self,
+        account: &AccountId,
+        after: Option<&DraftId>,
+        limit: u32,
+    ) -> Result<Vec<DraftView>, StoreError> {
+        crate::Store::drafts(&self.inner, account, after, limit).await
+    }
+
+    async fn draft(
+        &self,
+        account: &AccountId,
+        id: &DraftId,
+    ) -> Result<Option<DraftView>, StoreError> {
+        crate::Store::draft(&self.inner, account, id).await
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +402,24 @@ mod tests {
             "label_generation",
             store.label_generation(account).await.err(),
         );
+        assert_draft_calls_refused(store, account, applied).await;
+    }
+
+    /// The draft index's [`Store`] methods, as [`assert_every_call_refused`].
+    async fn assert_draft_calls_refused(store: &SqliteStore, account: &AccountId, applied: u32) {
+        let refusal = Some(StoreError::SchemaOutOfDate {
+            applied,
+            expected: crate::sql::SCHEMA_VERSION,
+        });
+        let now = Timestamp(0);
+        let write = mailtide::drafts::DraftWrite::Refresh { at: now };
+        let draft = mailtide::ids::DraftId("r1".into());
+        assert_eq!(
+            store.record_draft(account, &write, now).await.err(),
+            refusal
+        );
+        assert_eq!(store.drafts(account, None, 10).await.err(), refusal);
+        assert_eq!(store.draft(account, &draft).await.err(), refusal);
     }
 
     /// The purge's store calls, each refused like every other call.
@@ -500,9 +547,11 @@ mod tests {
                 cleanup_due_at: now,
                 deliver_due_at: now,
                 confirm_due_at: now,
+                draft_refresh_due_at: now,
             },
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 
@@ -632,7 +681,7 @@ mod tests {
         // The documented downgrade, after reverting the later migrations
         // (label editing's columns) and forgetting the rest (version-only, or
         // an index that migrating again keeps).
-        run(label_editing_rollback()).await;
+        run(later_rollbacks()).await;
         run(vec![
             "DELETE FROM mailtide_schema WHERE version > 4".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at".to_owned(),
@@ -673,7 +722,7 @@ mod tests {
         // The documented downgrade, after reverting label editing (its
         // columns) and forgetting the other later migrations (what they add,
         // migrating again keeps).
-        for statement in label_editing_rollback().into_iter().chain([
+        for statement in later_rollbacks().into_iter().chain([
             "DELETE FROM mailtide_schema WHERE version > 5".to_owned(),
             "DELETE FROM mailtide_schema WHERE version = 5".to_owned(),
         ]) {
@@ -777,7 +826,7 @@ mod tests {
         );
         // The documented downgrade, after reverting label editing (its
         // columns) and forgetting the other later migrations.
-        run(label_editing_rollback()).await;
+        run(later_rollbacks()).await;
         run(vec![
             format!("DELETE FROM mailtide_schema WHERE version > {version}"),
             "DROP TABLE mailtide_consumers".to_owned(),
@@ -793,6 +842,122 @@ mod tests {
             store.consumers(&account).await.map(|list| list.cursors),
             Ok(Vec::new())
         );
+    }
+    /// SPEC §11's rollback of migration 9 (the draft index), as written
+    /// there.
+    /// The draft index's migration, and the ones before it.
+    fn drafts_migration() -> (Vec<crate::sql::Migration>, crate::sql::Migration) {
+        let all = crate::sql::migrations();
+        let index = all
+            .iter()
+            .position(|m| {
+                m.statements
+                    .iter()
+                    .any(|s| s.contains("TABLE IF NOT EXISTS mailtide_drafts"))
+            })
+            .expect("the draft migration");
+        (all[..index].to_vec(), all[index].clone())
+    }
+
+    /// The draft index migration's documented rollback (SPEC §11).
+    fn drafts_rollback() -> Vec<String> {
+        let (_, migration) = drafts_migration();
+        [
+            "DELETE FROM mailtide_jobs WHERE kind = 4",
+            "DELETE FROM mailtide_changes WHERE change LIKE '{\"DraftSaved\"%'
+                OR change LIKE '{\"DraftRemoved\"%' OR change LIKE '{\"DraftSent\"%'",
+            "DROP TABLE mailtide_drafts",
+            "ALTER TABLE mailtide_accounts DROP COLUMN drafts_generation",
+            "ALTER TABLE mailtide_accounts DROP COLUMN drafts_refreshed_at",
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .chain([format!(
+            "DELETE FROM mailtide_schema WHERE version = {}",
+            migration.version
+        )])
+        .collect()
+    }
+
+    /// The documented rollbacks of the migrations after message facts, the
+    /// latest first: the draft index, then label editing.
+    fn later_rollbacks() -> Vec<String> {
+        drafts_rollback()
+            .into_iter()
+            .chain(label_editing_rollback())
+            .collect()
+    }
+
+    /// The draft migration adds the draft index; an account from before
+    /// reads as never having listed its drafts. Its rollback leaves a
+    /// database a version behind that the build before it reads (no draft
+    /// entry in the feed), and migrating again restores it with no draft
+    /// rows.
+    #[tokio::test]
+    async fn the_draft_migration_is_additive_and_revertible() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState};
+        use mailtide::drafts::{DraftWrite, ListedDraft};
+        use mailtide::ids::DraftId;
+        let (before, migration) = drafts_migration();
+        assert_eq!(migration.version as usize, before.len() + 1);
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        store.track(&account, 1).await.expect("track");
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.drafts_refreshed_at, None);
+        let saved = DraftWrite::Saved {
+            draft: ListedDraft {
+                id: DraftId("r1".into()),
+                message: MessageId("m1".into()),
+                thread_id: ThreadId("t1".into()),
+            },
+            tracking_id: "tracking-0123456789".into(),
+        };
+        store
+            .record_draft(&account, &saved, Timestamp(5))
+            .await
+            .expect("record");
+        let refresh = DraftWrite::Refresh { at: Timestamp(6) };
+        store
+            .record_draft(&account, &refresh, Timestamp(6))
+            .await
+            .expect("record");
+        for statement in drafts_rollback() {
+            store
+                .inner
+                .execute_for_tests(&statement)
+                .await
+                .expect("statement");
+        }
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: migration.version - 1,
+                expected: SCHEMA_VERSION
+            }
+        );
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests("SELECT CAST(COUNT(*) AS TEXT) FROM mailtide_changes")
+                .await
+                .expect("changes"),
+            "0",
+            "no entry an older build can't decode"
+        );
+        store.migrate().await.expect("migrate again");
+        assert_eq!(store.drafts(&account, None, 10).await, Ok(Vec::new()));
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.drafts_refreshed_at, None);
     }
 
     /// Migration 8 is version only: content records written by version 7
@@ -849,7 +1014,7 @@ mod tests {
         assert_eq!(content.facts, None);
         // The documented downgrade, after reverting label editing (its
         // columns) and forgetting the other later migrations.
-        run(label_editing_rollback()).await;
+        run(later_rollbacks()).await;
         run(vec![
             r#"INSERT INTO mailtide_changes (account, seq, idx, change)
                VALUES ('a@example.com', 1, 0, '{"FactsRefreshed":{"id":"m1","thread_id":"t1"}}')"#
@@ -1002,7 +1167,10 @@ mod tests {
             .await
             .expect("claim");
         assert_eq!(snapshot.labels_refreshed_at, Some(Timestamp(5_000)));
-        for statement in label_editing_rollback() {
+        for statement in drafts_rollback()
+            .into_iter()
+            .chain(label_editing_rollback())
+        {
             store
                 .inner
                 .execute_for_tests(&statement)
@@ -1146,7 +1314,7 @@ mod tests {
         assert_eq!(read[1].labels.len(), 0, "the archive overlays");
         // After reverting label editing (its columns) and forgetting the
         // other later migrations (what they add, migrating again keeps).
-        for statement in label_editing_rollback().into_iter().chain([
+        for statement in later_rollbacks().into_iter().chain([
             format!(
                 "DELETE FROM mailtide_schema WHERE version > {}",
                 migration.version

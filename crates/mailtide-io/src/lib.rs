@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod blobs;
+pub mod drafts;
 pub mod labels;
 pub mod parts;
 pub mod purge;

@@ -469,6 +469,7 @@ impl Fixture {
                     },
                     watch: WatchMode::Disabled,
                     log_accounts: LogAccounts::default(),
+                    drafts: mailtide_io::drafts::DraftSettings::default(),
                 },
             ),
         }
@@ -557,9 +558,11 @@ impl Fixture {
                 cleanup_due_at: Timestamp(0),
                 deliver_due_at: Timestamp(0),
                 confirm_due_at: Timestamp(0),
+                draft_refresh_due_at: Timestamp(0),
             },
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         };
         let outcome = store.apply(&commit).await.expect("apply");
         assert!(

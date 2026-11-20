@@ -89,9 +89,11 @@ async fn synced() -> MemoryStore {
             cleanup_due_at: Timestamp(0),
             deliver_due_at: Timestamp(0),
             confirm_due_at: Timestamp(0),
+            draft_refresh_due_at: Timestamp(0),
         },
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     };
     assert!(matches!(
         store.apply(&commit).await.expect("apply"),
@@ -114,6 +116,7 @@ async fn a_thread_read_asks_for_no_token_and_calls_no_gmail() {
             engine: EngineConfig::default(),
             watch: WatchMode::Disabled,
             log_accounts: LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     );
     let epoch = runner

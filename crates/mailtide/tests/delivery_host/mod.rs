@@ -32,6 +32,7 @@ fn plan() -> JobPlan {
         cleanup_due_at: Timestamp(0),
         deliver_due_at: Timestamp(0),
         confirm_due_at: Timestamp(0),
+        draft_refresh_due_at: Timestamp(0),
     }
 }
 
@@ -53,6 +54,7 @@ fn commit(mirror: &AccountMirror) -> Commit {
         job_plan: plan(),
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     }
 }
 

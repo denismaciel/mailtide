@@ -54,9 +54,11 @@ fn apply(mirror: &mut AccountMirror, ops: Vec<MessageOp>) {
             cleanup_due_at: Timestamp(0),
             deliver_due_at: Timestamp(0),
             confirm_due_at: Timestamp(0),
+            draft_refresh_due_at: Timestamp(0),
         },
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     };
     assert!(matches!(
         mirror.apply(&commit),

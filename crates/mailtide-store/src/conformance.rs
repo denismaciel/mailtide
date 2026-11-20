@@ -137,7 +137,7 @@ where
     cases.extend(isolation_cases());
     cases.extend(consumer_cases());
     cases.extend(search_cases());
-    cases.extend(message_facts_cases());
+    cases.extend(message_facts_cases().into_iter().chain(draft_cases()));
     cases.extend(label_edit_cases().into_iter().chain(purge_cases()));
     let mut results = Vec::new();
     for (name, case) in cases {
@@ -275,6 +275,19 @@ fn message_facts_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     ]
 }
 
+/// The cases of the draft index (SPEC §7a).
+fn draft_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        (
+            "draft rows survive, fence older listings and settle sends",
+            |s| Box::pin(draft_rows(s)),
+        ),
+        ("the draft listing is one account-level job", |s| {
+            Box::pin(draft_refresh_job(s))
+        }),
+    ]
+}
+
 /// The cases of label attributes and local label writes.
 fn label_edit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     vec![
@@ -305,6 +318,7 @@ fn plan() -> JobPlan {
         cleanup_due_at: Timestamp(0),
         deliver_due_at: Timestamp(0),
         confirm_due_at: Timestamp(0),
+        draft_refresh_due_at: Timestamp(0),
     }
 }
 
@@ -326,6 +340,7 @@ fn commit(snapshot: &StoreSnapshot, seq: u64) -> Commit {
         job_plan: plan(),
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     }
 }
 
@@ -1279,7 +1294,10 @@ fn discovered(entries: &[ChangeEntry]) -> Vec<&str> {
             | Change::OverlayChanged { .. }
             | Change::MessageDeleted { .. }
             | Change::LabelDefinitionsChanged
-            | Change::FactsRefreshed { .. } => None,
+            | Change::FactsRefreshed { .. }
+            | Change::DraftSaved { .. }
+            | Change::DraftRemoved { .. }
+            | Change::DraftSent { .. } => None,
         })
         .collect()
 }
@@ -2310,7 +2328,10 @@ fn imports(entries: &[ChangeEntry]) -> Vec<(&str, Option<&mailtide::mirror::Stor
             | Change::OverlayChanged { .. }
             | Change::MessageDeleted { .. }
             | Change::LabelDefinitionsChanged
-            | Change::FactsRefreshed { .. } => None,
+            | Change::FactsRefreshed { .. }
+            | Change::DraftSaved { .. }
+            | Change::DraftRemoved { .. }
+            | Change::DraftSent { .. } => None,
         })
         .collect()
 }
@@ -2447,7 +2468,14 @@ async fn claim_at<S: Store>(
 /// The claimed jobs as (message, class).
 fn classes(jobs: &[mailtide::jobs::ClaimedJob]) -> Vec<(String, Priority)> {
     jobs.iter()
-        .map(|job| (job.kind().message().0.clone(), job.priority))
+        .map(|job| {
+            (
+                job.kind()
+                    .message()
+                    .map_or_else(String::new, |m| m.0.clone()),
+                job.priority,
+            )
+        })
         .collect()
 }
 
@@ -3644,4 +3672,278 @@ async fn an_incomplete_listing_changes_nothing<S: Store>(store: &S) -> Result<()
         )?;
     }
     Ok(())
+}
+
+// ------------------------------------------------------------ drafts
+
+const TRACKING: &str = "conformance-tracking-01";
+
+fn listed(id: &str, message: &str) -> mailtide::drafts::ListedDraft {
+    mailtide::drafts::ListedDraft {
+        id: mailtide::ids::DraftId(id.into()),
+        message: MessageId(message.into()),
+        thread_id: ThreadId("t".into()),
+    }
+}
+
+async fn record<S: Store>(
+    store: &S,
+    write: &mailtide::drafts::DraftWrite,
+    at: i64,
+) -> Result<mailtide::drafts::DraftRecorded, String> {
+    store
+        .record_draft(&account(), write, Timestamp(at))
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+async fn draft_views<S: Store>(store: &S) -> Result<Vec<mailtide::drafts::DraftView>, String> {
+    store
+        .drafts(&account(), None, 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// The generation a claim of the draft listing reads.
+async fn claimed_generation<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    attempt: u64,
+    at: i64,
+) -> Result<Option<(u64, mailtide::jobs::ClaimedJob)>, String> {
+    let jobs = claimed(
+        store
+            .claim_jobs(
+                &account(),
+                snapshot.epoch,
+                10,
+                Timestamp(at),
+                AttemptId(attempt),
+                Priority::Backfill,
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?;
+    Ok(jobs.into_iter().find_map(|job| match job.work {
+        mailtide::jobs::ClaimedWork::RefreshDrafts { generation, .. } => Some((generation, job)),
+        _ => None,
+    }))
+}
+
+async fn draft_rows<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::drafts::{DraftOp, DraftReconcile, DraftRecorded, DraftStatus, DraftWrite};
+    use mailtide::ids::DraftId;
+    let snapshot = claim(store).await?;
+    let save = |message: &str| DraftWrite::Saved {
+        draft: listed("r1", message),
+        tracking_id: TRACKING.into(),
+    };
+    record(store, &save("m1"), 1).await?;
+    record(store, &DraftWrite::Refresh { at: Timestamp(2) }, 2).await?;
+    let Some((generation, job)) = claimed_generation(store, &snapshot, 1, 3).await? else {
+        return Err("the listing was claimed".into());
+    };
+    // A local write after the claim fences that listing out.
+    record(store, &save("m2"), 4).await?;
+    let mut stale = commit(&snapshot, 0);
+    stale.claim = Some(job.claim());
+    stale.jobs = vec![JobOp::Finish {
+        claim: job.claim(),
+        outcome: JobOutcome::Done,
+    }];
+    stale.drafts = vec![DraftOp::Reconcile(DraftReconcile {
+        listed: Vec::new(),
+        generation,
+        claimed_at: Timestamp(3),
+        grace: std::time::Duration::from_hours(1),
+    })];
+    apply(store, &stale).await?;
+    let views = draft_views(store).await?;
+    expect(views.len() == 1, "the older listing removed nothing")?;
+    expect(
+        views[0].message_id == MessageId("m2".into())
+            && views[0].tracking_id.as_deref() == Some(TRACKING)
+            && views[0].state == DraftStatus::Saved
+            && views[0].rfc822_message_id.is_none(),
+        &format!("the row as last saved: {views:?}"),
+    )?;
+    // Gmail's copy of the current message names its Message-ID.
+    let mut c = commit(&snapshot, 1);
+    c.messages = vec![import("m2", &["DRAFT"], 5)];
+    apply(store, &c).await?;
+    let view = store
+        .draft(&account(), &DraftId("r1".into()))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        view.and_then(|v| v.rfc822_message_id).as_deref() == Some("<m2@example.com>"),
+        "the Message-ID is Gmail's, read from the import",
+    )?;
+    // saved -> sending is a compare-and-set.
+    let begin = DraftWrite::BeginSend {
+        draft: DraftId("r1".into()),
+        if_message: Some(MessageId("m2".into())),
+        retry_at: Timestamp(60_000),
+    };
+    expect(
+        matches!(
+            record(store, &begin, 10).await?,
+            DraftRecorded::Started { retry: false, .. }
+        ),
+        "the first send wins",
+    )?;
+    expect(
+        record(store, &begin, 11).await?
+            == DraftRecorded::InProgress {
+                retry_at: Timestamp(60_000),
+            },
+        "a second is refused",
+    )?;
+    draft_rows_settle(store, &snapshot).await
+}
+
+/// The second half of [`draft_rows`]: a sending row settled by its sent
+/// message's import, the feed in order, and forget.
+async fn draft_rows_settle<S: Store>(store: &S, snapshot: &StoreSnapshot) -> Result<(), String> {
+    use mailtide::drafts::{DraftWrite, RemovedReason};
+    use mailtide::ids::DraftId;
+    let save = |message: &str| DraftWrite::Saved {
+        draft: listed("r1", message),
+        tracking_id: TRACKING.into(),
+    };
+    // The sent message's import settles it by tracking id.
+    let mut c = commit(snapshot, 2);
+    c.messages = vec![MessageOp::MarkImported {
+        observation: MessageObservation {
+            id: MessageId("s1".into()),
+            thread_id: ThreadId("t".into()),
+            labels: set(["SENT"]),
+            checkpoint: HistoryId(6),
+        },
+        blob: BlobRef("s1.eml".into()),
+        size: 10,
+        internal_date: Timestamp(0),
+        headers: Box::new(HeaderFacts::default()),
+        facts: Some(Box::new(mailtide::gmail::MessageFacts {
+            tracking_id: Some(TRACKING.into()),
+            ..mailtide::gmail::MessageFacts::empty()
+        })),
+    }];
+    apply(store, &c).await?;
+    expect(draft_views(store).await?.is_empty(), "the sent draft left")?;
+    record(store, &save("m3"), 20).await?;
+    record(
+        store,
+        &DraftWrite::Removed {
+            draft: DraftId("r1".into()),
+            reason: RemovedReason::Deleted,
+        },
+        21,
+    )
+    .await?;
+    let entries: Vec<Change> = page(
+        store
+            .changes(&account(), StateSeq(0).into(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?
+    .changes
+    .into_iter()
+    .map(|entry| entry.change)
+    .filter(|change| {
+        matches!(
+            change,
+            Change::DraftSaved { .. } | Change::DraftRemoved { .. } | Change::DraftSent { .. }
+        )
+    })
+    .collect();
+    let kinds: Vec<&str> = entries
+        .iter()
+        .map(|change| match change {
+            Change::DraftSaved { .. } => "saved",
+            Change::DraftRemoved { .. } => "removed",
+            Change::DraftSent { .. } => "sent",
+            _ => "other",
+        })
+        .collect();
+    expect(
+        kinds == ["saved", "saved", "sent", "saved", "removed"],
+        &format!("the feed in order: {entries:?}"),
+    )?;
+    record(store, &save("m4"), 30).await?;
+    store
+        .forget(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        draft_views(store).await?.is_empty(),
+        "forget removes the draft rows",
+    )
+}
+
+async fn draft_refresh_job<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::drafts::{DraftOp, DraftReconcile, DraftWrite};
+    let snapshot = claim(store).await?;
+    record(store, &DraftWrite::Refresh { at: Timestamp(5) }, 1).await?;
+    // A history commit asks for one too: still one job, due when first asked.
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![observe("m9", &["DRAFT"], 3)];
+    apply(store, &c).await?;
+    expect(
+        claimed_generation(store, &snapshot, 1, 4).await?.is_none(),
+        "not due yet",
+    )?;
+    let Some((generation, job)) = claimed_generation(store, &snapshot, 2, 5).await? else {
+        return Err("one listing is claimed".into());
+    };
+    // A draft trigger while it runs does not replace the claim.
+    let mut c = commit(&snapshot, 1);
+    c.messages = vec![observe("m8", &["DRAFT"], 4)];
+    apply(store, &c).await?;
+    let mut done = commit(&snapshot, 2);
+    done.claim = Some(job.claim());
+    done.jobs = vec![JobOp::Finish {
+        claim: job.claim(),
+        outcome: JobOutcome::Done,
+    }];
+    done.drafts = vec![DraftOp::Reconcile(DraftReconcile {
+        listed: vec![listed("r9", "m9")],
+        generation,
+        claimed_at: Timestamp(5),
+        grace: std::time::Duration::from_hours(1),
+    })];
+    done.account_ops = vec![mailtide::commit::AccountOp::SetDraftsRefreshedAt(
+        Timestamp(6),
+    )];
+    expect(
+        matches!(apply(store, &done).await?, CommitOutcome::Applied { .. }),
+        "the claim held",
+    )?;
+    expect(
+        draft_views(store).await?.is_empty(),
+        "a trigger since the claim fences the listing",
+    )?;
+    let Some((generation, job)) = claimed_generation(store, &snapshot, 3, 20_000).await? else {
+        return Err("the listing is asked for again".into());
+    };
+    let mut done = commit(&snapshot, 3);
+    done.claim = Some(job.claim());
+    done.jobs = vec![JobOp::Finish {
+        claim: job.claim(),
+        outcome: JobOutcome::Done,
+    }];
+    done.drafts = vec![DraftOp::Reconcile(DraftReconcile {
+        listed: vec![listed("r9", "m9"), listed("r8", "m8")],
+        generation,
+        claimed_at: Timestamp(20_000),
+        grace: std::time::Duration::from_hours(1),
+    })];
+    apply(store, &done).await?;
+    let views = draft_views(store).await?;
+    expect(views.len() == 2, &format!("both drafts listed: {views:?}"))?;
+    let snapshot = claim(store).await?;
+    expect(
+        snapshot.drafts_refreshed_at == Some(Timestamp(6)),
+        "the listing time survives",
+    )
 }

@@ -12,8 +12,11 @@
 use std::future::Future;
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
+use mailtide::drafts::{DraftRecorded, DraftView, DraftWrite};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{
+    AccountId, DraftId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp,
+};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -300,4 +303,33 @@ pub trait Store: Send + Sync {
         &self,
         account: &AccountId,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
+
+    /// Record what mailtide's own draft call learned (see
+    /// [`mailtide::mirror::AccountMirror::record_draft`]), atomically and
+    /// without an engine: not fenced by an epoch, like `admit`, since a
+    /// save must survive a sync superseding another. `BeginSend` is a
+    /// compare-and-set: of concurrent callers in any process, one wins.
+    /// [`StoreError::NotTracked`] for an account not mirrored.
+    fn record_draft(
+        &self,
+        account: &AccountId,
+        write: &DraftWrite,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<DraftRecorded, StoreError>> + Send;
+
+    /// Up to `limit` drafts of the index after `after`, in draft id order
+    /// (empty for an unknown account).
+    fn drafts(
+        &self,
+        account: &AccountId,
+        after: Option<&DraftId>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<DraftView>, StoreError>> + Send;
+
+    /// One draft of the index, if the mirror knows it.
+    fn draft(
+        &self,
+        account: &AccountId,
+        id: &DraftId,
+    ) -> impl Future<Output = Result<Option<DraftView>, StoreError>> + Send;
 }

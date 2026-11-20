@@ -60,6 +60,7 @@ mod common {
             cleanup_due_at: now,
             deliver_due_at: now,
             confirm_due_at: now,
+            draft_refresh_due_at: now,
         }
     }
 
@@ -82,6 +83,7 @@ mod common {
             job_plan: plan(0),
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 

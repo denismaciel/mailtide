@@ -81,6 +81,8 @@ impl GmailTransport for FakeGmail {
                 ok(&json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}))
             }
             "history" => ok(&json!({"historyId": "10"})),
+            // A reconciliation ends by listing the drafts.
+            "drafts" => ok(&json!({"resultSizeEstimate": 0})),
             "messages" => match query.get("labelIds") {
                 None | Some(&"INBOX") => ok(&json!({"messages": [{"id": "m1", "threadId": "t1"}]})),
                 Some(_) => ok(&json!({})),
@@ -216,6 +218,7 @@ fn runner(gmail: FakeGmail, gate: RecordingGate) -> TestRunner {
                 access: mailtide_io::runner::Access::ReadWrite,
                 watch: WatchMode::Disabled,
                 log_accounts: mailtide_io::runner::LogAccounts::default(),
+                drafts: mailtide_io::drafts::DraftSettings::default(),
             },
         ),
     }
@@ -261,7 +264,7 @@ fn gmail_transport_quota_gate_charges_every_sdk_call_with_its_method_cost_and_am
             let expected = match request.as_str() {
                 "profile" | "labels" => 1,
                 "history" => 2,
-                "messages" => 5,
+                "messages" | "drafts" => 5,
                 "messages/m1?minimal" => 20,
                 "messages/m1?raw" => 60,
                 other => panic!("unexpected request {other}"),

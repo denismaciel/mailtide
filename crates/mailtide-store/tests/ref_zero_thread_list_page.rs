@@ -71,9 +71,11 @@ async fn seed<S: Store>(store: &S, messages: Vec<MessageOp>) {
             cleanup_due_at: Timestamp(0),
             deliver_due_at: Timestamp(0),
             confirm_due_at: Timestamp(0),
+            draft_refresh_due_at: Timestamp(0),
         },
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     };
     assert!(matches!(
         store.apply(&commit).await.expect("apply"),

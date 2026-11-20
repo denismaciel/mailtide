@@ -16,6 +16,7 @@ use crate::command::{Command, CommandKind, GmailCall, GmailRequest};
 use crate::commit::{
     AccountOp, Commit, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
+use crate::drafts::{DraftOp, DraftPage, DraftReconcile, ListedDraft};
 use crate::event::{Event, EventKind};
 use crate::gmail::{
     HistoryPage, HistoryRecord, ImportedMessage, Label, ListPage, MessageObservation,
@@ -24,7 +25,9 @@ use crate::history::{self, CursorUpdate};
 use crate::ids::{
     CommandId, CommitId, ENGINE_VERSION, HistoryId, LabelId, MessageId, PageToken, Timestamp,
 };
-use crate::jobs::{AttemptId, ClaimedJob, ClaimedWork, Delivery, JobKind, JobOp, JobOutcome};
+use crate::jobs::{
+    AttemptId, ClaimedJob, ClaimedWork, Delivery, JobKind, JobOp, JobOutcome, NewJob,
+};
 use crate::labels::LabelSet;
 use crate::outbox::{ActionRequest, IntentOp};
 use crate::quota::{self, Priority};
@@ -54,6 +57,15 @@ pub struct EngineConfig {
     pub confirm_timeout: Duration,
     /// List the label definitions again once they are this old (SPEC §6.6).
     pub label_refresh: Duration,
+    /// How long after a draft change seen in history the drafts are listed
+    /// (SPEC §7a); changes within it share one listing.
+    pub draft_refresh_delay: Duration,
+    /// List the drafts at least this often while live, the safety net
+    /// under history and listing consistency.
+    pub draft_refresh_every: Duration,
+    /// How long a send whose answer was lost waits for its sent message
+    /// before it ends as unconfirmed.
+    pub draft_send_grace: Duration,
 }
 
 /// Whether the engine keeps a Gmail push watch alive.
@@ -77,6 +89,9 @@ impl Default for EngineConfig {
             draft_settle: Duration::from_mins(2),
             confirm_timeout: Duration::from_mins(1),
             label_refresh: Duration::from_mins(15),
+            draft_refresh_delay: Duration::from_secs(10),
+            draft_refresh_every: Duration::from_mins(15),
+            draft_send_grace: Duration::from_hours(1),
         }
     }
 }
@@ -197,6 +212,10 @@ pub struct Engine {
     /// Messages whose refused delivery was already retried after a
     /// listing: a refusal now blocks.
     relisted: std::collections::BTreeSet<MessageId>,
+    /// When the periodic draft listing is due; `None` until known.
+    drafts_due: Option<Timestamp>,
+    /// The pages of the draft listing in flight, by its claim.
+    drafts_listing: Option<(AttemptId, Vec<ListedDraft>)>,
     /// The highest history id a push or page reported.
     notified: Option<HistoryId>,
     /// Another pass is needed once the current one ends.
@@ -242,6 +261,8 @@ impl Engine {
             labels: LabelRefresh::default(),
             parked: Vec::new(),
             relisted: std::collections::BTreeSet::new(),
+            drafts_due: None,
+            drafts_listing: None,
             notified: None,
             follow_up: false,
             running_jobs: 0,
@@ -295,6 +316,12 @@ impl Engine {
             self.config.label_refresh,
         ));
         out.extend(self.pump_labels(now));
+        self.drafts_due = Some(schedule::draft_refresh_due(
+            self.state.drafts_refreshed_at,
+            now,
+            self.config.draft_refresh_every,
+        ));
+        out.extend(self.pump_drafts(now));
         out.push(self.status_command());
         out
     }
@@ -366,6 +393,7 @@ impl Engine {
             EventKind::RequestDeferred { command, until } => self.on_deferred(command, until),
             EventKind::ActionRequested { action } => self.on_action(action, now),
             EventKind::LabelsModified { command } => self.on_modified(command, now),
+            EventKind::DraftsListed { command, page } => self.on_drafts_listed(command, page, now),
             // A search, its label check and the label writes are the
             // driver's direct calls: no engine command waits for them.
             EventKind::Searched { .. }
@@ -376,8 +404,7 @@ impl Engine {
             | EventKind::MessagesDeleted { .. } => Vec::new(),
             // Answers to direct calls (the driver's draft methods): no
             // engine command asks for these.
-            EventKind::DraftsListed { .. }
-            | EventKind::DraftFetched { .. }
+            EventKind::DraftFetched { .. }
             | EventKind::DraftSaved { .. }
             | EventKind::DraftDeleted { .. }
             | EventKind::DraftSent { .. }
@@ -452,6 +479,7 @@ impl Engine {
                 out
             }
             TimerKind::Labels => self.pump_labels(now),
+            TimerKind::Drafts => self.pump_drafts(now),
         }
     }
 
@@ -1053,6 +1081,11 @@ impl Engine {
                 ClaimedWork::Deliver(_, Delivery::Settled) => {
                     out.push(self.finish_job(&job, JobOutcome::Done, Vec::new(), now));
                 }
+                ClaimedWork::RefreshDrafts { .. } => {
+                    self.drafts_listing = Some((job.attempt, Vec::new()));
+                    let request = GmailRequest::ListDrafts { page_token: None };
+                    out.push(self.gmail(request, priority, Waiting::Job(job)));
+                }
                 ClaimedWork::BlobCleanup(message) => {
                     let message = message.clone();
                     let id = self.command_id();
@@ -1145,7 +1178,9 @@ impl Engine {
         let Some(job) = self.take_job(command, |kind| matches!(kind, JobKind::Deliver(_))) else {
             return Vec::new();
         };
-        self.relisted.remove(job.kind().message());
+        if let Some(message) = job.kind().message() {
+            self.relisted.remove(message);
+        }
         let versions = job.delivery_versions();
         let intents = vec![IntentOp::Delivered {
             versions,
@@ -1153,6 +1188,102 @@ impl Engine {
             by: job.attempt,
         }];
         vec![self.finish_job_with(&job, JobOutcome::Done, Vec::new(), intents, now)]
+    }
+
+    // ------------------------------------------------------------ drafts (SPEC §7a)
+
+    /// A `drafts.list` page of the refresh job: ask for the next, or commit
+    /// the whole listing. The store applies it only if the draft index is
+    /// still at the generation the claim read; otherwise it lists again.
+    fn on_drafts_listed(
+        &mut self,
+        command: CommandId,
+        page: DraftPage,
+        now: Timestamp,
+    ) -> Vec<Command> {
+        let Some(job) = self.take_job(command, |kind| *kind == JobKind::RefreshDrafts) else {
+            return Vec::new();
+        };
+        let ClaimedWork::RefreshDrafts {
+            generation,
+            claimed_at,
+        } = job.work
+        else {
+            return Vec::new();
+        };
+        let mut listed = match self.drafts_listing.take() {
+            Some((attempt, listed)) if attempt == job.attempt => listed,
+            Some(_) | None => Vec::new(),
+        };
+        listed.extend(page.drafts);
+        if let Some(token) = page.next_page_token {
+            self.drafts_listing = Some((job.attempt, listed));
+            let request = GmailRequest::ListDrafts {
+                page_token: Some(token),
+            };
+            let priority = job.priority;
+            return vec![self.gmail(request, priority, Waiting::Job(job))];
+        }
+        let mut commit = self.commit(now, job.priority);
+        commit.claim = Some(job.claim());
+        commit.jobs = vec![JobOp::Finish {
+            claim: job.claim(),
+            outcome: JobOutcome::Done,
+        }];
+        commit.drafts = vec![DraftOp::Reconcile(DraftReconcile {
+            listed,
+            generation,
+            claimed_at,
+            grace: self.config.draft_send_grace,
+        })];
+        commit.account_ops = vec![AccountOp::SetDraftsRefreshedAt(now)];
+        self.state.drafts_refreshed_at =
+            Some(self.state.drafts_refreshed_at.map_or(now, |at| at.max(now)));
+        self.drafts_due = Some(now.plus(self.config.draft_refresh_every));
+        let at = now.plus(self.config.draft_refresh_every);
+        vec![
+            self.send_commit(commit, AfterCommit::Job),
+            self.schedule(TimerKind::Drafts, at),
+        ]
+    }
+
+    /// Gmail refused the listing for good (or 404): drop the job; the next
+    /// periodic listing tries again.
+    fn drafts_refused(&mut self, job: &ClaimedJob, now: Timestamp) -> Vec<Command> {
+        self.drafts_listing = None;
+        let at = now.plus(self.config.draft_refresh_every);
+        self.drafts_due = Some(at);
+        vec![
+            self.finish_job(job, JobOutcome::Done, Vec::new(), now),
+            self.schedule(TimerKind::Drafts, at),
+        ]
+    }
+
+    /// Enqueue the periodic draft listing if it is due and the account is
+    /// live; otherwise wake when it will be. Bootstrapping and reconciling
+    /// end with a listing of their own; a blocked engine has stopped.
+    fn pump_drafts(&mut self, now: Timestamp) -> Vec<Command> {
+        let Some(due) = self.drafts_due else {
+            return Vec::new();
+        };
+        if self.state.sync != SyncState::Live {
+            return Vec::new();
+        }
+        if due > now {
+            return vec![self.schedule(TimerKind::Drafts, due)];
+        }
+        self.drafts_due = None;
+        let mut commit = self.commit(now, Priority::Live);
+        commit.jobs = vec![JobOp::Enqueue(NewJob {
+            kind: JobKind::RefreshDrafts,
+            priority: Priority::Live,
+            due_at: now,
+        })];
+        // The job runs with the others when the jobs timer fires.
+        vec![
+            self.send_commit(commit, AfterCommit::Bookkeeping),
+            self.schedule_jobs(now),
+        ]
     }
 
     fn on_imported(
@@ -1204,7 +1335,7 @@ impl Engine {
     fn on_not_found(&mut self, command: CommandId, id: MessageId, now: Timestamp) -> Vec<Command> {
         let answers = |kind: &JobKind| match kind {
             JobKind::Import(m) | JobKind::Verify(m) | JobKind::Deliver(m) => *m == id,
-            JobKind::BlobCleanup(_) => false,
+            JobKind::BlobCleanup(_) | JobKind::RefreshDrafts => false,
         };
         let Some(job) = self.take_job(command, answers) else {
             return Vec::new();
@@ -1249,6 +1380,9 @@ impl Engine {
                 self.adopt_cursor(cursor, now);
                 let mut out = vec![self.status_command(), self.schedule_jobs(now)];
                 out.extend(self.request_pass());
+                // The reconciliation enqueued a listing of its own (the
+                // store's rule); the periodic one follows from it.
+                out.extend(self.pump_drafts(now));
                 out
             }
             AfterCommit::Job => {
@@ -1432,6 +1566,9 @@ impl Engine {
                         now,
                     )]
                 }
+                // Drafts are not mail: never park or block over them; the
+                // next periodic listing tries again.
+                JobKind::RefreshDrafts => self.drafts_refused(&job, now),
             },
             // A sync request mailtide built itself, refused for good, will be
             // refused next time too: stop for an operator instead of looping.
@@ -1470,6 +1607,7 @@ impl Engine {
                 JobKind::BlobCleanup(_) => {
                     vec![self.finish_job(&job, JobOutcome::Done, Vec::new(), now)]
                 }
+                JobKind::RefreshDrafts => self.drafts_refused(&job, now),
             },
             // The cursor is too old: reconcile.
             Waiting::History => {
@@ -1683,9 +1821,11 @@ impl Engine {
                 cleanup_due_at: now.plus(BLOB_GRACE),
                 deliver_due_at: now,
                 confirm_due_at: now.plus(self.config.confirm_timeout),
+                draft_refresh_due_at: now.plus(self.config.draft_refresh_delay),
             },
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 
@@ -1745,6 +1885,7 @@ mod tests {
             rng_seed: 7,
             labels_refreshed_at: None,
             label_ids: LabelSet::new(),
+            drafts_refreshed_at: None,
         };
         Engine::new(
             snapshot.validate().expect("valid snapshot"),
@@ -2018,9 +2159,11 @@ mod tests {
                     cleanup_due_at: Timestamp(0),
                     deliver_due_at: Timestamp(0),
                     confirm_due_at: Timestamp(0),
+                    draft_refresh_due_at: Timestamp(0),
                 },
                 jobs: Vec::new(),
                 intents: Vec::new(),
+                drafts: Vec::new(),
             }
         }
 
@@ -2199,9 +2342,11 @@ mod tests {
                 cleanup_due_at: Timestamp(0),
                 deliver_due_at: Timestamp(0),
                 confirm_due_at: Timestamp(0),
+                draft_refresh_due_at: Timestamp(0),
             },
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         };
         mirror.apply(&discover(&mirror, 1_000, "old"));
 
@@ -2268,6 +2413,7 @@ mod tests {
             rng_seed: 7,
             labels_refreshed_at: None,
             label_ids: LabelSet::new(),
+            drafts_refreshed_at: None,
         };
         let config = EngineConfig {
             watch: WatchPolicy::Off,

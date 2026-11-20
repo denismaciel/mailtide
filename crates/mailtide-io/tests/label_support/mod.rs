@@ -338,6 +338,8 @@ impl Mailbox {
         let parts: Vec<&str> = path.split('/').collect();
         match (request.method, parts.as_slice()) {
             (Method::Get, ["profile"]) => ok(&json!({"historyId": self.history_id.to_string()})),
+            // A reconciliation ends with a draft listing: there are none.
+            (Method::Get, ["drafts"]) => ok(&json!({"resultSizeEstimate": 0})),
             (Method::Get, ["labels"]) => {
                 let labels: Vec<Value> = self
                     .labels
@@ -680,6 +682,7 @@ pub fn runner_over<S: mailtide_store::Store, T: GmailTransport>(
             },
             watch: WatchMode::Disabled,
             log_accounts: LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     )
     .with_clock(mailtide_io::Clock::from_fn(move || {

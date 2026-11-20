@@ -6,7 +6,8 @@
 //!
 //! Zero counterpart: `lib/mail-data-revision.ts`.
 
-use crate::ids::{BlobRef, MessageId, ThreadId, Timestamp};
+use crate::drafts::{DraftOrigin, RemovedReason};
+use crate::ids::{BlobRef, DraftId, MessageId, ThreadId, Timestamp};
 use crate::labels::LabelSet;
 use crate::mirror::StoredContent;
 
@@ -764,6 +765,37 @@ pub enum Change {
         /// Its thread.
         thread_id: ThreadId,
     },
+    /// A draft was created or now holds another message (`origin` says
+    /// whether mailtide saved it). Precedes its message's entries.
+    DraftSaved {
+        /// The draft.
+        draft_id: DraftId,
+        /// Its current message.
+        message_id: MessageId,
+        /// That message's thread.
+        thread_id: ThreadId,
+        /// Who saved it.
+        origin: DraftOrigin,
+    },
+    /// A draft left the index.
+    DraftRemoved {
+        /// The draft.
+        draft_id: DraftId,
+        /// The message it last held.
+        last_message_id: MessageId,
+        /// Why.
+        reason: RemovedReason,
+    },
+    /// A draft was sent: this is the message that left (a new id, in
+    /// whatever thread Gmail put it).
+    DraftSent {
+        /// The draft.
+        draft_id: DraftId,
+        /// The sent message.
+        message_id: MessageId,
+        /// Its thread.
+        thread_id: ThreadId,
+    },
 }
 
 impl Change {
@@ -777,7 +809,10 @@ impl Change {
             | Self::OverlayChanged { id, .. }
             | Self::MessageDeleted { id, .. }
             | Self::FactsRefreshed { id, .. } => Some(id),
-            Self::LabelDefinitionsChanged => None,
+            Self::LabelDefinitionsChanged
+            | Self::DraftSaved { .. }
+            | Self::DraftRemoved { .. }
+            | Self::DraftSent { .. } => None,
         }
     }
 }

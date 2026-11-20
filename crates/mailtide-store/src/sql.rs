@@ -13,12 +13,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp, MessageOp, Rejection};
+use mailtide::drafts::{
+    DraftIndex, DraftOp, DraftRecord, DraftRecorded, DraftState, DraftView, DraftWrite,
+};
 use mailtide::gmail::{Label, LabelColor, LabelKind, LabelListVisibility, MessageListVisibility};
 use mailtide::ids::{
-    AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
+    AccountId, DraftId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
 use mailtide::jobs::{
-    AttemptId, ClaimOutcome, ClaimedJob, ClaimedWork, Job, JobKind, JobState, Prioritised,
+    AttemptId, ClaimContext, ClaimOutcome, ClaimedJob, ClaimedWork, Job, JobKind, JobState,
+    Prioritised,
 };
 use mailtide::labels::LabelSet;
 use mailtide::mirror::{
@@ -120,6 +124,19 @@ const MIGRATIONS: &[&[&str]] = &[&[
     "ALTER TABLE mailtide_labels ADD COLUMN attrs TEXT",
     "ALTER TABLE mailtide_accounts ADD COLUMN label_generation BIGINT NOT NULL DEFAULT 0",
     "ALTER TABLE mailtide_accounts ADD COLUMN deleted_labels TEXT",
+],
+// 10: the draft index (SPEC §7a): a row per draft naming its current message,
+// a generation that fences listings, and when the drafts were last listed.
+// Raises the version so an older build refuses a database holding draft
+// feed entries and RefreshDrafts jobs it cannot read.
+&[
+    "CREATE TABLE IF NOT EXISTS mailtide_drafts (
+        account TEXT NOT NULL, id TEXT NOT NULL, message TEXT NOT NULL, thread_id TEXT NOT NULL,
+        tracking_id TEXT, state TEXT NOT NULL, since BIGINT NOT NULL, PRIMARY KEY (account, id))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS mailtide_drafts_message ON mailtide_drafts (account, message)",
+    "CREATE INDEX IF NOT EXISTS mailtide_drafts_tracking ON mailtide_drafts (account, tracking_id)",
+    "ALTER TABLE mailtide_accounts ADD COLUMN drafts_generation BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE mailtide_accounts ADD COLUMN drafts_refreshed_at BIGINT",
 ]];
 
 /// The schema version this build expects.
@@ -225,12 +242,14 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, text: &str) -> Result<T, St
 
 // Column encodings shared by reads and writes.
 
-fn kind_code(kind: &JobKind) -> (i64, &MessageId) {
+/// A job's kind and message key; an account-level job's key is empty.
+fn kind_code(kind: &JobKind) -> (i64, &str) {
     match kind {
-        JobKind::Import(id) => (0, id),
-        JobKind::Verify(id) => (1, id),
-        JobKind::BlobCleanup(id) => (2, id),
-        JobKind::Deliver(id) => (3, id),
+        JobKind::Import(id) => (0, id.0.as_str()),
+        JobKind::Verify(id) => (1, id.0.as_str()),
+        JobKind::BlobCleanup(id) => (2, id.0.as_str()),
+        JobKind::Deliver(id) => (3, id.0.as_str()),
+        JobKind::RefreshDrafts => (4, ""),
     }
 }
 
@@ -241,6 +260,7 @@ fn kind_from(code: i64, message: String) -> Result<JobKind, StoreError> {
         1 => Ok(JobKind::Verify(id)),
         2 => Ok(JobKind::BlobCleanup(id)),
         3 => Ok(JobKind::Deliver(id)),
+        4 if id.0.is_empty() => Ok(JobKind::RefreshDrafts),
         other => Err(corrupt("job kind", other)),
     }
 }
@@ -486,6 +506,7 @@ impl SqlStore {
             "mailtide_intents",
             "mailtide_changes",
             "mailtide_consumers",
+            "mailtide_drafts",
         ] {
             // Table names are constants, never input.
             sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
@@ -549,7 +570,7 @@ impl SqlStore {
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
             "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at,
-               label_generation, deleted_labels
+               label_generation, deleted_labels, drafts_generation, drafts_refreshed_at
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -602,6 +623,8 @@ impl SqlStore {
                 .into_iter()
                 .map(|(id, at)| (id, Timestamp(at)))
                 .collect(),
+            drafts_generation: uint("drafts_generation", get_i("drafts_generation")?)?,
+            drafts_refreshed_at: get_oi("drafts_refreshed_at")?.map(Timestamp),
         };
         Ok(Some((record, StateSeq(uint("seq", get_i("seq")?)?))))
     }
@@ -615,15 +638,16 @@ impl SqlStore {
         sqlx::query(
             "INSERT INTO mailtide_accounts
                (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at,
-                label_generation, deleted_labels)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                label_generation, deleted_labels, drafts_generation, drafts_refreshed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              ON CONFLICT (account) DO UPDATE SET
                epoch = excluded.epoch, engine_version = excluded.engine_version, cursor = excluded.cursor,
                sync = excluded.sync, watch_expiration = excluded.watch_expiration,
                last_activity = excluded.last_activity, cooldown = excluded.cooldown,
                rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor,
                generation = excluded.generation, labels_refreshed_at = excluded.labels_refreshed_at,
-               label_generation = excluded.label_generation, deleted_labels = excluded.deleted_labels",
+               label_generation = excluded.label_generation, deleted_labels = excluded.deleted_labels,
+               drafts_generation = excluded.drafts_generation, drafts_refreshed_at = excluded.drafts_refreshed_at",
         )
         .bind(account.as_str())
         .bind(int("epoch", record.epoch.0)?)
@@ -652,6 +676,8 @@ impl SqlStore {
                 })
                 .transpose()?,
         )
+        .bind(int("drafts_generation", record.drafts_generation)?)
+        .bind(record.drafts_refreshed_at.map(|t| t.0))
         .execute(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -706,16 +732,21 @@ impl SqlStore {
                 MessageOp::FinishReconcile { baseline } => finish_baseline = Some(*baseline),
             }
         }
-        if let Some(claim) = &commit.claim {
-            ids.insert(kind_code(&claim.kind).1.clone());
-        }
-        for op in &commit.jobs {
+        let job_messages = commit
+            .claim
+            .iter()
+            .map(|claim| &claim.kind)
+            .chain(commit.jobs.iter().map(|op| match op {
+                mailtide::jobs::JobOp::Enqueue(job) => &job.kind,
+                mailtide::jobs::JobOp::Finish { claim, .. } => &claim.kind,
+            }))
+            .filter_map(JobKind::message);
+        ids.extend(job_messages.cloned());
+        // A listing is checked against the tombstones of what it names.
+        for op in &commit.drafts {
             match op {
-                mailtide::jobs::JobOp::Enqueue(job) => {
-                    ids.insert(kind_code(&job.kind).1.clone());
-                }
-                mailtide::jobs::JobOp::Finish { claim, .. } => {
-                    ids.insert(kind_code(&claim.kind).1.clone());
+                DraftOp::Reconcile(listing) => {
+                    ids.extend(listing.listed.iter().map(|d| d.message.clone()));
                 }
             }
         }
@@ -774,7 +805,43 @@ impl SqlStore {
         }
         let ids: Vec<MessageId> = ids.into_iter().collect();
         Self::load_rows(tx, account, &ids, &mut mirror).await?;
+        Self::load_account_jobs(tx, account, &mut mirror).await?;
+        Self::load_commit_drafts(tx, account, commit, &ids, &mut mirror).await?;
         Ok(mirror)
+    }
+
+    /// The draft rows a commit can touch: all of them for a listing;
+    /// otherwise those naming its messages (`ids`), and those whose
+    /// tracking id an imported message carries.
+    async fn load_commit_drafts(
+        tx: &mut Transaction<'static, Any>,
+        account: &AccountId,
+        commit: &Commit,
+        ids: &[MessageId],
+        mirror: &mut AccountMirror,
+    ) -> Result<(), StoreError> {
+        if commit.drafts.is_empty() {
+            let tracking: Vec<&str> = commit
+                .messages
+                .iter()
+                .filter_map(|op| match op {
+                    MessageOp::MarkImported { facts, .. } => {
+                        facts.as_ref().and_then(|f| f.tracking_id.as_deref())
+                    }
+                    MessageOp::Observe(_)
+                    | MessageOp::PatchLabels { .. }
+                    | MessageOp::Tombstone { .. }
+                    | MessageOp::Listed { .. }
+                    | MessageOp::FinishReconcile { .. } => None,
+                })
+                .collect();
+            let names: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+            load_drafts_where(tx, account, "message", &names, mirror).await?;
+            load_drafts_where(tx, account, "tracking_id", &tracking, mirror).await?;
+        } else {
+            mirror.drafts = load_drafts(&mut **tx, account).await?;
+        }
+        Ok(())
     }
 
     /// Load the rows of `ids` into `mirror`: five set-based queries per chunk
@@ -869,6 +936,28 @@ impl SqlStore {
         Ok(())
     }
 
+    /// Load the account-level jobs (an empty message key): a commit that
+    /// enqueues one must see it, or it would replace a running claim.
+    async fn load_account_jobs(
+        tx: &mut Transaction<'static, Any>,
+        account: &AccountId,
+        mirror: &mut AccountMirror,
+    ) -> Result<(), StoreError> {
+        for row in sqlx::query(
+            "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure
+             FROM mailtide_jobs WHERE account = $1 AND message = ''",
+        )
+        .bind(account.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| unavailable(&e))?
+        {
+            let job = job_from_row(&row)?;
+            mirror.jobs.insert(job.kind.clone(), job);
+        }
+        Ok(())
+    }
+
     /// Write what changed between `before` and `after`.
     async fn write_diff(
         tx: &mut Transaction<'static, Any>,
@@ -925,7 +1014,7 @@ impl SqlStore {
                     sqlx::query("DELETE FROM mailtide_jobs WHERE account = $1 AND kind = $2 AND message = $3")
                         .bind(account)
                         .bind(code)
-                        .bind(message.0.as_str())
+                        .bind(message)
                         .execute(&mut **tx)
                         .await
                         .map_err(|e| unavailable(&e))?;
@@ -935,6 +1024,7 @@ impl SqlStore {
         }
         write_seen(tx, account, before, after).await?;
         write_intents(tx, account, before, after).await?;
+        write_drafts(tx, account, before, after).await?;
         // Definitions are loaded only for a commit that lists them, so they
         // differ only when that listing changed them.
         if before.labels != after.labels {
@@ -1043,6 +1133,7 @@ impl SqlStore {
             rng_seed: record.rng_seed,
             labels_refreshed_at: record.labels_refreshed_at,
             label_ids,
+            drafts_refreshed_at: record.drafts_refreshed_at,
         })
     }
 
@@ -1106,9 +1197,11 @@ impl SqlStore {
                 cleanup_due_at: Timestamp(0),
                 deliver_due_at: Timestamp(0),
                 confirm_due_at: Timestamp(0),
+                draft_refresh_due_at: Timestamp(0),
             },
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         };
         let mut mirror = self
             .load_partial(&mut tx, account, record, seq, &carrier)
@@ -1150,13 +1243,14 @@ impl SqlStore {
     ) -> Result<ClaimOutcome, StoreError> {
         self.ensure_schema().await?;
         let mut tx = self.begin().await?;
-        let current = self
-            .load_account(&mut tx, account)
-            .await?
-            .map(|(record, _)| record.epoch);
-        if current != Some(epoch) {
+        let record = self.load_account(&mut tx, account).await?;
+        let Some((record, _)) = record.filter(|(record, _)| record.epoch == epoch) else {
             return Ok(ClaimOutcome::Rejected(Rejection::StaleEpoch));
-        }
+        };
+        let context = ClaimContext {
+            drafts_generation: record.drafts_generation,
+            now,
+        };
         let skip_locked = match self.dialect {
             Dialect::Postgres => " FOR UPDATE SKIP LOCKED",
             Dialect::Sqlite => "",
@@ -1184,7 +1278,7 @@ impl SqlStore {
             )
             .bind(account.as_str())
             .bind(code)
-            .bind(message.0.as_str())
+            .bind(message)
             .bind(attempt.0.cast_signed())
             .execute(&mut *tx)
             .await
@@ -1193,10 +1287,13 @@ impl SqlStore {
                 JobKind::Deliver(id) => plan_delivery(&load_intents(&mut tx, account, id).await?)
                     .into_iter()
                     .next(),
-                JobKind::Import(_) | JobKind::Verify(_) | JobKind::BlobCleanup(_) => None,
+                JobKind::Import(_)
+                | JobKind::Verify(_)
+                | JobKind::BlobCleanup(_)
+                | JobKind::RefreshDrafts => None,
             };
             claimed.push(ClaimedJob {
-                work: ClaimedWork::plan(job.kind, |_| group),
+                work: ClaimedWork::plan(job.kind, context, |_| group),
                 priority: job.priority,
                 failed_attempts: job.failed_attempts,
                 attempt,
@@ -1418,6 +1515,202 @@ async fn carrying(
     Ok(ids)
 }
 
+impl SqlStore {
+    /// Record mailtide's own draft call (`Store::record_draft`): one
+    /// transaction under the account row's lock, so `BeginSend`'s
+    /// compare-and-set has one winner across processes.
+    pub(crate) async fn record_draft(
+        &self,
+        account: &AccountId,
+        write: &DraftWrite,
+        now: Timestamp,
+    ) -> Result<DraftRecorded, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Err(StoreError::NotTracked);
+        };
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
+        mirror.record = record;
+        mirror.seq = seq;
+        mirror.drafts = load_drafts(&mut *tx, account).await?;
+        Self::load_account_jobs(&mut tx, account, &mut mirror).await?;
+        let before = mirror.clone();
+        let outcome = mirror.record_draft(write, now);
+        Self::write_diff(&mut tx, &before, &mirror).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(outcome)
+    }
+
+    /// Up to `limit` drafts after `after` (`Store::drafts`), or the one
+    /// named `only`, with the Message-ID of their imported messages.
+    async fn draft_views(
+        &self,
+        account: &AccountId,
+        after: Option<&DraftId>,
+        only: Option<&DraftId>,
+        limit: u32,
+    ) -> Result<Vec<DraftView>, StoreError> {
+        self.ensure_schema().await?;
+        let (filter, key) = match (only, after) {
+            (Some(id), _) => ("d.id = $2", id.0.as_str()),
+            (None, after) => ("d.id > $2", after.map_or("", |id| id.0.as_str())),
+        };
+        // Only a constant filter is interpolated; values are bound.
+        let sql = format!(
+            "SELECT d.id, d.message, d.thread_id, d.tracking_id, d.state, d.since, m.content
+             FROM mailtide_drafts d LEFT JOIN mailtide_messages m
+               ON m.account = d.account AND m.id = d.message
+             WHERE d.account = $1 AND {filter} ORDER BY d.id LIMIT $3"
+        );
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(account.as_str())
+            .bind(key)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        rows.iter()
+            .map(|row| {
+                let record = draft_from_row(row)?;
+                let content: Option<String> =
+                    row.try_get("content").map_err(|e| corrupt("content", e))?;
+                let message_id = content
+                    .as_deref()
+                    .map(|text| parse::<StoredContent>("content", text))
+                    .transpose()?
+                    .and_then(|stored| stored.headers.rfc822_message_id);
+                Ok(record.view(message_id))
+            })
+            .collect()
+    }
+}
+
+/// Every draft row of `account`.
+async fn load_drafts<'e, E>(executor: E, account: &AccountId) -> Result<DraftIndex, StoreError>
+where
+    E: sqlx::Executor<'e, Database = Any>,
+{
+    let rows = sqlx::query(
+        "SELECT id, message, thread_id, tracking_id, state, since FROM mailtide_drafts WHERE account = $1",
+    )
+    .bind(account.as_str())
+    .fetch_all(executor)
+    .await
+    .map_err(|e| unavailable(&e))?;
+    rows.iter()
+        .map(|row| draft_from_row(row).map(|record| (record.id.clone(), record)))
+        .collect()
+}
+
+/// The draft rows whose `column` (`message` or `tracking_id`) is one of
+/// `values`, into `mirror`.
+async fn load_drafts_where(
+    tx: &mut Transaction<'static, Any>,
+    account: &AccountId,
+    column: &'static str,
+    values: &[&str],
+    mirror: &mut AccountMirror,
+) -> Result<(), StoreError> {
+    for chunk in values.chunks(VIEW_CHUNK) {
+        let placeholders = (2..chunk.len() + 2)
+            .map(|n| format!("${n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Only a constant column and numbered placeholders are interpolated.
+        let sql = format!(
+            "SELECT id, message, thread_id, tracking_id, state, since FROM mailtide_drafts
+             WHERE account = $1 AND {column} IN ({placeholders})"
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+        for value in chunk {
+            query = query.bind(*value);
+        }
+        for row in query
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+        {
+            let record = draft_from_row(&row)?;
+            mirror.drafts.insert(record.id.clone(), record);
+        }
+    }
+    Ok(())
+}
+
+fn draft_from_row(row: &AnyRow) -> Result<DraftRecord, StoreError> {
+    let state: String = row
+        .try_get("state")
+        .map_err(|e| corrupt("draft state", e))?;
+    Ok(DraftRecord {
+        id: DraftId(row.try_get("id").map_err(|e| corrupt("draft id", e))?),
+        message: MessageId(
+            row.try_get("message")
+                .map_err(|e| corrupt("draft message", e))?,
+        ),
+        thread_id: ThreadId(
+            row.try_get("thread_id")
+                .map_err(|e| corrupt("draft thread_id", e))?,
+        ),
+        tracking_id: row
+            .try_get("tracking_id")
+            .map_err(|e| corrupt("tracking_id", e))?,
+        state: parse::<DraftState>("draft state", &state)?,
+        since: Timestamp(row.try_get("since").map_err(|e| corrupt("since", e))?),
+    })
+}
+
+/// Write the draft rows that changed: rows that go or change are deleted
+/// first, so a row re-pointed at a message never meets the unique index
+/// while another still names it.
+async fn write_drafts(
+    tx: &mut Transaction<'static, Any>,
+    account: &str,
+    before: &AccountMirror,
+    after: &AccountMirror,
+) -> Result<(), StoreError> {
+    let changed: Vec<&DraftId> = before
+        .drafts
+        .keys()
+        .chain(after.drafts.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|id| before.drafts.get(*id) != after.drafts.get(*id))
+        .collect();
+    for id in &changed {
+        if before.drafts.contains_key(*id) {
+            sqlx::query("DELETE FROM mailtide_drafts WHERE account = $1 AND id = $2")
+                .bind(account)
+                .bind(id.0.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| unavailable(&e))?;
+        }
+    }
+    for id in changed {
+        let Some(record) = after.drafts.get(id) else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO mailtide_drafts (account, id, message, thread_id, tracking_id, state, since)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(account)
+        .bind(record.id.0.as_str())
+        .bind(record.message.0.as_str())
+        .bind(record.thread_id.0.as_str())
+        .bind(record.tracking_id.as_deref())
+        .bind(json(&record.state)?)
+        .bind(record.since.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| unavailable(&e))?;
+    }
+    Ok(())
+}
+
 async fn load_intents(
     tx: &mut Transaction<'static, Any>,
     account: &AccountId,
@@ -1613,7 +1906,7 @@ async fn put_job(
     )
     .bind(account)
     .bind(code)
-    .bind(message.0.as_str())
+    .bind(message)
     .bind(priority_code(job.priority))
     .bind(i64::from(job.failed_attempts))
     .bind(state)
@@ -2084,6 +2377,7 @@ impl crate::Store for SqlStore {
             "mailtide_intents",
             "mailtide_changes",
             "mailtide_consumers",
+            "mailtide_drafts",
             "mailtide_accounts",
         ] {
             // Table names are constants, never input.
@@ -2136,9 +2430,11 @@ impl crate::Store for SqlStore {
                 cleanup_due_at: now,
                 deliver_due_at: now,
                 confirm_due_at: now,
+                draft_refresh_due_at: now,
             },
             jobs: Vec::new(),
             intents: vec![IntentOp::Request(request.clone())],
+            drafts: Vec::new(),
         };
         let mut mirror = self
             .load_partial(&mut tx, account, record, seq, &carrier)
@@ -2483,6 +2779,36 @@ impl crate::Store for SqlStore {
 
     async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
         Self::label_generation(self, account).await
+    }
+
+    async fn record_draft(
+        &self,
+        account: &AccountId,
+        write: &DraftWrite,
+        now: Timestamp,
+    ) -> Result<DraftRecorded, StoreError> {
+        Self::record_draft(self, account, write, now).await
+    }
+
+    async fn drafts(
+        &self,
+        account: &AccountId,
+        after: Option<&DraftId>,
+        limit: u32,
+    ) -> Result<Vec<DraftView>, StoreError> {
+        self.draft_views(account, after, None, limit).await
+    }
+
+    async fn draft(
+        &self,
+        account: &AccountId,
+        id: &DraftId,
+    ) -> Result<Option<DraftView>, StoreError> {
+        Ok(self
+            .draft_views(account, None, Some(id), 1)
+            .await?
+            .into_iter()
+            .next())
     }
 }
 

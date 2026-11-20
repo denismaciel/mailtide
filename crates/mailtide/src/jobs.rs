@@ -1,7 +1,8 @@
 //! Durable work items: body import, verification, blob cleanup (SPEC §6.4).
 //!
-//! Deduplicated per kind and message; priorities `foreground > live >
-//! backfill`. A job is ready, running under one claim, or blocked. Failed
+//! Deduplicated per kind and message (an account-level kind, such as the
+//! draft index refresh, has no message and one row per account); priorities
+//! `foreground > live > backfill`. A job is ready, running under one claim, or blocked. Failed
 //! attempts are counted separately from claims (review #8). Commits that
 //! finish a job carry its claim, and apply only while the claim still holds.
 //! Every message seen is in exactly one recorded state (I6).
@@ -23,14 +24,20 @@ pub enum JobKind {
     BlobCleanup(MessageId),
     /// Send a message's pending label intents to Gmail (phase 6).
     Deliver(MessageId),
+    /// List the account's drafts and reconcile the draft index with them
+    /// (account-level: one per account).
+    RefreshDrafts,
 }
 
 impl JobKind {
-    /// The message the job is about.
+    /// The message the job is about; `None` for an account-level job.
     #[must_use]
-    pub fn message(&self) -> &MessageId {
+    pub fn message(&self) -> Option<&MessageId> {
         match self {
-            Self::Import(id) | Self::Verify(id) | Self::BlobCleanup(id) | Self::Deliver(id) => id,
+            Self::Import(id) | Self::Verify(id) | Self::BlobCleanup(id) | Self::Deliver(id) => {
+                Some(id)
+            }
+            Self::RefreshDrafts => None,
         }
     }
 }
@@ -95,6 +102,23 @@ pub enum ClaimedWork {
     BlobCleanup(MessageId),
     /// Send the message's pending label changes.
     Deliver(MessageId, Delivery),
+    /// List the drafts; the listing applies only if the draft index is
+    /// still at `generation` (no local write or draft trigger since).
+    RefreshDrafts {
+        /// The account's draft generation at the claim.
+        generation: u64,
+        /// When the job was claimed.
+        claimed_at: Timestamp,
+    },
+}
+
+/// What a claim reads beside the job itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimContext {
+    /// The account's draft generation.
+    pub drafts_generation: u64,
+    /// The claim's time.
+    pub now: Timestamp,
 }
 
 /// A delivery job's plan, read when it was claimed.
@@ -110,9 +134,14 @@ impl ClaimedWork {
     /// The work for `kind`; `plan` reads a delivery's pending changes.
     pub fn plan(
         kind: JobKind,
+        context: ClaimContext,
         plan: impl FnOnce(&MessageId) -> Option<crate::outbox::ModifyGroup>,
     ) -> Self {
         match kind {
+            JobKind::RefreshDrafts => Self::RefreshDrafts {
+                generation: context.drafts_generation,
+                claimed_at: context.now,
+            },
             JobKind::Import(id) => Self::Import(id),
             JobKind::Verify(id) => Self::Verify(id),
             JobKind::BlobCleanup(id) => Self::BlobCleanup(id),
@@ -131,6 +160,7 @@ impl ClaimedWork {
             Self::Verify(id) => JobKind::Verify(id.clone()),
             Self::BlobCleanup(id) => JobKind::BlobCleanup(id.clone()),
             Self::Deliver(id, _) => JobKind::Deliver(id.clone()),
+            Self::RefreshDrafts { .. } => JobKind::RefreshDrafts,
         }
     }
 }
@@ -164,7 +194,8 @@ impl ClaimedJob {
             ClaimedWork::Deliver(_, Delivery::Settled)
             | ClaimedWork::Import(_)
             | ClaimedWork::Verify(_)
-            | ClaimedWork::BlobCleanup(_) => None,
+            | ClaimedWork::BlobCleanup(_)
+            | ClaimedWork::RefreshDrafts { .. } => None,
         }
     }
 

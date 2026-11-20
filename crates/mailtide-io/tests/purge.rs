@@ -186,9 +186,11 @@ async fn a_stale_mirror_refuses_the_whole_purge() {
             cleanup_due_at: mailtide::ids::Timestamp(0),
             deliver_due_at: mailtide::ids::Timestamp(0),
             confirm_due_at: mailtide::ids::Timestamp(0),
+            draft_refresh_due_at: mailtide::ids::Timestamp(0),
         },
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     };
     host.runner.store().apply(&reconcile).await.expect("apply");
     assert_eq!(

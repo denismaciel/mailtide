@@ -128,6 +128,8 @@ impl GmailTransport for FakeGmail {
                 ok(&json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}))
             }
             ["history"] => ok(&json!({"historyId": "10"})),
+            // A reconciliation ends by listing the drafts.
+            ["drafts"] => ok(&json!({"resultSizeEstimate": 0})),
             ["messages"] => match query.get("labelIds") {
                 None | Some(&"INBOX") => ok(&json!({"messages": self
                     .messages
@@ -186,6 +188,7 @@ fn runner<B: BlobStore>(gmail: FakeGmail, blobs: B) -> TestRunner<B> {
             access: mailtide_io::runner::Access::ReadWrite,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     )
 }
@@ -602,6 +605,7 @@ async fn tombstone<B: BlobStore>(runner: &TestRunner<B>, message: &str) {
         cleanup_due_at: Timestamp(0),
         deliver_due_at: Timestamp(0),
         confirm_due_at: Timestamp(0),
+        draft_refresh_due_at: Timestamp(0),
     };
     let commit = Commit {
         id: CommitId {
@@ -623,6 +627,7 @@ async fn tombstone<B: BlobStore>(runner: &TestRunner<B>, message: &str) {
         job_plan: plan,
         jobs: Vec::new(),
         intents: Vec::new(),
+        drafts: Vec::new(),
     };
     let outcome = runner.store().apply(&commit).await.expect("apply");
     assert!(matches!(outcome, CommitOutcome::Applied { .. }));

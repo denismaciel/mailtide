@@ -164,9 +164,7 @@ build from before it can decode. The migration raises `SCHEMA_VERSION`, so
 such a build sees the database as `ahead` and refuses to sync
 (`SchemaOutOfDate`) before it claims a job or writes a row. Its reads that
 check no schema (`changes()`) fail with `CorruptState` on the first draft
-entry of a page; they never skip it. Imported content gains the
-`tracking_id` header fact (a JSON key an older build reads past and would
-drop on rewrite: the raised version covers it too). Reverting:
+entry of a page; they never skip it. Reverting:
 
 ```sql
 DELETE FROM mailtide_jobs WHERE kind = <RefreshDrafts>;
@@ -419,11 +417,13 @@ e.g. as a `RunnerConfig` field.
   of imported `SENT` messages. `DraftView.rfc822_message_id` is Gmail's,
   read from the import. *Would change it:* nothing Gmail does today; the
   rule is the repository's (`docs/features/README.md`).
-- **D13. The tracking-id reader and fact sit behind a seam.** `compose-mime`
-  owns `mailtide_mime::tracking_id` and `message-facts` the import's
-  `tracking_id` fact; neither has landed. This plan carries the minimum
-  under their names (`crates/mailtide-mime/src/tracking.rs`,
-  `HeaderFacts.tracking_id`), and the rebase onto either replaces the copy.
+- **D13. The tracking id comes from the import's facts.** `compose-mime`
+  owns `mailtide_mime::tracking_id` (the first valid header) and
+  `message-facts` the import's `tracking_id` fact (`MessageFacts`, on the
+  stored content). The settle rule reads that fact; an import without
+  facts (the extractor gave up) settles nothing, and its send ends
+  unconfirmed after the grace period, never resent. `tracking_headers`
+  beside the reader counts the headers, so a draft carrying two is refused.
 
 Unknowns (`scripts/features.py unknowns drafts` prints each test):
 

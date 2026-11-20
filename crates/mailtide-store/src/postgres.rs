@@ -1,8 +1,11 @@
 //! Postgres store: mailtide's tables inside the host database.
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
+use mailtide::drafts::{DraftRecorded, DraftView, DraftWrite};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{
+    AccountId, DraftId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp,
+};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -216,6 +219,32 @@ impl Store for PostgresStore {
 
     async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
         crate::Store::label_generation(&self.inner, account).await
+    }
+
+    async fn record_draft(
+        &self,
+        account: &AccountId,
+        write: &DraftWrite,
+        now: Timestamp,
+    ) -> Result<DraftRecorded, StoreError> {
+        crate::Store::record_draft(&self.inner, account, write, now).await
+    }
+
+    async fn drafts(
+        &self,
+        account: &AccountId,
+        after: Option<&DraftId>,
+        limit: u32,
+    ) -> Result<Vec<DraftView>, StoreError> {
+        crate::Store::drafts(&self.inner, account, after, limit).await
+    }
+
+    async fn draft(
+        &self,
+        account: &AccountId,
+        id: &DraftId,
+    ) -> Result<Option<DraftView>, StoreError> {
+        crate::Store::draft(&self.inner, account, id).await
     }
 }
 

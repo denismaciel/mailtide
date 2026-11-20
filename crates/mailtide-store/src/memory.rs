@@ -5,8 +5,11 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
+use mailtide::drafts::{DraftRecorded, DraftView, DraftWrite};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{
+    AccountId, DraftId, EngineVersion, Epoch, LabelId, MessageId, ThreadId, Timestamp,
+};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{AccountMirror, FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
@@ -317,6 +320,34 @@ impl Store for MemoryStore {
 
     async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
         self.on_account(account, 0, |mirror| mirror.record.label_generation)
+    }
+
+    async fn record_draft(
+        &self,
+        account: &AccountId,
+        write: &DraftWrite,
+        now: Timestamp,
+    ) -> Result<DraftRecorded, StoreError> {
+        self.with_account(account, |mirror| mirror.record_draft(write, now))
+    }
+
+    async fn drafts(
+        &self,
+        account: &AccountId,
+        after: Option<&DraftId>,
+        limit: u32,
+    ) -> Result<Vec<DraftView>, StoreError> {
+        self.on_account(account, Vec::new(), |mirror| {
+            mirror.draft_views(after, limit)
+        })
+    }
+
+    async fn draft(
+        &self,
+        account: &AccountId,
+        id: &DraftId,
+    ) -> Result<Option<DraftView>, StoreError> {
+        self.on_account(account, None, |mirror| mirror.draft_view(id))
     }
 }
 

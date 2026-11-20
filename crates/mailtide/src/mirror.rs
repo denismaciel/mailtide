@@ -12,14 +12,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::commit::{
     AccountOp, Commit, CommitOutcome, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
+use crate::drafts::{
+    self, DraftEffects, DraftIndex, DraftOp, DraftRecorded, DraftView, DraftWrite, Reconciled,
+};
 use crate::gmail::{HeaderFacts, Label, LabelKind, MessageFacts, MessageObservation};
 use crate::ids::{
-    AccountId, BlobRef, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
-    stable_hash,
+    AccountId, BlobRef, DraftId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId,
+    Timestamp, stable_hash,
 };
 use crate::jobs::{
-    AttemptId, ClaimedJob, ClaimedWork, FOREGROUND_IMPORT_CAP, Job, JobClaim, JobKind, JobOp,
-    JobOutcome, JobState, NewJob, Prioritised,
+    AttemptId, ClaimContext, ClaimedJob, ClaimedWork, FOREGROUND_IMPORT_CAP, Job, JobClaim,
+    JobKind, JobOp, JobOutcome, JobState, NewJob, Prioritised,
 };
 use crate::labels::{self, LabelSet};
 use crate::outbox::{self, ActionRequest, Delivery, Intent, IntentOp, IntentState, IntentVersion};
@@ -193,6 +196,12 @@ pub struct AccountRecord {
     /// back on a row. Kept for [`DELETED_LABEL_MEMORY`]; a listing that
     /// names one again restores it.
     pub deleted_labels: BTreeMap<LabelId, Timestamp>,
+    /// Bumped by every change to the draft index outside a listing and by
+    /// every draft change history shows: a listing claimed at an older
+    /// value is not applied (SPEC §7a).
+    pub drafts_generation: u64,
+    /// When the drafts were last listed.
+    pub drafts_refreshed_at: Option<Timestamp>,
 }
 
 /// How long a deleted label's id is remembered: longer than Gmail keeps
@@ -217,6 +226,8 @@ impl AccountRecord {
             generation,
             label_generation: 0,
             deleted_labels: BTreeMap::new(),
+            drafts_generation: 0,
+            drafts_refreshed_at: None,
         }
     }
 }
@@ -250,6 +261,23 @@ pub fn check_guards(
 
 fn claim_holds(job: Option<&Job>, claim: &JobClaim) -> bool {
     job.is_some_and(|job| job.kind == claim.kind && job.state == JobState::Running(claim.attempt))
+}
+
+/// The message one message operation is about (none for finishing a
+/// reconciliation).
+#[must_use]
+pub fn message_op_id(op: &MessageOp) -> Option<&MessageId> {
+    match op {
+        MessageOp::Observe(MessageObservation { id, .. })
+        | MessageOp::MarkImported {
+            observation: MessageObservation { id, .. },
+            ..
+        }
+        | MessageOp::PatchLabels { id, .. }
+        | MessageOp::Tombstone { id, .. }
+        | MessageOp::Listed { id, .. } => Some(id),
+        MessageOp::FinishReconcile { .. } => None,
+    }
 }
 
 // ------------------------------------------------------------ message decisions
@@ -874,6 +902,8 @@ pub struct AccountMirror {
     pub labels: Vec<Label>,
     /// Pending user actions, one per (message, label).
     pub intents: BTreeMap<(MessageId, crate::ids::LabelId), Intent>,
+    /// The draft index.
+    pub drafts: DraftIndex,
     /// The change log.
     pub log: Vec<(StateSeq, Change)>,
     /// The latest change-log position.
@@ -895,6 +925,7 @@ impl AccountMirror {
             seen: BTreeMap::new(),
             labels: Vec::new(),
             intents: BTreeMap::new(),
+            drafts: DraftIndex::new(),
             log: Vec::new(),
             seq: StateSeq(0),
             consumers: BTreeMap::new(),
@@ -999,6 +1030,7 @@ impl AccountMirror {
             rng_seed: self.record.rng_seed,
             labels_refreshed_at: self.record.labels_refreshed_at,
             label_ids: self.labels.iter().map(|label| label.id.clone()).collect(),
+            drafts_refreshed_at: self.record.drafts_refreshed_at,
         }
     }
 
@@ -1050,6 +1082,10 @@ impl AccountMirror {
                     self.record.labels_refreshed_at =
                         Some(self.record.labels_refreshed_at.map_or(*at, |t| t.max(*at)));
                 }
+                AccountOp::SetDraftsRefreshedAt(at) => {
+                    self.record.drafts_refreshed_at =
+                        Some(self.record.drafts_refreshed_at.map_or(*at, |t| t.max(*at)));
+                }
                 AccountOp::Block(reason) => {
                     let resume = match std::mem::replace(&mut self.record.sync, SyncState::Live) {
                         SyncState::Blocked { resume, .. } => resume,
@@ -1064,10 +1100,13 @@ impl AccountMirror {
         }
         let mut skipped = 0;
         for op in &commit.messages {
+            let existed = message_op_id(op).is_some_and(|id| self.messages.contains_key(id));
             if !self.apply_message(op, &commit.job_plan, seq) {
                 skipped += 1;
             }
             self.settle(op, commit.claim.as_ref(), seq);
+            let effects = self.draft_rules(op, existed);
+            self.draft_effects(effects, commit.job_plan.draft_refresh_due_at, seq);
         }
         for op in &commit.intents {
             if !self.apply_intent(op, &commit.job_plan, seq) {
@@ -1095,6 +1134,13 @@ impl AccountMirror {
                         skipped += 1;
                     }
                 }
+            }
+        }
+        // After the jobs: a listing that may not apply lists again, after
+        // its own job finished.
+        for op in &commit.drafts {
+            if !self.apply_draft(op, commit.job_plan.draft_refresh_due_at, seq) {
+                skipped += 1;
             }
         }
         self.keep_verifying(commit);
@@ -1236,7 +1282,7 @@ impl AccountMirror {
                 commit
                     .claim
                     .iter()
-                    .map(|claim| claim.kind.message().clone()),
+                    .filter_map(|claim| claim.kind.message().cloned()),
             )
             .collect();
         let touched: BTreeSet<MessageId> = touched
@@ -1650,6 +1696,151 @@ impl AccountMirror {
         crate::status::ResumeOutcome::Resumed { phase, jobs }
     }
 
+    // ------------------------------------------------------------ drafts (SPEC §7a)
+
+    /// What the draft rules make of one message operation, applied just
+    /// before: `existed` says whether its row was there before.
+    fn draft_rules(&mut self, op: &MessageOp, existed: bool) -> DraftEffects {
+        match op {
+            MessageOp::Observe(MessageObservation { id, .. })
+            | MessageOp::PatchLabels { id, .. } => match self.messages.get(id) {
+                Some(record) if !existed => {
+                    drafts::on_new_message(&self.drafts, id, &record.labels)
+                }
+                Some(_) | None => DraftEffects::default(),
+            },
+            MessageOp::MarkImported {
+                observation, facts, ..
+            } => {
+                let mut effects = if existed {
+                    DraftEffects::default()
+                } else {
+                    drafts::on_new_message(&self.drafts, &observation.id, &observation.labels)
+                };
+                let settled = drafts::on_import(
+                    &mut self.drafts,
+                    &observation.id,
+                    &observation.thread_id,
+                    &observation.labels,
+                    // The import's facts carry the X-Mailtide-Id; an import
+                    // whose extractor gave up has none, and its send ends
+                    // unconfirmed after the grace period (never resent).
+                    facts.as_ref().and_then(|f| f.tracking_id.as_deref()),
+                );
+                effects.changes.extend(settled.changes);
+                effects.changed |= settled.changed;
+                effects
+            }
+            MessageOp::Tombstone { id, .. } => drafts::on_tombstone(&mut self.drafts, id),
+            // History was lost: draft changes in that window left no record.
+            MessageOp::FinishReconcile { .. } => DraftEffects {
+                changes: Vec::new(),
+                refresh: true,
+                changed: true,
+            },
+            MessageOp::Listed { .. } => DraftEffects::default(),
+        }
+    }
+
+    /// Log a draft rule's entries at `seq`, bump the draft generation if
+    /// the index changed, and enqueue a listing due at `due` if asked.
+    fn draft_effects(&mut self, effects: DraftEffects, due: Timestamp, seq: StateSeq) {
+        for change in effects.changes {
+            self.log.push((seq, change));
+        }
+        if effects.changed {
+            self.record.drafts_generation += 1;
+        }
+        if effects.refresh {
+            self.enqueue_draft_refresh(due);
+        }
+    }
+
+    fn enqueue_draft_refresh(&mut self, due: Timestamp) {
+        self.enqueue(&NewJob {
+            kind: JobKind::RefreshDrafts,
+            priority: Priority::Live,
+            due_at: due,
+        });
+    }
+
+    /// Apply one draft operation; `false` if the listing was not applied
+    /// (another follows at `retry_at`).
+    fn apply_draft(&mut self, op: &DraftOp, retry_at: Timestamp, seq: StateSeq) -> bool {
+        match op {
+            DraftOp::Reconcile(listing) => {
+                let tombstones = &self.tombstones;
+                match drafts::reconcile(
+                    &mut self.drafts,
+                    listing,
+                    self.record.drafts_generation,
+                    |message| tombstones.contains_key(message),
+                    self.record.cursor,
+                ) {
+                    Reconciled::Applied(effects) => {
+                        self.draft_effects(effects, retry_at, seq);
+                        true
+                    }
+                    Reconciled::Stale => {
+                        self.enqueue_draft_refresh(retry_at);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record what mailtide's own draft call learned, outside any engine
+    /// (like [`Self::admit_action`]): a draft save must survive a sync
+    /// superseding another. The index changes, its feed entries and any
+    /// listing it asks for land together.
+    pub fn record_draft(&mut self, write: &DraftWrite, now: Timestamp) -> DraftRecorded {
+        let (outcome, effects) = drafts::record(&mut self.drafts, write, now, self.record.cursor);
+        let due = match write {
+            DraftWrite::Stale { refresh_at, .. } => *refresh_at,
+            DraftWrite::Refresh { at } => *at,
+            DraftWrite::Saved { .. }
+            | DraftWrite::Removed { .. }
+            | DraftWrite::BeginSend { .. }
+            | DraftWrite::EndSend { .. } => now,
+        };
+        if !effects.changes.is_empty() {
+            self.seq = StateSeq(self.seq.0 + 1);
+        }
+        let seq = self.seq;
+        self.draft_effects(effects, due, seq);
+        outcome
+    }
+
+    /// How hosts see a draft.
+    #[must_use]
+    pub fn draft_view(&self, id: &DraftId) -> Option<DraftView> {
+        self.drafts
+            .get(id)
+            .map(|record| record.view(self.rfc822_message_id(&record.message)))
+    }
+
+    /// Up to `limit` drafts after `after`, in draft id order.
+    #[must_use]
+    pub fn draft_views(&self, after: Option<&DraftId>, limit: u32) -> Vec<DraftView> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.drafts
+            .values()
+            .filter(|record| after.is_none_or(|after| &record.id > after))
+            .take(limit)
+            .map(|record| record.view(self.rfc822_message_id(&record.message)))
+            .collect()
+    }
+
+    /// The Message-ID Gmail's stored copy of `message` carries, once
+    /// imported.
+    fn rfc822_message_id(&self, message: &MessageId) -> Option<String> {
+        match &self.messages.get(message)?.content {
+            Content::Imported(stored) => stored.headers.rfc822_message_id.clone(),
+            Content::Pending => None,
+        }
+    }
+
     /// Admit a user action directly, outside any engine: a user's intent is
     /// not fenced by whichever engine currently holds the account, so a sync
     /// that supersedes another can't lose it. Delivery is a durable job the
@@ -1663,6 +1854,7 @@ impl AccountMirror {
             cleanup_due_at: now,
             deliver_due_at: now,
             confirm_due_at: now,
+            draft_refresh_due_at: now,
         };
         self.seq = StateSeq(self.seq.0 + 1);
         let seq = self.seq;
@@ -1697,6 +1889,8 @@ impl AccountMirror {
             cleanup_due_at: now.plus(crate::engine::BLOB_GRACE),
             deliver_due_at: now,
             confirm_due_at: now,
+            // Purge refuses drafts: no draft row names a purged message.
+            draft_refresh_due_at: now,
         };
         let seq = StateSeq(self.seq.0 + 1);
         let mut deleted = 0;
@@ -1882,7 +2076,11 @@ impl AccountMirror {
                 break;
             };
             let kind = job.kind.clone();
-            let work = ClaimedWork::plan(kind.clone(), |id| {
+            let context = ClaimContext {
+                drafts_generation: self.record.drafts_generation,
+                now,
+            };
+            let work = ClaimedWork::plan(kind.clone(), context, |id| {
                 outbox::plan_delivery(&self.intents_of(id))
                     .into_iter()
                     .next()
@@ -2092,6 +2290,7 @@ mod tests {
             cleanup_due_at: Timestamp(1_000),
             deliver_due_at: Timestamp(0),
             confirm_due_at: Timestamp(0),
+            draft_refresh_due_at: Timestamp(0),
         }
     }
 
@@ -2113,6 +2312,7 @@ mod tests {
             job_plan: plan(),
             jobs: Vec::new(),
             intents: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 

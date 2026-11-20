@@ -79,6 +79,8 @@ impl GmailTransport for FakeGmail {
                     ok(json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}))
                 }
                 "history" => ok(json!({"historyId": "10"})),
+                // A reconciliation ends by listing the drafts.
+                "drafts" => ok(json!({"resultSizeEstimate": 0})),
                 "messages" => match query.get("labelIds") {
                     None | Some(&"INBOX") => {
                         ok(json!({"messages": [{"id": "m1", "threadId": "t1"}]}))
@@ -136,6 +138,7 @@ fn runner<B: BlobStore>(
             access: mailtide_io::runner::Access::ReadWrite,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     )
 }

@@ -92,6 +92,9 @@ pub struct StoreSnapshot {
     pub labels_refreshed_at: Option<Timestamp>,
     /// The ids of the stored label definitions, to notice ids they lack.
     pub label_ids: LabelSet,
+    /// When the drafts were last listed; `None` before the first listing
+    /// (SPEC §7a).
+    pub drafts_refreshed_at: Option<Timestamp>,
 }
 
 /// A snapshot whose fields contradict each other.
@@ -158,6 +161,7 @@ mod tests {
             rng_seed: 0,
             labels_refreshed_at: None,
             label_ids: LabelSet::new(),
+            drafts_refreshed_at: None,
         }
     }
 

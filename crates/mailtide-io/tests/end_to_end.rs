@@ -228,6 +228,8 @@ impl GmailTransport for FakeGmail {
                 mailbox.modify(id, &body);
                 ok(&json!({}))
             }
+            // No drafts: a reconciliation ends by listing them.
+            ["drafts"] => ok(&json!({"resultSizeEstimate": 0})),
             other => panic!("unexpected request {other:?}"),
         };
         Ok(response)
@@ -272,6 +274,7 @@ fn runner_for<T: GmailTransport, A: TokenSource>(
             access: mailtide_io::runner::Access::ReadWrite,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     )
 }
@@ -433,6 +436,7 @@ fn backlog(count: usize, access: Access) -> (TightRunner, Arc<Mutex<Vec<Priority
             access,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     );
     (runner, imports)

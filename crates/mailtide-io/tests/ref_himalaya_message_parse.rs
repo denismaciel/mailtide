@@ -102,6 +102,8 @@ impl GmailTransport for FakeGmail {
                     ok(&json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}))
                 }
                 "history" => ok(&json!({"historyId": "10"})),
+                // A reconciliation ends by listing the drafts.
+                "drafts" => ok(&json!({"resultSizeEstimate": 0})),
                 "messages" if listing => ok(&json!({})),
                 "messages" => ok(&json!({"messages": [{"id": "m1", "threadId": "t1"}]})),
                 "messages/m1" => {
@@ -148,6 +150,7 @@ fn runner(raw: &[u8]) -> TestRunner {
             access: mailtide_io::runner::Access::ReadWrite,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
+            drafts: mailtide_io::drafts::DraftSettings::default(),
         },
     )
 }

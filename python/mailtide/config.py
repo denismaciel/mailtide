@@ -69,6 +69,14 @@ class Engine:
     draft_settle_s: float = 120.0
     confirm_timeout_s: float = 60.0
     label_refresh_s: float = 900.0
+    # Drafts (SPEC §7a): a draft change seen in history lists the drafts
+    # this long after; they are listed at least every draft_refresh_every_s
+    # while live; a send whose answer was lost waits draft_send_grace_s for
+    # its sent message; a draft above draft_inline_limit bytes is refused.
+    draft_refresh_delay_s: float = 10.0
+    draft_refresh_every_s: float = 900.0
+    draft_send_grace_s: float = 3600.0
+    draft_inline_limit: int = 3 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
