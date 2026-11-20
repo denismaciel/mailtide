@@ -795,6 +795,7 @@ mod _core {
         watch_renew_margin_s: f64,
         draft_settle_s: f64,
         confirm_timeout_s: f64,
+        label_refresh_s: f64,
     }
 
     #[derive(FromPyObject)]
@@ -860,6 +861,7 @@ mod _core {
                     watch_renew_margin_s: c.engine.watch_renew_margin_s,
                     draft_settle_s: c.engine.draft_settle_s,
                     confirm_timeout_s: c.engine.confirm_timeout_s,
+                    label_refresh_s: c.engine.label_refresh_s,
                 },
                 quota: crate::settings::RawQuota {
                     account_per_minute: c.quota.account_per_minute,

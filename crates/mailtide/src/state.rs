@@ -8,6 +8,7 @@
 //! (invariant I11).
 
 use crate::ids::{AccountId, EngineVersion, Epoch, HistoryId, Timestamp};
+use crate::labels::LabelSet;
 use crate::reconcile::ReconcileProgress;
 use crate::retry::{BlockingFailure, Cooldown};
 
@@ -86,6 +87,11 @@ pub struct StoreSnapshot {
     pub cooldown: Option<Cooldown>,
     /// Seed for deterministic jitter, stored per account.
     pub rng_seed: u64,
+    /// When the label definitions were last listed; `None` before the first
+    /// listing (SPEC §6.6).
+    pub labels_refreshed_at: Option<Timestamp>,
+    /// The ids of the stored label definitions, to notice ids they lack.
+    pub label_ids: LabelSet,
 }
 
 /// A snapshot whose fields contradict each other.
@@ -150,6 +156,8 @@ mod tests {
             last_activity: None,
             cooldown: None,
             rng_seed: 0,
+            labels_refreshed_at: None,
+            label_ids: LabelSet::new(),
         }
     }
 

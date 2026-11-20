@@ -142,6 +142,8 @@ pub struct AccountRecord {
     pub cooldown: Option<Cooldown>,
     /// Seed for deterministic jitter.
     pub rng_seed: u64,
+    /// When the label definitions were last listed.
+    pub labels_refreshed_at: Option<Timestamp>,
     /// Change-feed entries at or before this state were compacted away.
     pub log_floor: StateSeq,
     /// Which incarnation of the account this is: set when it is tracked, so
@@ -162,6 +164,7 @@ impl AccountRecord {
             last_activity: None,
             cooldown: None,
             rng_seed: stable_hash(account.as_str().as_bytes()),
+            labels_refreshed_at: None,
             log_floor: StateSeq(0),
             generation,
         }
@@ -646,6 +649,17 @@ pub fn sort_labels(labels: &mut [Label]) {
     labels.sort_by(|a, b| a.id.cmp(&b.id));
 }
 
+/// Whether two label lists define the same labels, in whatever order: a
+/// refresh that lists what is stored changes nothing (SPEC §6.6).
+#[must_use]
+pub fn same_labels(stored: &[Label], listed: &[Label]) -> bool {
+    let mut stored = stored.to_vec();
+    let mut listed = listed.to_vec();
+    sort_labels(&mut stored);
+    sort_labels(&mut listed);
+    stored == listed
+}
+
 // ------------------------------------------------------------ the in-memory mirror
 
 /// One account's complete mirror, applying commits with the shared rules.
@@ -746,6 +760,8 @@ impl AccountMirror {
             last_activity: self.record.last_activity,
             cooldown: self.record.cooldown.clone(),
             rng_seed: self.record.rng_seed,
+            labels_refreshed_at: self.record.labels_refreshed_at,
+            label_ids: self.labels.iter().map(|label| label.id.clone()).collect(),
         }
     }
 
@@ -784,8 +800,10 @@ impl AccountMirror {
         for op in &commit.labels {
             match op {
                 LabelOp::ReplaceAll(labels) => {
-                    self.labels.clone_from(labels);
-                    self.log.push((seq, Change::LabelDefinitionsChanged));
+                    if !same_labels(&self.labels, labels) {
+                        self.labels.clone_from(labels);
+                        self.log.push((seq, Change::LabelDefinitionsChanged));
+                    }
                 }
             }
         }
@@ -797,6 +815,10 @@ impl AccountMirror {
                 AccountOp::SetLastActivity(at) => {
                     self.record.last_activity =
                         Some(self.record.last_activity.map_or(*at, |t| t.max(*at)));
+                }
+                AccountOp::SetLabelsRefreshedAt(at) => {
+                    self.record.labels_refreshed_at =
+                        Some(self.record.labels_refreshed_at.map_or(*at, |t| t.max(*at)));
                 }
                 AccountOp::Block(reason) => {
                     let resume = match std::mem::replace(&mut self.record.sync, SyncState::Live) {

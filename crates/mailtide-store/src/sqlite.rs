@@ -189,6 +189,189 @@ mod tests {
         );
     }
 
+    /// A commit moving `snapshot`'s account to `sync`, recording a label
+    /// listing at `listed`.
+    fn lifecycle_commit(
+        snapshot: &StoreSnapshot,
+        seq: u64,
+        sync: mailtide::state::SyncState,
+        cursor: Option<mailtide::commit::CursorMove>,
+        listed: i64,
+    ) -> Commit {
+        let now = Timestamp(0);
+        Commit {
+            id: mailtide::ids::CommitId {
+                epoch: snapshot.epoch,
+                seq,
+            },
+            account: snapshot.account.clone(),
+            epoch: snapshot.epoch,
+            engine_version: mailtide::ids::ENGINE_VERSION,
+            cursor,
+            claim: None,
+            sync: Some(sync),
+            messages: Vec::new(),
+            labels: Vec::new(),
+            account_ops: vec![mailtide::commit::AccountOp::SetLabelsRefreshedAt(
+                Timestamp(listed),
+            )],
+            job_plan: mailtide::commit::JobPlan {
+                priority: mailtide::quota::Priority::Live,
+                import_due_at: now,
+                draft_import_due_at: now,
+                verify_due_at: now,
+                cleanup_due_at: now,
+                deliver_due_at: now,
+                confirm_due_at: now,
+            },
+            jobs: Vec::new(),
+            intents: Vec::new(),
+        }
+    }
+
+    /// The `sync` column keeps the format earlier builds write and read (the
+    /// bare lifecycle); the label refresh time has a column of its own, so an
+    /// older build never meets a value it can't parse.
+    #[tokio::test]
+    async fn the_sync_column_keeps_its_format() {
+        use mailtide::reconcile::{ReconcileProgress, ReconcileReason};
+        use mailtide::state::SyncState;
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        store.track(&account, 1).await.expect("track");
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        let live = lifecycle_commit(
+            &snapshot,
+            0,
+            SyncState::Live,
+            Some(mailtide::commit::CursorMove {
+                expected: None,
+                to: mailtide::ids::HistoryId(7),
+            }),
+            5_000,
+        );
+        assert!(matches!(
+            store.apply(&live).await.expect("apply"),
+            CommitOutcome::Applied { .. }
+        ));
+        let column = |name: &str| format!("SELECT {name} FROM mailtide_accounts");
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests(&column("sync"))
+                .await
+                .expect("sync"),
+            r#""Live""#
+        );
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests(&column("CAST(labels_refreshed_at AS TEXT)"))
+                .await
+                .expect("refreshed"),
+            "5000"
+        );
+        let reconciling = lifecycle_commit(
+            &snapshot,
+            1,
+            SyncState::Reconciling(ReconcileProgress::begin(ReconcileReason::HistoryExpired)),
+            None,
+            6_000,
+        );
+        assert!(matches!(
+            store.apply(&reconciling).await.expect("apply"),
+            CommitOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests(&column("sync"))
+                .await
+                .expect("sync"),
+            r#"{"Reconciling":{"reason":"HistoryExpired","step":"CaptureBaseline"}}"#
+        );
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.labels_refreshed_at, Some(Timestamp(6_000)));
+    }
+
+    /// Migration 4 adds a nullable column: accounts from version 3 read as
+    /// never refreshed. Reverting it (drop the column, forget the version) is
+    /// safe: nothing else depends on it, and migrating again restores it.
+    #[tokio::test]
+    async fn migration_4_is_additive_and_revertible() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState, migrations};
+        assert_eq!(SCHEMA_VERSION, 4);
+        let all = migrations();
+        assert_eq!(
+            all[3].statements[1..],
+            [
+                "ALTER TABLE mailtide_accounts ADD COLUMN labels_refreshed_at BIGINT".to_owned(),
+                "INSERT INTO mailtide_schema (version) VALUES (4)".to_owned(),
+            ]
+        );
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        let run = |statements: Vec<String>| {
+            let store = &store;
+            async move {
+                for statement in statements {
+                    store
+                        .inner
+                        .execute_for_tests(&statement)
+                        .await
+                        .expect("statement");
+                }
+            }
+        };
+        run(all[..3].iter().flat_map(|m| m.statements.clone()).collect()).await;
+        // A live account as version 3 stored it.
+        run(vec![
+            "INSERT INTO mailtide_accounts
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity,
+                cooldown, rng_seed, seq, log_floor, generation)
+             VALUES ('a@example.com', 1, 1, 7, '\"Live\"', NULL, NULL, NULL, 0, 0, 0, 1)"
+                .to_owned(),
+        ])
+        .await;
+        run(all[3].statements.clone()).await;
+        let account = AccountId("a@example.com".into());
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.sync, mailtide::state::SyncState::Live);
+        assert_eq!(snapshot.labels_refreshed_at, None);
+        // The documented downgrade.
+        run(vec![
+            "ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at".to_owned(),
+            "DELETE FROM mailtide_schema WHERE version = 4".to_owned(),
+        ])
+        .await;
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: 3,
+                expected: SCHEMA_VERSION
+            }
+        );
+        store.migrate().await.expect("migrate again");
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.cursor, Some(mailtide::ids::HistoryId(7)));
+    }
+
     /// A stored number out of range is corrupt, never read as another value.
     #[tokio::test]
     async fn a_negative_stored_cursor_is_corrupt() {

@@ -68,6 +68,7 @@ class Engine:
     watch_renew_margin_s: float = 3600.0
     draft_settle_s: float = 120.0
     confirm_timeout_s: float = 60.0
+    label_refresh_s: float = 900.0
 
 
 @dataclass(frozen=True, slots=True)

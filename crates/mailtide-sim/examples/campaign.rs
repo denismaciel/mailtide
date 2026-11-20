@@ -16,6 +16,8 @@ fn main() {
         totals.rejections += result.stats.rejections;
         totals.messages += result.stats.messages;
         totals.deliveries += result.stats.deliveries;
+        totals.label_edits += result.stats.label_edits;
+        totals.label_listings += result.stats.label_listings;
         if !result.passed() {
             failed += 1;
             println!(

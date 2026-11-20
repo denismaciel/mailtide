@@ -7,8 +7,10 @@
 //! activity, out-of-order results, transient failures, rate limits, history
 //! expiry, dropped and duplicated pushes, lost commit acknowledgements and
 //! crashes (the engine is rebuilt from the store; results meant for the dead
-//! engine still arrive). Invariants are checked after every commit. Then all
-//! faults heal and the mirror must converge to Gmail.
+//! engine still arrive). Label definitions are created, renamed and deleted
+//! while the account is live. Invariants are checked after every commit. Then
+//! all faults heal and the mirror must converge to Gmail, its label
+//! definitions within the refresh interval.
 //!
 //! Zero counterpart, by role: `lib/imap/testing/memory-server.ts`.
 
@@ -183,6 +185,18 @@ pub enum UserOp {
         /// Which message.
         pick: usize,
     },
+    /// A user label is created (Gmail records no history for it).
+    CreateLabel,
+    /// The n-th user label is renamed (no history either).
+    RenameLabel {
+        /// Which label.
+        pick: usize,
+    },
+    /// The n-th user label is deleted: Gmail removes it from its messages.
+    DeleteLabel {
+        /// Which label.
+        pick: usize,
+    },
     /// The user acts in the host's UI on the n-th mirrored message (or
     /// its whole thread); the engine delivers it to Gmail.
     HostAction {
@@ -238,6 +252,10 @@ pub struct Stats {
     pub user_ops: u64,
     /// Label changes the engine delivered to Gmail (user actions in the host).
     pub deliveries: u64,
+    /// Label definitions created, renamed or deleted in Gmail.
+    pub label_edits: u64,
+    /// `labels.list` calls Gmail answered.
+    pub label_listings: u64,
 }
 
 /// The outcome of one run.
@@ -298,15 +316,7 @@ pub fn replay(seed: u64, script: &[UserOp]) -> RunResult {
 
 // ------------------------------------------------------------ fake Gmail
 
-const LABELS: [&str; 7] = [
-    "INBOX",
-    "UNREAD",
-    "STARRED",
-    "IMPORTANT",
-    "SPAM",
-    "TRASH",
-    "Label_1",
-];
+const LABELS: [&str; 6] = ["INBOX", "UNREAD", "STARRED", "IMPORTANT", "SPAM", "TRASH"];
 const HISTORY_PAGE: usize = 3;
 const LIST_PAGE: usize = 5;
 
@@ -317,7 +327,7 @@ struct GmailMessage {
     modified: HistoryId,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Gmail {
     messages: BTreeMap<MessageId, GmailMessage>,
     history: Vec<HistoryRecord>,
@@ -326,6 +336,25 @@ struct Gmail {
     next_message: u64,
     next_thread: u64,
     draft: Option<MessageId>,
+    /// User label definitions: id to name.
+    user_labels: BTreeMap<LabelId, String>,
+    next_label: u64,
+}
+
+impl Default for Gmail {
+    fn default() -> Self {
+        Self {
+            messages: BTreeMap::new(),
+            history: Vec::new(),
+            last_history: 0,
+            expired_before: 0,
+            next_message: 0,
+            next_thread: 0,
+            draft: None,
+            user_labels: BTreeMap::from([(LabelId("Label_1".into()), "Label_1".into())]),
+            next_label: 1,
+        }
+    }
 }
 
 impl Gmail {
@@ -461,7 +490,65 @@ impl Gmail {
                 }
                 self.delete(&id);
             }
+            UserOp::CreateLabel => {
+                self.next_label += 1;
+                let id = LabelId(format!("Label_{}", self.next_label));
+                self.user_labels
+                    .insert(id, format!("label {}", self.next_label));
+            }
+            UserOp::RenameLabel { pick } => {
+                if let Some(name) = self
+                    .user_label(*pick)
+                    .and_then(|id| self.user_labels.get_mut(&id))
+                {
+                    name.push('+');
+                }
+            }
+            UserOp::DeleteLabel { pick } => {
+                if let Some(id) = self.user_label(*pick) {
+                    self.delete_label(&id);
+                }
+            }
         }
+    }
+
+    fn user_label(&self, pick: usize) -> Option<LabelId> {
+        let ids: Vec<&LabelId> = self.user_labels.keys().collect();
+        (!ids.is_empty()).then(|| ids[pick % ids.len()].clone())
+    }
+
+    /// Delete a user label: it leaves every message carrying it, and those
+    /// removals are recorded as history.
+    fn delete_label(&mut self, label: &LabelId) {
+        self.user_labels.remove(label);
+        let carrying: Vec<MessageId> = self
+            .messages
+            .iter()
+            .filter(|(_, m)| m.labels.contains(label))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in carrying {
+            let at = self.next_id();
+            if let Some(message) = self.messages.get_mut(&id) {
+                message.labels.remove(label);
+                message.modified = at;
+            }
+            self.history.push(HistoryRecord::LabelsRemoved {
+                id: at,
+                message_id: id,
+                labels: LabelSet::from([label.clone()]),
+            });
+        }
+    }
+
+    /// Labels a message may carry now: the system ones and the defined user
+    /// ones.
+    fn assignable(&self) -> Vec<LabelId> {
+        LABELS
+            .iter()
+            .map(|id| LabelId((*id).to_owned()))
+            .chain(self.user_labels.keys().cloned())
+            .collect()
     }
 
     fn relabel(&mut self, pick: usize, label: &LabelId) {
@@ -475,6 +562,11 @@ impl Gmail {
             return;
         }
         let id = candidates[pick % candidates.len()].clone();
+        let undefined = label.0.starts_with("Label_") && !self.user_labels.contains_key(label);
+        if undefined && !self.messages[&id].labels.contains(label) {
+            // Gmail refuses to add a label that doesn't exist.
+            return;
+        }
         let at = self.next_id();
         let Some(message) = self.messages.get_mut(&id) else {
             return;
@@ -550,20 +642,24 @@ impl Gmail {
         })
     }
 
-    fn labels() -> Vec<Label> {
-        LABELS
+    /// `labels.list`, in id order.
+    fn labels(&self) -> Vec<Label> {
+        let mut labels: Vec<Label> = LABELS
             .iter()
             .chain(["DRAFT"].iter())
             .map(|id| Label {
                 id: LabelId((*id).to_owned()),
                 name: (*id).to_owned(),
-                kind: if id.starts_with("Label_") {
-                    LabelKind::User
-                } else {
-                    LabelKind::System
-                },
+                kind: LabelKind::System,
             })
-            .collect()
+            .chain(self.user_labels.iter().map(|(id, name)| Label {
+                id: id.clone(),
+                name: name.clone(),
+                kind: LabelKind::User,
+            }))
+            .collect();
+        mailtide::mirror::sort_labels(&mut labels);
+        labels
     }
 }
 
@@ -700,6 +796,12 @@ impl Sim {
             self.host_action(pick, action, whole_thread);
             return;
         }
+        if matches!(
+            op,
+            UserOp::CreateLabel | UserOp::RenameLabel { .. } | UserOp::DeleteLabel { .. }
+        ) {
+            self.stats.label_edits += 1;
+        }
         self.gmail.apply(&op);
         if !self.rng.chance(self.faults.push_dropped) {
             let push = Event {
@@ -772,16 +874,24 @@ impl Sim {
                 whole_thread: self.rng.below(3) == 0,
             };
         }
-        match self.rng.below(10) {
+        match self.rng.below(11) {
             0..=3 => UserOp::Receive {
                 thread: pick.is_multiple_of(2).then_some(pick),
             },
             4 => UserOp::SaveDraft,
-            5..=7 => UserOp::Relabel {
-                pick,
-                label: LabelId(LABELS[self.rng.below(LABELS.len())].to_owned()),
+            5..=7 => {
+                let labels = self.gmail.assignable();
+                UserOp::Relabel {
+                    pick,
+                    label: labels[self.rng.below(labels.len())].clone(),
+                }
+            }
+            8 => UserOp::Delete { pick },
+            _ => match self.rng.below(3) {
+                0 => UserOp::CreateLabel,
+                1 => UserOp::RenameLabel { pick },
+                _ => UserOp::DeleteLabel { pick },
             },
-            _ => UserOp::Delete { pick },
         }
     }
 
@@ -975,10 +1085,13 @@ impl Sim {
                     message_id: id.clone(),
                 },
             },
-            GmailRequest::ListLabels => EventKind::LabelsListed {
-                command,
-                labels: Gmail::labels(),
-            },
+            GmailRequest::ListLabels => {
+                self.stats.label_listings += 1;
+                EventKind::LabelsListed {
+                    command,
+                    labels: self.gmail.labels(),
+                }
+            }
             GmailRequest::Watch => EventKind::WatchRenewed {
                 command,
                 expiration: self.now.plus(Duration::from_hours(168)),
@@ -1002,12 +1115,26 @@ impl Sim {
         }
     }
 
-    /// Heal all faults and run until the mirror matches Gmail.
+    /// Heal all faults and run until the mirror matches Gmail. Label
+    /// definitions must match within the refresh interval (plus the longest
+    /// backoff a failure before healing can leave).
     fn heal(&mut self) -> Convergence {
         const BUDGET: u64 = 50_000;
+        let labels_by = self
+            .now
+            .plus(EngineConfig::default().label_refresh)
+            .plus(Duration::from_mins(2));
         let mut difference = String::from("never idle");
         for healing_step in 0..BUDGET {
             self.step += 1;
+            if self.now > labels_by
+                && let Some(stale) = self.label_difference()
+            {
+                return Convergence::NotReached {
+                    difference: format!("{stale}, past the refresh interval"),
+                    trace: self.trace.iter().cloned().collect(),
+                };
+            }
             if self.pending.is_empty() && self.deliveries.is_empty() {
                 match self.difference() {
                     None => {
@@ -1026,8 +1153,18 @@ impl Sim {
         }
     }
 
+    /// How the mirror's label definitions differ from Gmail's, if they do.
+    fn label_difference(&self) -> Option<String> {
+        let gmail = self.gmail.labels();
+        let mirror = self.mirror.label_definitions();
+        (gmail != mirror).then(|| format!("label definitions {mirror:?} != Gmail {gmail:?}"))
+    }
+
     /// How the mirror differs from Gmail, if it does.
     fn difference(&self) -> Option<String> {
+        if let Some(labels) = self.label_difference() {
+            return Some(labels);
+        }
         let gmail: BTreeSet<&MessageId> = self.gmail.messages.keys().collect();
         let mirror: BTreeSet<&MessageId> = self.mirror.messages.keys().collect();
         if let Some(missing) = gmail.difference(&mirror).next() {

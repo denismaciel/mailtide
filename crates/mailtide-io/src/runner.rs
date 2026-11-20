@@ -579,9 +579,9 @@ where
 
     /// Queued work (jobs deferred by the quota gate or backing off, a
     /// cooldown ending) due within the budget: the account isn't caught up,
-    /// so the run waits for it. Polls and watch renewals end the run; the
-    /// host schedules those. Only on the system clock: a host clock moves
-    /// when the host moves it.
+    /// so the run waits for it. Polls, watch renewals and label refreshes end
+    /// the run; the host schedules those. Only on the system clock: a host
+    /// clock moves when the host moves it.
     fn due_soon(
         &self,
         timers: &BTreeMap<TimerKind, Timestamp>,
@@ -595,7 +595,7 @@ where
             .iter()
             .filter(|(timer, _)| match timer {
                 TimerKind::Jobs | TimerKind::CooldownOver => true,
-                TimerKind::Poll | TimerKind::WatchRenewal => false,
+                TimerKind::Poll | TimerKind::WatchRenewal | TimerKind::Labels => false,
             })
             .map(|(_, at)| Duration::from_millis(u64::try_from(at.0 - now.0).unwrap_or(0)))
             .min()

@@ -21,6 +21,36 @@ pub enum TimerKind {
     Jobs,
     /// Retry after a cooldown.
     CooldownOver,
+    /// Refresh the label definitions (SPEC §6.6).
+    Labels,
+}
+
+/// How soon after a listing a label id the definitions lack may list them
+/// again: a burst of new ids costs one listing, and an id Gmail never lists
+/// can't make the engine list labels over and over (SPEC §6.6).
+pub const UNKNOWN_LABEL_GAP: Duration = Duration::from_mins(1);
+
+/// When the label definitions are due for their periodic refresh:
+/// `interval` after the last listing, or now if they were never listed.
+#[must_use]
+pub fn label_refresh_due(
+    refreshed_at: Option<Timestamp>,
+    now: Timestamp,
+    interval: Duration,
+) -> Timestamp {
+    refreshed_at.map_or(now, |at| at.plus(interval).max(now))
+}
+
+/// When an unknown label id may refresh the definitions: now, unless they
+/// were listed less than [`UNKNOWN_LABEL_GAP`] (or `interval`, if shorter)
+/// ago.
+#[must_use]
+pub fn unknown_label_refresh(
+    refreshed_at: Option<Timestamp>,
+    now: Timestamp,
+    interval: Duration,
+) -> Timestamp {
+    label_refresh_due(refreshed_at, now, interval.min(UNKNOWN_LABEL_GAP))
 }
 
 /// When to poll next, staggered by account so accounts don't poll together.
@@ -76,6 +106,39 @@ mod tests {
         let idle = next_poll(&account, now, None, MINUTE, 15 * MINUTE, 60 * MINUTE);
         assert!(active.since(now) >= MINUTE && active.since(now) <= MINUTE + MINUTE / 10);
         assert!(idle.since(now) >= 15 * MINUTE);
+    }
+
+    #[test]
+    fn labels_refresh_an_interval_after_the_last_listing() {
+        let now = Timestamp(10_000_000);
+        let interval = 15 * MINUTE;
+        assert_eq!(label_refresh_due(None, now, interval), now, "never listed");
+        let recent = now.minus(MINUTE);
+        assert_eq!(
+            label_refresh_due(Some(recent), now, interval),
+            recent.plus(interval)
+        );
+        let long_ago = now.minus(Duration::from_hours(1));
+        assert_eq!(label_refresh_due(Some(long_ago), now, interval), now);
+    }
+
+    #[test]
+    fn unknown_labels_refresh_at_most_once_a_gap() {
+        let now = Timestamp(10_000_000);
+        let interval = 15 * MINUTE;
+        let just_now = now.minus(Duration::from_secs(10));
+        assert_eq!(
+            unknown_label_refresh(Some(just_now), now, interval),
+            just_now.plus(UNKNOWN_LABEL_GAP)
+        );
+        let earlier = now.minus(2 * MINUTE);
+        assert_eq!(unknown_label_refresh(Some(earlier), now, interval), now);
+        let short = Duration::from_secs(5);
+        assert_eq!(
+            unknown_label_refresh(Some(just_now), now, short),
+            now,
+            "a shorter interval wins"
+        );
     }
 
     #[test]

@@ -95,6 +95,9 @@ pub enum AccountOp {
     /// The mailbox saw activity at this time (polling speeds up). Never
     /// moves backwards.
     SetLastActivity(Timestamp),
+    /// The label definitions were listed at this time (SPEC §6.6). Never
+    /// moves backwards.
+    SetLabelsRefreshedAt(Timestamp),
     /// Block the account until an operator acts. The store wraps the state
     /// it holds at apply time (not the engine's view, which may be behind a
     /// commit still in flight), so the stored state stays valid.
@@ -197,7 +200,8 @@ pub enum MessageOp {
 /// A label definition change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LabelOp {
-    /// Replace all label definitions with Gmail's current list.
+    /// Replace all label definitions with Gmail's current list. A list equal
+    /// to the stored one (in any order) changes nothing and logs nothing.
     ReplaceAll(Vec<Label>),
 }
 

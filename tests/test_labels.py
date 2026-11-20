@@ -1,11 +1,14 @@
 """Label definitions: what the label ids on messages are called."""
 
 import asyncio
+from typing import Literal
 
 import mailtide
 import pytest
 from conftest import make_config, tokens
 from fake_gmail import Mailbox
+from mailtide.config import Blobs, Config, Database, Engine, Http
+from mailtide.testing import FakeGmail, ManualClock
 
 ACCOUNT = "alice@example.com"
 
@@ -50,6 +53,57 @@ def test_labels_name_the_ids_on_messages_and_follow_renames(gmail: tuple[Mailbox
         assert ("Label_12", "Invoices", "user") in described(await r.labels(ACCOUNT))
 
     asyncio.run(main())
+
+
+def definition_changes(page: mailtide.ChangePage | mailtide.StateTooOld) -> int:
+    assert isinstance(page, mailtide.ChangePage)
+    return sum(isinstance(c, mailtide.LabelDefinitionsChanged) for c in page.changes)
+
+
+@pytest.mark.parametrize("access", ["read_write", "read_only"])
+def test_a_live_account_refreshes_renamed_labels_after_the_interval(
+    access: Literal["read_write", "read_only"],
+) -> None:
+    """No reconciliation needed: once the definitions are older than
+    ``label_refresh_s``, the next run lists them again; an unchanged list
+    adds nothing to the feed. Read-only runners refresh too (it is a read)."""
+    clock = ManualClock()
+    with FakeGmail() as gmail:
+        gmail.mailbox.label("Label_12", "Receipts")
+        gmail.add("m1", ["INBOX", "Label_12"])
+        config = Config(
+            Database("sqlite::memory:"),
+            Blobs("memory:///"),
+            access=access,
+            http=Http(gmail_origin=gmail.origin),
+            engine=Engine(label_refresh_s=600),
+        )
+        runner = mailtide.BlockingRunner(config, tokens, clock=clock)
+        runner.migrate()
+        runner.track(ACCOUNT)
+        runner.run(ACCOUNT, budget_s=30)
+        assert ("Label_12", "Receipts", "user") in described(runner.labels(ACCOUNT))
+        page = runner.changes(ACCOUNT)
+        assert isinstance(page, mailtide.ChangePage)
+
+        gmail.mailbox.label("Label_12", "Invoices")
+        clock.advance(300)
+        runner.run(ACCOUNT, budget_s=30)
+        assert ("Label_12", "Receipts", "user") in described(runner.labels(ACCOUNT)), "not due yet"
+
+        clock.advance(301)
+        runner.run(ACCOUNT, budget_s=30)
+        assert ("Label_12", "Invoices", "user") in described(runner.labels(ACCOUNT))
+        later = runner.changes(ACCOUNT, since=page.next)
+        assert definition_changes(later) == 1
+        assert gmail.mailbox.history_floor == 0, "history never expired"
+        status = runner.status(ACCOUNT)
+        assert status is not None and status.phase == "live"
+
+        clock.advance(601)
+        runner.run(ACCOUNT, budget_s=30)
+        assert isinstance(later, mailtide.ChangePage)
+        assert definition_changes(runner.changes(ACCOUNT, since=later.next)) == 0
 
 
 def test_blocking_labels(gmail: tuple[Mailbox, str]) -> None:

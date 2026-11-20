@@ -19,6 +19,7 @@ def test_host_applied_migrations_are_current(tmp_path: Path) -> None:
         for migration in mailtide.migrations():
             for statement in migration.statements:
                 db.execute(statement)
+    assert mailtide.SCHEMA_VERSION == 4  # 4: mailtide_accounts.labels_refreshed_at
     assert [m.version for m in mailtide.migrations()] == list(range(1, mailtide.SCHEMA_VERSION + 1))
     config = Config(Database(f"sqlite:{path}"), Blobs("memory:///"))
     runner = mailtide.BlockingRunner(config, tokens)

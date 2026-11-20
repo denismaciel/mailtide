@@ -45,6 +45,7 @@ pub struct RawEngine {
     pub watch_renew_margin_s: f64,
     pub draft_settle_s: f64,
     pub confirm_timeout_s: f64,
+    pub label_refresh_s: f64,
 }
 
 /// `mailtide.config.Quota`.
@@ -227,6 +228,7 @@ fn engine(raw: &RawEngine, watch: &WatchMode) -> Result<EngineConfig, Invalid> {
         watch_renew_margin: duration("engine.watch_renew_margin_s", raw.watch_renew_margin_s)?,
         draft_settle: duration("engine.draft_settle_s", raw.draft_settle_s)?,
         confirm_timeout: duration("engine.confirm_timeout_s", raw.confirm_timeout_s)?,
+        label_refresh: positive("engine.label_refresh_s", raw.label_refresh_s)?,
     };
     if engine.poll_active > engine.poll_idle {
         return Err(invalid(
@@ -368,6 +370,7 @@ mod tests {
                 watch_renew_margin_s: 3600.0,
                 draft_settle_s: 120.0,
                 confirm_timeout_s: 60.0,
+                label_refresh_s: 900.0,
             },
             quota: RawQuota {
                 account_per_minute: 4_800,
@@ -412,6 +415,13 @@ mod tests {
         assert_eq!(
             validate(raw).map(|_| ()).unwrap_err().field,
             "engine.poll_active_s"
+        );
+
+        let mut raw = defaults();
+        raw.engine.label_refresh_s = 0.0;
+        assert_eq!(
+            validate(raw).map(|_| ()).unwrap_err().field,
+            "engine.label_refresh_s"
         );
 
         let mut raw = defaults();

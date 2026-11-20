@@ -284,8 +284,37 @@ when an operator asks for it. Repeated expiries back off.
 
 ### 6.6 Labels
 
-- Refresh `labels.list` on start, on an unknown label id in history, and at
-  most every 15 min otherwise [Z].
+History carries label ids, never definitions (a new name leaves no record),
+so the definitions are listed again (`labels.list`) on a schedule [Z]:
+
+- **Periodically, and on start.** They are listed once they are older than
+  `label_refresh` (default 15 min). Age is measured from the last listing,
+  whose time the account row keeps (`labels_refreshed_at`, migration 4;
+  `NULL` until the first listing), never from how long an engine has run: a
+  starting engine lists them at once if that time is `label_refresh` ago or
+  unset, and otherwise sets the `Labels` timer for when it will be. A host
+  that starts a run every few seconds lists them once per interval; an
+  account idle for an hour lists them on its next run. Reconciliation's own
+  listing (§6.3) counts as one.
+- **On an unknown label id.** A label id the stored definitions lack, in a
+  history page or a fetched or imported message, asks for a listing: one
+  for the whole batch, and no sooner than 1 min (or `label_refresh`, if
+  shorter) after the last one. An id seen while a listing is in flight may
+  postdate it, so if that listing lacks it, one more follows. An id still
+  missing from a listing sent after it was seen asks for nothing more in
+  that engine (the periodic listing still runs), so an id Gmail never lists
+  can't make the engine list labels over and over.
+- **Quiet when unchanged.** A listing replaces the stored definitions only
+  if it differs from them (in any order), and only then logs a
+  `LabelDefinitionsChanged` feed entry; its time is recorded either way.
+  Reconciliation's listing follows the same rule.
+- **Never in the way of mail.** A refresh runs beside history passes and
+  jobs, never holds them back, and its commit never moves the cursor or the
+  lifecycle. It is a Live read (1 unit, §8), so read-only runners do it too.
+  A transient failure retries with the engine's backoff (a quota deferral
+  waits as long as the gate says; a cooldown, until it ends); a permanent
+  refusal or a 404 doesn't block the account, and the next periodic listing
+  tries again.
 - Store label ids, never names, on messages. Renames are a label-table update.
 
 ## 7. Actions (write path)
@@ -440,7 +469,8 @@ engine's epoch, so results meant for a dead engine are ignored).
 
 - `claim(account, version)`: bump the epoch (fencing every older writer),
   release jobs held by older engines, return the snapshot to build an engine
-  from (validated into a `ValidSnapshot`).
+  from (validated into a `ValidSnapshot`), including when the label
+  definitions were last listed and their ids (§6.6).
 - `apply(commit)`: all or nothing; rejections (`StaleEpoch`, `StaleVersion`,
   `CursorMismatch`, `StaleClaim`) are outcomes, not errors.
 - `claim_jobs(account, epoch, limit, now, attempt)`: refused for an older
@@ -455,7 +485,7 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
   last synced, in id order; empty before the first label sync.
 
-The conformance suite (`mailtide_store::conformance`, 12 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 28 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -464,10 +494,11 @@ Python stays thin; everything else is Rust. `mailtide.Runner(config,
 token_source)` is async (every method is a coroutine); `mailtide.BlockingRunner`
 has the same methods, blocking, for code without an event loop. `config` is a
 `mailtide.config.Config` of plain frozen dataclasses (database URL and pool
-limits, blob URL, watch mode, HTTP, engine tunables, quota budget); the Rust
-core parses and validates it once and raises `ValueError` naming the first
-invalid field. Postgres pools default to 2 connections opened lazily; a run
-uses one at a time. Build one runner per process, after forking:
+limits, blob URL, watch mode, HTTP, engine tunables such as
+`label_refresh_s`, quota budget); the Rust core parses and validates it once
+and raises `ValueError` naming the first invalid field. Postgres pools
+default to 2 connections opened lazily; a run uses one at a time. Build one
+runner per process, after forking:
 
 - `await migrate()`; `await run(account, budget_s) -> RunOutcome` (call on a
   schedule and on each verified push; `stop` says why it stopped: `idle` with
@@ -484,8 +515,10 @@ uses one at a time. Build one runner per process, after forking:
   actions applied, observed labels, and `content` once imported);
 - `await labels(account) -> list[Label]`: the label definitions (`id`,
   `name`, `kind`: `system` or `user`) as the mirror last synced them, in id
-  order, to show label ids as names; empty before the first label sync. A
-  `LabelDefinitionsChanged` feed entry means: read them again;
+  order, to show label ids as names; empty before the first label sync.
+  They are listed again at least every `Engine.label_refresh_s` (default
+  900 s, §6.6). A `LabelDefinitionsChanged` feed entry (logged only when
+  they changed) means: read them again;
 - `await changes(account, since) -> ChangePage | StateTooOld`: typed entries,
   each with a stable `(state, index)` identity: `MessageDiscovered`,
   `MessageImported` (once per message, with its labels then, e.g. `SENT`, its
@@ -515,7 +548,20 @@ Schema: `await migrate()` applies mailtide's versioned migrations under an
 advisory lock; hosts that run migrations with their own tool execute
 `mailtide.migrations()` (ordered SQL with its bookkeeping) instead.
 `schema()` reports `current`, `behind` or `ahead`, and `run`/`act`/`admit`
-refuse with `SchemaOutOfDate` unless it is current. Tests: `mailtide.testing`
+refuse with `SchemaOutOfDate` unless it is current.
+
+Migrations are additive. Migration 4 adds the nullable
+`mailtide_accounts.labels_refreshed_at` (§6.6); a build from before it sees
+a database migrated to version 4 as `ahead` and refuses to sync. Reverting
+it is safe, because the column is disposable (without it, the next run just
+lists the labels again):
+
+```sql
+ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at;  -- SQLite ≥ 3.35
+DELETE FROM mailtide_schema WHERE version = 4;
+```
+
+Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach
 retries, cleanups and confirmations without sleeping.
 
@@ -550,11 +596,12 @@ Wheels: abi3 for CPython ≥ 3.12, plus free-threaded 3.14t and 3.15t.
 
 Status: unit tests per rule; the simulator (`mailtide-sim`) runs the real
 engine and the shared mirror rules against a fake Gmail with swarm-sampled
-faults, including users acting through the engine, and checks invariants
-after every commit and convergence after healing (CI: 500 seeds × 1,000
-steps; locally 3,000 seeds). Zero's suites are ported by name and tracked by
-`scripts/zero_tests.py`. Python tests drive the real `Runner` against a fake
-Gmail over HTTP.
+faults, including users acting through the engine and label definitions
+created, renamed and deleted in Gmail, and checks invariants after every
+commit and convergence after healing, label definitions within the refresh
+interval (CI: 500 seeds × 1,000 steps; locally 3,000 seeds). Zero's suites
+are ported by name and tracked by `scripts/zero_tests.py`. Python tests drive
+the real `Runner` against a fake Gmail over HTTP.
 
 ## 12a. Running beside an existing system
 

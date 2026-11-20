@@ -2,14 +2,15 @@
 //!
 //! A commit runs in one transaction: lock the account row, load exactly the
 //! rows the commit touches (its messages, tombstones, jobs and reconciliation
-//! seen-set; all older messages when reconciliation finishes), apply the
-//! commit with the core's shared rules ([`AccountMirror::apply`]), and write
-//! back the difference. The rules exist once, so SQL and memory stores can't
-//! drift; the conformance suite checks both.
+//! seen-set; all older messages when reconciliation finishes; the label
+//! definitions when it lists them), apply the commit with the core's shared
+//! rules ([`AccountMirror::apply`]), and write back the difference. The rules
+//! exist once, so SQL and memory stores can't drift; the conformance suite
+//! checks both.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use mailtide::commit::{Commit, CommitOutcome, LabelOp, MessageOp, Rejection};
+use mailtide::commit::{Commit, CommitOutcome, MessageOp, Rejection};
 use mailtide::gmail::{Label, LabelKind};
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
@@ -79,7 +80,10 @@ const MIGRATIONS: &[&[&str]] = &[&[
 // 2: change-feed compaction.
 &["ALTER TABLE mailtide_accounts ADD COLUMN log_floor BIGINT NOT NULL DEFAULT 0"],
 // 3: account generations (feed positions name an incarnation).
-&["ALTER TABLE mailtide_accounts ADD COLUMN generation BIGINT NOT NULL DEFAULT 0"]];
+&["ALTER TABLE mailtide_accounts ADD COLUMN generation BIGINT NOT NULL DEFAULT 0"],
+// 4: when the label definitions were last listed (NULL: never). Disposable:
+// dropping it only makes the next run list them again.
+&["ALTER TABLE mailtide_accounts ADD COLUMN labels_refreshed_at BIGINT"]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
@@ -363,6 +367,16 @@ impl SqlStore {
         tx.commit().await.map_err(|e| unavailable(&e))
     }
 
+    /// The text a query's first column holds in its first row (tests only).
+    #[cfg(test)]
+    pub(crate) async fn text_for_tests(&self, query: &str) -> Result<String, StoreError> {
+        let row = sqlx::query(AssertSqlSafe(query.to_owned()))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        row.try_get(0).map_err(|e| corrupt("text", e))
+    }
+
     /// Run one statement (tests only).
     #[cfg(test)]
     pub(crate) async fn execute_for_tests(&self, statement: &str) -> Result<(), StoreError> {
@@ -447,7 +461,7 @@ impl SqlStore {
         lock: &'static str,
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
-            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation
+            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -485,6 +499,7 @@ impl SqlStore {
                 .map(|c| parse("cooldown", c))
                 .transpose()?,
             rng_seed: get_i("rng_seed")?.cast_unsigned(),
+            labels_refreshed_at: get_oi("labels_refreshed_at")?.map(Timestamp),
             log_floor: StateSeq(uint("log_floor", get_i("log_floor")?)?),
             generation: uint("generation", get_i("generation")?)?,
         };
@@ -499,14 +514,14 @@ impl SqlStore {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO mailtide_accounts
-               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (account) DO UPDATE SET
                epoch = excluded.epoch, engine_version = excluded.engine_version, cursor = excluded.cursor,
                sync = excluded.sync, watch_expiration = excluded.watch_expiration,
                last_activity = excluded.last_activity, cooldown = excluded.cooldown,
                rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor,
-               generation = excluded.generation",
+               generation = excluded.generation, labels_refreshed_at = excluded.labels_refreshed_at",
         )
         .bind(account.as_str())
         .bind(int("epoch", record.epoch.0)?)
@@ -520,6 +535,7 @@ impl SqlStore {
         .bind(int("seq", seq.0)?)
         .bind(int("log_floor", record.log_floor.0)?)
         .bind(int("generation", record.generation)?)
+        .bind(record.labels_refreshed_at.map(|t| t.0))
         .execute(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -607,6 +623,10 @@ impl SqlStore {
         }
         let ids: Vec<MessageId> = ids.into_iter().collect();
         Self::load_rows(tx, account, &ids, &mut mirror).await?;
+        // A label refresh compares with the stored definitions.
+        if !commit.labels.is_empty() {
+            mirror.labels = load_labels(&mut **tx, account).await?;
+        }
         Ok(mirror)
     }
 
@@ -707,7 +727,6 @@ impl SqlStore {
         tx: &mut Transaction<'static, Any>,
         before: &AccountMirror,
         after: &AccountMirror,
-        labels: &[LabelOp],
     ) -> Result<(), StoreError> {
         let account = after.account.as_str();
         Self::write_account(tx, &after.account, &after.record, after.seq).await?;
@@ -767,29 +786,29 @@ impl SqlStore {
         }
         write_seen(tx, account, before, after).await?;
         write_intents(tx, account, before, after).await?;
-        for op in labels {
-            match op {
-                LabelOp::ReplaceAll(labels) => {
-                    sqlx::query("DELETE FROM mailtide_labels WHERE account = $1")
-                        .bind(account)
-                        .execute(&mut **tx)
-                        .await
-                        .map_err(|e| unavailable(&e))?;
-                    for label in labels {
-                        let kind = match label.kind {
-                            LabelKind::System => "system",
-                            LabelKind::User => "user",
-                        };
-                        sqlx::query("INSERT INTO mailtide_labels (account, id, name, kind) VALUES ($1, $2, $3, $4)")
-                            .bind(account)
-                            .bind(label.id.0.as_str())
-                            .bind(label.name.as_str())
-                            .bind(kind)
-                            .execute(&mut **tx)
-                            .await
-                            .map_err(|e| unavailable(&e))?;
-                    }
-                }
+        // Definitions are loaded only for a commit that lists them, so they
+        // differ only when that listing changed them.
+        if before.labels != after.labels {
+            sqlx::query("DELETE FROM mailtide_labels WHERE account = $1")
+                .bind(account)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| unavailable(&e))?;
+            for label in &after.labels {
+                let kind = match label.kind {
+                    LabelKind::System => "system",
+                    LabelKind::User => "user",
+                };
+                sqlx::query(
+                    "INSERT INTO mailtide_labels (account, id, name, kind) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(account)
+                .bind(label.id.0.as_str())
+                .bind(label.name.as_str())
+                .bind(kind)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| unavailable(&e))?;
             }
         }
         for (idx, (seq, change)) in (0_i64..).zip(after.log.iter()) {
@@ -856,6 +875,11 @@ impl SqlStore {
         record.epoch = Epoch(record.epoch.0 + 1);
         record.engine_version = version;
         Self::write_account(&mut tx, account, &record, seq).await?;
+        let label_ids = load_labels(&mut *tx, account)
+            .await?
+            .into_iter()
+            .map(|label| label.id)
+            .collect();
         sqlx::query(
             "UPDATE mailtide_jobs SET state = 'ready', due_at = $2, attempt = NULL WHERE account = $1 AND state = 'running'",
         )
@@ -877,6 +901,8 @@ impl SqlStore {
             last_activity: record.last_activity,
             cooldown: record.cooldown,
             rng_seed: record.rng_seed,
+            labels_refreshed_at: record.labels_refreshed_at,
+            label_ids,
         })
     }
 
@@ -895,7 +921,7 @@ impl SqlStore {
                 tx.rollback().await.map_err(|e| unavailable(&e))?;
             }
             CommitOutcome::Applied { .. } => {
-                Self::write_diff(&mut tx, &before, &mirror, &commit.labels).await?;
+                Self::write_diff(&mut tx, &before, &mirror).await?;
                 tx.commit()
                     .await
                     .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
@@ -1569,7 +1595,7 @@ impl crate::Store for SqlStore {
         }
         let before = mirror.clone();
         let outcome = mirror.resume(now);
-        Self::write_diff(&mut tx, &before, &mirror, &[]).await?;
+        Self::write_diff(&mut tx, &before, &mirror).await?;
         tx.commit()
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
@@ -1656,7 +1682,7 @@ impl crate::Store for SqlStore {
             .await?;
         let before = mirror.clone();
         let admitted = mirror.admit_action(request, now);
-        Self::write_diff(&mut tx, &before, &mirror, &[]).await?;
+        Self::write_diff(&mut tx, &before, &mirror).await?;
         tx.commit()
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
@@ -1727,29 +1753,37 @@ impl crate::Store for SqlStore {
     }
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
-        let rows = sqlx::query("SELECT id, name, kind FROM mailtide_labels WHERE account = $1")
-            .bind(account.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| unavailable(&e))?;
-        let mut labels = rows
-            .iter()
-            .map(|row| {
-                let kind: String = row.try_get("kind").map_err(|e| corrupt("kind", e))?;
-                Ok(Label {
-                    id: LabelId(row.try_get("id").map_err(|e| corrupt("id", e))?),
-                    name: row.try_get("name").map_err(|e| corrupt("name", e))?,
-                    kind: match kind.as_str() {
-                        "system" => LabelKind::System,
-                        "user" => LabelKind::User,
-                        other => return Err(corrupt("label kind", other)),
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-        mailtide::mirror::sort_labels(&mut labels);
-        Ok(labels)
+        load_labels(&self.pool, account).await
     }
+}
+
+/// An account's label definitions, in id order.
+async fn load_labels<'e, E>(executor: E, account: &AccountId) -> Result<Vec<Label>, StoreError>
+where
+    E: sqlx::Executor<'e, Database = Any>,
+{
+    let rows = sqlx::query("SELECT id, name, kind FROM mailtide_labels WHERE account = $1")
+        .bind(account.as_str())
+        .fetch_all(executor)
+        .await
+        .map_err(|e| unavailable(&e))?;
+    let mut labels = rows
+        .iter()
+        .map(|row| {
+            let kind: String = row.try_get("kind").map_err(|e| corrupt("kind", e))?;
+            Ok(Label {
+                id: LabelId(row.try_get("id").map_err(|e| corrupt("id", e))?),
+                name: row.try_get("name").map_err(|e| corrupt("name", e))?,
+                kind: match kind.as_str() {
+                    "system" => LabelKind::System,
+                    "user" => LabelKind::User,
+                    other => return Err(corrupt("label kind", other)),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    mailtide::mirror::sort_labels(&mut labels);
+    Ok(labels)
 }
 
 /// Ids per `IN (...)` query when reading views and feed content (well under

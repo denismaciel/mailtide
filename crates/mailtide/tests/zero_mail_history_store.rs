@@ -43,7 +43,7 @@ mod common {
     use std::collections::{BTreeMap, VecDeque};
 
     use mailtide::command::{Command, CommandKind, GmailRequest};
-    use mailtide::commit::{Commit, CommitOutcome, CursorMove, JobPlan, MessageOp};
+    use mailtide::commit::{AccountOp, Commit, CommitOutcome, CursorMove, JobPlan, MessageOp};
     use mailtide::event::{Event, EventKind};
     use mailtide::gmail::{HeaderFacts, MessageObservation};
     use mailtide::ids::{
@@ -105,7 +105,9 @@ mod common {
         );
     }
 
-    /// A store following history from `cursor`, owned by a current engine.
+    /// A store following history from `cursor`, owned by a current engine,
+    /// whose label definitions were listed at time 0 (so no refresh is due
+    /// until 15 minutes in).
     pub fn live_mirror(cursor: u64) -> AccountMirror {
         let mut mirror = AccountMirror::new(account(), 1);
         mirror.claim(ENGINE_VERSION).expect("current version");
@@ -115,6 +117,7 @@ mod common {
             expected: None,
             to: HistoryId(cursor),
         });
+        c.account_ops = vec![AccountOp::SetLabelsRefreshedAt(Timestamp(0))];
         apply(&mut mirror, &c);
         mirror
     }

@@ -119,6 +119,10 @@ where
         ("label definitions read back as last synced", |s| {
             Box::pin(label_definitions(s))
         }),
+        (
+            "label refreshes persist their time; unchanged ones log nothing",
+            |s| Box::pin(label_refreshes(s)),
+        ),
         ("imported entries carry the stored envelope", |s| {
             Box::pin(imports_carry_envelopes(s))
         }),
@@ -1313,6 +1317,71 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
     expect(
         labels(store, &stranger).await?.is_empty(),
         "labels belong to their account",
+    )
+}
+
+/// When labels were last listed, and which ids are defined, reach the next
+/// engine (SPEC §6.6); a listing equal to the stored one changes nothing.
+async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    expect(
+        snapshot.labels_refreshed_at.is_none() && snapshot.label_ids.is_empty(),
+        "never listed",
+    )?;
+    let listed = vec![
+        label("INBOX", "INBOX", LabelKind::System),
+        label("Label_1", "Travel", LabelKind::User),
+    ];
+    let mut first = commit(&snapshot, 0);
+    first.labels = vec![LabelOp::ReplaceAll(listed.clone())];
+    first.account_ops = vec![mailtide::commit::AccountOp::SetLabelsRefreshedAt(
+        Timestamp(5_000),
+    )];
+    apply(store, &first).await?;
+    let snapshot = claim(store).await?;
+    expect(
+        snapshot.labels_refreshed_at == Some(Timestamp(5_000)),
+        "the refresh time survives a hand-over",
+    )?;
+    expect(
+        snapshot.label_ids == set(["INBOX", "Label_1"]),
+        "the next engine knows the defined ids",
+    )?;
+    let mut same = commit(&snapshot, 0);
+    let mut reordered = listed.clone();
+    reordered.reverse();
+    same.labels = vec![LabelOp::ReplaceAll(reordered)];
+    same.account_ops = vec![mailtide::commit::AccountOp::SetLabelsRefreshedAt(
+        Timestamp(9_000),
+    )];
+    apply(store, &same).await?;
+    // An older time never moves it back.
+    let mut late = commit(&snapshot, 1);
+    late.account_ops = vec![mailtide::commit::AccountOp::SetLabelsRefreshedAt(
+        Timestamp(7_000),
+    )];
+    apply(store, &late).await?;
+    let page = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        page.changes
+            .iter()
+            .filter(|e| e.change == Change::LabelDefinitionsChanged)
+            .count()
+            == 1,
+        "an unchanged listing is no feed entry",
+    )?;
+    expect(
+        labels(store, &account()).await? == listed,
+        "an unchanged listing keeps the definitions",
+    )?;
+    let snapshot = claim(store).await?;
+    expect(
+        snapshot.labels_refreshed_at == Some(Timestamp(9_000)),
+        "an unchanged listing still records its time, which never moves back",
     )
 }
 
