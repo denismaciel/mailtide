@@ -2555,6 +2555,21 @@ impl Sim {
                 };
                 self.deliver(kind);
             }
+            CommandKind::RunSubmissions {
+                generation,
+                attempt,
+                ..
+            } => {
+                self.mirror.write_submission(
+                    generation,
+                    &mailtide::submission::SubmissionWrite::Release(attempt),
+                    self.now,
+                );
+                self.deliver(EventKind::SubmissionsProcessed {
+                    command: id,
+                    refresh: false,
+                });
+            }
             CommandKind::DeleteBlob { message, .. } => {
                 self.blobs.remove(&message);
                 self.deliver(EventKind::BlobDeleted { command: id });
@@ -3806,5 +3821,106 @@ mod tests {
             "{:?}",
             sim.violations
         );
+    }
+}
+
+#[cfg(test)]
+mod submission_tests {
+    use mailtide::ids::{AccountId, BlobRef, ENGINE_VERSION, Timestamp};
+    use mailtide::jobs::AttemptId;
+    use mailtide::mirror::AccountMirror;
+    use mailtide::submission::{
+        Disposition, Submission, SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite,
+        SubmissionWritten,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn sends_under_faults_are_never_duplicated_and_always_settle() {
+        for seed in 0..24 {
+            let mut mirror = AccountMirror::new(AccountId("sender@example.org".into()), 1);
+            let now = Timestamp(100);
+            let key = SubmissionKey("key".into());
+            let write = |mirror: &mut AccountMirror, op| mirror.write_submission(1, &op, now);
+            let row = SubmissionRow {
+                view: Submission {
+                    key: key.clone(),
+                    tracking_id: format!("tracking-token-{seed:04}"),
+                    state: SubmissionState::Pending,
+                    send_at: now,
+                    confirmation_deadline: None,
+                    message_id: None,
+                    thread_id: None,
+                    refusal: None,
+                    retry_at: None,
+                },
+                fingerprint: "same".into(),
+                content_digest: "bytes".into(),
+                target_thread: None,
+                blob: Some(BlobRef("candidate".into())),
+                due_at: Some(now),
+                dispatch: None,
+                terminal_at: None,
+            };
+            write(&mut mirror, SubmissionWrite::Admit(Box::new(row)));
+            let first = AttemptId(1);
+            mirror
+                .claim_jobs(mirror.record.epoch, 1, now, first)
+                .unwrap();
+            if seed % 4 == 0 {
+                write(&mut mirror, SubmissionWrite::Cancel(key.clone()));
+            }
+            write(&mut mirror, SubmissionWrite::Take(first));
+            let dispatch = write(&mut mirror, SubmissionWrite::Begin(first, key.clone()));
+            let expected = match seed % 4 {
+                0 => {
+                    assert_eq!(dispatch, SubmissionWritten::Stale);
+                    SubmissionState::Canceled
+                }
+                1 => {
+                    assert!(matches!(dispatch, SubmissionWritten::Row(_)));
+                    write(
+                        &mut mirror,
+                        SubmissionWrite::Complete(
+                            first,
+                            key.clone(),
+                            Disposition::Refused {
+                                reason: "refused".into(),
+                                retry_at: None,
+                            },
+                        ),
+                    );
+                    SubmissionState::Refused
+                }
+                2 => {
+                    assert!(matches!(dispatch, SubmissionWritten::Row(_)));
+                    write(
+                        &mut mirror,
+                        SubmissionWrite::Complete(first, key.clone(), Disposition::Unanswered),
+                    );
+                    SubmissionState::Unknown
+                }
+                _ => {
+                    assert!(matches!(dispatch, SubmissionWritten::Row(_)));
+                    SubmissionState::Unknown
+                }
+            };
+            mirror.claim(ENGINE_VERSION).unwrap();
+            let successor = AttemptId(2);
+            mirror
+                .claim_jobs(mirror.record.epoch, 1, now, successor)
+                .unwrap();
+            write(&mut mirror, SubmissionWrite::Take(successor));
+            assert_eq!(
+                write(&mut mirror, SubmissionWrite::Begin(successor, key.clone())),
+                SubmissionWritten::Stale
+            );
+            mirror.write_submission(
+                1,
+                &SubmissionWrite::Expire,
+                now.plus(Duration::from_mins(10)),
+            );
+            assert_eq!(mirror.submissions[&key].view.state, expected);
+        }
     }
 }

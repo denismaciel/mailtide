@@ -131,3 +131,46 @@ fn does_not_expose_an_inbox_message_as_an_editable_draft() {
         assert!(gmail.draft_list().is_empty());
     });
 }
+
+// Zero's SMTP case maps to Gmail's wire, SENT and threading behavior in send.
+#[test]
+fn a_reply_goes_out_once_with_its_bcc_lands_in_sent_and_joins_the_thread() {
+    use mailtide::ids::MessageId;
+    use mailtide::submission::SubmissionState;
+    use mailtide_io::send::SendOptions;
+    block_on(async {
+        let (r, setup) = runner();
+        let parent =
+            setup
+                .gmail
+                .lock()
+                .add_message(Some("thread"), &["INBOX"], raw(&token(9), "Parent"));
+        synced(&r).await;
+        let bytes = [
+            b"To: reader@example.org\r\nBcc: blind@example.org\r\n".as_slice(),
+            &raw(&token(1), "Reply"),
+        ]
+        .concat();
+        let row = r
+            .submit(
+                &account(),
+                None,
+                bytes,
+                SendOptions {
+                    thread_of: Some(MessageId(parent)),
+                    ..SendOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        sync(&r).await;
+        let sent = r.submission(&account(), &row.key).await.unwrap().unwrap();
+        assert_eq!(sent.state, SubmissionState::Sent);
+        assert_eq!(sent.thread_id.unwrap().0, "thread");
+        assert_eq!(setup.gmail.sent("POST messages/send").len(), 1);
+        let gmail = setup.gmail.lock();
+        let stored = &gmail.messages[&sent.message_id.unwrap().0];
+        assert!(stored.labels.iter().any(|label| label == "SENT"));
+        assert!(String::from_utf8_lossy(&stored.raw).contains("Bcc: blind@example.org"));
+    });
+}

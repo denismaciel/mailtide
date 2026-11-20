@@ -221,6 +221,13 @@ pub enum EventKind {
         /// The command it answers.
         command: CommandId,
     },
+    /// The driver processed one account submission job.
+    SubmissionsProcessed {
+        /// The command being answered.
+        command: CommandId,
+        /// A request may have left. Poll ordinary history.
+        refresh: bool,
+    },
     /// `messages.send` acknowledged the request. Ordinary sync imports the
     /// sent message separately.
     MessageSent {

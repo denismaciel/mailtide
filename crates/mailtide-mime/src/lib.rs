@@ -23,7 +23,8 @@ pub use facts::facts;
 pub use message_id::MessageId;
 pub use parts::{PartInfo, PartRole, parts};
 pub use respond::{
-    ForwardHeaders, ForwardPart, ForwardPlan, ReplyPlan, forward_plan, quote_plain, reply_plan,
+    ForwardHeaders, ForwardPart, ForwardPlan, ReplyPlan, forward_plan, has_send_recipient,
+    quote_plain, reply_plan,
 };
 pub use tracking::{
     TRACKING_HEADER, is_tracking_id, new_tracking_id, tracking_headers, tracking_id,

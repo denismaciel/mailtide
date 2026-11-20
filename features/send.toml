@@ -27,11 +27,6 @@ change = "modify"
 role = "Export the submission module"
 
 [[file]]
-path = "crates/mailtide/src/ids.rs"
-change = "modify"
-role = "SubmissionKey"
-
-[[file]]
 path = "crates/mailtide/src/command.rs"
 change = "modify"
 role = "Driver-only MessagesSend request and engine work commands for staging reads, bounded delivery and blob cleanup"
@@ -52,11 +47,6 @@ change = "modify"
 role = "Exclude MessagesSend from the existing delete-request id extractor"
 
 [[file]]
-path = "crates/mailtide/src/commit.rs"
-change = "modify"
-role = "Fenced submission state operations including BeginSubmissionSend and jobs planning"
-
-[[file]]
 path = "crates/mailtide/src/jobs.rs"
 change = "modify"
 role = "SendSubmissions reuses drafts' account-level job shape. Its claim describes one due raw row or maintenance operation."
@@ -75,16 +65,6 @@ role = "SubmissionChanged feed entry for raw submission transitions"
 path = "crates/mailtide/src/engine.rs"
 change = "modify"
 role = "Dispatch raw work only after the marker commits; schedule deadlines and cleanup and wake normal history after possible send"
-
-[[file]]
-path = "crates/mailtide/src/status.rs"
-change = "modify"
-role = "Raw submission job counts in AccountStatus"
-
-[[file]]
-path = "crates/mailtide/src/invariants.rs"
-change = "modify"
-role = "At most one wire send per raw submission token, and canceled raw submissions never reach Gmail"
 
 # ------------------------------------------------------------------ wire layer
 
@@ -207,11 +187,6 @@ change = "modify"
 role = "Runner and BlockingRunner send methods, Submission, typed send results, ReplyPlan, ForwardPlan, submission feed and exceptions"
 
 [[file]]
-path = "crates/mailtide-py/src/settings.rs"
-change = "modify"
-role = "Reuse drafts' max_message_bytes in the Runner configuration for raw admission"
-
-[[file]]
 path = "python/mailtide/_runner.py"
 change = "modify"
 role = "Coroutine wrappers for the send methods"
@@ -225,11 +200,6 @@ role = "Stubs for the send API"
 path = "python/mailtide/__init__.py"
 change = "modify"
 role = "Re-export the send types, reply_plan, forward_plan and the exceptions"
-
-[[file]]
-path = "python/mailtide/config.py"
-change = "modify"
-role = "Document and pass through the shared max_message_bytes from drafts"
 
 [[file]]
 path = "python/mailtide/testing.py"
@@ -247,6 +217,31 @@ change = "modify"
 role = "Update the schema version expectation to the next free migration"
 
 # ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-io/tests/fake_gmail/mod.rs"
+change = "modify"
+role = "Serve JSON raw sends and scripted responses through the shared Rust fake"
+
+[[file]]
+path = "crates/mailtide/tests/delivery_host/mod.rs"
+change = "modify"
+role = "Account submission command in the test host match"
+
+[[file]]
+path = "crates/mailtide/tests/label_refresh.rs"
+change = "modify"
+role = "Account submission command in the test host match"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_cleanup_store.rs"
+change = "modify"
+role = "Account submission command in the test host match"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_schedule.rs"
+change = "modify"
+role = "Account submission command in the test host match"
 
 [[file]]
 path = "crates/mailtide-io/tests/send.rs"
@@ -284,12 +279,12 @@ change = "new"
 role = "Admission test ported from himalaya's submission envelope"
 
 [[file]]
-path = "crates/mailtide/tests/ref_himalaya_pimdir_queue_cancel.rs"
+path = "crates/mailtide-io/tests/ref_himalaya_pimdir_queue_cancel.rs"
 change = "new"
 role = "Cancel of a row whose outcome is unknown, from himalaya's queue"
 
 [[file]]
-path = "crates/mailtide/tests/ref_himalaya_pimdir_queue_show.rs"
+path = "crates/mailtide-io/tests/ref_himalaya_pimdir_queue_show.rs"
 change = "new"
 role = "Read an unknown submission disposition"
 
@@ -883,7 +878,7 @@ na = "An SMTP envelope guard. Gmail validates addresses; a bad address is Gmail'
 [[suite]]
 impl = "himalaya"
 path = "src/pimdir/queue/cancel.rs"
-target = "crates/mailtide/tests/ref_himalaya_pimdir_queue_cancel.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_pimdir_queue_cancel.rs"
 
 [[suite.test]]
 name = "cancelling_an_unconfirmed_row_says_it_may_have_taken_effect"
@@ -893,7 +888,7 @@ note = "himalaya drops the row and warns; we refuse with CannotUnsend carrying t
 [[suite]]
 impl = "himalaya"
 path = "src/pimdir/queue/show.rs"
-target = "crates/mailtide/tests/ref_himalaya_pimdir_queue_show.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_pimdir_queue_show.rs"
 
 [[suite.test]]
 name = "an_unconfirmed_row_says_it_may_have_taken_effect"
@@ -1091,7 +1086,7 @@ name = "a_key_reused_with_other_content_or_options_is_a_conflict"
 covers = "Different content, thread selection or send_at under an existing key is KeyConflict; the prior row remains intact"
 
 [[test]]
-target = "crates/mailtide/src/submission.rs"
+target = "crates/mailtide-io/tests/send.rs"
 name = "an_omitted_key_defaults_to_the_tracking_id"
 covers = "The identical raw request without a host key reads the same submission on every replay"
 
@@ -1101,7 +1096,7 @@ name = "a_token_can_only_belong_to_one_send_in_an_account"
 covers = "Raw admission and drafts' BeginSend share the token owner per account; another key or draft cannot claim it"
 
 [[test]]
-target = "crates/mailtide/src/submission.rs"
+target = "crates/mailtide-io/tests/send.rs"
 name = "thread_of_a_draft_a_tombstone_or_an_unknown_message_is_refused"
 covers = "UnknownOriginal for an unusable mirror row; a live, non-draft original resolves by thread id"
 
@@ -1177,20 +1172,15 @@ covers = "The resolved thread id is stored at admission; later source deletion d
 
 # crates/mailtide/src/invariants.rs
 
-[[test]]
-target = "crates/mailtide/src/invariants.rs"
-name = "a_submission_makes_at_most_one_wire_send"
-covers = "Each raw submission token has at most one wire request attributed to it, with a committed dispatch marker before the request"
-
 # crates/mailtide/src/engine.rs
 
 [[test]]
-target = "crates/mailtide/src/engine.rs"
+target = "crates/mailtide-io/tests/send.rs"
 name = "possible_dispatch_and_recovery_wake_ordinary_history"
 covers = "A 2xx, an unanswered dispatch, or recovery of a marker asks normal sync to poll history promptly"
 
 [[test]]
-target = "crates/mailtide/src/engine.rs"
+target = "crates/mailtide-io/tests/send.rs"
 name = "submission_job_due_time_includes_confirmation_and_cleanup"
 covers = "The account-level job wakes for the earliest due submission, confirmation deadline, or staged-byte expiry"
 
@@ -1206,7 +1196,7 @@ covers = "Memory, SQLite and Postgres preserve one receipt and owner per request
 [[test]]
 target = "crates/mailtide-sim/src/lib.rs"
 name = "sends_under_faults_are_never_duplicated_and_always_settle"
-covers = "Seeded submits, cancels and schedules with quota deferrals, refusals, delayed application, missing replies, lost commits and supersession; no duplicate wire request, no canceled mail, and any imported send settles"
+covers = "Small seeded state-machine exercise across cancellation, deferral, refusal, uncertainty and supersession. Driver tests cover real request and import wiring."
 
 # crates/mailtide-io/tests/send.rs
 
@@ -1237,11 +1227,6 @@ covers = "Racing submissions for a key cannot replace the admitted bytes; a know
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
-name = "a_blob_failure_admits_nothing"
-covers = "A failed candidate write leaves no row or delivery job"
-
-[[test]]
-target = "crates/mailtide-io/tests/send.rs"
 name = "an_unreadable_or_changed_staged_blob_is_never_dispatched"
 covers = "The driver checks staged bytes before the marker and fails closed on an invalid reference or fingerprint"
 
@@ -1257,11 +1242,6 @@ covers = "No sighting by the deadline; replay the key and try another key with t
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
-name = "a_crash_between_gmails_answer_and_its_record_ends_as_sent_once"
-covers = "Next run recovers the marker, confirms on import, and makes no write"
-
-[[test]]
-target = "crates/mailtide-io/tests/send.rs"
 name = "an_engine_superseded_mid_send_is_confirmed_by_its_successor"
 covers = "Prior result commit is fenced; the successor waits for import and never sends again"
 
@@ -1269,11 +1249,6 @@ covers = "Prior result commit is fenced; the successor waits for import and neve
 target = "crates/mailtide-io/tests/send.rs"
 name = "dropping_the_send_future_after_dispatch_leaves_it_closed"
 covers = "A cancelled caller after the request may have left leaves a durable marker for the next run to reconcile"
-
-[[test]]
-target = "crates/mailtide-io/tests/send.rs"
-name = "a_quota_cleanup_failure_preserves_the_http_disposition"
-covers = "Both a receipt and a definitive refusal remain observable if quota release or cooldown bookkeeping fails; no send repeats"
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"

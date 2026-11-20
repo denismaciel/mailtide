@@ -19,6 +19,7 @@ pub mod purge;
 pub mod quota_gate;
 pub mod runner;
 pub mod search;
+pub mod send;
 pub mod transport;
 
 /// The host's clock, as the engine's time type.

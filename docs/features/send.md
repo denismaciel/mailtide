@@ -236,6 +236,18 @@ send receipts loses raw idempotency history and cross-route reservations.
 Hosts must preserve those keys and tokens across rollback to avoid replay.
 Feed cursors can retain their positions across the deleted entries.
 
+### Known limits
+
+- Submission state counts are available through the paged outbox. Account
+  sync status does not aggregate them.
+- A process crash between staging and admission can leave an orphan
+  candidate until account offboarding.
+- Raw confirmation uses ordinary import. An import with missing facts can
+  leave a send unknown. Later first imports can still settle a token after
+  its report deadline.
+- The run budget bounds dispatch. A request already issued may take up to
+  the request timeout, plus bounded quota cleanup.
+
 ### Reply and forward
 
 In `mailtide-mime`, build on `compose-mime`'s `Address` and `MessageId`
@@ -289,9 +301,9 @@ Own tests cover the JSON request, quota and write guards, one-request
 dispositions, admission and cross-route token collisions, the claim/cancel
 race, restart and schedule, atomic import confirmation, unknown and late
 import, receipt and blob retention, draft routing, reply/forward and Python.
-Store conformance runs on every backend. The simulator varies crashes,
-supersession, and Gmail accepting, refusing, dropping or applying a request
-after its answer is lost.
+Store conformance runs on every backend. The shared fake exercises
+supersession, refusal and lost answers through the real driver. The
+simulator tests the send state transitions without a new Gmail fault suite.
 
 ## 6. Slices
 

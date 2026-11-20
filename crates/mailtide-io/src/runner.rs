@@ -1159,9 +1159,15 @@ where
                 let seed = mailtide::ids::stable_hash(account.as_str().as_bytes())
                     ^ u64::try_from(now.0).unwrap_or(0);
                 if let Some(cooldown) = Backoff::DEFAULT.cooldown(&failure, account, now, seed) {
-                    match self.quota.cool_down_until(cooldown).await {
-                        Ok(until) => *retry_at = Some(until),
-                        Err(error) => {
+                    let deadline = Some(Instant::now() + self.config.writes.request_timeout);
+                    match before_budget(deadline, self.quota.cool_down_until(cooldown)).await {
+                        None => {
+                            cleanup.get_or_insert(RunError::Quota(
+                                "cooldown exceeded the request timeout".into(),
+                            ));
+                        }
+                        Some(Ok(until)) => *retry_at = Some(until),
+                        Some(Err(error)) => {
                             cleanup.get_or_insert(RunError::Quota(error.0));
                         }
                     }
@@ -1290,6 +1296,17 @@ where
             Err(StoreError::Rejected(_)) => return Ok(None),
             Err(error) => return Err(RunError::Store(error)),
         };
+        if matches!(snapshot.sync, mailtide::state::SyncState::Blocked { .. }) {
+            self.store
+                .write_submission(
+                    account,
+                    snapshot.account_generation,
+                    &mailtide::submission::SubmissionWrite::Expire,
+                    self.clock.now(),
+                )
+                .await
+                .map_err(RunError::Store)?;
+        }
         let snapshot = snapshot
             .validate()
             .map_err(|e| RunError::Corrupt(format!("{e:?}")))?;
@@ -1397,8 +1414,9 @@ where
                     | CommandKind::Commit(_)
                     | CommandKind::AdvanceAudit(_)
                     | CommandKind::ClaimJobs { .. }
-                    | CommandKind::DeleteBlob { .. }) => {
-                        if let Some(event) = self.execute(id, kind, &mut report).await? {
+                    | CommandKind::DeleteBlob { .. }
+                    | CommandKind::RunSubmissions { .. }) => {
+                        if let Some(event) = self.execute(id, kind, &mut report, deadline).await? {
                             enqueue_followups(
                                 &mut queue,
                                 engine.handle(Event {
@@ -1450,8 +1468,9 @@ where
         let mut refused = None;
         while let Some(command) = queue.pop_front() {
             if matches!(command.kind, CommandKind::Commit(_))
-                && let Some(EventKind::CommitRejected { reason, .. }) =
-                    self.execute(command.id, command.kind, report).await?
+                && let Some(EventKind::CommitRejected { reason, .. }) = self
+                    .execute(command.id, command.kind, report, Instant::now())
+                    .await?
             {
                 refused = Some(reason);
             }
@@ -1465,6 +1484,7 @@ where
         id: CommandId,
         kind: CommandKind,
         report: &mut SyncReport,
+        deadline: Instant,
     ) -> Result<Option<EventKind>, RunError> {
         match kind {
             CommandKind::Gmail(call) => self.gmail(id, call, report).await.map(Some),
@@ -1523,6 +1543,19 @@ where
                 })),
                 Err(error) => Err(RunError::Store(error)),
             },
+            CommandKind::RunSubmissions {
+                account,
+                generation,
+                attempt,
+            } => {
+                let refresh = self
+                    .run_submission_work(&account, generation, attempt, deadline, report)
+                    .await?;
+                Ok(Some(EventKind::SubmissionsProcessed {
+                    command: id,
+                    refresh,
+                }))
+            }
             CommandKind::DeleteBlob { account, message } => {
                 if let Ok(()) = self.blobs.delete(&blob_key(&account, &message)).await {
                     Ok(Some(EventKind::BlobDeleted { command: id }))
@@ -1731,8 +1764,11 @@ where
         };
         // After a possible send, preserve the disposition even past the
         // budget. Otherwise an expired budget can abandon the unused lease.
-        let release_budget =
-            budget.filter(|_| matches!(&outcome, Outcome::DispatchExpired | Outcome::NotSent(_)));
+        let release_budget = if matches!(call.request, GmailRequest::MessagesSend { .. }) {
+            Some(Instant::now() + self.config.writes.request_timeout)
+        } else {
+            budget.filter(|_| matches!(&outcome, Outcome::DispatchExpired | Outcome::NotSent(_)))
+        };
         let cleanup = held.release(bytes, self.clock.now(), release_budget).await;
         Ok(Attempt::Done { outcome, cleanup })
     }
@@ -1766,7 +1802,19 @@ where
                 return Outcome::DispatchExpired;
             }
             report.gmail_requests += 1;
-            let response = match self.transport.send(http, &token).await {
+            let send = self.transport.send(http, &token);
+            let sent = if matches!(gmail_request, GmailRequest::MessagesSend { .. }) {
+                tokio::time::timeout(self.config.writes.request_timeout, send)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(TransportError::OutcomeUnknown(
+                            "messages.send timed out".into(),
+                        ))
+                    })
+            } else {
+                send.await
+            };
+            let response = match sent {
                 Ok(response) => response,
                 Err(TransportError::NotSent(detail)) if last.is_none() => {
                     return Outcome::NotSent(transient(detail));

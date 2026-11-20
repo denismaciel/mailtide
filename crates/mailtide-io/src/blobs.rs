@@ -118,6 +118,12 @@ pub fn blob_key(account: &AccountId, message: &MessageId) -> BlobRef {
     BlobRef(format!("{}/{}.eml", account.as_str(), message.0))
 }
 
+/// A unique candidate staged under the account's outbox prefix.
+#[must_use]
+pub fn outbox_key(account: &AccountId, nonce: &str) -> BlobRef {
+    BlobRef(format!("{}/outbox/{nonce}.eml", account.as_str()))
+}
+
 /// The settings a store is built with: backend environment variables
 /// (lowercased, as `object_store` config keys), then explicit options.
 fn store_options(

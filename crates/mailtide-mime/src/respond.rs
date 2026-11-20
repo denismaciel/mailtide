@@ -162,6 +162,29 @@ pub fn forward_plan(raw: &[u8]) -> Result<ForwardPlan, MimeError> {
     })
 }
 
+/// Whether these bytes have a readable To, Cc or Bcc recipient.
+#[must_use]
+pub fn has_send_recipient(raw: &[u8]) -> bool {
+    // Parse only the header block. Staged attachments may be large.
+    let headers = raw
+        .split_inclusive(|byte| *byte == b'\n')
+        .take_while(|line| *line != b"\r\n" && *line != b"\n")
+        .map(<[u8]>::len)
+        .sum();
+    let mut block = raw[..headers].to_vec();
+    block.extend_from_slice(b"\r\n\r\n");
+    parser().parse(&block).is_some_and(|message| {
+        [HeaderName::To, HeaderName::Cc, HeaderName::Bcc]
+            .into_iter()
+            .any(|name| {
+                message
+                    .headers()
+                    .all(name)
+                    .any(|header| !parse_addresses(&unfold(header.raw_value())).is_empty())
+            })
+    })
+}
+
 fn original(raw: &[u8]) -> Result<Message<'_>, MimeError> {
     parser()
         .parse(raw)

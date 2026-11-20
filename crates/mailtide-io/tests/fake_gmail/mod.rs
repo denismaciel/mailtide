@@ -343,6 +343,23 @@ impl FakeGmail {
                     {"id": "SENT", "name": "SENT", "type": "system"},
                 ]}),
             ),
+            (Method::Post, ["messages", "send"]) => {
+                let thread = body["threadId"].as_str();
+                if thread
+                    .is_some_and(|thread| !mailbox.messages.values().any(|m| m.thread == thread))
+                {
+                    return not_found();
+                }
+                let raw = URL_SAFE_NO_PAD
+                    .decode(body["raw"].as_str().expect("raw"))
+                    .expect("base64url");
+                let bytes = mailbox.stamp(&raw);
+                let id = mailbox.add_message(thread, &["SENT"], bytes);
+                answer(
+                    200,
+                    &json!({"id": id, "threadId": mailbox.messages[&id].thread}),
+                )
+            }
             (Method::Get, ["history"]) => {
                 let start: u64 = query["startHistoryId"].parse().expect("start");
                 let records: Vec<&Value> = mailbox

@@ -468,6 +468,9 @@ impl Engine {
             EventKind::LabelsModified { command } => self.on_modified(command, now),
             EventKind::DraftsListed { command, page } => self.on_drafts_listed(command, page, now),
             // Search, label writes, and draft methods are direct driver calls.
+            EventKind::SubmissionsProcessed { command, refresh } => {
+                self.on_submissions_processed(command, refresh, now)
+            }
             EventKind::Searched { .. }
             | EventKind::LabelSaved { .. }
             | EventKind::LabelNameTaken { .. }
@@ -1455,7 +1458,17 @@ impl Engine {
                     out.push(self.gmail(request, priority, Waiting::Job(job)));
                 }
                 ClaimedWork::SendSubmissions => {
-                    out.push(self.finish_job(&job, JobOutcome::Done, Vec::new(), now));
+                    let id = self.command_id();
+                    let attempt = job.attempt;
+                    self.waiting.insert(id, Waiting::Job(job));
+                    out.push(Command {
+                        id,
+                        kind: CommandKind::RunSubmissions {
+                            account: self.state.account.clone(),
+                            generation: self.state.account_generation,
+                            attempt,
+                        },
+                    });
                 }
                 ClaimedWork::BlobCleanup(message) => {
                     let message = message.clone();
@@ -1481,6 +1494,28 @@ impl Engine {
         if out.is_empty() {
             return vec![self.status_command()];
         }
+        out
+    }
+
+    fn on_submissions_processed(
+        &mut self,
+        command: CommandId,
+        refresh: bool,
+        now: Timestamp,
+    ) -> Vec<Command> {
+        if self
+            .take_job(command, |kind| *kind == JobKind::SendSubmissions)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        self.running_jobs = self.running_jobs.saturating_sub(1);
+        let mut out = if refresh {
+            self.resume_sync(now)
+        } else {
+            Vec::new()
+        };
+        out.extend(self.claim_jobs(now));
         out
     }
 
@@ -2701,7 +2736,8 @@ mod tests {
                     CommandKind::Schedule { .. }
                     | CommandKind::DeleteBlob { .. }
                     | CommandKind::ReportStatus(_)
-                    | CommandKind::AdvanceAudit(_) => None,
+                    | CommandKind::AdvanceAudit(_)
+                    | CommandKind::RunSubmissions { .. } => None,
                 };
                 if let Some(answer) = answer {
                     queue.extend(self.engine.handle(answer));
@@ -3174,7 +3210,8 @@ mod tests {
                 | CommandKind::ClaimJobs { .. }
                 | CommandKind::DeleteBlob { .. }
                 | CommandKind::ReportStatus(_)
-                | CommandKind::AdvanceAudit(_) => None,
+                | CommandKind::AdvanceAudit(_)
+                | CommandKind::RunSubmissions { .. } => None,
             })
             .collect()
     }
@@ -3187,7 +3224,8 @@ mod tests {
             | CommandKind::ClaimJobs { .. }
             | CommandKind::DeleteBlob { .. }
             | CommandKind::ReportStatus(_)
-            | CommandKind::AdvanceAudit(_) => None,
+            | CommandKind::AdvanceAudit(_)
+            | CommandKind::RunSubmissions { .. } => None,
         })
     }
 

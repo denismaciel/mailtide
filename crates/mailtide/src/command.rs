@@ -56,6 +56,15 @@ pub enum CommandKind {
         /// by the quota gate.
         floor: crate::quota::Priority,
     },
+    /// Process one due raw submission using a claimed account job.
+    RunSubmissions {
+        /// The account.
+        account: AccountId,
+        /// Its incarnation from the claim.
+        generation: u64,
+        /// The attempt that holds the queue job.
+        attempt: crate::jobs::AttemptId,
+    },
     /// Delete a message's raw content at its deterministic key; report
     /// `BlobDeleted`.
     DeleteBlob {

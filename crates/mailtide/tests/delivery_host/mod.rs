@@ -244,7 +244,9 @@ impl Host {
                     next_due: self.mirror.next_due(),
                 }),
                 CommandKind::DeleteBlob { .. } => Some(EventKind::BlobDeleted { command: id }),
-                CommandKind::ReportStatus(_) | CommandKind::AdvanceAudit(_) => None,
+                CommandKind::ReportStatus(_)
+                | CommandKind::AdvanceAudit(_)
+                | CommandKind::RunSubmissions { .. } => None,
             };
             if let Some(kind) = event {
                 queue.extend(self.engine.handle(Event {
