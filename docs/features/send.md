@@ -368,6 +368,10 @@ is:
   whichever of `drafts`, `identities`, `label-edit`, `purge`, `send` lands
   first.
 
+**Landed.** PUT, PATCH and DELETE are on `main`; headers, raw bodies and
+session URIs stay this plan's. The transport now reports a connection dropped
+after the request went out as `OutcomeUnknown`, never `NotSent`.
+
 ## 7. Decisions
 
 1. **A send is an intent with delivery and confirmation; draft writes are

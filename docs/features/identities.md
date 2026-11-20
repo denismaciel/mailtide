@@ -134,10 +134,10 @@ default identity; two candidates at one level are `Ambiguous`.
 
 `SenderError`: `NotAnIdentity`, `NotVerified`, `Unknown` (identities never
 read, or a fresh read failed: no guess is made).
-`SettingsError`: `NotFound`, `Invalid { field }`, `Forbidden`, `Deferred`,
+`SettingsError`: `NotFound`, `Invalid { field }`, `Forbidden`, `Deferred { until }`,
 `ReadOnly`, `Retryable`, `OutcomeUnknown`. Python: `SenderNotAllowed`,
 `AmbiguousSender`, `SettingNotFound`, `SettingInvalid`, `SettingForbidden`,
-and the shared `QuotaDeferred` and `WriteOutcomeUnknown`.
+and the shared `QuotaDeferred` (`until_ms`) and `WriteOutcomeUnknown`.
 
 Patches are tri-state per field (keep, set, clear; `mailtide.UNSET` in
 Python). `set_vacation` validates before any call: an enabled responder needs
@@ -366,6 +366,16 @@ is:
 - the `QuotaDeferred` Python exception in `crates/mailtide-py/src/lib.rs`
   (a gate deferral that outlasted the call's budget): added by whichever of
   `drafts`, `identities`, `label-edit`, `purge`, `search` lands first.
+
+**Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
+and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
+`WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
+method that raises them), PUT, PATCH and DELETE, and schema checks on every
+store read and write. The account-level job kind is not part of it: the first
+of `drafts` and `identities` adds it. The refresh reads run in the engine job,
+not through `call_gmail`, so "a refused read never blocks the account" is this
+plan's own engine handling; a write's missing scope arrives as
+`CallError::Refused` with `ApiAccessDenied`.
 
 ## 7. Decisions
 

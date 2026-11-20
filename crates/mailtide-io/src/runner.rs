@@ -567,6 +567,10 @@ where
     /// the answer and the record loses nothing the next sync does not bring
     /// back.
     ///
+    /// It is for the driver's features, not a host API promise: it sends
+    /// what it is given, bypassing intents and the overlay (read-only mode
+    /// still applies).
+    ///
     /// [`AccountProblem::ApiAccessDenied`]: mailtide::retry::AccountProblem::ApiAccessDenied
     pub async fn call_gmail(
         &self,

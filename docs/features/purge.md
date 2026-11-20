@@ -100,7 +100,7 @@ Python: `await runner.purge(account, message_ids=… | thread_id=…,
 anywhere=False, budget_s=…) -> PurgeOutcome`, `await runner.empty(account,
 "trash" | "spam", budget_s=…) -> EmptyOutcome`, `Config(purge="off")`, and
 the exceptions `PurgeDisabled`, `PurgeScopeRequired`, `MirrorStale`,
-`TooManyMessages`; `ReadOnlyMode` and `QuotaDeferred` are shared.
+`TooManyMessages`; `ReadOnlyMode` and `QuotaDeferred` (`until_ms`) are shared.
 
 ### What a call does
 
@@ -279,6 +279,13 @@ is:
 - the `QuotaDeferred` Python exception in `crates/mailtide-py/src/lib.rs`
   (a gate deferral that outlasted the call's budget): added by whichever of
   `drafts`, `identities`, `label-edit`, `purge`, `search` lands first.
+
+**Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
+and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
+`WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
+method that raises them), PUT, PATCH and DELETE, and schema checks on every
+store read and write. A history 404 arrives as the `HistoryExpired` event, not
+`NotFound`; a missing scope is `CallError::Refused` with `ApiAccessDenied`.
 
 Slice 3 starts after the unknowns below are run: two of them decide
 constants, one decides the pre-check.

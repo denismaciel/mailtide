@@ -126,7 +126,7 @@ message_visibility=None, color=KEEP, sublabels="follow")`,
 `list_visibility` (`"show" | "show_if_unread" | "hide" | None`),
 `message_visibility` (`"show" | "hide" | None`), `color: LabelColor | None`
 and `parent_id: str | None`. Exceptions: `LabelNotFound`, `LabelNameTaken`,
-`InvalidLabel`, `LabelHasSublabels`, plus the shared `QuotaDeferred`,
+`InvalidLabel`, `LabelHasSublabels`, plus the shared `QuotaDeferred` (`until_ms`),
 `WriteOutcomeUnknown` and `ReadOnlyMode`.
 
 ### Gmail calls and quota
@@ -360,6 +360,12 @@ is:
 - the `QuotaDeferred` Python exception in `crates/mailtide-py/src/lib.rs`
   (a gate deferral that outlasted the call's budget): added by whichever of
   `drafts`, `identities`, `label-edit`, `purge`, `search` lands first.
+
+**Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
+and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
+`WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
+method that raises them), PUT, PATCH and DELETE, and schema checks on every
+store read and write. A lost answer arrives as `CallError::OutcomeUnknown`.
 
 ## 7. Decisions
 

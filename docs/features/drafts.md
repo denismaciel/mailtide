@@ -92,7 +92,7 @@ has not run yet), `sending` or `send_unconfirmed`.
 
 Python `Runner` and `BlockingRunner` get the same seven methods (`raw: bytes`,
 keyword options), frozen dataclasses for the four result types, and the
-exceptions `DraftNotFound`, `DraftConflict`, `DraftTooLarge`, `QuotaDeferred`,
+exceptions `DraftNotFound`, `DraftConflict`, `DraftTooLarge`, `QuotaDeferred` (`until_ms`),
 `WriteOutcomeUnknown`, `SendInProgress`, `SendUnconfirmed`; `ReadOnlyMode`
 exists.
 
@@ -323,6 +323,16 @@ is:
 - the `QuotaDeferred` Python exception in `crates/mailtide-py/src/lib.rs`
   (a gate deferral that outlasted the call's budget): added by whichever of
   `drafts`, `identities`, `label-edit`, `purge`, `search` lands first.
+
+**Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
+and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
+`WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
+method that raises them), PUT, PATCH and DELETE, and schema checks on every
+store read and write. The account-level job kind is not part of it: the first
+of `drafts` and `identities` adds it with its own claim payload. A send retry
+waits out the HTTP request timeout, which `Runner` does not expose (it is the
+transport's, and `Runner` is generic over the transport); this plan adds it,
+e.g. as a `RunnerConfig` field.
 
 ## 7. Decisions
 

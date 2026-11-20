@@ -134,7 +134,7 @@ limit=100, page_token=None, priority="foreground", budget_s=10.0)` and
 `search_threads(...)`, on `Runner` and `BlockingRunner`; frozen dataclasses
 `SearchPage`, `SearchHit`, `ThreadSearchPage`, `ThreadHit`; exceptions
 `SearchRefused`, `InvalidPageToken`, `PageTokenRejected` (a subclass),
-the shared `QuotaDeferred`, `GmailUnavailable`, `AccountBlocked`;
+the shared `QuotaDeferred` (`until_ms`), `GmailUnavailable`, `AccountBlocked`;
 `AccountNotTracked` exists. Two pure helpers, `mailtide.search_literal(text)`
 and `mailtide.search_by_message_id(id)`.
 
@@ -363,6 +363,13 @@ is:
 - the `QuotaDeferred` Python exception in `crates/mailtide-py/src/lib.rs`
   (a gate deferral that outlasted the call's budget): added by whichever of
   `drafts`, `identities`, `label-edit`, `purge`, `search` lands first.
+
+**Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
+and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
+`WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
+method that raises them), PUT, PATCH and DELETE, and schema checks on every
+store read and write. Map `CallError::OutcomeUnknown` (a timeout) to
+`Retryable`, and a continuation's `NotFound` (404) to `PageTokenRejected`.
 
 Slices 1 to 3 are a usable feature. The `[[unknown]]` checks run before
 slice 1.
