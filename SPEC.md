@@ -143,7 +143,12 @@ The store keeps, per account:
   `version`, `state` (`pending | delivered | blocked`), attempts and error.
 - **change log** (for consumers): an append-only list of
   `(state_seq, object_type, object_id, kind)`, so host features can ask "what
-  changed since state S" [J]. The state string encodes `state_seq`. An import
+  changed since state S" [J]. Entries are numbered within their commit, and
+  a state string names how far a consumer read: `mt2-<gen>.<seq>` is commit
+  `seq` and everything before it, `mt2-<gen>.<seq>.<idx>` everything through
+  entry `idx` of commit `seq` (fields hex). A page that ends inside a commit
+  returns the three-field form; one that ends on a commit boundary returns
+  the two-field form, which means what it always did. An import
   entry is read together with the envelope its message row holds (header
   facts and blob) instead of keeping a copy in the log: a message's content
   never changes in Gmail, so the row matches the entry, and older entries
@@ -509,11 +514,18 @@ engine's epoch, so results meant for a dead engine are ignored).
   epoch; `Deliver` jobs carry their pending changes.
 - `admit(account, request, now)` and `prioritise(account, ids, now)`:
   unfenced writes for users' actions (§7.1) and opened messages (§6.4).
-- `changes(account, since, limit)`: the change feed (`ChangeFeed::Page` of
-  `ChangeEntry { state, index, change, content }`, whole commits only, or
-  `TooOld` after compaction; `content` is the stored content of a
-  `MessageImported` entry's message, loaded in chunks of ids, `None` once it
-  is deleted); `compact(account, through)`;
+- `changes(account, since: FeedCursor, limit)`: the change feed
+  (`ChangeFeed::Page` of `ChangeEntry { state, index, change, content }`, or
+  `TooOld` after compaction). A page is the first `limit` entries after
+  `since` in `(state, index)` order (`limit` clamped to `1..=MAX_FEED_PAGE`,
+  5,000), so it may end inside a commit; `next` is its last entry, as the
+  whole commit when that entry ends it (or `since` for an empty page), and
+  `has_more` says whether more follow. `TooOld` when `since` is behind the
+  floor or inside the floor commit (compaction removes whole commits).
+  `content` is the stored content of a `MessageImported` entry's message,
+  loaded for the page's imports in chunks of ids, `None` once it is
+  deleted. `compact(account, through)` removes whole commits; a reader
+  inside commit `S` compacts through `FeedCursor::compactable()`, `S - 1`;
   `message_ids(account, after, limit)` to rebuild a consumer.
 - `messages(account, ids)`: `MessageView`s for hosts.
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
@@ -524,7 +536,7 @@ engine's epoch, so results meant for a dead engine are ignored).
   missing) or ahead of it (a newer mailtide migrated it). It asks once: after
   it has seen the schema current, it and its clones do not ask again.
 
-The conformance suite (`mailtide_store::conformance`, 35 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 39 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -565,14 +577,18 @@ runner per process, after forking:
   They are listed again at least every `Engine.label_refresh_s` (default
   900 s, §6.6). A `LabelDefinitionsChanged` feed entry (logged only when
   they changed) means: read them again;
-- `await changes(account, since) -> ChangePage | StateTooOld`: typed entries,
+- `await changes(account, since, limit=500) -> ChangePage | StateTooOld`:
+  at most `limit` entries per page (at most 5,000), continuing from
+  `page.next` while `page.has_more`; `next` may point inside a commit, and
+  every state string stored before still resumes where it did. Typed entries,
   each with a stable `(state, index)` identity: `MessageDiscovered`,
   `MessageImported` (once per message, with its labels then, e.g. `SENT`, its
   blob, and `content`: the `MessageContent` `messages` returns, so a message
   list needs no second call; `None` once the message is deleted),
   `LabelsChanged` (added/removed), `OverlayChanged`,
   `MessageDeleted` (last thread and labels), `LabelDefinitionsChanged`;
-  `await compact(account, through)`; `await message_ids(account, after)`;
+  `await compact(account, through)` (whole commits: a `through` inside a
+  commit keeps that commit); `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
@@ -616,6 +632,20 @@ lists the labels again):
 ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at;  -- SQLite ≥ 3.35
 DELETE FROM mailtide_schema WHERE version = 4;
 ```
+
+Migration 5 has no statement of its own: it raises the version because
+state strings may now name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`,
+§4), which a build from before it cannot decode, so such a build sees the
+database as `ahead` and refuses to sync (its `changes` raises `ValueError`
+for such a string, never a wrong page). Reverting loses nothing:
+
+```sql
+DELETE FROM mailtide_schema WHERE version = 5;
+```
+
+A consumer holding a three-field position must first read on with the new
+build until `next` is a commit boundary (a two-field string), or rebuild as
+after `StateTooOld`; two-field positions mean the same in every build.
 
 Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach

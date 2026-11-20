@@ -244,12 +244,15 @@ class Runner:
         self, account: str, since: str | None = None, limit: int = 500
     ) -> ChangePage | StateTooOld:
         """Feed entries after state string ``since`` (``None``: from the start), or
-        ``StateTooOld`` if that state was compacted away."""
+        ``StateTooOld`` if that state was compacted away. A page holds at most
+        ``limit`` entries (at most 5,000) and may end inside a commit; continue
+        from ``page.next`` while ``page.has_more``."""
         return await self._core.changes(account, since, limit)
 
     async def compact(self, account: str, through: str) -> int:
         """Drop feed entries at or before state ``through`` once every consumer
-        processed them. Returns how many were removed."""
+        processed them: whole commits only, so a ``through`` inside a commit
+        keeps that commit. Returns how many were removed."""
         return await self._core.compact(account, through)
 
     async def message_ids(

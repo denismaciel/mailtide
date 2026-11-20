@@ -54,7 +54,7 @@ outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule an
 await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from request paths
 await runner.prioritise("alice@example.com", ["18c…"])  # opened: fetch its body next
 status = await runner.status("alice@example.com")  # never preempts a running sync
-page = await runner.changes("alice@example.com", since=None)  # typed feed; imports carry headers
+page = await runner.changes("alice@example.com", since=None)  # bounded pages; imports carry headers
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
 ```
