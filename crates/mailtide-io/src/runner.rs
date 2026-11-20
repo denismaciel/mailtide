@@ -13,13 +13,16 @@ use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
 use mailtide::engine::Stopped;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{ImportedMessage, Label};
-use mailtide::ids::{AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, Timestamp};
+use mailtide::ids::{
+    AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, ThreadId, Timestamp,
+};
 use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
 use mailtide::outbox::ActionRequest;
 use mailtide::quota::{Admission, Priority};
 use mailtide::retry::{Backoff, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::schedule::TimerKind;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status, TrackOutcome};
+use mailtide::thread::ThreadView;
 use mailtide::{Engine, EngineConfig};
 use mailtide_gmail::request::{self, RequestConfig};
 use mailtide_gmail::{decode, errors, headers};
@@ -492,6 +495,21 @@ where
     /// `LabelDefinitionsChanged` feed entry. Resolves label ids to names.
     pub async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, RunError> {
         self.store.labels(account).await.map_err(RunError::Store)
+    }
+
+    /// `account`'s threads `ids` as the mirror holds them, in the order asked
+    /// (see [`Store::threads`]): a store read that claims nothing and calls
+    /// no Gmail, so it needs no token and works while the account is blocked
+    /// or cooling down. Ids the mirror has no message in are left out.
+    pub async fn threads(
+        &self,
+        account: &AccountId,
+        ids: &[ThreadId],
+    ) -> Result<Vec<ThreadView>, RunError> {
+        self.store
+            .threads(account, ids)
+            .await
+            .map_err(RunError::Store)
     }
 
     /// Compare the mirror with Gmail for `ids` (a sample the host picks),

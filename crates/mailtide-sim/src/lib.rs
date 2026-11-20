@@ -257,6 +257,8 @@ pub struct Stats {
     pub expiries: u64,
     /// Messages in Gmail at the end.
     pub messages: u64,
+    /// Threads in Gmail at the end.
+    pub threads: u64,
     /// User operations applied.
     pub user_ops: u64,
     /// Label changes the engine delivered to Gmail (user actions in the host).
@@ -341,6 +343,8 @@ struct GmailMessage {
     thread: ThreadId,
     labels: LabelSet,
     modified: HistoryId,
+    /// `internalDate`: two messages in a row share one, so ties occur.
+    date: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +405,7 @@ impl Gmail {
                 thread,
                 labels,
                 modified: at,
+                date: Timestamp(i64::try_from(self.next_message / 2).unwrap_or(i64::MAX)),
             },
         );
         id
@@ -658,6 +663,18 @@ impl Gmail {
         })
     }
 
+    /// Messages by thread.
+    fn threads(&self) -> BTreeMap<&ThreadId, Vec<(&MessageId, &GmailMessage)>> {
+        let mut threads: BTreeMap<&ThreadId, Vec<(&MessageId, &GmailMessage)>> = BTreeMap::new();
+        for (id, message) in &self.messages {
+            threads
+                .entry(&message.thread)
+                .or_default()
+                .push((id, message));
+        }
+        threads
+    }
+
     /// `labels.list`, in id order.
     fn labels(&self) -> Vec<Label> {
         let mut labels: Vec<Label> = LABELS
@@ -883,6 +900,7 @@ impl Sim {
             });
         }
         self.stats.messages = u64::try_from(self.gmail.messages.len()).unwrap_or(u64::MAX);
+        self.stats.threads = u64::try_from(self.gmail.threads().len()).unwrap_or(u64::MAX);
         let result = RunResult {
             seed,
             faults,
@@ -1260,7 +1278,7 @@ impl Sim {
                         message: Box::new(ImportedMessage {
                             blob: BlobRef(format!("{}/{}", self.account.as_str(), id.0)),
                             size: 1_000,
-                            internal_date: self.now,
+                            internal_date: self.gmail.messages.get(id).map_or(self.now, |m| m.date),
                             headers: HeaderFacts::default(),
                             observation,
                         }),
@@ -1347,6 +1365,59 @@ impl Sim {
         (gmail != mirror).then(|| format!("label definitions {mirror:?} != Gmail {gmail:?}"))
     }
 
+    /// How a thread's view differs from the same rule restated over Gmail's
+    /// messages (SPEC §4), once every message is imported and every action
+    /// settled: members by date then id, the union of the non-draft members'
+    /// labels, unread, the newest non-draft member, the counts.
+    fn thread_difference(&self) -> Option<String> {
+        for (thread, mut members) in self.gmail.threads() {
+            members.sort_by_key(|(id, message)| (message.date, *id));
+            let non_draft: Vec<&(&MessageId, &GmailMessage)> = members
+                .iter()
+                .filter(|(_, message)| !labels::is_draft(&message.labels))
+                .collect();
+            let union: LabelSet = non_draft
+                .iter()
+                .flat_map(|(_, message)| message.labels.iter().cloned())
+                .collect();
+            let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+            let expected = (
+                members
+                    .iter()
+                    .map(|(id, _)| (*id).clone())
+                    .collect::<Vec<_>>(),
+                labels::has(&union, labels::system::UNREAD),
+                union,
+                non_draft.last().map(|(id, _)| (*id).clone()),
+                count(non_draft.len()),
+                count(members.len() - non_draft.len()),
+                0,
+            );
+            let Some(view) = self.mirror.thread(thread) else {
+                return Some(format!("thread {} has no view", thread.0));
+            };
+            let found = (
+                view.messages
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect::<Vec<_>>(),
+                view.unread,
+                view.labels,
+                view.latest,
+                view.message_count,
+                view.draft_count,
+                view.awaiting_import,
+            );
+            if found != expected {
+                return Some(format!(
+                    "thread {} view {found:?} != Gmail {expected:?}",
+                    thread.0
+                ));
+            }
+        }
+        None
+    }
+
     /// How the mirror differs from Gmail, if it does.
     fn difference(&self) -> Option<String> {
         if let Some(labels) = self.label_difference() {
@@ -1383,9 +1454,18 @@ impl Sim {
                     id.0, record.labels, message.labels
                 ));
             }
+            if record.thread_id != message.thread {
+                return Some(format!(
+                    "{} thread {} != Gmail {}",
+                    id.0, record.thread_id.0, message.thread.0
+                ));
+            }
             if !matches!(record.content, Content::Imported(_)) || !self.blobs.contains(id) {
                 return Some(format!("{} content not imported", id.0));
             }
+        }
+        if let Some(thread) = self.thread_difference() {
+            return Some(thread);
         }
         if let Some(intent) = self
             .mirror
@@ -1566,6 +1646,49 @@ mod tests {
             .collect();
         let result = replay(3, &script);
         assert!(result.passed(), "{result:#?}");
+    }
+
+    #[test]
+    fn converged_mirrors_group_messages_as_gmail_does() {
+        // A scripted mailbox: replies in one thread, a draft, a deleted
+        // member and actions on whole threads.
+        let script = [
+            UserOp::Receive { thread: Some(0) },
+            UserOp::Receive { thread: Some(0) },
+            UserOp::SaveDraft,
+            UserOp::Receive { thread: Some(1) },
+            UserOp::Delete { pick: 2 },
+            UserOp::HostAction {
+                pick: 0,
+                action: Action::SetRead(ReadState::Read),
+                whole_thread: true,
+            },
+            UserOp::HostAction {
+                pick: 3,
+                action: Action::MarkSpam,
+                whole_thread: true,
+            },
+            UserOp::Receive { thread: Some(0) },
+        ];
+        for seed in 0..50 {
+            let result = replay(seed, &script);
+            assert!(result.passed(), "{result:#?}");
+        }
+        // Random mailboxes: convergence compares every thread id and every
+        // thread's view with Gmail's grouping.
+        let results: Vec<RunResult> = (0..100).map(|seed| run(seed, 300)).collect();
+        let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
+        assert!(failures.is_empty(), "{:#?}", failures.first());
+        let messages: u64 = results.iter().map(|r| r.stats.messages).sum();
+        let threads: u64 = results.iter().map(|r| r.stats.threads).sum();
+        assert!(
+            threads > 0 && messages > threads,
+            "threads hold several messages"
+        );
+        assert!(
+            results.iter().any(|r| r.stats.deliveries > 0),
+            "actions reached Gmail"
+        );
     }
 
     #[test]

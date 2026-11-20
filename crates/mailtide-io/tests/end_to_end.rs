@@ -9,14 +9,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mailtide::EngineConfig;
 use mailtide::engine::JOB_CONCURRENCY;
-use mailtide::ids::{AccountId, MessageId, Timestamp};
+use mailtide::ids::{AccountId, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::PRIORITISE_MAX_IDS;
 use mailtide::labels::set;
 use mailtide::mirror::Content;
-use mailtide::outbox::{Action, ActionRequest};
+use mailtide::outbox::{Action, ActionRequest, ReadState};
 use mailtide::quota::{Admission, Budget, Lease, Priority, QuotaUnits};
 use mailtide::retry::Cooldown;
 use mailtide::state::SyncPhase;
+use mailtide::thread::ThreadView;
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
 use mailtide_io::auth::{AccessToken, StaticTokens};
 use mailtide_io::blobs::{BlobStore, ObjectBlobs, blob_key};
@@ -31,6 +32,7 @@ struct Message {
     thread: String,
     labels: Vec<String>,
     history_id: u64,
+    date: i64,
 }
 
 #[derive(Debug, Default)]
@@ -40,23 +42,60 @@ struct Mailbox {
     history_id: u64,
     /// Every raw fetch (an import), in order.
     raw_fetches: Vec<String>,
+    modified: u32,
 }
 
 impl Mailbox {
     fn add(&mut self, id: &str, labels: &[&str]) {
+        self.add_in(&format!("t-{id}"), id, labels, 1_700_000_000_000);
+    }
+
+    fn add_in(&mut self, thread: &str, id: &str, labels: &[&str], date: i64) {
         self.history_id += 1;
         let labels: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
         self.messages.insert(
             id.to_owned(),
             Message {
-                thread: format!("t-{id}"),
+                thread: thread.to_owned(),
                 labels: labels.clone(),
                 history_id: self.history_id,
+                date,
             },
         );
         self.history.push(json!({
             "id": self.history_id.to_string(),
-            "messagesAdded": [{"message": {"id": id, "threadId": format!("t-{id}"), "labelIds": labels}}],
+            "messagesAdded": [{"message": {"id": id, "threadId": thread, "labelIds": labels}}],
+        }));
+    }
+
+    /// `messages.modify`: the change and its history records.
+    fn modify(&mut self, id: &str, body: &serde_json::Value) {
+        self.modified += 1;
+        self.history_id += 1;
+        let names = |key: &str| -> Vec<String> {
+            body[key]
+                .as_array()
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(|l| l.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (add, remove) = (names("addLabelIds"), names("removeLabelIds"));
+        let message = self.messages.get_mut(id).expect("message");
+        message.labels.retain(|l| !remove.contains(l));
+        for label in &add {
+            if !message.labels.contains(label) {
+                message.labels.push(label.clone());
+            }
+        }
+        message.history_id = self.history_id;
+        self.history.push(json!({
+            "id": self.history_id.to_string(),
+            "labelsAdded": [{"message": {"id": id, "threadId": message.thread}, "labelIds": add}],
+            "labelsRemoved": [{"message": {"id": id, "threadId": message.thread}, "labelIds": remove}],
         }));
     }
 
@@ -146,7 +185,7 @@ impl GmailTransport for FakeGmail {
                 Some(m) => {
                     let mut body = json!({
                         "id": id, "threadId": m.thread, "labelIds": m.labels,
-                        "historyId": m.history_id.to_string(), "internalDate": "1700000000000", "sizeEstimate": 40,
+                        "historyId": m.history_id.to_string(), "internalDate": m.date.to_string(), "sizeEstimate": 40,
                         "snippet": "hello",
                     });
                     if query.get("format") == Some(&"raw") {
@@ -158,6 +197,12 @@ impl GmailTransport for FakeGmail {
                     ok(&body)
                 }
             },
+            ["messages", id, "modify"] => {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).expect("json");
+                mailbox.modify(id, &body);
+                ok(&json!({}))
+            }
             other => panic!("unexpected request {other:?}"),
         };
         Ok(response)
@@ -187,6 +232,7 @@ fn runner(
         RunnerConfig {
             engine: EngineConfig {
                 draft_settle: Duration::ZERO,
+                confirm_timeout: Duration::ZERO,
                 ..EngineConfig::default()
             },
             access: mailtide_io::runner::Access::ReadWrite,
@@ -467,4 +513,116 @@ async fn prioritise_works_in_read_only_mode() {
         runner.act(&account(), action, Duration::from_secs(1)).await,
         Err(RunError::ReadOnly)
     ));
+}
+
+async fn thread(
+    runner: &Runner<MemoryStore, ObjectBlobs, FakeGmail, LocalGate, StaticTokens>,
+    id: &str,
+) -> ThreadView {
+    runner
+        .threads(&account(), &[ThreadId(id.into())])
+        .await
+        .expect("threads")
+        .pop()
+        .expect("the thread")
+}
+
+async fn run_to_idle(
+    runner: &Runner<MemoryStore, ObjectBlobs, FakeGmail, LocalGate, StaticTokens>,
+) {
+    let outcome = runner
+        .run(&account(), Duration::from_secs(30))
+        .await
+        .expect("run");
+    assert!(
+        matches!(outcome.stop, StopReason::Idle { .. }),
+        "{:?}",
+        outcome.stop
+    );
+}
+
+#[tokio::test]
+async fn a_reply_synced_from_history_shows_in_its_thread_view() {
+    let gmail = FakeGmail::default();
+    gmail
+        .0
+        .lock()
+        .expect("lock")
+        .add_in("t", "m1", &["INBOX"], 1_700_000_000_000);
+    let runner = runner(gmail);
+    run_to_idle(&runner).await;
+    let before = thread(&runner, "t").await;
+    assert_eq!(before.latest, Some(MessageId("m1".into())));
+    assert!(!before.unread);
+
+    runner_gmail(&runner).0.lock().expect("lock").add_in(
+        "t",
+        "m2",
+        &["INBOX", "UNREAD"],
+        1_700_000_060_000,
+    );
+    run_to_idle(&runner).await;
+    let after = thread(&runner, "t").await;
+    let ids: Vec<&str> = after.messages.iter().map(|m| m.id.0.as_str()).collect();
+    assert_eq!(ids, ["m1", "m2"]);
+    assert!(after.unread);
+    assert_eq!(after.labels, set(["INBOX", "UNREAD"]));
+    assert_eq!(after.latest, Some(MessageId("m2".into())));
+    assert_eq!((after.message_count, after.awaiting_import), (2, 0));
+    let latest = after.messages[1].content.as_ref().expect("imported");
+    assert_eq!(latest.headers.subject.as_deref(), Some("Message m2"));
+    assert_eq!(latest.internal_date, Timestamp(1_700_000_060_000));
+    assert_eq!(after.participants, ["a@example.com"]);
+}
+
+#[tokio::test]
+async fn a_thread_action_shows_in_the_thread_view_before_it_is_delivered() {
+    let gmail = FakeGmail::default();
+    {
+        let mut mailbox = gmail.0.lock().expect("lock");
+        mailbox.add_in("t", "m1", &["INBOX", "UNREAD"], 1_700_000_000_000);
+        mailbox.add_in("t", "m2", &["INBOX", "UNREAD"], 1_700_000_060_000);
+    }
+    let runner = runner(gmail);
+    run_to_idle(&runner).await;
+    assert!(thread(&runner, "t").await.unread);
+
+    let admitted = runner
+        .admit(
+            &account(),
+            &ActionRequest::Thread {
+                id: ThreadId("t".into()),
+                action: Action::SetRead(ReadState::Read),
+            },
+        )
+        .await
+        .expect("admit");
+    assert_eq!(admitted, 2);
+    assert_eq!(runner_gmail(&runner).0.lock().expect("lock").modified, 0);
+    let admitted_view = thread(&runner, "t").await;
+    assert!(!admitted_view.unread);
+    assert_eq!(admitted_view.labels, set(["INBOX"]));
+    assert!(
+        admitted_view
+            .messages
+            .iter()
+            .all(|m| m.pending_actions == 1 && m.observed_labels == set(["INBOX", "UNREAD"]))
+    );
+
+    run_to_idle(&runner).await;
+    {
+        let mailbox = runner_gmail(&runner).0.lock().expect("lock");
+        assert_eq!(mailbox.modified, 2);
+        assert!(mailbox.messages.values().all(|m| m.labels == ["INBOX"]));
+    }
+    let confirmed = thread(&runner, "t").await;
+    assert!(
+        confirmed
+            .messages
+            .iter()
+            .all(|m| m.pending_actions == 0 && m.observed_labels == set(["INBOX"]))
+    );
+    assert_eq!(confirmed.unread, admitted_view.unread);
+    assert_eq!(confirmed.labels, admitted_view.labels);
+    assert_eq!(confirmed.latest, admitted_view.latest);
 }

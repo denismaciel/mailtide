@@ -15,6 +15,7 @@ fn main() {
         totals.user_ops += result.stats.user_ops;
         totals.rejections += result.stats.rejections;
         totals.messages += result.stats.messages;
+        totals.threads += result.stats.threads;
         totals.deliveries += result.stats.deliveries;
         totals.label_edits += result.stats.label_edits;
         totals.label_listings += result.stats.label_listings;
