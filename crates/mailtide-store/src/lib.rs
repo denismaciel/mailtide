@@ -26,6 +26,9 @@ use mailtide::revision::{
 };
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::submission::{
+    SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite, SubmissionWritten,
+};
 use mailtide::thread::ThreadView;
 
 pub mod config;
@@ -335,6 +338,31 @@ pub trait Store: Send + Sync {
         write: &DraftWrite,
         now: Timestamp,
     ) -> impl Future<Output = Result<DraftRecorded, StoreError>> + Send;
+
+    /// Apply a raw submission transition under the account lock and incarnation.
+    fn write_submission(
+        &self,
+        account: &AccountId,
+        generation: u64,
+        write: &SubmissionWrite,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<SubmissionWritten, StoreError>> + Send;
+
+    /// Read one raw submission and its staging reference.
+    fn submission(
+        &self,
+        account: &AccountId,
+        key: &SubmissionKey,
+    ) -> impl Future<Output = Result<Option<SubmissionRow>, StoreError>> + Send;
+
+    /// Page raw submissions, optionally restricted to the requested states.
+    fn submissions(
+        &self,
+        account: &AccountId,
+        after: Option<&SubmissionKey>,
+        states: &[SubmissionState],
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<SubmissionRow>, StoreError>> + Send;
 
     /// Up to `limit` drafts of the index after `after`, in draft id order
     /// (empty for an unknown account).

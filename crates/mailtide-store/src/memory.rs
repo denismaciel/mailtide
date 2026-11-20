@@ -22,6 +22,9 @@ use mailtide::revision::{
 };
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::submission::{
+    SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite, SubmissionWritten,
+};
 use mailtide::thread::ThreadView;
 
 use crate::{Store, StoreError};
@@ -376,6 +379,47 @@ impl Store for MemoryStore {
         now: Timestamp,
     ) -> Result<DraftRecorded, StoreError> {
         self.with_account(account, |mirror| mirror.record_draft(write, now))
+    }
+
+    async fn write_submission(
+        &self,
+        account: &AccountId,
+        generation: u64,
+        write: &SubmissionWrite,
+        now: Timestamp,
+    ) -> Result<SubmissionWritten, StoreError> {
+        self.on_account(account, SubmissionWritten::Stale, |mirror| {
+            mirror.write_submission(generation, write, now)
+        })
+    }
+
+    async fn submission(
+        &self,
+        account: &AccountId,
+        key: &SubmissionKey,
+    ) -> Result<Option<SubmissionRow>, StoreError> {
+        self.on_account(account, None, |mirror| mirror.submissions.get(key).cloned())
+    }
+
+    async fn submissions(
+        &self,
+        account: &AccountId,
+        after: Option<&SubmissionKey>,
+        states: &[SubmissionState],
+        limit: u32,
+    ) -> Result<Vec<SubmissionRow>, StoreError> {
+        self.on_account(account, Vec::new(), |mirror| {
+            mirror
+                .submissions
+                .values()
+                .filter(|row| {
+                    after.is_none_or(|key| &row.view.key > key)
+                        && (states.is_empty() || states.contains(&row.view.state))
+                })
+                .take(limit as usize)
+                .cloned()
+                .collect()
+        })
     }
 
     async fn drafts(

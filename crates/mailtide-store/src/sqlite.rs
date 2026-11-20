@@ -14,6 +14,9 @@ use mailtide::revision::{
 };
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::submission::{
+    SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite, SubmissionWritten,
+};
 use mailtide::thread::ThreadView;
 
 use crate::sql::SqlStore;
@@ -246,6 +249,34 @@ impl Store for SqliteStore {
         now: Timestamp,
     ) -> Result<DraftRecorded, StoreError> {
         crate::Store::record_draft(&self.inner, account, write, now).await
+    }
+
+    async fn write_submission(
+        &self,
+        account: &AccountId,
+        generation: u64,
+        write: &SubmissionWrite,
+        now: Timestamp,
+    ) -> Result<SubmissionWritten, StoreError> {
+        crate::Store::write_submission(&self.inner, account, generation, write, now).await
+    }
+
+    async fn submission(
+        &self,
+        account: &AccountId,
+        key: &SubmissionKey,
+    ) -> Result<Option<SubmissionRow>, StoreError> {
+        crate::Store::submission(&self.inner, account, key).await
+    }
+
+    async fn submissions(
+        &self,
+        account: &AccountId,
+        after: Option<&SubmissionKey>,
+        states: &[SubmissionState],
+        limit: u32,
+    ) -> Result<Vec<SubmissionRow>, StoreError> {
+        crate::Store::submissions(&self.inner, account, after, states, limit).await
     }
 
     async fn drafts(
@@ -1252,7 +1283,7 @@ mod tests {
 
     fn audit_rollback() -> Vec<String> {
         let (_, migration) = audit_migration();
-        vec![
+        let statements = vec![
             "UPDATE mailtide_jobs SET state = 'ready' WHERE state = 'deferred'".to_owned(),
             "DROP TABLE mailtide_audit_seen".to_owned(),
             "DROP TABLE mailtide_generation".to_owned(),
@@ -1264,7 +1295,19 @@ mod tests {
                 "DELETE FROM mailtide_schema WHERE version = {}",
                 migration.version
             ),
+        ];
+        // Revert the newest queue before rolling back the audit.
+        [
+            "DELETE FROM mailtide_jobs WHERE kind = 5",
+            "DELETE FROM mailtide_changes WHERE change LIKE '{\"SubmissionChanged\"%'",
+            "DROP TABLE mailtide_send_tokens",
+            "DROP TABLE mailtide_submissions",
+            "DELETE FROM mailtide_schema WHERE version = 12",
         ]
+        .map(str::to_owned)
+        .into_iter()
+        .chain(statements)
+        .collect()
     }
 
     #[tokio::test]

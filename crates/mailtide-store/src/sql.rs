@@ -40,6 +40,9 @@ use mailtide::state::StoreSnapshot;
 use mailtide::status::{
     AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome, TrackOutcome,
 };
+use mailtide::submission::{
+    SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite, SubmissionWritten,
+};
 use mailtide::thread::ThreadView;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolOptions;
@@ -152,6 +155,17 @@ const MIGRATIONS: &[&[&str]] = &[&[
        FROM mailtide_accounts",
     "CREATE TABLE mailtide_audit_seen (
         account TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (account, id))",
+],
+// 12: durable raw submissions and the tracking tokens shared with draft sends.
+&[
+    "CREATE TABLE mailtide_submissions (
+       account TEXT NOT NULL, key TEXT NOT NULL, tracking_id TEXT NOT NULL,
+       state TEXT NOT NULL, due_at BIGINT, data TEXT NOT NULL, PRIMARY KEY(account, key))",
+    "CREATE UNIQUE INDEX mailtide_submissions_tracking ON mailtide_submissions(account, tracking_id)",
+    "CREATE INDEX mailtide_submissions_due ON mailtide_submissions(account, due_at, key)",
+    "CREATE TABLE mailtide_send_tokens (
+       account TEXT NOT NULL, tracking_id TEXT NOT NULL, owner TEXT NOT NULL,
+       PRIMARY KEY(account, tracking_id))",
 ]];
 
 /// The schema version this build expects.
@@ -265,6 +279,7 @@ fn kind_code(kind: &JobKind) -> (i64, &str) {
         JobKind::BlobCleanup(id) => (2, id.0.as_str()),
         JobKind::Deliver(id) => (3, id.0.as_str()),
         JobKind::RefreshDrafts => (4, ""),
+        JobKind::SendSubmissions => (5, ""),
     }
 }
 
@@ -276,6 +291,7 @@ fn kind_from(code: i64, message: String) -> Result<JobKind, StoreError> {
         2 => Ok(JobKind::BlobCleanup(id)),
         3 => Ok(JobKind::Deliver(id)),
         4 if id.0.is_empty() => Ok(JobKind::RefreshDrafts),
+        5 if id.0.is_empty() => Ok(JobKind::SendSubmissions),
         other => Err(corrupt("job kind", other)),
     }
 }
@@ -839,6 +855,7 @@ impl SqlStore {
         Self::load_rows(tx, account, &ids, &mut mirror).await?;
         Self::load_account_jobs(tx, account, &mut mirror).await?;
         Self::load_commit_drafts(tx, account, commit, &ids, &mut mirror).await?;
+        load_import_submissions(tx, account, &commit.messages, &mut mirror).await?;
         Ok(mirror)
     }
 
@@ -1057,6 +1074,7 @@ impl SqlStore {
         write_seen(tx, account, before, after).await?;
         write_intents(tx, account, before, after).await?;
         write_drafts(tx, account, before, after).await?;
+        write_submission_diff(tx, account, before, after).await?;
         if before.labels != after.labels {
             write_labels(tx, account, &before.labels, &after.labels, after.seq).await?;
         }
@@ -1334,7 +1352,8 @@ impl SqlStore {
                 JobKind::Import(_)
                 | JobKind::Verify(_)
                 | JobKind::BlobCleanup(_)
-                | JobKind::RefreshDrafts => None,
+                | JobKind::RefreshDrafts
+                | JobKind::SendSubmissions => None,
             };
             claimed.push(ClaimedJob {
                 work: ClaimedWork::plan(job.kind, context, |_| group),
@@ -1578,6 +1597,14 @@ impl SqlStore {
         mirror.record = record;
         mirror.seq = seq;
         mirror.drafts = load_drafts(&mut *tx, account).await?;
+        if let DraftWrite::BeginSend { draft, .. } = write
+            && let Some(token) = mirror
+                .drafts
+                .get(draft)
+                .and_then(|row| row.tracking_id.clone())
+        {
+            load_token(&mut tx, account, &token, &mut mirror).await?;
+        }
         Self::load_account_jobs(&mut tx, account, &mut mirror).await?;
         // A sent message the mirror may not have seen gets a verification.
         if let DraftWrite::EndSend {
@@ -2446,6 +2473,8 @@ impl crate::Store for SqlStore {
             "mailtide_changes",
             "mailtide_consumers",
             "mailtide_drafts",
+            "mailtide_submissions",
+            "mailtide_send_tokens",
             "mailtide_accounts",
         ] {
             // Table names are constants, never input.
@@ -2885,6 +2914,34 @@ impl crate::Store for SqlStore {
         Self::record_draft(self, account, write, now).await
     }
 
+    async fn write_submission(
+        &self,
+        account: &AccountId,
+        generation: u64,
+        write: &SubmissionWrite,
+        now: Timestamp,
+    ) -> Result<SubmissionWritten, StoreError> {
+        Self::write_submission(self, account, generation, write, now).await
+    }
+
+    async fn submission(
+        &self,
+        account: &AccountId,
+        key: &SubmissionKey,
+    ) -> Result<Option<SubmissionRow>, StoreError> {
+        Self::submission(self, account, key).await
+    }
+
+    async fn submissions(
+        &self,
+        account: &AccountId,
+        after: Option<&SubmissionKey>,
+        states: &[SubmissionState],
+        limit: u32,
+    ) -> Result<Vec<SubmissionRow>, StoreError> {
+        Self::submissions(self, account, after, states, limit).await
+    }
+
     async fn drafts(
         &self,
         account: &AccountId,
@@ -3090,4 +3147,230 @@ pub(crate) fn thread_rows(count: usize) -> String {
          LEFT JOIN mailtide_intents i ON i.account = m.account AND i.message = m.id
          WHERE m.account = $1 AND m.thread_id IN ({placeholders})"
     )
+}
+
+async fn load_token(
+    tx: &mut Transaction<'static, Any>,
+    account: &AccountId,
+    token: &str,
+    mirror: &mut AccountMirror,
+) -> Result<(), StoreError> {
+    if let Some(row) = sqlx::query(
+        "SELECT owner FROM mailtide_send_tokens WHERE account = $1 AND tracking_id = $2",
+    )
+    .bind(account.as_str())
+    .bind(token)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| unavailable(&e))?
+    {
+        let owner: String = row.try_get("owner").map_err(|e| corrupt("owner", e))?;
+        mirror
+            .send_tokens
+            .insert(token.to_owned(), parse("owner", &owner)?);
+    }
+    Ok(())
+}
+
+fn submission_from_row(row: &sqlx::any::AnyRow) -> Result<SubmissionRow, StoreError> {
+    let data: String = row
+        .try_get("data")
+        .map_err(|e| corrupt("submission data", e))?;
+    parse("submission data", &data)
+}
+
+async fn load_import_submissions(
+    tx: &mut Transaction<'static, Any>,
+    account: &AccountId,
+    ops: &[MessageOp],
+    mirror: &mut AccountMirror,
+) -> Result<(), StoreError> {
+    for token in ops.iter().filter_map(|op| match op {
+        MessageOp::MarkImported {
+            facts: Some(facts), ..
+        } => facts.tracking_id.as_deref(),
+        _ => None,
+    }) {
+        if let Some(row) = sqlx::query(
+            "SELECT data FROM mailtide_submissions WHERE account = $1 AND tracking_id = $2",
+        )
+        .bind(account.as_str())
+        .bind(token)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| unavailable(&e))?
+        {
+            let row = submission_from_row(&row)?;
+            mirror.submissions.insert(row.view.key.clone(), row);
+        }
+    }
+    Ok(())
+}
+
+async fn write_submission_diff(
+    tx: &mut Transaction<'static, Any>,
+    account: &str,
+    before: &AccountMirror,
+    after: &AccountMirror,
+) -> Result<(), StoreError> {
+    for (token, owner) in &after.send_tokens {
+        if before.send_tokens.get(token) == Some(owner) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO mailtide_send_tokens (account, tracking_id, owner) VALUES ($1, $2, $3)",
+        )
+        .bind(account)
+        .bind(token.as_str())
+        .bind(json(owner)?)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| unavailable(&e))?;
+    }
+    for (key, row) in &after.submissions {
+        if before.submissions.get(key) == Some(row) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO mailtide_submissions (account, key, tracking_id, state, due_at, data)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (account, key) DO UPDATE SET state = excluded.state,
+                 due_at = excluded.due_at, data = excluded.data",
+        )
+        .bind(account)
+        .bind(key.0.as_str())
+        .bind(row.view.tracking_id.as_str())
+        .bind(row.view.state.as_str())
+        .bind(row.due_at.map(|at| at.0))
+        .bind(json(row)?)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| unavailable(&e))?;
+    }
+    Ok(())
+}
+
+impl SqlStore {
+    async fn write_submission(
+        &self,
+        account: &AccountId,
+        generation: u64,
+        write: &SubmissionWrite,
+        now: Timestamp,
+    ) -> Result<SubmissionWritten, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Ok(SubmissionWritten::Stale);
+        };
+        if record.generation != generation {
+            return Ok(SubmissionWritten::Stale);
+        }
+        let mut mirror = AccountMirror::new(account.clone(), generation);
+        mirror.record = record;
+        mirror.seq = seq;
+        Self::load_account_jobs(&mut tx, account, &mut mirror).await?;
+        let key = match write {
+            SubmissionWrite::Admit(row) => {
+                load_token(&mut tx, account, &row.view.tracking_id, &mut mirror).await?;
+                Some(&row.view.key)
+            }
+            SubmissionWrite::Cancel(key)
+            | SubmissionWrite::Begin(_, key)
+            | SubmissionWrite::Complete(_, key, _)
+            | SubmissionWrite::Prune(_, key) => Some(key),
+            SubmissionWrite::Take(_) | SubmissionWrite::Release(_) | SubmissionWrite::Expire => {
+                None
+            }
+        };
+        let rows = if let Some(key) = key {
+            sqlx::query("SELECT data FROM mailtide_submissions WHERE account = $1 AND key = $2")
+                .bind(account.as_str())
+                .bind(key.0.as_str())
+                .fetch_all(&mut *tx)
+                .await
+        } else if matches!(write, SubmissionWrite::Expire) {
+            sqlx::query(
+                "SELECT data FROM mailtide_submissions WHERE account = $1 AND due_at <= $2
+                        AND state IN ('sending', 'confirming')",
+            )
+            .bind(account.as_str())
+            .bind(now.0)
+            .fetch_all(&mut *tx)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT data FROM mailtide_submissions WHERE account = $1 AND due_at IS NOT NULL
+                         ORDER BY due_at, key LIMIT 1",
+            )
+            .bind(account.as_str())
+            .fetch_all(&mut *tx)
+            .await
+        }
+        .map_err(|e| unavailable(&e))?;
+        for row in &rows {
+            let row = submission_from_row(row)?;
+            mirror.submissions.insert(row.view.key.clone(), row);
+        }
+        let before = mirror.clone();
+        let result = mirror.write_submission(generation, write, now);
+        if mirror != before {
+            Self::write_diff(&mut tx, &before, &mirror).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(result)
+    }
+
+    async fn submission(
+        &self,
+        account: &AccountId,
+        key: &SubmissionKey,
+    ) -> Result<Option<SubmissionRow>, StoreError> {
+        self.ensure_schema().await?;
+        sqlx::query("SELECT data FROM mailtide_submissions WHERE account = $1 AND key = $2")
+            .bind(account.as_str())
+            .bind(key.0.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?
+            .as_ref()
+            .map(submission_from_row)
+            .transpose()
+    }
+
+    async fn submissions(
+        &self,
+        account: &AccountId,
+        after: Option<&SubmissionKey>,
+        states: &[SubmissionState],
+        limit: u32,
+    ) -> Result<Vec<SubmissionRow>, StoreError> {
+        self.ensure_schema().await?;
+        let mut sql =
+            "SELECT data FROM mailtide_submissions WHERE account = $1 AND key > $2".to_owned();
+        if !states.is_empty() {
+            let slots = (4..4 + states.len())
+                .map(|n| format!("${n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" AND state IN ({slots})"));
+        }
+        sql.push_str(" ORDER BY key LIMIT $3");
+        let mut query = sqlx::query(AssertSqlSafe(sql))
+            .bind(account.as_str())
+            .bind(after.map_or("", |key| key.0.as_str()))
+            .bind(i64::from(limit));
+        for state in states {
+            query = query.bind(state.as_str());
+        }
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?
+            .iter()
+            .map(submission_from_row)
+            .collect()
+    }
 }

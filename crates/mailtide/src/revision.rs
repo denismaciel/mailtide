@@ -786,6 +786,11 @@ pub enum Change {
         /// Why.
         reason: RemovedReason,
     },
+    /// The public state of a raw submission changed.
+    SubmissionChanged {
+        /// The submission as of this transition.
+        submission: crate::submission::Submission,
+    },
     /// A draft was sent: this is the message that left (a new id, in
     /// whatever thread Gmail put it).
     DraftSent {
@@ -812,7 +817,8 @@ impl Change {
             Self::LabelDefinitionsChanged
             | Self::DraftSaved { .. }
             | Self::DraftRemoved { .. }
-            | Self::DraftSent { .. } => None,
+            | Self::DraftSent { .. }
+            | Self::SubmissionChanged { .. } => None,
         }
     }
 }

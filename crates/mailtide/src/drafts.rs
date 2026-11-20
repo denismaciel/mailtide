@@ -330,6 +330,8 @@ pub enum SendEnd {
 /// What [`DraftWrite`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DraftRecorded {
+    /// Another submission owns the tracking token.
+    TokenConflict,
     /// Recorded (possibly as a no-op).
     Done,
     /// `BeginSend`: the row is sending now; `retry` when it took over an

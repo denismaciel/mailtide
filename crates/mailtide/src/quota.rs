@@ -47,7 +47,9 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
         | GmailRequest::DeleteLabel { .. } => 5,
         GmailRequest::GetMessage { .. } => 20,
         GmailRequest::ImportMessage { .. } => 60,
-        GmailRequest::Watch | GmailRequest::SendDraft { .. } | GmailRequest::MessagesSend { .. } => 100,
+        GmailRequest::Watch
+        | GmailRequest::SendDraft { .. }
+        | GmailRequest::MessagesSend { .. } => 100,
         GmailRequest::Modify(group) => match u32::try_from(group.messages.len()) {
             Ok(n) if n < BATCH_MODIFY_THRESHOLD => 5 * n,
             _ => 50,

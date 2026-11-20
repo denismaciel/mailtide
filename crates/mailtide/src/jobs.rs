@@ -27,6 +27,8 @@ pub enum JobKind {
     /// List the account's drafts and reconcile the draft index with them
     /// (account-level: one per account).
     RefreshDrafts,
+    /// Process the account's earliest due raw submission.
+    SendSubmissions,
 }
 
 impl JobKind {
@@ -37,7 +39,7 @@ impl JobKind {
             Self::Import(id) | Self::Verify(id) | Self::BlobCleanup(id) | Self::Deliver(id) => {
                 Some(id)
             }
-            Self::RefreshDrafts => None,
+            Self::RefreshDrafts | Self::SendSubmissions => None,
         }
     }
 }
@@ -115,6 +117,8 @@ pub enum ClaimedWork {
         /// When the job was claimed.
         claimed_at: Timestamp,
     },
+    /// A claimed account queue slot for raw submissions.
+    SendSubmissions,
 }
 
 /// What a claim reads beside the job itself.
@@ -147,6 +151,7 @@ impl ClaimedWork {
                 generation: context.drafts_generation,
                 claimed_at: context.now,
             },
+            JobKind::SendSubmissions => Self::SendSubmissions,
             JobKind::Import(id) => Self::Import(id),
             JobKind::Verify(id) => Self::Verify(id),
             JobKind::BlobCleanup(id) => Self::BlobCleanup(id),
@@ -166,6 +171,7 @@ impl ClaimedWork {
             Self::BlobCleanup(id) => JobKind::BlobCleanup(id.clone()),
             Self::Deliver(id, _) => JobKind::Deliver(id.clone()),
             Self::RefreshDrafts { .. } => JobKind::RefreshDrafts,
+            Self::SendSubmissions => JobKind::SendSubmissions,
         }
     }
 }
@@ -200,7 +206,8 @@ impl ClaimedJob {
             | ClaimedWork::Import(_)
             | ClaimedWork::Verify(_)
             | ClaimedWork::BlobCleanup(_)
-            | ClaimedWork::RefreshDrafts { .. } => None,
+            | ClaimedWork::RefreshDrafts { .. }
+            | ClaimedWork::SendSubmissions => None,
         }
     }
 

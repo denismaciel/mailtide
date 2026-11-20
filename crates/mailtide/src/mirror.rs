@@ -934,6 +934,10 @@ pub struct AccountMirror {
     pub intents: BTreeMap<(MessageId, crate::ids::LabelId), Intent>,
     /// The draft index.
     pub drafts: DraftIndex,
+    /// Raw submissions keyed by the host's key.
+    pub submissions: BTreeMap<crate::submission::SubmissionKey, crate::submission::SubmissionRow>,
+    /// Reserved outgoing tokens.
+    pub send_tokens: BTreeMap<String, crate::submission::TokenOwner>,
     /// The change log.
     pub log: Vec<(StateSeq, Change)>,
     /// The latest change-log position.
@@ -958,6 +962,8 @@ impl AccountMirror {
             label_defined: BTreeMap::new(),
             intents: BTreeMap::new(),
             drafts: DraftIndex::new(),
+            submissions: BTreeMap::new(),
+            send_tokens: BTreeMap::new(),
             log: Vec::new(),
             seq: StateSeq(0),
             consumers: BTreeMap::new(),
@@ -1246,12 +1252,20 @@ impl AccountMirror {
             let before = message_op_id(op).and_then(|id| self.messages.get(id));
             let existed = before.is_some();
             let was_imported = before.is_some_and(|r| matches!(r.content, Content::Imported(_)));
-            if !self.apply_message(op, &commit.job_plan, seq) {
+            let applied = self.apply_message(op, &commit.job_plan, seq);
+            if !applied {
                 skipped += 1;
             }
             self.settle(op, commit.claim.as_ref(), seq);
-            let effects =
-                self.draft_rules(op, existed, was_imported, commit.job_plan.verify_due_at);
+            let raw_owner = applied
+                && !was_imported
+                && self.confirm_submission(op, commit.job_plan.verify_due_at, seq);
+            let effects = self.draft_rules(
+                op,
+                existed,
+                was_imported || raw_owner || !applied,
+                commit.job_plan.verify_due_at,
+            );
             self.draft_effects(effects, commit.job_plan.draft_refresh_due_at, seq);
         }
         for op in &commit.intents {
@@ -2072,7 +2086,29 @@ impl AccountMirror {
     /// superseding another. The index changes, its feed entries and any
     /// listing it asks for land together.
     pub fn record_draft(&mut self, write: &DraftWrite, now: Timestamp) -> DraftRecorded {
+        use crate::submission::TokenOwner;
+        let reservation = match write {
+            DraftWrite::BeginSend { draft, .. } => self
+                .drafts
+                .get(draft)
+                .and_then(|record| record.tracking_id.as_ref())
+                .map(|token| (token.clone(), TokenOwner::Draft(draft.clone()))),
+            _ => None,
+        };
+        if let Some((token, owner)) = &reservation
+            && self
+                .send_tokens
+                .get(token)
+                .is_some_and(|existing| existing != owner)
+        {
+            return DraftRecorded::TokenConflict;
+        }
         let (outcome, effects) = drafts::record(&mut self.drafts, write, now, self.record.cursor);
+        if matches!(outcome, DraftRecorded::Started { .. })
+            && let Some((token, owner)) = reservation
+        {
+            self.send_tokens.insert(token, owner);
+        }
         let due = match write {
             DraftWrite::Stale { refresh_at, .. } => *refresh_at,
             DraftWrite::Refresh { at } => *at,

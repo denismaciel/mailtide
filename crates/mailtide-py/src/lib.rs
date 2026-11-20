@@ -1198,6 +1198,11 @@ mod _core {
                 },
             )?
             .into_any(),
+            Change::SubmissionChanged { .. } => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "raw submission delivery is unavailable",
+                ));
+            }
             Change::DraftSent {
                 draft_id,
                 message_id,

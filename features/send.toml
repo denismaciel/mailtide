@@ -18,7 +18,7 @@ role = "Raw submission rows, state, receipt, and pure admission, claim, dispatch
 
 [[file]]
 path = "crates/mailtide/src/drafts.rs"
-change = "new"
+change = "modify"
 role = "Shared with drafts at this base. Integrate token ownership in BeginSend after drafts lands, using the existing draft send lifecycle."
 
 [[file]]
@@ -116,6 +116,21 @@ change = "modify"
 role = "Unfenced admission and cancellation, schema-checked raw submission reads, fenced submission commits and local due confirmation expiry"
 
 [[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "Delegate submission operations to the shared SQL store"
+
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "Delegate submission operations to the shared SQL store"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_history_store.rs"
+change = "modify"
+role = "Exclude account-level send work from reference message-job views"
+
+[[file]]
 path = "crates/mailtide-store/src/memory.rs"
 change = "modify"
 role = "Submission methods and account offboarding over AccountMirror"
@@ -139,7 +154,7 @@ role = "Runner submission admission, send source routing, cancellation and reads
 
 [[file]]
 path = "crates/mailtide-io/src/drafts.rs"
-change = "new"
+change = "modify"
 role = "Shared with drafts at this base. Surface BeginSend token collision through draft validation after drafts lands."
 
 [[file]]
@@ -245,12 +260,12 @@ role = "Include messages.send in the public direct-call write guard test"
 
 [[file]]
 path = "crates/mailtide-io/tests/ref_zero_draft_providers.rs"
-change = "new"
+change = "modify"
 role = "Shared with drafts: fail-closed forwarding test"
 
 [[file]]
 path = "crates/mailtide-io/tests/ref_zero_driver_imap.rs"
-change = "new"
+change = "modify"
 role = "Shared with drafts: one Gmail reply, Bcc, SENT import and thread"
 
 [[file]]

@@ -73,6 +73,9 @@ where
             Box::pin(claims(s))
         }),
         ("the change log pages in order", |s| Box::pin(change_log(s))),
+        ("submission transitions and imports are atomic", |s| {
+            Box::pin(submissions(s))
+        }),
         ("claims from an older epoch are refused", |s| {
             Box::pin(stale_claims(s))
         }),
@@ -1330,7 +1333,8 @@ fn discovered(entries: &[ChangeEntry]) -> Vec<&str> {
             | Change::FactsRefreshed { .. }
             | Change::DraftSaved { .. }
             | Change::DraftRemoved { .. }
-            | Change::DraftSent { .. } => None,
+            | Change::DraftSent { .. }
+            | Change::SubmissionChanged { .. } => None,
         })
         .collect()
 }
@@ -2715,7 +2719,8 @@ fn imports(entries: &[ChangeEntry]) -> Vec<(&str, Option<&mailtide::mirror::Stor
             | Change::FactsRefreshed { .. }
             | Change::DraftSaved { .. }
             | Change::DraftRemoved { .. }
-            | Change::DraftSent { .. } => None,
+            | Change::DraftSent { .. }
+            | Change::SubmissionChanged { .. } => None,
         })
         .collect()
 }
@@ -4415,4 +4420,156 @@ async fn draft_refresh_job<S: Store>(store: &S) -> Result<(), String> {
         snapshot.drafts_refreshed_at == Some(Timestamp(6)),
         "the listing time survives",
     )
+}
+
+async fn submissions<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::drafts::{DraftRecorded, DraftWrite};
+    use mailtide::ids::DraftId;
+    use mailtide::submission::{
+        Submission, SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite,
+        SubmissionWritten,
+    };
+    fn debug(error: StoreError) -> String {
+        format!("{error:?}")
+    }
+    fn exact<T: PartialEq + std::fmt::Debug>(actual: T, expected: T) -> Result<(), String> {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("expected {expected:?}, got {actual:?}"))
+        }
+    }
+    let snapshot = claim(store).await?;
+    let account = account();
+    let generation = store
+        .status(&account)
+        .await
+        .map_err(debug)?
+        .ok_or("tracked account")?
+        .generation;
+    let now = Timestamp(100);
+    let key = SubmissionKey("raw".into());
+    let token = "tracking-token-100001";
+    let candidate = SubmissionRow {
+        view: Submission {
+            key: key.clone(),
+            tracking_id: token.into(),
+            state: SubmissionState::Pending,
+            send_at: now,
+            confirmation_deadline: None,
+            message_id: None,
+            thread_id: None,
+            refusal: None,
+            retry_at: None,
+        },
+        fingerprint: "same".into(),
+        content_digest: "bytes".into(),
+        target_thread: Some(ThreadId("t".into())),
+        blob: Some(BlobRef("outbox".into())),
+        due_at: Some(now),
+        dispatch: None,
+        terminal_at: None,
+    };
+    let admit = SubmissionWrite::Admit(Box::new(candidate));
+    exact(
+        store
+            .write_submission(&account, generation + 1, &admit, now)
+            .await
+            .map_err(debug)?,
+        SubmissionWritten::Stale,
+    )?;
+    let admitted = store
+        .write_submission(&account, generation, &admit, now)
+        .await
+        .map_err(debug)?;
+    exact(
+        store
+            .write_submission(&account, generation, &admit, now)
+            .await
+            .map_err(debug)?,
+        admitted,
+    )?;
+    let save = DraftWrite::Saved {
+        draft: listed("draft-token", "draft-message"),
+        tracking_id: token.into(),
+        created: true,
+    };
+    store
+        .record_draft(&account, &save, now)
+        .await
+        .map_err(debug)?;
+    let attempt = AttemptId(44);
+    let claimed = store
+        .claim_jobs(
+            &account,
+            (snapshot.epoch, generation),
+            1,
+            now,
+            attempt,
+            Priority::Foreground,
+        )
+        .await
+        .map_err(debug)?;
+    if !matches!(claimed, mailtide::jobs::ClaimOutcome::Claimed { jobs, .. } if jobs.len() == 1 && jobs[0].kind() == JobKind::SendSubmissions)
+    {
+        return Err("raw submission job was not claimed".into());
+    }
+    store
+        .write_submission(&account, generation, &SubmissionWrite::Take(attempt), now)
+        .await
+        .map_err(debug)?;
+    exact(
+        store
+            .write_submission(
+                &account,
+                generation,
+                &SubmissionWrite::Cancel(key.clone()),
+                now,
+            )
+            .await
+            .map_err(debug)?,
+        SubmissionWritten::CannotUnsend(SubmissionState::Claimed),
+    )?;
+    let begin = DraftWrite::BeginSend {
+        draft: DraftId("draft-token".into()),
+        retry_at: Timestamp(500),
+    };
+    exact(
+        store
+            .record_draft(&account, &begin, now)
+            .await
+            .map_err(debug)?,
+        DraftRecorded::TokenConflict,
+    )?;
+    store
+        .write_submission(
+            &account,
+            generation,
+            &SubmissionWrite::Begin(attempt, key.clone()),
+            now,
+        )
+        .await
+        .map_err(debug)?;
+    let mut imported = import("gmail-sent", &["SENT"], 1);
+    if let MessageOp::MarkImported {
+        facts: Some(facts), ..
+    } = &mut imported
+    {
+        facts.tracking_id = Some(token.into());
+    }
+    let mut commit = commit(&snapshot, 2);
+    commit.messages.push(imported);
+    let applied = store.apply(&commit).await.map_err(debug)?;
+    if !matches!(applied, CommitOutcome::Applied { .. }) {
+        return Err(format!("import: {applied:?}"));
+    }
+    let row = store
+        .submission(&account, &key)
+        .await
+        .map_err(debug)?
+        .ok_or("submission lost")?;
+    exact(row.view.state, SubmissionState::Sent)?;
+    exact(row.view.message_id, Some(MessageId("gmail-sent".into())))?;
+    store.forget(&account).await.map_err(debug)?;
+    exact(store.submission(&account, &key).await.map_err(debug)?, None)
 }

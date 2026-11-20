@@ -14,6 +14,9 @@ use mailtide::revision::{
 };
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::submission::{
+    SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite, SubmissionWritten,
+};
 use mailtide::thread::ThreadView;
 
 use crate::sql::SqlStore;
@@ -246,6 +249,34 @@ impl Store for PostgresStore {
         now: Timestamp,
     ) -> Result<DraftRecorded, StoreError> {
         crate::Store::record_draft(&self.inner, account, write, now).await
+    }
+
+    async fn write_submission(
+        &self,
+        account: &AccountId,
+        generation: u64,
+        write: &SubmissionWrite,
+        now: Timestamp,
+    ) -> Result<SubmissionWritten, StoreError> {
+        crate::Store::write_submission(&self.inner, account, generation, write, now).await
+    }
+
+    async fn submission(
+        &self,
+        account: &AccountId,
+        key: &SubmissionKey,
+    ) -> Result<Option<SubmissionRow>, StoreError> {
+        crate::Store::submission(&self.inner, account, key).await
+    }
+
+    async fn submissions(
+        &self,
+        account: &AccountId,
+        after: Option<&SubmissionKey>,
+        states: &[SubmissionState],
+        limit: u32,
+    ) -> Result<Vec<SubmissionRow>, StoreError> {
+        crate::Store::submissions(&self.inner, account, after, states, limit).await
     }
 
     async fn drafts(

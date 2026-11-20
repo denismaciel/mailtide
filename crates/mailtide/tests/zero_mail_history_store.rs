@@ -193,7 +193,8 @@ mod common {
                 JobKind::Verify(_)
                 | JobKind::BlobCleanup(_)
                 | JobKind::Deliver(_)
-                | JobKind::RefreshDrafts => None,
+                | JobKind::RefreshDrafts
+                | JobKind::SendSubmissions => None,
             })
             .collect()
     }

@@ -34,6 +34,7 @@ pub mod schedule;
 pub mod search;
 pub mod state;
 pub mod status;
+pub mod submission;
 pub mod thread;
 
 pub use command::Command;

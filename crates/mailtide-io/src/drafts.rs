@@ -678,6 +678,11 @@ where
                 });
             }
             DraftRecorded::Unconfirmed => return Err(DraftError::SendUnconfirmed),
+            DraftRecorded::TokenConflict => {
+                return Err(DraftError::Invalid(
+                    "tracking id already belongs to another send".into(),
+                ));
+            }
             DraftRecorded::NotIndexed | DraftRecorded::Done | DraftRecorded::Superseded => {
                 return Err(DraftError::NotFound);
             }

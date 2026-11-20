@@ -1454,6 +1454,9 @@ impl Engine {
                     let request = GmailRequest::ListDrafts { page_token: None };
                     out.push(self.gmail(request, priority, Waiting::Job(job)));
                 }
+                ClaimedWork::SendSubmissions => {
+                    out.push(self.finish_job(&job, JobOutcome::Done, Vec::new(), now));
+                }
                 ClaimedWork::BlobCleanup(message) => {
                     let message = message.clone();
                     let id = self.command_id();
@@ -1705,7 +1708,7 @@ impl Engine {
     fn on_not_found(&mut self, command: CommandId, id: MessageId, now: Timestamp) -> Vec<Command> {
         let answers = |kind: &JobKind| match kind {
             JobKind::Import(m) | JobKind::Verify(m) | JobKind::Deliver(m) => *m == id,
-            JobKind::BlobCleanup(_) | JobKind::RefreshDrafts => false,
+            JobKind::BlobCleanup(_) | JobKind::RefreshDrafts | JobKind::SendSubmissions => false,
         };
         let Some(job) = self.take_job(command, answers) else {
             return Vec::new();
@@ -1979,6 +1982,7 @@ impl Engine {
                 // Drafts are not mail: never park or block over them; the
                 // next periodic listing tries again.
                 JobKind::RefreshDrafts => self.drafts_refused(&job, now),
+                JobKind::SendSubmissions => Vec::new(),
             },
             // A sync request mailtide built itself, refused for good, will be
             // refused next time too: stop for an operator instead of looping.
@@ -2021,6 +2025,7 @@ impl Engine {
                     vec![self.finish_job(&job, JobOutcome::Done, Vec::new(), now)]
                 }
                 JobKind::RefreshDrafts => self.drafts_refused(&job, now),
+                JobKind::SendSubmissions => Vec::new(),
             },
             // The cursor is too old: reconcile.
             Waiting::History => {

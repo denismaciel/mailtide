@@ -2006,6 +2006,7 @@ fn decode_draft(
         | GmailRequest::PatchLabel { .. }
         | GmailRequest::DeleteLabel { .. }
         | GmailRequest::DeleteMessage { .. }
+        | GmailRequest::MessagesSend { .. }
         | GmailRequest::BatchDeleteMessages { .. } => Err(decode::DecodeError::InvalidJson(
             "not a draft request".into(),
         )),
