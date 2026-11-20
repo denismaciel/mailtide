@@ -351,12 +351,24 @@ pub struct Stats {
     pub consumers_cut_off: u64,
     /// Message facts a refresh brought up to date.
     pub facts_refreshed: u64,
-    /// Purges and emptyings the host ran (checked against history).
+    /// Purges and emptyings started on a live account.
     pub purges: u64,
     /// Messages they deleted in Gmail.
     pub purge_deletes: u64,
     /// Messages they recorded as deleted from Gmail's evidence.
     pub purged: u64,
+    /// Purge batches dispatched.
+    pub purge_batches: u64,
+    /// Remaining targets that left their bin during a preceding single.
+    pub purge_restores_between_requests: u64,
+    /// Purge token failures before any send.
+    pub purge_token_failures: u64,
+    /// Purge releases that failed after a send.
+    pub purge_release_failures: u64,
+    /// Partially applied batch refusals.
+    pub purge_partial_refusals: u64,
+    /// Purge confirmations with withheld deletion records.
+    pub purge_late_confirmations: u64,
 }
 
 /// The outcome of one run.
@@ -1021,6 +1033,24 @@ impl FeedReader {
 
 // ------------------------------------------------------------ the simulated host
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PurgeFault {
+    None,
+    Deferred,
+    Token,
+    Release,
+    Missing,
+    Partial,
+    Late,
+    Server(bool),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PurgePoint {
+    AfterCheck,
+    DuringSingle,
+}
+
 struct Sim {
     rng: Rng,
     faults: Faults,
@@ -1040,6 +1070,7 @@ struct Sim {
     stalled: FeedReader,
     /// Decides when the log is compacted, from its own generator.
     compactor: Rng,
+    purge_rng: Rng,
     /// The entries compaction removed, in log order.
     compacted: Vec<(StateSeq, Change)>,
     step: u64,
@@ -1077,6 +1108,7 @@ impl Sim {
         let reader = FeedReader::steady(&rng);
         let stalled = FeedReader::stalled(&rng);
         let compactor = Rng(splitmix64(rng.0 ^ 0xc0_4ac7_0000_0002));
+        let purge_rng = Rng(splitmix64(rng.0 ^ 0x0050_7572_6765));
         Self {
             rng,
             faults,
@@ -1095,6 +1127,7 @@ impl Sim {
             reader,
             stalled,
             compactor,
+            purge_rng,
             compacted: Vec::new(),
             step: 0,
             trace: std::collections::VecDeque::new(),
@@ -1513,7 +1546,7 @@ impl Sim {
     /// a few ids at a time, each chunk judged on the rolling history read,
     /// with another client acting between chunks.
     fn host_empty(&mut self, spam: bool) {
-        const CHUNK: u32 = 3;
+        const CHUNK: u32 = 8;
         let bin = if spam { Bin::Spam } else { Bin::Trash };
         let Some(mut scan) = self.purge_check() else {
             return;
@@ -1526,11 +1559,13 @@ impl Sim {
             let Some(last) = page.last() else {
                 return;
             };
+            if after.is_some() {
+                self.elsewhere();
+            }
             after = Some(last.clone());
             if !self.purge_round(&page, Scope::Bin(bin), &mut scan) {
                 return;
             }
-            self.elsewhere();
         }
     }
 
@@ -1550,86 +1585,149 @@ impl Sim {
         }
     }
 
-    /// A purge's check: the account must be live with a cursor, and history
-    /// from the cursor is read (after another client may have acted since
-    /// the last sync). `None`: the purge is refused.
+    /// Set up a private history scan for a live account.
     fn purge_check(&mut self) -> Option<PurgeScan> {
-        let cursor = self.mirror.record.cursor?;
+        self.mirror.record.cursor?;
         if self.mirror.record.sync != mailtide::state::SyncState::Live {
             return None;
         }
         self.elsewhere();
-        let mut scan = PurgeScan::new();
-        if !self.read_history(cursor, &mut scan) {
-            return None;
-        }
         self.stats.purges += 1;
-        Some(scan)
+        Some(PurgeScan::new())
     }
 
-    /// What one round of `Runner::purge` does against the simulated Gmail:
-    /// judge `targets` with the pure rules on the rows as they are now,
-    /// delete by id (each once; a deferral, a 5xx that may or may not have
-    /// been applied, a 404 for a live message), read history again and
-    /// record only the `messagesDeleted` records it shows. `false` when the
-    /// run must stop (a deferral, a 5xx, a crash, an unread confirmation).
     fn purge_round(&mut self, targets: &[MessageId], scope: Scope, scan: &mut PurgeScan) -> bool {
-        let mut eligible = Vec::new();
-        let mut checked = Vec::new();
-        for id in targets {
-            match scan.verdict(id, self.mirror.view(id).as_ref(), scope) {
-                Verdict::Eligible => {
-                    eligible.push(id.clone());
-                    checked.push(id.clone());
-                }
-                Verdict::Gone { .. } => checked.push(id.clone()),
-                Verdict::Refused(_) => {}
+        self.purge_round_with(targets, scope, scan, None, |sim, point| {
+            if point == PurgePoint::DuringSingle {
+                sim.elsewhere();
             }
-        }
-        let mut go_on = true;
-        let mut sent = false;
-        for request in purge::delete_requests(&eligible) {
-            if self.rng.chance(self.faults.rate_limited) {
-                // The gate can't admit it now: never sent later.
-                go_on = false;
-                break;
+        })
+    }
+
+    /// A fresh pre-check and a confirmation per wire request. The hook
+    /// lets tests put a mailbox change on either side of the last check.
+    fn purge_round_with(
+        &mut self,
+        targets: &[MessageId],
+        scope: Scope,
+        scan: &mut PurgeScan,
+        fixed_fault: Option<PurgeFault>,
+        mut activity: impl FnMut(&mut Self, PurgePoint),
+    ) -> bool {
+        let mut pending = targets.to_vec();
+        while !pending.is_empty() {
+            let Some(head) = scan.head().or(self.mirror.record.cursor) else {
+                return false;
+            };
+            if !self.read_history(head, scan, &[]) {
+                return false;
             }
-            sent = true;
-            if self.rng.chance(self.faults.transient) {
-                // Something answered 404 without Gmail applying it.
-                continue;
-            }
-            let failed = self.rng.chance(self.faults.transient);
-            if !failed || self.rng.below(2) == 0 {
-                for id in purge::request_ids(&request) {
-                    self.delete_checked(&id, scope);
-                }
-            }
-            if failed {
-                // A 5xx: it may have been applied; nothing more is sent.
-                go_on = false;
-                break;
-            }
-        }
-        if sent && !self.rng.chance(self.faults.push_dropped) {
-            self.deliveries.push(Event {
-                now: self.now,
-                kind: EventKind::PushReceived {
-                    history_id: self.gmail.current(),
+            let mut gone = Vec::new();
+            pending.retain(
+                |id| match scan.verdict(id, self.mirror.view(id).as_ref(), scope) {
+                    Verdict::Eligible => true,
+                    Verdict::Gone { .. } => {
+                        gone.push(id.clone());
+                        false
+                    }
+                    Verdict::Refused(_) => false,
                 },
-            });
+            );
+            self.record_purge_evidence(&gone, scan);
+            let Some(request) = purge::delete_requests(&pending).into_iter().next() else {
+                break;
+            };
+            let ids = purge::request_ids(&request);
+            pending.drain(..ids.len());
+            let single = matches!(request, GmailRequest::DeleteMessage { .. });
+            let fault = fixed_fault.unwrap_or_else(|| self.purge_fault(single));
+            if fault == PurgeFault::Deferred {
+                return false;
+            }
+            if fault == PurgeFault::Token {
+                self.stats.purge_token_failures += 1;
+                return false;
+            }
+            if !single {
+                self.stats.purge_batches += 1;
+            }
+            activity(self, PurgePoint::AfterCheck);
+            let applied = match fault {
+                PurgeFault::Missing | PurgeFault::Server(false) => &[][..],
+                PurgeFault::Partial => {
+                    self.stats.purge_partial_refusals += 1;
+                    &ids[..ids.len() / 2]
+                }
+                _ => ids.as_slice(),
+            };
+            for id in applied {
+                self.delete_checked(id, scope);
+            }
+            if single && !pending.is_empty() {
+                activity(self, PurgePoint::DuringSingle);
+                let restored = pending
+                    .iter()
+                    .filter(|id| {
+                        self.gmail
+                            .messages
+                            .get(*id)
+                            .is_some_and(|message| !labels_in_scope(&message.labels, scope))
+                    })
+                    .count();
+                self.stats.purge_restores_between_requests += u64::try_from(restored).unwrap_or(0);
+            }
+            if !self.purge_rng.chance(self.faults.push_dropped) {
+                self.deliveries.push(Event {
+                    now: self.now,
+                    kind: EventKind::PushReceived {
+                        history_id: self.gmail.current(),
+                    },
+                });
+            }
+            if fault == PurgeFault::Release {
+                self.stats.purge_release_failures += 1;
+            }
+            if self.purge_rng.chance(self.faults.crash)
+                || self.purge_rng.chance(self.faults.transient)
+            {
+                return false;
+            }
+            let hidden = if fault == PurgeFault::Late {
+                self.stats.purge_late_confirmations += 1;
+                applied
+            } else {
+                &[]
+            };
+            if !self.read_history(scan.head().unwrap_or(head), scan, hidden) {
+                return false;
+            }
+            self.record_purge_evidence(&ids, scan);
+            if matches!(fault, PurgeFault::Release | PurgeFault::Server(_)) {
+                return false;
+            }
         }
-        // A crash before the record, or an unread confirmation: Gmail
-        // deleted, nothing recorded; the next sync's history tombstones.
-        if self.rng.chance(self.faults.crash) || self.rng.chance(self.faults.transient) {
-            return false;
+        true
+    }
+
+    fn purge_fault(&mut self, single: bool) -> PurgeFault {
+        if self.purge_rng.chance(self.faults.rate_limited) {
+            return PurgeFault::Deferred;
         }
-        let Some(head) = scan.head() else {
-            return false;
-        };
-        if !self.read_history(head, scan) {
-            return false;
+        if !self.purge_rng.chance(self.faults.transient) {
+            return PurgeFault::None;
         }
+        match self.purge_rng.below(7) {
+            0 => PurgeFault::Token,
+            1 => PurgeFault::Release,
+            2 => PurgeFault::Missing,
+            3 if !single => PurgeFault::Partial,
+            3 | 4 => PurgeFault::Late,
+            5 => PurgeFault::Server(false),
+            _ => PurgeFault::Server(true),
+        }
+    }
+
+    fn record_purge_evidence(&mut self, checked: &[MessageId], scan: &PurgeScan) {
         let evidence: Vec<(MessageId, DeletionEvidence)> = checked
             .iter()
             .filter_map(|id| {
@@ -1637,7 +1735,10 @@ impl Sim {
                     .map(|at| (id.clone(), DeletionEvidence::History { at }))
             })
             .collect();
-        let before = self.mirror.clone();
+        if evidence.is_empty() {
+            return;
+        }
+        let before = self.mirror.record.cursor;
         let recorded = self.mirror.record_deleted(&evidence, self.now);
         self.stats.purged += u64::from(recorded);
         self.note(&format!("purge recorded {evidence:?}"));
@@ -1647,17 +1748,16 @@ impl Sim {
                 violation,
             });
         }
-        if before.record.cursor != self.mirror.record.cursor {
+        if before != self.mirror.record.cursor {
             self.violations.push(ObservedViolation {
                 step: self.step,
                 violation: Violation::CursorMovedWithoutCommit {
-                    before: before.record.cursor,
+                    before,
                     after: self.mirror.record.cursor,
                 },
             });
         }
         self.check_tombstones();
-        go_on
     }
 
     /// Gmail deletes `id`, which must be in the bin at that moment.
@@ -1665,15 +1765,7 @@ impl Sim {
         let Some(message) = self.gmail.messages.get(id) else {
             return;
         };
-        let in_bin = match scope {
-            Scope::Bin(bin) => message.labels.contains(&bin.label()),
-            Scope::TrashOrSpam => {
-                labels::has(&message.labels, labels::system::TRASH)
-                    || labels::has(&message.labels, labels::system::SPAM)
-            }
-            Scope::Anywhere => true,
-        };
-        if !in_bin {
+        if !labels_in_scope(&message.labels, scope) {
             self.violations.push(ObservedViolation {
                 step: self.step,
                 violation: Violation::PurgedOutsideTrashOrSpam {
@@ -1688,12 +1780,18 @@ impl Sim {
     /// Read every history page from `start` into `scan`, at most
     /// [`purge::PURGE_HISTORY_PAGES`]; `false` if history expired or is
     /// too long (the purge is refused as stale).
-    fn read_history(&self, start: HistoryId, scan: &mut PurgeScan) -> bool {
+    fn read_history(&self, start: HistoryId, scan: &mut PurgeScan, hidden: &[MessageId]) -> bool {
         let mut token: Option<PageToken> = None;
         for _ in 0..purge::PURGE_HISTORY_PAGES {
-            let Some(page) = self.gmail.history_page(start, token.as_ref()) else {
+            let Some(mut page) = self.gmail.history_page(start, token.as_ref()) else {
                 return false;
             };
+            page.records.retain(|record| {
+                !matches!(
+                    record,
+                    HistoryRecord::MessageDeleted { message_id, .. } if hidden.contains(message_id)
+                )
+            });
             scan.read(&page);
             match page.next_page_token {
                 None => return true,
@@ -2276,6 +2374,16 @@ impl Sim {
     }
 }
 
+fn labels_in_scope(labels: &LabelSet, scope: Scope) -> bool {
+    match scope {
+        Scope::Bin(bin) => labels.contains(&bin.label()),
+        Scope::TrashOrSpam => {
+            labels::has(labels, labels::system::TRASH) || labels::has(labels, labels::system::SPAM)
+        }
+        Scope::Anywhere => true,
+    }
+}
+
 fn build_engine(mirror: &mut AccountMirror) -> Engine {
     let snapshot = mirror
         .claim(ENGINE_VERSION)
@@ -2350,14 +2458,8 @@ mod tests {
 
     #[test]
     fn purges_never_tombstone_a_message_gmail_still_has() {
-        // Other seeds again: purges and emptyings (chunked, re-judged on
-        // the rolling history read) from the host while the engine syncs,
-        // with changes elsewhere since the last sync and between chunks,
-        // quota deferrals, 5xx answers applied or not, 404s for live
-        // messages, unread confirmations and crashes before the record.
-        // Every tombstone must be for a message Gmail no longer has, every
-        // delete must find its message in the bin, and the mirror must
-        // converge (I9) once faults heal.
+        // Every delete must find its message in the bin, every tombstone
+        // must have lost its Gmail message, and the mirror must converge.
         let results: Vec<RunResult> = (400..600).map(|seed| run(seed, 400)).collect();
         let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
         assert!(
@@ -2373,6 +2475,119 @@ mod tests {
             calls > 0 && deletes > 0 && recorded > 0,
             "{calls} purges deleted {deletes} and recorded {recorded}"
         );
+    }
+
+    fn purge_fixture(n: usize) -> (Sim, Vec<MessageId>) {
+        let mut sim = Sim::new(Rng(11), Faults::none(), Some(Vec::new()));
+        while sim.gmail.messages.len() < n {
+            sim.gmail.apply(&UserOp::Receive { thread: None });
+        }
+        let ids: Vec<_> = sim.gmail.messages.keys().take(n).cloned().collect();
+        assert!(matches!(
+            sim.gmail.modify(&ModifyGroup {
+                messages: ids.clone(),
+                add: vec![Bin::Trash.label()],
+                remove: vec![LabelId(labels::system::INBOX.into())],
+                versions: Vec::new(),
+            }),
+            Modified::Done
+        ));
+        let start = sim.engine.start(sim.now);
+        sim.pending.extend(start);
+        assert!(matches!(sim.heal(), Convergence::Reached { .. }));
+        (sim, ids)
+    }
+
+    fn restore(sim: &mut Sim, id: &MessageId) {
+        assert!(matches!(
+            sim.gmail.modify(&ModifyGroup {
+                messages: vec![id.clone()],
+                add: vec![LabelId(labels::system::INBOX.into())],
+                remove: vec![Bin::Trash.label()],
+                versions: Vec::new(),
+            }),
+            Modified::Done
+        ));
+    }
+
+    #[test]
+    fn a_restore_during_one_single_delete_protects_the_next_target() {
+        let (mut sim, ids) = purge_fixture(2);
+        let mut scan = sim.purge_check().expect("live");
+        assert!(
+            sim.purge_round_with(&ids, Scope::TrashOrSpam, &mut scan, None, |sim, point| {
+                if point == PurgePoint::DuringSingle {
+                    restore(sim, &ids[1]);
+                }
+            },)
+        );
+        assert_eq!(sim.stats.purge_restores_between_requests, 1);
+        assert_eq!(sim.stats.purge_deletes, 1);
+        assert!(sim.gmail.messages.contains_key(&ids[1]));
+        assert!(sim.violations.is_empty());
+    }
+
+    #[test]
+    fn a_restore_after_the_last_observation_can_escape_the_check() {
+        let (mut sim, ids) = purge_fixture(1);
+        let mut scan = sim.purge_check().expect("live");
+        assert!(
+            sim.purge_round_with(&ids, Scope::TrashOrSpam, &mut scan, None, |sim, point| {
+                if point == PurgePoint::AfterCheck {
+                    restore(sim, &ids[0]);
+                }
+            },)
+        );
+        assert_eq!(sim.stats.purge_deletes, 1);
+        assert!(matches!(
+            sim.violations.as_slice(),
+            [ObservedViolation { violation: Violation::PurgedOutsideTrashOrSpam { message }, .. }]
+            if message == &ids[0]
+        ));
+    }
+
+    #[test]
+    fn empty_in_the_model_exercises_batches_and_the_final_small_page() {
+        let (mut sim, _) = purge_fixture(9);
+        sim.host_empty(false);
+        assert_eq!(sim.stats.purge_batches, 1);
+        assert_eq!(sim.stats.purge_deletes, 9);
+        assert_eq!(sim.stats.purged, 9);
+        assert!(sim.violations.is_empty());
+    }
+
+    #[test]
+    fn purge_faults_keep_evidence_and_application_distinct() {
+        for fault in [
+            PurgeFault::Token,
+            PurgeFault::Release,
+            PurgeFault::Partial,
+            PurgeFault::Late,
+        ] {
+            let (mut sim, ids) = purge_fixture(if fault == PurgeFault::Release { 2 } else { 5 });
+            let mut scan = sim.purge_check().expect("live");
+            let completed =
+                sim.purge_round_with(&ids, Scope::TrashOrSpam, &mut scan, Some(fault), |_, _| {});
+            let counters = (
+                sim.stats.purge_token_failures,
+                sim.stats.purge_release_failures,
+                sim.stats.purge_partial_refusals,
+                sim.stats.purge_late_confirmations,
+                sim.stats.purge_deletes,
+                sim.stats.purged,
+                completed,
+            );
+            let expected = match fault {
+                PurgeFault::Token => (1, 0, 0, 0, 0, 0, false),
+                PurgeFault::Release => (0, 1, 0, 0, 1, 1, false),
+                PurgeFault::Partial => (0, 0, 1, 0, 2, 2, true),
+                PurgeFault::Late => (0, 0, 0, 1, 5, 0, true),
+                _ => unreachable!("case specifies a fault"),
+            };
+            assert_eq!(counters, expected);
+            assert!(sim.violations.is_empty());
+            assert!(matches!(sim.heal(), Convergence::Reached { .. }));
+        }
     }
 
     #[test]

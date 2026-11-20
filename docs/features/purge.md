@@ -279,13 +279,18 @@ Not declared: Zero has no test of a permanent delete, and its spam-cleanup
 suite belongs to `scripts/zero_tests.py`. jmap-client and the Stalwart
 server have no tests for destroy.
 
-The tests listed in the plan cover the request shapes and costs; every branch of the
-eligibility fold (restore seen only in history, trash seen only in history,
-pending intents either way, unverified rows, drafts, threads); confirmation
-by history; the store methods; each row of the failure table; the scope
-refusal; `empty` with messages arriving in and leaving the bin while it
-runs; a simulator campaign with the invariant "a tombstone exists only for
-a message Gmail no longer has"; and the Python API.
+The plan lists request shape and quota tests, label eligibility, store
+conformance, delivery racing a tombstone, and the synchronous and async
+Python interfaces. Driver tests pause quota admission or token acquisition,
+restore a target during a preceding single or after its confirmation,
+and force release, refusal and confirmation failures.
+
+The simulator checks Gmail's bin labels at application and checks that
+tombstones belong to deleted messages. Its empty path includes batches
+and a short tail. Deterministic tests count restores during a previous
+single, token and release failures, partial refusals and late history.
+One characterization test restores the message after the last eligible
+snapshot and expects the at-delete oracle to flag the resulting deletion.
 
 ## 6. Slices
 

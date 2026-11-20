@@ -36,6 +36,12 @@ fn main() {
         totals.purges += result.stats.purges;
         totals.purge_deletes += result.stats.purge_deletes;
         totals.purged += result.stats.purged;
+        totals.purge_batches += result.stats.purge_batches;
+        totals.purge_restores_between_requests += result.stats.purge_restores_between_requests;
+        totals.purge_token_failures += result.stats.purge_token_failures;
+        totals.purge_release_failures += result.stats.purge_release_failures;
+        totals.purge_partial_refusals += result.stats.purge_partial_refusals;
+        totals.purge_late_confirmations += result.stats.purge_late_confirmations;
         if !result.passed() {
             failed += 1;
             println!(

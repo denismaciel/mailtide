@@ -1172,6 +1172,9 @@ Wheels: abi3 for CPython ≥ 3.12, plus free-threaded 3.14t and 3.15t.
    - slow blob storage;
    - concurrent user changes in "Gmail" while actions are in flight
      (phase 6).
+   - purge token and lease-release failures, partial batch refusal, late
+     history, and a restore during an earlier single delete. The bin
+     oracle also characterizes a restore after the last history observation.
 
    Each run is seeded and reproducible. Invariants I1–I10 are checked after
    every step. Long seeded campaigns run in CI nightly.

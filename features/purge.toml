@@ -2,7 +2,7 @@ id = "purge"
 title = "Purge: permanent delete, empty trash and empty spam"
 summary = "A switched-off-by-default call that permanently deletes named messages, a thread's messages, or everything the mirror holds in trash or spam: checked against Gmail's history since the mirror's cursor, sent by id only, never repeated by mailtide, and tombstoned only on Gmail's own evidence."
 roadmap = ["W1"]
-status = "in_progress"
+status = "done"
 design = "docs/features/purge.md"
 depends_on = []
 
@@ -107,7 +107,7 @@ role = "Export the purge types"
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
-role = "Purges from the driver in the fake Gmail, with lost answers, crashes before the record and restores made elsewhere in between; the purge invariant"
+role = "A wire-request purge model with fresh checks, interleaving counters and the at-delete bin and evidence invariants"
 
 # -------------------------------------------------------------------- bindings
 
@@ -828,6 +828,26 @@ covers = "A quota release failure preserves the direct call's response or unknow
 target = "crates/mailtide-io/src/runner.rs"
 name = "cooldown_failure_keeps_the_rate_limit_disposition"
 covers = "The quota cooldown failure and 429 disposition are both available"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_restore_during_one_single_delete_protects_the_next_target"
+covers = "The at-delete oracle verifies the next single sees a restore while the first was in flight"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_restore_after_the_last_observation_can_escape_the_check"
+covers = "Characterizes the unavoidable race with an explicit at-delete violation"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "empty_in_the_model_exercises_batches_and_the_final_small_page"
+covers = "Empty exercises a full batch and a final single with counted application"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "purge_faults_keep_evidence_and_application_distinct"
+covers = "Count token and release failures, partial refusal and late confirmation, and check convergence"
 
 # ------------------------------------------- Gmail behaviour assumed, to test
 
