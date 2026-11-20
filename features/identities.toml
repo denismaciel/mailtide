@@ -2,7 +2,7 @@ id = "identities"
 title = "Identities and the settings mirror: send-as aliases, signatures, vacation responder, filters, forwarding"
 summary = "Mirror four small account settings (send-as identities with their signatures, the vacation responder, filters, forwarding) into the store with a slow refresh job, an on-demand refresh and a feed entry when one changes; then make identity fields, the vacation responder and filters writable as synchronous calls. Reads need no scope beyond what a sync already holds."
 roadmap = ["C4", "A1"]
-status = "approved"
+status = "planned"
 design = "docs/features/identities.md"
 # No hard dependency. Shared groundwork, added by whichever plan lands first:
 #   an account-level job kind (also `drafts`: RefreshDrafts), the PUT, PATCH

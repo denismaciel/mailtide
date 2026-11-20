@@ -1,6 +1,6 @@
 # Identities and the settings mirror
 
-Plan: `features/identities.toml` (roadmap C4 and A1). Status: planned.
+Plan: `features/identities.toml` (roadmap C4 and A1). Status: planned, not built. This is a specification only: nothing in it exists in the code yet, and its Gmail unknowns that need the settings scope are untested.
 
 ## 1. Goal and scope
 
