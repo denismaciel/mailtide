@@ -27,6 +27,8 @@ def describe(change: mailtide.Change) -> str:
             return f"deleted {change.id}"
         case mailtide.LabelDefinitionsChanged():
             return "label definitions"
+        case mailtide.FactsRefreshed():
+            return f"facts {change.id}"
         case _:
             assert_never(change)
 

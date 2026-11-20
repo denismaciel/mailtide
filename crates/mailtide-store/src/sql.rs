@@ -22,7 +22,8 @@ use mailtide::jobs::{
 };
 use mailtide::labels::LabelSet;
 use mailtide::mirror::{
-    AccountMirror, AccountRecord, Content, Located, MessageRecord, MessageView, StoredContent,
+    AccountMirror, AccountRecord, Content, FactsUpdate, Located, MessageRecord, MessageView,
+    StoredContent,
 };
 use mailtide::outbox::{ActionRequest, Intent, IntentOp, plan_delivery};
 use mailtide::quota::Priority;
@@ -1192,17 +1193,22 @@ impl SqlStore {
                 content: None,
             });
         }
+        let with_content = |change: &Change| match change {
+            Change::MessageImported { id, .. } | Change::FactsRefreshed { id, .. } => {
+                Some(id.clone())
+            }
+            _ => None,
+        };
         let imported: Vec<MessageId> = changes
             .iter()
-            .filter_map(|entry| match &entry.change {
-                Change::MessageImported { id, .. } => Some(id.clone()),
-                _ => None,
-            })
+            .filter_map(|entry| with_content(&entry.change))
             .collect();
-        let mut contents = self.contents(account, &imported).await?;
+        // A page can hold a message's import and its refresh: both show the
+        // content as stored now.
+        let contents = self.contents(account, &imported).await?;
         for entry in &mut changes {
-            if let Change::MessageImported { id, .. } = &entry.change {
-                entry.content = contents.remove(id);
+            if let Some(id) = with_content(&entry.change) {
+                entry.content = contents.get(&id).cloned();
             }
         }
         let next = cut.next.unwrap_or(since);
@@ -1925,6 +1931,30 @@ impl crate::Store for SqlStore {
             .await
             .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
         Ok(admitted)
+    }
+
+    async fn refresh_facts(
+        &self,
+        account: &AccountId,
+        updates: &[FactsUpdate],
+    ) -> Result<u32, StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
+            return Ok(0);
+        };
+        let mut mirror = AccountMirror::new(account.clone(), record.generation);
+        mirror.record = record;
+        mirror.seq = seq;
+        let ids: Vec<MessageId> = updates.iter().map(|update| update.id.clone()).collect();
+        Self::load_rows(&mut tx, account, &ids, &mut mirror).await?;
+        let before = mirror.clone();
+        let applied = mirror.refresh_facts(updates);
+        Self::write_diff(&mut tx, &before, &mirror).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
+        Ok(applied)
     }
 
     async fn prioritise(

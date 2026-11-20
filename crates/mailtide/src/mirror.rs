@@ -612,6 +612,42 @@ pub fn row_changes(previous: Option<&MessageRecord>, record: &MessageRecord) -> 
     changes
 }
 
+// ------------------------------------------------------------ facts refresh
+
+/// Facts extracted again from a message's stored raw content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactsUpdate {
+    /// The message.
+    pub id: MessageId,
+    /// The blob the facts were extracted from.
+    pub blob: BlobRef,
+    /// The raw size the row held when the refresher read it.
+    pub read_size: u64,
+    /// The length of the blob the facts were extracted from.
+    pub size: u64,
+    /// The facts.
+    pub facts: MessageFacts,
+}
+
+/// Whether a facts refresh applies to `record` (pure): only while the row is
+/// still the one the refresher read (imported, same blob, same size) and the
+/// update improves it (its facts are missing or older, or the blob's length
+/// differs from the size the row holds). A message deleted, re-imported or
+/// refreshed meanwhile is left alone.
+#[must_use]
+pub fn refresh_applies(record: &MessageRecord, update: &FactsUpdate) -> bool {
+    let Content::Imported(stored) = &record.content else {
+        return false;
+    };
+    let older = stored
+        .facts
+        .as_ref()
+        .is_none_or(|facts| facts.version < update.facts.version);
+    stored.blob == update.blob
+        && stored.size == update.read_size
+        && (older || stored.size != update.size)
+}
+
 // ------------------------------------------------------------ intent decisions
 
 /// The intents admitting `action` on a message adds, given its labels and
@@ -1450,6 +1486,40 @@ impl AccountMirror {
         report
     }
 
+    /// Bring stored facts up to date, outside any engine: like an admitted
+    /// action, a refresh is not fenced by the engine holding the account and
+    /// does not supersede it. Each update applies only by [`refresh_applies`];
+    /// every applied one logs a `FactsRefreshed` entry, all under one new
+    /// state (none when nothing applied). Returns how many applied.
+    pub fn refresh_facts(&mut self, updates: &[FactsUpdate]) -> u32 {
+        let seq = StateSeq(self.seq.0 + 1);
+        let mut applied = 0;
+        for update in updates {
+            let Some(record) = self.messages.get_mut(&update.id) else {
+                continue;
+            };
+            if !refresh_applies(record, update) {
+                continue;
+            }
+            if let Content::Imported(stored) = &mut record.content {
+                stored.facts = Some(update.facts.clone());
+                stored.size = update.size;
+            }
+            self.log.push((
+                seq,
+                Change::FactsRefreshed {
+                    id: record.id.clone(),
+                    thread_id: record.thread_id.clone(),
+                },
+            ));
+            applied += 1;
+        }
+        if applied > 0 {
+            self.seq = seq;
+        }
+        applied
+    }
+
     /// When the earliest ready job is due (see [`crate::jobs::next_due`]).
     #[must_use]
     pub fn next_due(&self) -> Option<Timestamp> {
@@ -1607,9 +1677,11 @@ impl AccountMirror {
         crate::revision::ChangeFeed::Page(self.changes(since, limit))
     }
 
-    /// The content stored for an import entry's message, if it is still here.
+    /// The content stored for an import or refresh entry's message, if it
+    /// is still here.
     fn imported_content(&self, change: &Change) -> Option<StoredContent> {
-        let Change::MessageImported { id, .. } = change else {
+        let (Change::MessageImported { id, .. } | Change::FactsRefreshed { id, .. }) = change
+        else {
             return None;
         };
         match &self.messages.get(id)?.content {
@@ -2805,5 +2877,184 @@ mod tests {
             stored(&mirror, "b").map(|content| content.facts),
             Some(None)
         );
+    }
+
+    fn refreshed(id: &str, read_size: u64, size: u64, version: u32) -> FactsUpdate {
+        FactsUpdate {
+            id: MessageId(id.into()),
+            blob: BlobRef(format!("{id}.eml")),
+            read_size,
+            size,
+            facts: MessageFacts {
+                version,
+                sender_email: Some(format!("{id}@x.org")),
+                ..MessageFacts::default()
+            },
+        }
+    }
+
+    fn imported_with(id: &str, version: Option<u32>) -> AccountMirror {
+        let mut mirror = claimed();
+        let mut c = commit(&mirror);
+        c.messages = vec![import_op(
+            id,
+            3,
+            version.map(|version| MessageFacts {
+                version,
+                ..MessageFacts::default()
+            }),
+        )];
+        let _ = mirror.apply(&c);
+        mirror
+    }
+
+    #[test]
+    fn a_refresh_applies_only_to_the_same_blob_at_an_older_version() {
+        for (version, update, applies) in [
+            (None, refreshed("a", 120, 120, 1), true),
+            (Some(0), refreshed("a", 120, 120, 1), true),
+            (Some(1), refreshed("a", 120, 120, 1), false),
+            (Some(2), refreshed("a", 120, 120, 1), false),
+            (Some(1), refreshed("a", 120, 130, 1), true),
+            (None, refreshed("a", 110, 120, 1), false),
+            (
+                None,
+                FactsUpdate {
+                    blob: BlobRef("other.eml".into()),
+                    ..refreshed("a", 120, 120, 1)
+                },
+                false,
+            ),
+        ] {
+            let mut mirror = imported_with("a", version);
+            let record = mirror.messages[&MessageId("a".into())].clone();
+            assert_eq!(
+                refresh_applies(&record, &update),
+                applies,
+                "{version:?} {update:?}"
+            );
+            assert_eq!(
+                mirror.refresh_facts(std::slice::from_ref(&update)),
+                u32::from(applies)
+            );
+            let content = stored(&mirror, "a").expect("imported");
+            if applies {
+                assert_eq!(content.facts, Some(update.facts));
+                assert_eq!(content.size, update.size, "the size is the blob's length");
+            } else {
+                assert_eq!(content.facts.map(|facts| facts.version), version);
+                assert_eq!(content.size, 120);
+            }
+        }
+    }
+
+    #[test]
+    fn a_refresh_of_a_deleted_or_pending_message_applies_nothing() {
+        let mut mirror = claimed();
+        let mut c = commit(&mirror);
+        c.messages = vec![
+            MessageOp::Observe(observation("pending", &["INBOX"], 2)),
+            import_op("gone", 2, None),
+        ];
+        let _ = mirror.apply(&c);
+        let mut c = commit(&mirror);
+        c.messages = vec![MessageOp::Tombstone {
+            id: MessageId("gone".into()),
+            evidence: DeletionEvidence::History { at: HistoryId(4) },
+        }];
+        let _ = mirror.apply(&c);
+        let before = mirror.clone();
+        let updates = [
+            refreshed("pending", 120, 120, 1),
+            refreshed("gone", 120, 120, 1),
+            refreshed("never", 120, 120, 1),
+        ];
+        assert_eq!(mirror.refresh_facts(&updates), 0);
+        assert_eq!(mirror, before, "no row, no entry, no new state");
+    }
+
+    #[test]
+    fn a_refresh_touches_only_the_facts() {
+        let mut mirror = imported_with("a", None);
+        let _ = mirror.admit_action(
+            &ActionRequest::Messages {
+                ids: vec![MessageId("a".into())],
+                action: outbox::Action::Archive,
+            },
+            Timestamp(5),
+        );
+        let before = mirror.clone();
+        assert_eq!(mirror.refresh_facts(&[refreshed("a", 120, 120, 1)]), 1);
+        let (old, new) = (
+            &before.messages[&MessageId("a".into())],
+            &mirror.messages[&MessageId("a".into())],
+        );
+        assert_eq!(
+            (&new.labels, new.checkpoint, new.unverified, &new.thread_id),
+            (&old.labels, old.checkpoint, old.unverified, &old.thread_id)
+        );
+        let (Content::Imported(old), Content::Imported(new)) = (&old.content, &new.content) else {
+            panic!("imported");
+        };
+        assert_eq!(
+            (&new.blob, new.size, new.internal_date, &new.headers),
+            (&old.blob, old.size, old.internal_date, &old.headers)
+        );
+        assert_eq!(mirror.intents, before.intents);
+        assert_eq!(mirror.jobs, before.jobs);
+        assert_eq!(mirror.record, before.record);
+    }
+
+    #[test]
+    fn a_refresh_records_one_entry_per_message_changed_in_one_state() {
+        let mut mirror = claimed();
+        let mut c = commit(&mirror);
+        c.messages = vec![
+            import_op("a", 2, None),
+            import_op("b", 2, Some(MessageFacts::empty())),
+            import_op("c", 2, None),
+        ];
+        let _ = mirror.apply(&c);
+        let head = mirror.seq;
+        let applied = mirror.refresh_facts(&[
+            refreshed("a", 120, 120, 1),
+            refreshed("b", 120, 120, 1),
+            refreshed("c", 120, 120, 1),
+        ]);
+        assert_eq!(applied, 2, "b is current");
+        assert_eq!(mirror.seq, StateSeq(head.0 + 1));
+        let page = mirror.changes(head.into(), 100);
+        let entries: Vec<(&Change, StateSeq)> = page
+            .changes
+            .iter()
+            .map(|entry| (&entry.change, entry.state))
+            .collect();
+        let thread = ThreadId("t".into());
+        assert_eq!(
+            entries,
+            [
+                (
+                    &Change::FactsRefreshed {
+                        id: MessageId("a".into()),
+                        thread_id: thread.clone()
+                    },
+                    mirror.seq
+                ),
+                (
+                    &Change::FactsRefreshed {
+                        id: MessageId("c".into()),
+                        thread_id: thread
+                    },
+                    mirror.seq
+                ),
+            ]
+        );
+        assert!(page.changes.iter().all(|entry| {
+            entry
+                .content
+                .as_ref()
+                .and_then(|content| content.facts.as_ref())
+                .is_some_and(|facts| facts.version == 1)
+        }));
     }
 }

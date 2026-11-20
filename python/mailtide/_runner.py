@@ -18,6 +18,7 @@ from mailtide._core import (
     ChangePage,
     ConsumerCursor,
     DriftResult,
+    FactsRefresh,
     ForgetResult,
     Health,
     Label,
@@ -375,6 +376,20 @@ class Runner:
         its reference and role. The blob is read and parsed in Rust; only the
         metadata crosses over."""
         return await self._core.parts(account, message_id)
+
+    async def refresh_facts(
+        self,
+        account: str,
+        after: str | None = None,
+        limit: int = 1_000,
+        budget_s: float = 60.0,
+    ) -> FactsRefresh:
+        """Bring the facts of messages imported before the current extractor up
+        to date from their stored content, without a Gmail call (one blob read
+        per stale message). Schedule it like ``compact``: call again from
+        ``next`` until it is ``None``; a second pass reads no blob. Each brought
+        up to date logs a ``FactsRefreshed`` feed entry."""
+        return await self._core.refresh_facts(account, after, limit, budget_s)
 
     async def open_part(
         self, account: str, message_id: str, part: str, chunk_size: int = 262_144

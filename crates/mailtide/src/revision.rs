@@ -755,6 +755,15 @@ pub enum Change {
     },
     /// The account's label definitions were replaced.
     LabelDefinitionsChanged,
+    /// The facts extracted from the message's raw content were brought up
+    /// to date (a facts refresh, SPEC §10.3): read them again from the
+    /// entry's content.
+    FactsRefreshed {
+        /// The message.
+        id: MessageId,
+        /// Its thread.
+        thread_id: ThreadId,
+    },
 }
 
 impl Change {
@@ -766,7 +775,8 @@ impl Change {
             | Self::MessageImported { id, .. }
             | Self::LabelsChanged { id, .. }
             | Self::OverlayChanged { id, .. }
-            | Self::MessageDeleted { id, .. } => Some(id),
+            | Self::MessageDeleted { id, .. }
+            | Self::FactsRefreshed { id, .. } => Some(id),
             Self::LabelDefinitionsChanged => None,
         }
     }
@@ -783,11 +793,13 @@ pub struct ChangeEntry {
     pub index: u32,
     /// What changed.
     pub change: Change,
-    /// For a [`Change::MessageImported`] entry, the content the mirror
-    /// stores for its message (where the raw content is and its header
-    /// facts), so a consumer needs no second read. Read with the feed, not
-    /// kept in the log: entries recorded before it existed carry it too.
-    /// `None` once the message is deleted, and for every other kind.
+    /// For a [`Change::MessageImported`] or [`Change::FactsRefreshed`]
+    /// entry, the content the mirror stores for its message now (where the
+    /// raw content is, its header facts and its message facts), so a
+    /// consumer needs no second read. Read with the feed, not kept in the
+    /// log: entries recorded before it existed carry it too, and an import
+    /// entry shows facts refreshed since. `None` once the message is
+    /// deleted, and for every other kind.
     pub content: Option<StoredContent>,
 }
 

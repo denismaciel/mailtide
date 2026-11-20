@@ -68,6 +68,7 @@ def every_database_call(
         "consumers": lambda: runner.consumers(ACCOUNT),
         "drop_consumer": lambda: runner.drop_consumer(ACCOUNT, "indexer"),
         "message_ids": lambda: runner.message_ids(ACCOUNT),
+        "refresh_facts": lambda: runner.refresh_facts(ACCOUNT),
     }
 
 

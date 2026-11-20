@@ -436,6 +436,11 @@ where
         self
     }
 
+    /// The facts extractor imports and refreshes use.
+    pub(crate) fn facts_extractor(&self) -> fn(&[u8]) -> MessageFacts {
+        self.extract
+    }
+
     /// The store, for reads.
     pub fn store(&self) -> &S {
         &self.store

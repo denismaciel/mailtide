@@ -8,7 +8,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::{AccountMirror, Located, MessageView};
+use mailtide::mirror::{AccountMirror, FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -247,6 +247,14 @@ impl Store for MemoryStore {
         self.on_account(account, Prioritised::unknown(ids), |mirror| {
             mirror.prioritise(ids, now)
         })
+    }
+
+    async fn refresh_facts(
+        &self,
+        account: &AccountId,
+        updates: &[FactsUpdate],
+    ) -> Result<u32, StoreError> {
+        self.on_account(account, 0, |mirror| mirror.refresh_facts(updates))
     }
 
     async fn messages(

@@ -2,20 +2,24 @@
 //! messages with attachments, real blob writes and store commits.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mailtide::EngineConfig;
-use mailtide::gmail::MessageFacts;
-use mailtide::ids::{AccountId, MessageId, Timestamp};
+use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, JobPlan, MessageOp};
+use mailtide::gmail::{FACTS_VERSION, MessageFacts};
+use mailtide::ids::{
+    AccountId, BlobRef, CommitId, ENGINE_VERSION, HistoryId, MessageId, Timestamp,
+};
 use mailtide::mirror::StoredContent;
 use mailtide::quota::Budget;
 use mailtide::revision::{Change, ChangeFeed, StateSeq};
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
 use mailtide_io::auth::{AccessToken, StaticTokens};
-use mailtide_io::blobs::{BlobStore, ObjectBlobs, blob_key};
+use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, RangeRead, blob_key};
 use mailtide_io::quota_gate::LocalGate;
 use mailtide_io::runner::{Runner, RunnerConfig, StopReason, WatchMode};
 use mailtide_io::transport::{GmailTransport, TransportError};
@@ -59,10 +63,11 @@ const REPORT: &[u8] = b"From: =?utf-8?Q?Ren=C3=A9?= <rene@example.org>\r\n\
 
 const PLAIN: &[u8] = b"From: a@example.org\r\nSubject: Plain\r\n\r\nhello\r\n";
 
-/// An inbox of raw messages; raw fetches are counted.
+/// An inbox of raw messages; requests and raw fetches are counted.
 #[derive(Debug, Default)]
 struct FakeGmail {
     messages: BTreeMap<String, Vec<u8>>,
+    requests: Mutex<u32>,
     raw_fetches: Mutex<u32>,
 }
 
@@ -75,6 +80,20 @@ impl FakeGmail {
                 .collect(),
             ..Self::default()
         }
+    }
+
+    /// `count` plain messages, `m00` to `m{count - 1}`.
+    fn plain(count: usize) -> Self {
+        Self {
+            messages: (0..count)
+                .map(|n| (format!("m{n:02}"), PLAIN.to_vec()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn requests(&self) -> u32 {
+        *self.requests.lock().expect("lock")
     }
 
     fn raw_fetches(&self) -> u32 {
@@ -96,6 +115,7 @@ impl GmailTransport for FakeGmail {
         request: HttpRequest,
         _token: &AccessToken,
     ) -> Result<HttpResponse, TransportError> {
+        *self.requests.lock().expect("lock") += 1;
         let query: BTreeMap<&str, &str> = request
             .query
             .iter()
@@ -155,7 +175,11 @@ fn runner<B: BlobStore>(gmail: FakeGmail, blobs: B) -> TestRunner<B> {
         MemoryStore::tracking(&[account()]),
         blobs,
         gmail,
-        LocalGate::new(Budget::GMAIL_DEFAULT),
+        // Room to import every test message in one minute.
+        LocalGate::new(Budget {
+            account_per_minute: 100_000,
+            ..Budget::GMAIL_DEFAULT
+        }),
         tokens,
         RunnerConfig {
             engine: EngineConfig::default(),
@@ -312,5 +336,334 @@ async fn the_tracking_id_reaches_the_import_entry() {
         tracking("m2"),
         Some(None),
         "a message mailtide did not write"
+    );
+}
+
+/// Blobs in memory that count whole reads and can hold one message's read
+/// until the test lets it go.
+struct Blobs {
+    inner: ObjectBlobs,
+    gets: Mutex<u32>,
+    hold: Option<(BlobRef, tokio::sync::Notify, tokio::sync::Notify)>,
+}
+
+impl Blobs {
+    fn new() -> Self {
+        Self {
+            inner: ObjectBlobs::memory(),
+            gets: Mutex::new(0),
+            hold: None,
+        }
+    }
+
+    /// Reads of `message` wait, once they started, until `release`.
+    fn holding(message: &str) -> Self {
+        Self {
+            hold: Some((
+                blob_key(&account(), &id(message)),
+                tokio::sync::Notify::new(),
+                tokio::sync::Notify::new(),
+            )),
+            ..Self::new()
+        }
+    }
+
+    fn gets(&self) -> u32 {
+        *self.gets.lock().expect("lock")
+    }
+}
+
+impl BlobStore for Blobs {
+    async fn put(&self, key: &BlobRef, bytes: Vec<u8>) -> Result<(), BlobError> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn get(&self, key: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        *self.gets.lock().expect("lock") += 1;
+        let bytes = self.inner.get(key).await;
+        if let Some((held, started, release)) = &self.hold
+            && held == key
+        {
+            started.notify_one();
+            release.notified().await;
+        }
+        bytes
+    }
+
+    async fn get_range(&self, key: &BlobRef, range: Range<u64>) -> Result<RangeRead, BlobError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn delete(&self, key: &BlobRef) -> Result<(), BlobError> {
+        self.inner.delete(key).await
+    }
+
+    async fn delete_account(&self, account: &AccountId) -> Result<u64, BlobError> {
+        self.inner.delete_account(account).await
+    }
+}
+
+/// A runner that imported `gmail`'s messages without facts, as a build from
+/// before them did, then took the current extractor.
+async fn imported_before_facts(gmail: FakeGmail, blobs: Blobs) -> TestRunner<Blobs> {
+    let runner = runner(gmail, blobs).with_facts_extractor(give_up);
+    sync(&runner).await;
+    runner.with_facts_extractor(mailtide_mime::facts)
+}
+
+async fn facts_of<B: BlobStore>(runner: &TestRunner<B>, message: &str) -> Option<MessageFacts> {
+    content(runner, message).await.facts
+}
+
+#[tokio::test]
+async fn refresh_facts_fills_old_rows_without_a_gmail_call() {
+    let runner = imported_before_facts(
+        FakeGmail::with(&[("m1", REPORT), ("m2", PLAIN)]),
+        Blobs::new(),
+    )
+    .await;
+    assert_eq!(facts_of(&runner, "m1").await, None);
+    let requests = runner.transport().requests();
+    let done = runner
+        .refresh_facts(&account(), None, 100, Duration::from_secs(30))
+        .await
+        .expect("refresh");
+    assert_eq!((done.examined, done.refreshed, done.next), (2, 2, None));
+    assert!(done.unreadable.is_empty());
+    assert_eq!(runner.transport().requests(), requests, "no Gmail call");
+    let facts = facts_of(&runner, "m1").await.expect("facts");
+    assert_eq!(facts.version, FACTS_VERSION);
+    assert_eq!((facts.attached, facts.inline), (1, 1));
+    assert_eq!(facts.tracking_id.as_deref(), Some("k3Jd9_x-Q2mZ8pLw"));
+    let ChangeFeed::Page(page) = runner
+        .store()
+        .changes(&account(), StateSeq(0).into(), 1_000)
+        .await
+        .expect("changes")
+    else {
+        panic!("the feed is not compacted");
+    };
+    let refreshed: Vec<&str> = page
+        .changes
+        .iter()
+        .filter_map(|entry| match &entry.change {
+            Change::FactsRefreshed { id, .. } => Some(id.0.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refreshed, ["m1", "m2"]);
+    assert_eq!(
+        import_entries(&runner).await["m1"]
+            .as_ref()
+            .and_then(|c| c.facts.clone()),
+        Some(facts),
+        "the earlier import entry shows them too"
+    );
+}
+
+#[tokio::test]
+async fn refresh_facts_resumes_from_next_and_ends_with_none() {
+    let runner = imported_before_facts(FakeGmail::plain(7), Blobs::new()).await;
+    let mut after = None;
+    let mut calls = Vec::new();
+    loop {
+        let done = runner
+            .refresh_facts(&account(), after.as_ref(), 3, Duration::from_secs(30))
+            .await
+            .expect("refresh");
+        calls.push((done.examined, done.refreshed));
+        match done.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(calls, [(3, 3), (3, 3), (1, 1)]);
+    for n in 0..7 {
+        assert!(facts_of(&runner, &format!("m{n:02}")).await.is_some());
+    }
+}
+
+#[tokio::test]
+async fn refresh_facts_stops_at_its_budget_between_batches() {
+    let runner = imported_before_facts(FakeGmail::plain(60), Blobs::new()).await;
+    let done = runner
+        .refresh_facts(&account(), None, 1_000, Duration::ZERO)
+        .await
+        .expect("refresh");
+    assert_eq!((done.examined, done.refreshed), (50, 50), "one whole batch");
+    assert_eq!(done.next, Some(id("m49")));
+    assert!(facts_of(&runner, "m49").await.is_some());
+    assert!(facts_of(&runner, "m50").await.is_none());
+    let rest = runner
+        .refresh_facts(&account(), done.next.as_ref(), 1_000, Duration::ZERO)
+        .await
+        .expect("refresh");
+    assert_eq!((rest.examined, rest.refreshed, rest.next), (10, 10, None));
+}
+
+#[tokio::test]
+async fn refresh_facts_skips_current_rows_without_reading_their_blobs() {
+    let runner = imported_before_facts(FakeGmail::plain(5), Blobs::new()).await;
+    let first = runner
+        .refresh_facts(&account(), None, 100, Duration::from_secs(30))
+        .await
+        .expect("refresh");
+    assert_eq!(first.refreshed, 5);
+    let reads = runner.blobs().gets();
+    let head = runner
+        .store()
+        .status(&account())
+        .await
+        .expect("status")
+        .expect("tracked")
+        .state;
+    let second = runner
+        .refresh_facts(&account(), None, 100, Duration::from_secs(30))
+        .await
+        .expect("refresh");
+    assert_eq!((second.examined, second.refreshed), (5, 0));
+    assert_eq!(runner.blobs().gets(), reads, "no blob read");
+    let status = runner
+        .store()
+        .status(&account())
+        .await
+        .expect("status")
+        .expect("tracked");
+    assert_eq!(status.state, head, "nothing written");
+}
+
+#[tokio::test]
+async fn refresh_facts_reports_a_missing_blob_and_goes_on() {
+    let runner = imported_before_facts(FakeGmail::plain(3), Blobs::new()).await;
+    runner
+        .blobs()
+        .delete(&blob_key(&account(), &id("m01")))
+        .await
+        .expect("delete");
+    let done = runner
+        .refresh_facts(&account(), None, 100, Duration::from_secs(30))
+        .await
+        .expect("refresh");
+    assert_eq!((done.examined, done.refreshed), (3, 2));
+    assert_eq!(done.unreadable, [id("m01")]);
+    assert!(facts_of(&runner, "m00").await.is_some());
+    assert!(
+        facts_of(&runner, "m01").await.is_none(),
+        "its row is untouched"
+    );
+    assert!(facts_of(&runner, "m02").await.is_some());
+}
+
+#[tokio::test]
+async fn refresh_facts_reextracts_a_row_whose_blob_length_changed() {
+    let runner = runner(FakeGmail::with(&[("m1", PLAIN)]), Blobs::new());
+    sync(&runner).await;
+    let before = content(&runner, "m1").await;
+    assert_eq!(
+        before.facts.as_ref().map(|f| f.version),
+        Some(FACTS_VERSION)
+    );
+    // A second write of other bytes (raw content not byte-stable), its
+    // import lost.
+    runner
+        .blobs()
+        .put(&blob_key(&account(), &id("m1")), REPORT.to_vec())
+        .await
+        .expect("put");
+    let done = runner
+        .refresh_facts(&account(), None, 100, Duration::from_secs(30))
+        .await
+        .expect("refresh");
+    assert_eq!(done.refreshed, 1);
+    let after = content(&runner, "m1").await;
+    assert_eq!(after.size, u64::try_from(REPORT.len()).expect("len"));
+    assert_eq!(after.facts, Some(mailtide_mime::facts(REPORT)));
+    assert!(
+        after
+            .facts
+            .iter()
+            .flat_map(|f| &f.parts)
+            .all(|p| p.part.total == after.size)
+    );
+}
+
+/// Delete `message` as a history record would, from a newer engine.
+async fn tombstone<B: BlobStore>(runner: &TestRunner<B>, message: &str) {
+    let snapshot = runner
+        .store()
+        .claim(&account(), ENGINE_VERSION)
+        .await
+        .expect("claim");
+    let plan = JobPlan {
+        priority: mailtide::quota::Priority::Live,
+        import_due_at: Timestamp(0),
+        draft_import_due_at: Timestamp(0),
+        verify_due_at: Timestamp(0),
+        cleanup_due_at: Timestamp(0),
+        deliver_due_at: Timestamp(0),
+        confirm_due_at: Timestamp(0),
+    };
+    let commit = Commit {
+        id: CommitId {
+            epoch: snapshot.epoch,
+            seq: 0,
+        },
+        account: account(),
+        epoch: snapshot.epoch,
+        engine_version: snapshot.engine_version,
+        cursor: None,
+        claim: None,
+        sync: None,
+        messages: vec![MessageOp::Tombstone {
+            id: id(message),
+            evidence: DeletionEvidence::History { at: HistoryId(11) },
+        }],
+        labels: Vec::new(),
+        account_ops: Vec::new(),
+        job_plan: plan,
+        jobs: Vec::new(),
+        intents: Vec::new(),
+    };
+    let outcome = runner.store().apply(&commit).await.expect("apply");
+    assert!(matches!(outcome, CommitOutcome::Applied { .. }));
+}
+
+#[tokio::test]
+async fn a_refresh_racing_a_delete_changes_nothing() {
+    let runner = imported_before_facts(FakeGmail::plain(1), Blobs::holding("m00")).await;
+    let user = account();
+    let refresh = runner.refresh_facts(&user, None, 100, Duration::from_secs(30));
+    let delete = async {
+        let (_, started, release) = runner.blobs().hold.as_ref().expect("held");
+        started.notified().await;
+        tombstone(&runner, "m00").await;
+        release.notify_one();
+    };
+    let (done, ()) = tokio::join!(refresh, delete);
+    let done = done.expect("no error");
+    assert_eq!((done.examined, done.refreshed), (1, 0));
+    assert!(
+        runner
+            .store()
+            .messages(&account(), &[id("m00")])
+            .await
+            .expect("messages")
+            .is_empty(),
+        "no row"
+    );
+    let ChangeFeed::Page(page) = runner
+        .store()
+        .changes(&account(), StateSeq(0).into(), 1_000)
+        .await
+        .expect("changes")
+    else {
+        panic!("the feed is not compacted");
+    };
+    assert!(
+        !page
+            .changes
+            .iter()
+            .any(|entry| matches!(entry.change, Change::FactsRefreshed { .. })),
+        "no entry"
     );
 }

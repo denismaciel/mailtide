@@ -53,6 +53,11 @@ change = "modify"
 role = "Imports in the label refresh tests carry no facts (facts: None)"
 
 [[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "check_refresh: a facts refresh changes only facts and raw sizes, never labels, rows, tombstones, jobs or intents; the simulator checks it after every refresh"
+
+[[file]]
 path = "crates/mailtide/src/revision.rs"
 change = "modify"
 role = "Change::FactsRefreshed; ChangeEntry.content is filled for it as for imports"
@@ -156,9 +161,14 @@ role = "Imports carry facts; a refresh step interleaved with sync, deletes and c
 # -------------------------------------------------------------------- bindings
 
 [[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "Total the facts refreshed across seeds"
+
+[[file]]
 path = "crates/mailtide-py/src/lib.rs"
 change = "modify"
-role = "MessageContent fields, AttachmentInfo, PartInfo, PartStream, FactsRefresh, FactsRefreshed, parts/read_part/open_part/refresh_facts, parse_addresses, decode_header, PartNotFound, PartTooLarge"
+role = "MessageContent fields (tracking_id and protocol_count included), AttachmentInfo, PartInfo, PartStream, FactsRefresh, FactsRefreshed, parts/read_part/open_part/refresh_facts, parse_addresses, decode_header, PartNotFound, PartTooLarge"
 
 [[file]]
 path = "python/mailtide/_runner.py"
@@ -271,6 +281,16 @@ role = "Driver tests against a fake Gmail: facts at import, the refresh"
 path = "crates/mailtide-io/tests/parts.rs"
 change = "new"
 role = "Driver tests: ranged reads, streaming, refusals, a blob store without ranges"
+
+[[file]]
+path = "tests/test_feed.py"
+change = "modify"
+role = "The exhaustive match over feed entries gains FactsRefreshed"
+
+[[file]]
+path = "crates/mailtide-py/Cargo.toml"
+change = "modify"
+role = "tokio's sync feature, for the lock a Python PartStream holds its Rust stream in"
 
 [[file]]
 path = "tests/test_migrations_clock.py"

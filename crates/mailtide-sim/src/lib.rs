@@ -27,17 +27,17 @@ use mailtide::commit::CommitOutcome;
 use mailtide::engine::Engine;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{
-    HeaderFacts, HistoryPage, HistoryRecord, ImportedMessage, Label, LabelKind, ListPage,
-    MessageFacts, MessageObservation, MessageRef,
+    FACTS_VERSION, HeaderFacts, HistoryPage, HistoryRecord, ImportedMessage, Label, LabelKind,
+    ListPage, MessageFacts, MessageObservation, MessageRef,
 };
 use mailtide::ids::{
     AccountId, BlobRef, CommandId, ENGINE_VERSION, HistoryId, LabelId, MessageId, PageToken,
-    ThreadId, Timestamp, splitmix64,
+    ThreadId, Timestamp, splitmix64, stable_hash,
 };
 use mailtide::invariants::{self, Violation};
 use mailtide::jobs::{JobKind, JobState};
 use mailtide::labels::{self, LabelSet};
-use mailtide::mirror::{AccountMirror, Content};
+use mailtide::mirror::{AccountMirror, Content, FactsUpdate};
 use mailtide::outbox::{
     Action, ActionRequest, IntentState, LabelDelta, ModifyGroup, ReadState, RestoreDestination,
     StarState,
@@ -135,6 +135,8 @@ pub struct Faults {
     pub lost_commit_ack: Probability,
     /// The host crashes and rebuilds the engine from the store.
     pub crash: Probability,
+    /// The host runs a facts refresh this step (outside the engine).
+    pub facts_refresh: Probability,
 }
 
 impl Faults {
@@ -150,6 +152,7 @@ impl Faults {
             rate_limited: Probability::NEVER,
             lost_commit_ack: Probability::NEVER,
             crash: Probability::NEVER,
+            facts_refresh: Probability::NEVER,
         }
     }
 
@@ -165,6 +168,7 @@ impl Faults {
             rate_limited: rng.probability(0.03),
             lost_commit_ack: rng.probability(0.02),
             crash: rng.probability(0.01),
+            facts_refresh: rng.probability(0.05),
         }
     }
 }
@@ -285,6 +289,8 @@ pub struct Stats {
     pub compacted: u64,
     /// Readers cut off for staying silent past the idle limit.
     pub consumers_cut_off: u64,
+    /// Message facts a refresh brought up to date.
+    pub facts_refreshed: u64,
 }
 
 /// The outcome of one run.
@@ -1029,6 +1035,9 @@ impl Sim {
         if self.rng.chance(self.faults.crash) {
             self.rebuild();
         }
+        if self.rng.chance(self.faults.facts_refresh) {
+            self.refresh_facts();
+        }
         self.advance();
         self.read_feed();
         self.compact();
@@ -1089,6 +1098,60 @@ impl Sim {
         self.stats.compacted += removed;
         self.note(&format!("compact {retention:?}: {removed} removed"));
         for violation in invariants::check_compaction(&before, &self.mirror, &retention) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+    }
+
+    /// A host's facts refresh, as `Store::refresh_facts` runs it: unfenced,
+    /// between the engine's commits. It brings rows imported without current
+    /// facts up to date, and also sends updates that must not apply (for a
+    /// deleted message, another blob, a stale size).
+    fn refresh_facts(&mut self) {
+        let mut updates: Vec<FactsUpdate> = self
+            .mirror
+            .messages
+            .values()
+            .filter_map(|record| match &record.content {
+                Content::Imported(stored)
+                    if stored
+                        .facts
+                        .as_ref()
+                        .is_none_or(|facts| facts.version < FACTS_VERSION) =>
+                {
+                    Some(FactsUpdate {
+                        id: record.id.clone(),
+                        blob: stored.blob.clone(),
+                        read_size: stored.size,
+                        size: stored.size,
+                        facts: MessageFacts::empty(),
+                    })
+                }
+                Content::Imported(_) | Content::Pending => None,
+            })
+            .collect();
+        let stale = self.mirror.tombstones.keys().take(2).map(|id| FactsUpdate {
+            id: id.clone(),
+            blob: BlobRef(format!("{}/{}", self.account.as_str(), id.0)),
+            read_size: 1_000,
+            size: 1_000,
+            facts: MessageFacts::empty(),
+        });
+        let elsewhere = self.mirror.messages.keys().take(1).map(|id| FactsUpdate {
+            id: id.clone(),
+            blob: BlobRef("elsewhere".into()),
+            read_size: 1_000,
+            size: 1_000,
+            facts: MessageFacts::empty(),
+        });
+        updates.extend(stale.chain(elsewhere).collect::<Vec<_>>());
+        let before = self.mirror.clone();
+        let applied = self.mirror.refresh_facts(&updates);
+        self.note(&format!("facts refresh: {applied} of {}", updates.len()));
+        self.stats.facts_refreshed += u64::from(applied);
+        for violation in invariants::check_refresh(&before, &self.mirror) {
             self.violations.push(ObservedViolation {
                 step: self.step,
                 violation,
@@ -1437,7 +1500,11 @@ impl Sim {
                             size: 1_000,
                             internal_date: self.gmail.messages.get(id).map_or(self.now, |m| m.date),
                             headers: HeaderFacts::default(),
-                            facts: Some(Box::new(MessageFacts::empty())),
+                            // Some imports come from a build without facts,
+                            // for the refresh to bring up to date.
+                            facts: stable_hash(id.0.as_bytes())
+                                .is_multiple_of(2)
+                                .then(|| Box::new(MessageFacts::empty())),
                             observation,
                         }),
                     }
@@ -1913,6 +1980,22 @@ mod tests {
             results.iter().any(|r| r.stats.deliveries > 0),
             "actions reached Gmail"
         );
+    }
+
+    #[test]
+    fn facts_refreshes_interleaved_with_sync_keep_the_invariants() {
+        let mut refreshed = 0;
+        for seed in 0..100 {
+            let mut rng = Rng(seed);
+            let faults = Faults {
+                facts_refresh: Probability::new(0.3).expect("valid"),
+                ..Faults::swarm(&mut rng)
+            };
+            let result = Sim::new(rng, faults, None).run(seed, 400);
+            assert!(result.passed(), "seed {seed}: {result:#?}");
+            refreshed += result.stats.facts_refreshed;
+        }
+        assert!(refreshed > 100, "refreshes applied: {refreshed}");
     }
 
     #[test]

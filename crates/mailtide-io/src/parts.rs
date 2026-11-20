@@ -4,18 +4,20 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, Stream, StreamExt as _};
-use mailtide::gmail::PartRef;
+use mailtide::gmail::{FACTS_VERSION, PartRef};
 use mailtide::ids::{AccountId, MessageId};
+use mailtide::mirror::{FactsUpdate, MessageView};
 use mailtide_mime::{PartDecoder, PartInfo};
 use mailtide_store::Store;
 
 use crate::auth::TokenSource;
 use crate::blobs::{BlobError, BlobStore, blob_key};
 use crate::quota_gate::QuotaGate;
-use crate::runner::Runner;
+use crate::runner::{RunError, Runner};
 use crate::transport::GmailTransport;
 
 /// Why a part could not be read.
@@ -65,6 +67,25 @@ impl From<BlobError> for PartError {
         }
     }
 }
+
+/// What one `refresh_facts` call did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FactsRefresh {
+    /// Messages looked at.
+    pub examined: u32,
+    /// Messages whose facts were brought up to date.
+    pub refreshed: u32,
+    /// Imported messages whose stored content is gone; their rows are left
+    /// as they are.
+    pub unreadable: Vec<MessageId>,
+    /// Where to continue from; `None` when the pass is complete.
+    pub next: Option<MessageId>,
+}
+
+/// Messages examined, and updates written, per batch (one transaction).
+const REFRESH_BATCH: u32 = 50;
+/// Blobs read at once by a refresh.
+const REFRESH_READS: usize = 8;
 
 /// The blob holds the bytes `part` was computed against, as far as its
 /// length tells.
@@ -203,6 +224,16 @@ impl Stream for PartStream {
     }
 }
 
+/// What a refresh does with one message.
+enum Refreshed {
+    /// Nothing to do.
+    Current,
+    /// Its stored content is gone.
+    Gone(MessageId),
+    /// Its facts, extracted again.
+    Update(Box<FactsUpdate>),
+}
+
 impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
 where
     S: Store,
@@ -252,6 +283,125 @@ where
         decoder.finish(&mut out);
         check_size(part, u64::try_from(out.len()).unwrap_or(u64::MAX))?;
         Ok(out)
+    }
+
+    /// Bring the facts of messages imported before the current extractor up
+    /// to date, without a Gmail call: a maintenance call the host schedules,
+    /// like `drift` and `compact`. Pages through the account's messages
+    /// from `after` (exclusive) in batches of 50; for each imported row whose
+    /// facts are missing or older than [`FACTS_VERSION`], or whose blob's
+    /// length differs from the size the row holds, reads the blob (8 at a
+    /// time), extracts, and writes the batch with
+    /// [`Store::refresh_facts`](mailtide_store::Store::refresh_facts) in one
+    /// transaction. Stops between batches once `limit` messages were
+    /// examined or `budget` is spent, and returns where to continue; a
+    /// second pass reads no blob. A message whose content is gone is named
+    /// in `unreadable` and the pass goes on; a store failure stops it (call
+    /// again from the same `after`).
+    pub async fn refresh_facts(
+        &self,
+        account: &AccountId,
+        after: Option<&MessageId>,
+        limit: u32,
+        budget: Duration,
+    ) -> Result<FactsRefresh, RunError> {
+        let deadline = Instant::now() + budget;
+        let mut done = FactsRefresh {
+            next: after.cloned(),
+            ..FactsRefresh::default()
+        };
+        while done.examined < limit {
+            let page = REFRESH_BATCH.min(limit - done.examined);
+            let ids = self
+                .store()
+                .message_ids(account, done.next.as_ref(), page)
+                .await
+                .map_err(RunError::Store)?;
+            let Some(last) = ids.last().cloned() else {
+                done.next = None;
+                return Ok(done);
+            };
+            let views = self
+                .store()
+                .messages(account, &ids)
+                .await
+                .map_err(RunError::Store)?;
+            let reads = futures_util::stream::iter(views)
+                .map(|view| self.refreshed(account, view))
+                .buffered(REFRESH_READS)
+                .collect::<Vec<_>>()
+                .await;
+            let mut updates = Vec::new();
+            for read in reads {
+                match read? {
+                    Refreshed::Current => {}
+                    Refreshed::Gone(id) => done.unreadable.push(id),
+                    Refreshed::Update(update) => updates.push(*update),
+                }
+            }
+            if !updates.is_empty() {
+                done.refreshed += self
+                    .store()
+                    .refresh_facts(account, &updates)
+                    .await
+                    .map_err(RunError::Store)?;
+            }
+            done.examined += u32::try_from(ids.len()).unwrap_or(u32::MAX);
+            done.next = Some(last);
+            if ids.len() < usize::try_from(page).unwrap_or(usize::MAX) {
+                done.next = None;
+                return Ok(done);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    /// What a refresh does with one message: nothing when its facts are
+    /// current and its blob the length it holds, else the facts of its blob.
+    async fn refreshed(
+        &self,
+        account: &AccountId,
+        view: MessageView,
+    ) -> Result<Refreshed, RunError> {
+        let Some(content) = view.content else {
+            return Ok(Refreshed::Current);
+        };
+        let key = blob_key(account, &view.id);
+        let current = content
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.version >= FACTS_VERSION);
+        if current {
+            // An empty range is the blob's length: no read where the store
+            // serves ranges.
+            match self.blobs().get_range(&key, 0..0).await {
+                Ok(read) if read.total == content.size => return Ok(Refreshed::Current),
+                Ok(_) => {}
+                Err(BlobError::NotFound) => return Ok(Refreshed::Gone(view.id)),
+                Err(error) => return Err(RunError::Blobs(format!("{error:?}"))),
+            }
+        }
+        let raw = match self.blobs().get(&key).await {
+            Ok(raw) => raw,
+            Err(BlobError::NotFound) => return Ok(Refreshed::Gone(view.id)),
+            Err(error) => return Err(RunError::Blobs(format!("{error:?}"))),
+        };
+        let size = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+        let extract = self.facts_extractor();
+        let Ok(facts) = tokio::task::spawn_blocking(move || extract(&raw)).await else {
+            tracing::warn!("facts extraction failed; the message keeps the facts it has");
+            return Ok(Refreshed::Current);
+        };
+        Ok(Refreshed::Update(Box::new(FactsUpdate {
+            id: view.id,
+            blob: content.blob,
+            read_size: content.size,
+            size,
+            facts,
+        })))
     }
 
     /// Stream one part's decoded bytes in chunks of at most `chunk_size`

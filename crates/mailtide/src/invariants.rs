@@ -93,6 +93,12 @@ pub enum Violation {
     },
     /// A rejected commit changed something.
     RejectedCommitChangedState,
+    /// A facts refresh changed more than a message's facts and raw size, or
+    /// added or removed a message (SPEC §10.3).
+    RefreshChangedMore {
+        /// The message, if one row changed beyond its facts.
+        message: Option<MessageId>,
+    },
     /// The stored lifecycle and cursor no longer form a valid snapshot.
     InvalidState(crate::state::InvalidSnapshot),
 }
@@ -206,6 +212,51 @@ pub fn check_compaction(
             kept: *kept,
         });
     }
+    violations
+}
+
+/// Check what a facts refresh may change: only the facts and raw size of
+/// rows it applied to, and the change log. Every row keeps its labels,
+/// checkpoint, verification floor, thread, blob and header facts; no row
+/// appears or goes; tombstones, jobs, intents and the account row stay.
+#[must_use]
+pub fn check_refresh(before: &AccountMirror, after: &AccountMirror) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    if before.messages.len() != after.messages.len()
+        || before.tombstones != after.tombstones
+        || before.jobs != after.jobs
+        || before.intents != after.intents
+        || before.record != after.record
+    {
+        violations.push(Violation::RefreshChangedMore { message: None });
+    }
+    for (id, new) in &after.messages {
+        let Some(old) = before.messages.get(id) else {
+            violations.push(Violation::RefreshChangedMore {
+                message: Some(id.clone()),
+            });
+            continue;
+        };
+        let same_content = match (&old.content, &new.content) {
+            (Content::Pending, Content::Pending) => true,
+            (Content::Imported(old), Content::Imported(new)) => {
+                old.blob == new.blob
+                    && old.internal_date == new.internal_date
+                    && old.headers == new.headers
+            }
+            (Content::Pending | Content::Imported(_), _) => false,
+        };
+        let same_row = old.thread_id == new.thread_id
+            && old.labels == new.labels
+            && old.checkpoint == new.checkpoint
+            && old.unverified == new.unverified;
+        if !(same_content && same_row) {
+            violations.push(Violation::RefreshChangedMore {
+                message: Some(id.clone()),
+            });
+        }
+    }
+    violations.extend(check_state(after));
     violations
 }
 

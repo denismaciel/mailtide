@@ -4,7 +4,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::{Located, MessageView};
+use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -153,6 +153,14 @@ impl Store for SqliteStore {
         now: Timestamp,
     ) -> Result<Prioritised, StoreError> {
         crate::Store::prioritise(&self.inner, account, ids, now).await
+    }
+
+    async fn refresh_facts(
+        &self,
+        account: &AccountId,
+        updates: &[FactsUpdate],
+    ) -> Result<u32, StoreError> {
+        crate::Store::refresh_facts(&self.inner, account, updates).await
     }
 
     async fn messages(
@@ -304,6 +312,17 @@ mod tests {
         refused(
             "prioritise",
             store.prioritise(account, &ids, now).await.err(),
+        );
+        let update = FactsUpdate {
+            id: MessageId("m".into()),
+            blob: mailtide::ids::BlobRef("m.eml".into()),
+            read_size: 1,
+            size: 1,
+            facts: mailtide::gmail::MessageFacts::empty(),
+        };
+        refused(
+            "refresh_facts",
+            store.refresh_facts(account, &[update]).await.err(),
         );
         refused("status", store.status(account).await.err());
         refused("accounts", store.accounts().await.err());

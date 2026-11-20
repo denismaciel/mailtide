@@ -15,7 +15,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::{Located, MessageView};
+use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -206,6 +206,18 @@ pub trait Store: Send + Sync {
         &self,
         account: &AccountId,
     ) -> impl Future<Output = Result<ForgetOutcome, StoreError>> + Send;
+
+    /// Bring stored message facts up to date, atomically and without an
+    /// engine: not fenced by the epoch (it neither supersedes a running sync
+    /// nor is rejected by one), but conditional per row
+    /// ([`mailtide::mirror::refresh_applies`]). Applied updates log
+    /// `FactsRefreshed` under one new state. Returns how many applied (0 for
+    /// an unknown account).
+    fn refresh_facts(
+        &self,
+        account: &AccountId,
+        updates: &[FactsUpdate],
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send;
 
     /// How hosts see these messages; unknown ids are left out.
     fn messages(

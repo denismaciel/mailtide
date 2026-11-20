@@ -25,6 +25,7 @@ fn main() {
         totals.compactions += result.stats.compactions;
         totals.compacted += result.stats.compacted;
         totals.consumers_cut_off += result.stats.consumers_cut_off;
+        totals.facts_refreshed += result.stats.facts_refreshed;
         if !result.passed() {
             failed += 1;
             println!(

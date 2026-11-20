@@ -125,6 +125,15 @@ class LabelDefinitionsChanged:
     state: str
     index: int
 
+@final
+class FactsRefreshed:
+    kind: Literal["facts_refreshed"]
+    state: str
+    index: int
+    id: str
+    thread_id: str
+    content: MessageContent | None
+
 Change = (
     MessageDiscovered
     | MessageImported
@@ -132,6 +141,7 @@ Change = (
     | OverlayChanged
     | MessageDeleted
     | LabelDefinitionsChanged
+    | FactsRefreshed
 )
 
 @final
@@ -209,6 +219,13 @@ class PartInfo:
     charset: str | None
     container: str | None
     depth: int
+
+@final
+class FactsRefresh:
+    examined: int
+    refreshed: int
+    unreadable: list[str]
+    next: str | None
 
 @final
 class PartStream:
@@ -581,6 +598,9 @@ class Runner:
     ) -> Awaitable[list[str]]: ...
     def read_blob(self, account: str, message_id: str) -> Awaitable[bytes]: ...
     def parts(self, account: str, message_id: str) -> Awaitable[list[PartInfo]]: ...
+    def refresh_facts(
+        self, account: str, after: str | None = None, limit: int = 1_000, budget_s: float = 60.0
+    ) -> Awaitable[FactsRefresh]: ...
     def open_part(
         self, account: str, message_id: str, part: str, chunk_size: int = 262_144
     ) -> Awaitable[PartStream]: ...
@@ -680,6 +700,9 @@ class BlockingRunner:
     ) -> list[str]: ...
     def read_blob(self, account: str, message_id: str) -> bytes: ...
     def parts(self, account: str, message_id: str) -> list[PartInfo]: ...
+    def refresh_facts(
+        self, account: str, after: str | None = None, limit: int = 1_000, budget_s: float = 60.0
+    ) -> FactsRefresh: ...
     def open_part(
         self, account: str, message_id: str, part: str, chunk_size: int = 262_144
     ) -> PartStream: ...

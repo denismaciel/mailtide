@@ -436,8 +436,9 @@ mod _core {
     #[pyclass(frozen, get_all)]
     struct ChangePage {
         /// The changes, oldest first: `MessageDiscovered`, `MessageImported`,
-        /// `LabelsChanged`, `OverlayChanged`, `MessageDeleted` or
-        /// `LabelDefinitionsChanged` (match on the class or on `kind`).
+        /// `LabelsChanged`, `OverlayChanged`, `MessageDeleted`,
+        /// `LabelDefinitionsChanged` or `FactsRefreshed` (match on the class
+        /// or on `kind`).
         changes: Vec<Py<PyAny>>,
         /// The state string to ask from next (opaque; it may point inside a
         /// commit).
@@ -575,6 +576,19 @@ mod _core {
         index: u32,
     }
 
+    /// The message's facts were brought up to date by `refresh_facts`.
+    #[pyclass(frozen, get_all)]
+    struct FactsRefreshed {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        id: String,
+        thread_id: String,
+        /// What the mirror stores for the message now, facts included;
+        /// `None` once the message is deleted.
+        content: Option<Py<MessageContent>>,
+    }
+
     /// One feed entry as its Python class (exhaustive: a new change kind is a
     /// compile error here).
     #[allow(clippy::too_many_lines)] // one flat arm per change kind
@@ -689,6 +703,22 @@ mod _core {
                 },
             )?
             .into_any(),
+            Change::FactsRefreshed { id, thread_id } => Py::new(
+                py,
+                FactsRefreshed {
+                    kind: "facts_refreshed",
+                    state,
+                    index,
+                    id: id.0.clone(),
+                    thread_id: thread_id.0.clone(),
+                    content: entry
+                        .content
+                        .clone()
+                        .map(|stored| message_content(py, stored))
+                        .transpose()?,
+                },
+            )?
+            .into_any(),
         })
     }
 
@@ -798,6 +828,19 @@ mod _core {
                 depth: info.depth,
             }
         }
+    }
+
+    /// What one `refresh_facts` call did.
+    #[pyclass(frozen, get_all)]
+    struct FactsRefresh {
+        /// Messages looked at.
+        examined: u32,
+        /// Messages whose facts were brought up to date.
+        refreshed: u32,
+        /// Imported messages whose stored content is gone (left as they are).
+        unreadable: Vec<String>,
+        /// The message id to continue from; `None` when the pass is complete.
+        next: Option<String>,
     }
 
     /// One part's decoded bytes, pulled one chunk at a time from a streamed
@@ -2483,6 +2526,26 @@ mod _core {
             Ok(parts.into_iter().map(PartInfo::from).collect())
         }
 
+        async fn refresh_facts(
+            self: Arc<Self>,
+            account: AccountId,
+            after: Option<MessageId>,
+            limit: u32,
+            budget: Duration,
+        ) -> PyResult<FactsRefresh> {
+            let done = self
+                .inner
+                .refresh_facts(&account, after.as_ref(), limit, budget)
+                .await
+                .map_err(run_error)?;
+            Ok(FactsRefresh {
+                examined: done.examined,
+                refreshed: done.refreshed,
+                unreadable: done.unreadable.into_iter().map(|id| id.0).collect(),
+                next: done.next.map(|id| id.0),
+            })
+        }
+
         async fn open_part(
             self: Arc<Self>,
             account: AccountId,
@@ -2946,6 +3009,28 @@ mod _core {
             )
         }
 
+        #[pyo3(signature = (account, after=None, limit=1_000, budget_s=60.0))]
+        fn refresh_facts<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            after: Option<String>,
+            limit: u32,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let budget = seconds(budget_s, "budget_s")?;
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().refresh_facts(
+                    account_id(account)?,
+                    after.map(MessageId),
+                    limit,
+                    budget,
+                ),
+            )
+        }
+
         #[pyo3(signature = (account, message_id, part, chunk_size=DEFAULT_PART_CHUNK))]
         fn open_part<'py>(
             &self,
@@ -3399,6 +3484,30 @@ mod _core {
                 self.shared
                     .clone()
                     .parts(account_id(account)?, MessageId(message_id.to_owned())),
+            )
+        }
+
+        /// Bring older messages' facts up to date from their stored content,
+        /// without a Gmail call; continue from `next` until it is `None`.
+        #[pyo3(signature = (account, after=None, limit=1_000, budget_s=60.0))]
+        fn refresh_facts(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            after: Option<String>,
+            limit: u32,
+            budget_s: f64,
+        ) -> PyResult<FactsRefresh> {
+            let budget = seconds(budget_s, "budget_s")?;
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().refresh_facts(
+                    account_id(account)?,
+                    after.map(MessageId),
+                    limit,
+                    budget,
+                ),
             )
         }
 

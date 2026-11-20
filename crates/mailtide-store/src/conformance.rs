@@ -16,7 +16,7 @@ use mailtide::ids::{
 };
 use mailtide::jobs::{AttemptId, FOREGROUND_IMPORT_CAP, JobKind, JobOp, JobOutcome, Prioritised};
 use mailtide::labels::{LabelSet, set};
-use mailtide::mirror::{Located, MessageView};
+use mailtide::mirror::{FactsUpdate, Located, MessageView};
 use mailtide::outbox::{Action, ActionRequest, IntentOp, ReadState};
 use mailtide::quota::Priority;
 use mailtide::revision::{
@@ -245,9 +245,22 @@ fn search_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
 
 /// The cases of message facts (SPEC §4, §10.3).
 fn message_facts_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
-    vec![("content written without facts reads back", |s| {
-        Box::pin(content_written_without_facts_reads_back(s))
-    })]
+    vec![
+        ("content written without facts reads back", |s| {
+            Box::pin(content_written_without_facts_reads_back(s))
+        }),
+        ("a facts refresh is conditional and atomic", |s| {
+            Box::pin(a_facts_refresh_is_conditional_and_atomic(s))
+        }),
+        (
+            "a facts refresh is not fenced and does not supersede",
+            |s| Box::pin(a_facts_refresh_is_not_fenced_and_does_not_supersede(s)),
+        ),
+        (
+            "import and refresh entries carry the current content",
+            |s| Box::pin(import_and_refresh_entries_carry_the_current_content(s)),
+        ),
+    ]
 }
 
 fn account() -> AccountId {
@@ -1236,7 +1249,8 @@ fn discovered(entries: &[ChangeEntry]) -> Vec<&str> {
             | Change::LabelsChanged { .. }
             | Change::OverlayChanged { .. }
             | Change::MessageDeleted { .. }
-            | Change::LabelDefinitionsChanged => None,
+            | Change::LabelDefinitionsChanged
+            | Change::FactsRefreshed { .. } => None,
         })
         .collect()
 }
@@ -2093,7 +2107,8 @@ fn imports(entries: &[ChangeEntry]) -> Vec<(&str, Option<&mailtide::mirror::Stor
             | Change::LabelsChanged { .. }
             | Change::OverlayChanged { .. }
             | Change::MessageDeleted { .. }
-            | Change::LabelDefinitionsChanged => None,
+            | Change::LabelDefinitionsChanged
+            | Change::FactsRefreshed { .. } => None,
         })
         .collect()
 }
@@ -2965,5 +2980,172 @@ async fn content_written_without_facts_reads_back<S: Store>(store: &S) -> Result
                 && entry.content.as_ref().is_some_and(|c| c.facts.is_none())
         }),
         "its import entry carries the content with no facts",
+    )
+}
+
+/// An import of `id` that carries no facts (as before they existed).
+fn import_without_facts(id: &str, checkpoint: u64) -> MessageOp {
+    let mut op = import(id, &["INBOX"], checkpoint);
+    if let MessageOp::MarkImported { facts, .. } = &mut op {
+        *facts = None;
+    }
+    op
+}
+
+/// Facts extracted again for `id`, whose row holds a 100-byte blob.
+fn update(id: &str) -> FactsUpdate {
+    FactsUpdate {
+        id: MessageId(id.into()),
+        blob: BlobRef(format!("{id}.eml")),
+        read_size: 100,
+        size: 100,
+        facts: MessageFacts {
+            precedence: Some("bulk".into()),
+            ..facts_of(id)
+        },
+    }
+}
+
+async fn refresh<S: Store>(store: &S, updates: &[FactsUpdate]) -> Result<u32, String> {
+    store
+        .refresh_facts(&account(), updates)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+async fn a_facts_refresh_is_conditional_and_atomic<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![
+        import_without_facts("a", 1),
+        import("b", &["INBOX"], 2),
+        import_without_facts("c", 3),
+    ];
+    apply(store, &c).await?;
+    let head = page(
+        store
+            .changes(&account(), StateSeq(0).into(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?
+    .head;
+    let other_blob = FactsUpdate {
+        blob: BlobRef("elsewhere.eml".into()),
+        ..update("c")
+    };
+    let applied = refresh(store, &[update("a"), update("b"), other_blob, update("d")]).await?;
+    expect(applied == 1, "only the stale row of the same blob applies")?;
+    expect(
+        view(store, "a").await?.content.and_then(|c| c.facts) == Some(update("a").facts),
+        "a's facts are refreshed",
+    )?;
+    expect(
+        view(store, "b").await?.content.and_then(|c| c.facts) == Some(facts_of("b")),
+        "b was current and is untouched",
+    )?;
+    expect(
+        view(store, "c")
+            .await?
+            .content
+            .and_then(|c| c.facts)
+            .is_none(),
+        "c's blob is another one: untouched",
+    )?;
+    let after = page(
+        store
+            .changes(&account(), head.into(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?;
+    expect(
+        after.changes.len() == 1 && after.changes.iter().all(|e| e.state == after.head),
+        "one entry, in one new state",
+    )?;
+    let unknown = AccountId("nobody@example.com".into());
+    expect(
+        store
+            .refresh_facts(&unknown, &[update("a")])
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == 0,
+        "an unknown account applies nothing",
+    )
+}
+
+async fn a_facts_refresh_is_not_fenced_and_does_not_supersede<S: Store>(
+    store: &S,
+) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![import_without_facts("a", 1)];
+    apply(store, &c).await?;
+    expect(
+        refresh(store, &[update("a")]).await? == 1,
+        "it applies while an engine holds the account",
+    )?;
+    let status = store
+        .status(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("tracked")?;
+    expect(status.epoch == snapshot.epoch, "the epoch is unchanged")?;
+    let mut next = commit(&snapshot, 1);
+    next.messages = vec![observe("a", &["INBOX", "STARRED"], 5)];
+    expect(
+        matches!(apply(store, &next).await?, CommitOutcome::Applied { .. }),
+        "the engine's next commit is accepted",
+    )?;
+    expect(
+        view(store, "a").await?.content.and_then(|c| c.facts) == Some(update("a").facts),
+        "and leaves the refreshed facts",
+    )
+}
+
+async fn import_and_refresh_entries_carry_the_current_content<S: Store>(
+    store: &S,
+) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![import_without_facts("a", 1)];
+    apply(store, &c).await?;
+    refresh(store, &[update("a")]).await?;
+    let entries = |page: &mailtide::revision::ChangePage| {
+        page.changes
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.change,
+                    Change::MessageImported { .. } | Change::FactsRefreshed { .. }
+                )
+            })
+            .map(|entry| entry.content.clone().map(|content| content.facts))
+            .collect::<Vec<_>>()
+    };
+    let feed = page(
+        store
+            .changes(&account(), StateSeq(0).into(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?;
+    let refreshed = Some(Some(update("a").facts));
+    expect(
+        entries(&feed) == vec![refreshed.clone(), refreshed],
+        "the import entry and the refresh entry both show the facts stored now",
+    )?;
+    let mut deleted = commit(&snapshot, 1);
+    deleted.messages = vec![MessageOp::Tombstone {
+        id: MessageId("a".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(4) },
+    }];
+    apply(store, &deleted).await?;
+    let feed = page(
+        store
+            .changes(&account(), StateSeq(0).into(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )?;
+    expect(
+        entries(&feed) == vec![None, None],
+        "nothing once the message is deleted",
     )
 }

@@ -266,3 +266,42 @@ def test_cancelling_a_part_stream_releases_it(gmail: tuple[Mailbox, str]) -> Non
         return stream
 
     assert asyncio.run(main()).closed, "a cancelled task drops the read"
+
+
+def test_refresh_facts_fills_old_rows_and_emits_facts_refreshed(
+    gmail: tuple[Mailbox, str], tmp_path: Path
+) -> None:
+    mailbox, origin = gmail
+    path = tmp_path / "mail.db"
+    config = Config(
+        Database(f"sqlite:{path}?mode=rwc"), Blobs("memory:///"), http=Http(gmail_origin=origin)
+    )
+    runner = synced(mailbox, origin, config)
+    since = runner.changes(ACCOUNT)
+    assert isinstance(since, mailtide.ChangePage)
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE mailtide_messages SET content = json_remove(content, '$.facts')")
+    [view] = runner.messages(ACCOUNT, ["m1"])
+    assert view.content is not None and view.content.facts_version == 0
+    requests = mailbox.requests
+
+    done = runner.refresh_facts(ACCOUNT, limit=1)
+    assert isinstance(done, mailtide.FactsRefresh)
+    assert (done.examined, done.refreshed, done.unreadable, done.next) == (1, 1, [], "m1")
+    done = runner.refresh_facts(ACCOUNT, after=done.next)
+    assert (done.examined, done.refreshed, done.next) == (1, 1, None)
+    assert mailbox.requests == requests, "no Gmail call"
+
+    page = runner.changes(ACCOUNT, since=since.next)
+    assert isinstance(page, mailtide.ChangePage)
+    refreshed = [c for c in page.changes if isinstance(c, mailtide.FactsRefreshed)]
+    assert [(c.kind, c.id) for c in refreshed] == [
+        ("facts_refreshed", "m1"),
+        ("facts_refreshed", "m2"),
+    ]
+    content = refreshed[0].content
+    assert content is not None
+    assert content.facts_version == 1 and content.attachment_count == 1
+    assert content.tracking_id == "k3Jd9_x-Q2mZ8pLw"
+    again = runner.refresh_facts(ACCOUNT)
+    assert (again.examined, again.refreshed) == (2, 0)

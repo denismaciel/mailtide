@@ -25,6 +25,8 @@ from mailtide._core import (
     CorruptState,
     DelegationRevoked,
     DriftResult,
+    FactsRefresh,
+    FactsRefreshed,
     ForgetResult,
     GmailUnavailable,
     Health,
@@ -97,6 +99,7 @@ Change = (
     | OverlayChanged
     | MessageDeleted
     | LabelDefinitionsChanged
+    | FactsRefreshed
 )
 
 __all__ = [
@@ -118,6 +121,8 @@ __all__ = [
     "CorruptState",
     "DelegationRevoked",
     "DriftResult",
+    "FactsRefresh",
+    "FactsRefreshed",
     "ForgetResult",
     "GmailUnavailable",
     "Health",
