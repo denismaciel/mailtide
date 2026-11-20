@@ -574,3 +574,54 @@ pub struct LabelColor {
     /// `backgroundColor`.
     pub background: String,
 }
+
+/// A user label to create (`labels.create`). Both visibilities are always
+/// sent, so the label shows as asked whatever Gmail's defaults are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLabel {
+    /// Its name; `Parent/Child` nests it under `Parent`.
+    pub name: String,
+    /// Whether it shows in the label list.
+    pub list_visibility: LabelListVisibility,
+    /// Whether messages show under it.
+    pub message_visibility: MessageListVisibility,
+    /// Its colour, if any.
+    pub color: Option<LabelColor>,
+}
+
+/// The fields of a label to change (`labels.patch`): only those given are
+/// sent, so the others keep their values.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LabelPatch {
+    /// A new name.
+    pub name: Option<String>,
+    /// A new list visibility.
+    pub list_visibility: Option<LabelListVisibility>,
+    /// A new message visibility.
+    pub message_visibility: Option<MessageListVisibility>,
+    /// What to do with the colour.
+    pub color: ColorChange,
+}
+
+impl LabelPatch {
+    /// Whether it changes nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.list_visibility.is_none()
+            && self.message_visibility.is_none()
+            && self.color == ColorChange::Keep
+    }
+}
+
+/// What a patch does to a label's colour.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ColorChange {
+    /// Leave it (nothing is sent).
+    #[default]
+    Keep,
+    /// Set this pair.
+    Set(LabelColor),
+    /// Remove it (`color: null`, which keeps the other fields).
+    Clear,
+}

@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::http::{HttpRequest, Method, encode};
 
-const USER: &str = "/gmail/v1/users/me";
+pub(crate) const USER: &str = "/gmail/v1/users/me";
 
 /// Page size for list calls (Gmail's maximum).
 pub const PAGE_SIZE: u32 = 500;
@@ -73,6 +73,9 @@ pub fn build(request: &GmailRequest, config: &RequestConfig) -> Vec<HttpRequest>
         GmailRequest::GetLabel { id } => {
             vec![get(format!("{USER}/labels/{}", encode(&id.0)), Vec::new())]
         }
+        GmailRequest::CreateLabel(label) => vec![crate::labels::create(label)],
+        GmailRequest::PatchLabel { id, patch } => vec![crate::labels::patch(id, patch)],
+        GmailRequest::DeleteLabel { id } => vec![crate::labels::delete(id)],
     }
 }
 

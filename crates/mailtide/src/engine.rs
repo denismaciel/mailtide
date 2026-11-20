@@ -358,6 +358,10 @@ impl Engine {
             // A search and its label check are the driver's direct calls: no
             // engine command waits for them.
             EventKind::Searched { .. } | EventKind::LabelFetched { .. } => Vec::new(),
+            // Answers to the driver's label writes: the engine sends none.
+            EventKind::LabelSaved { .. }
+            | EventKind::LabelNameTaken { .. }
+            | EventKind::LabelDeleted { .. } => Vec::new(),
         }
     }
 

@@ -138,6 +138,9 @@ fn request_kind(request: &GmailRequest) -> &'static str {
             SearchScope::Threads => "search_threads",
         },
         GmailRequest::GetLabel { .. } => "get_label",
+        GmailRequest::CreateLabel(_) => "create_label",
+        GmailRequest::PatchLabel { .. } => "patch_label",
+        GmailRequest::DeleteLabel { .. } => "delete_label",
     }
 }
 
@@ -414,11 +417,16 @@ where
         }
     }
 
-    fn writable(&self) -> Result<(), RunError> {
+    pub(crate) fn writable(&self) -> Result<(), RunError> {
         match self.config.access {
             Access::ReadWrite => Ok(()),
             Access::ReadOnly => Err(RunError::ReadOnly),
         }
+    }
+
+    /// The time on the runner's clock.
+    pub(crate) fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     /// Read the time from `clock` instead of the system.
@@ -1270,6 +1278,14 @@ where
                         command,
                         message_id: id.clone(),
                     }),
+                    // `Label name exists or conflicts`: the caller's to
+                    // resolve, with the label that holds the name.
+                    (
+                        Failure::Blocking(_),
+                        GmailRequest::CreateLabel(_) | GmailRequest::PatchLabel { .. },
+                    ) if response.status == 409 => {
+                        Outcome::Event(EventKind::LabelNameTaken { command })
+                    }
                     (failure, _) => Outcome::Failed(failure),
                 };
             }
@@ -1325,6 +1341,11 @@ where
             GmailRequest::GetLabel { .. } => {
                 decode::label_get(body).map(|label| EventKind::LabelFetched { command, label })
             }
+            GmailRequest::CreateLabel(_) | GmailRequest::PatchLabel { .. } => {
+                mailtide_gmail::labels::label(body)
+                    .map(|label| EventKind::LabelSaved { command, label })
+            }
+            GmailRequest::DeleteLabel { .. } => Ok(EventKind::LabelDeleted { command }),
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
@@ -1448,7 +1469,10 @@ fn request_failed(
 /// it is: a new kind must choose.
 fn changes_mailbox(request: &GmailRequest) -> bool {
     match request {
-        GmailRequest::Modify(_) => true,
+        GmailRequest::Modify(_)
+        | GmailRequest::CreateLabel(_)
+        | GmailRequest::PatchLabel { .. }
+        | GmailRequest::DeleteLabel { .. } => true,
         GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }

@@ -84,11 +84,6 @@ change = "modify"
 role = "Build the label variants of GmailRequest"
 
 [[file]]
-path = "crates/mailtide-gmail/src/http.rs"
-change = "modify"
-role = "PATCH and DELETE methods. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
-
-[[file]]
 path = "crates/mailtide-gmail/src/lib.rs"
 change = "modify"
 role = "Export the labels module"
@@ -155,12 +150,7 @@ role = "Runner::create_label, update_label and delete_label; LabelError; sublabe
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "Perform and decode label requests; read the label generation before labels.list; refuse label writes in read-only mode. Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
-
-[[file]]
-path = "crates/mailtide-io/src/transport.rs"
-change = "modify"
-role = "Send PATCH and DELETE. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+role = "Perform and decode label requests (a 409 to a create or a patch is LabelNameTaken); read the label generation before labels.list; label writes change the mailbox, so read-only mode refuses them. The shared groundwork (Runner::call_gmail, PUT, PATCH and DELETE in http.rs and transport.rs) is on main and used as it is"
 
 [[file]]
 path = "crates/mailtide-io/src/lib.rs"
@@ -250,6 +240,11 @@ role = "The create, rename under the parent, delete lifecycle, against the fake 
 path = "crates/mailtide-io/tests/ref_zero_imap_sync.rs"
 change = "new"
 role = "Zero's folder-disappears test, as a label deleted elsewhere"
+
+[[file]]
+path = "crates/mailtide-io/tests/label_support/mod.rs"
+change = "new"
+role = "The fake Gmail with label definitions the driver tests share (labels API as live Gmail answered it, scripted faults), a runner on a test clock with a recording gate"
 
 [[file]]
 path = "crates/mailtide-io/tests/label_edit.rs"
@@ -712,7 +707,7 @@ covers = "delete_label's answer strips the id from the mirror and the feed gets 
 [[test]]
 target = "crates/mailtide-io/tests/label_edit.rs"
 name = "deleting_a_missing_label_reports_already_gone"
-covers = "A 404 is proof too: the definition and its uses go, and a retry after a timeout is safe"
+covers = "A label the listing before the delete lacks, or a 404 to the delete, is proof too: the definition and its uses go, and a retry after a timeout is safe"
 
 [[test]]
 target = "crates/mailtide-io/tests/label_edit.rs"

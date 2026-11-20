@@ -1,7 +1,8 @@
 //! Requests the engine returns for the host to perform (SPEC §10.2).
 
 use crate::commit::Commit;
-use crate::ids::{AccountId, CommandId, HistoryId, MessageId, PageToken, Timestamp};
+use crate::gmail::{LabelPatch, NewLabel};
+use crate::ids::{AccountId, CommandId, HistoryId, LabelId, MessageId, PageToken, Timestamp};
 use crate::outbox::ModifyGroup;
 use crate::quota::{Priority, QuotaUnits};
 use crate::schedule::TimerKind;
@@ -120,5 +121,22 @@ pub enum GmailRequest {
     GetLabel {
         /// The label.
         id: crate::ids::LabelId,
+    },
+    /// `labels.create`. Issued by the driver for a host, never by the
+    /// engine; answered by `LabelSaved` (or `LabelNameTaken` for a 409).
+    CreateLabel(NewLabel),
+    /// `labels.patch` of label `id`, sending only what `patch` changes.
+    /// Issued by the driver; answered by `LabelSaved` (or `LabelNameTaken`).
+    PatchLabel {
+        /// The label.
+        id: LabelId,
+        /// What changes.
+        patch: LabelPatch,
+    },
+    /// `labels.delete` of label `id`. Issued by the driver; answered by
+    /// `LabelDeleted`.
+    DeleteLabel {
+        /// The label.
+        id: LabelId,
     },
 }

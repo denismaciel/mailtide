@@ -172,4 +172,23 @@ pub enum EventKind {
         /// The label's definition.
         label: Label,
     },
+    /// `labels.create` or `labels.patch` succeeded: the label as it is now.
+    /// The answer of a driver call; the engine issues none.
+    LabelSaved {
+        /// The command it answers.
+        command: CommandId,
+        /// Gmail's answer.
+        label: Label,
+    },
+    /// `labels.create` or `labels.patch` answered 409: another label holds
+    /// the name (Gmail compares names case-insensitively).
+    LabelNameTaken {
+        /// The command it answers.
+        command: CommandId,
+    },
+    /// `labels.delete` succeeded.
+    LabelDeleted {
+        /// The command it answers.
+        command: CommandId,
+    },
 }

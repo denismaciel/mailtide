@@ -19,6 +19,7 @@ pub mod history;
 pub mod ids;
 pub mod invariants;
 pub mod jobs;
+pub mod label_names;
 pub mod labels;
 pub mod mirror;
 pub mod outbox;

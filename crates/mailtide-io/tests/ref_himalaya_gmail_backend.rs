@@ -1,12 +1,20 @@
-//! The paging tests of himalaya's Gmail backend, `src/gmail/backend.rs`
-//! (pimalaya/himalaya, MIT OR Apache-2.0, commit a5623dcac615).
+//! Tests of himalaya's Gmail backend, `src/gmail/backend.rs`
+//! (pimalaya/himalaya, MIT OR Apache-2.0, commit a5623dcac615): the paging
+//! tests (`features/search.toml`) and the duplicate create
+//! (`features/label-edit.toml`).
 //!
 //! himalaya emulates numbered pages by listing ids; mailtide hands back
 //! Gmail's token, one call per page.
 
+pub mod label_support;
 pub mod search_support;
 
+use label_support::{BUDGET, Fault, account, harness, sync};
+use mailtide::gmail::{LabelListVisibility, MessageListVisibility, NewLabel};
+use mailtide::retry::{AccountProblem, Blocking};
 use mailtide::search::SearchQuery;
+use mailtide_io::labels::LabelError;
+use mailtide_io::runner::Access;
 use search_support::{Fixture, param, query};
 
 #[tokio::test]
@@ -59,4 +67,44 @@ async fn a_limit_above_gmails_maximum_is_one_page_of_500_with_a_token() {
         panic!("one call: {searches:?}");
     };
     assert_eq!(param(request, "maxResults"), Some("500"));
+}
+
+/// The reference codes Gmail's 409 to a create as a duplicate and keeps
+/// Gmail's words; mailtide answers `NameTaken` with the label that holds
+/// the name. Another refusal keeps its own code.
+#[tokio::test]
+async fn a_create_of_an_existing_label_is_name_taken_and_another_refusal_keeps_its_own_code() {
+    let runner = harness(Access::ReadWrite);
+    runner.transport().mailbox().create_label("Work");
+    sync(&runner).await;
+    let work = |name: &str| NewLabel {
+        name: name.into(),
+        list_visibility: LabelListVisibility::Show,
+        message_visibility: MessageListVisibility::Show,
+        color: None,
+    };
+    let duplicate = runner.create_label(&account(), work("WORK"), BUDGET).await;
+    let Err(LabelError::NameTaken {
+        existing: Some(existing),
+    }) = &duplicate
+    else {
+        panic!("{duplicate:?}");
+    };
+    assert_eq!(existing.name, "Work");
+    assert_eq!(
+        duplicate.as_ref().map_err(LabelError::code),
+        Err("name_taken")
+    );
+
+    runner
+        .transport()
+        .mailbox()
+        .fail_next("POST labels", Fault::Status(403, "forbidden"));
+    let forbidden = runner.create_label(&account(), work("Other"), BUDGET).await;
+    assert!(
+        matches!(&forbidden, Err(LabelError::Refused(f))
+            if f.class == Blocking::Account(AccountProblem::ApiAccessDenied)),
+        "{forbidden:?}"
+    );
+    assert_eq!(forbidden.map_err(|e| e.code()), Err("refused"));
 }

@@ -1697,14 +1697,19 @@ impl Sim {
                 }
                 EventKind::LabelsModified { command }
             }
-            // Searches and their label checks are the driver's direct
-            // calls; the engine never issues one, so the simulated Gmail
-            // refuses them.
-            GmailRequest::Search(_) | GmailRequest::GetLabel { .. } => EventKind::RequestFailed {
+            // Searches, their label checks and label writes are the
+            // driver's direct calls; the engine never issues one, so the
+            // simulated Gmail refuses them (a bug would show as a blocked
+            // request).
+            GmailRequest::Search(_)
+            | GmailRequest::GetLabel { .. }
+            | GmailRequest::CreateLabel(_)
+            | GmailRequest::PatchLabel { .. }
+            | GmailRequest::DeleteLabel { .. } => EventKind::RequestFailed {
                 command,
                 failure: Failure::Blocking(BlockingFailure {
                     class: Blocking::Permanent,
-                    detail: "the engine never searches".into(),
+                    detail: "the engine issues no direct call".into(),
                 }),
             },
         }

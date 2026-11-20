@@ -37,7 +37,11 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
     QuotaUnits(match request {
         GmailRequest::GetProfile | GmailRequest::ListLabels | GmailRequest::GetLabel { .. } => 1,
         GmailRequest::ListHistory { .. } => 2,
-        GmailRequest::ListMessages { .. } => 5,
+        // labels.patch is not in Google's table: declared as labels.update.
+        GmailRequest::ListMessages { .. }
+        | GmailRequest::CreateLabel(_)
+        | GmailRequest::PatchLabel { .. }
+        | GmailRequest::DeleteLabel { .. } => 5,
         GmailRequest::GetMessage { .. } => 20,
         GmailRequest::ImportMessage { .. } => 60,
         GmailRequest::Watch => 100,
@@ -289,6 +293,30 @@ mod tests {
             remove: Vec::new(),
             versions: Vec::new(),
         })
+    }
+
+    #[test]
+    fn label_write_costs_follow_gmails_quota_table() {
+        use crate::gmail::{LabelListVisibility, LabelPatch, MessageListVisibility, NewLabel};
+        use crate::ids::LabelId;
+        let create = GmailRequest::CreateLabel(NewLabel {
+            name: "Work".into(),
+            list_visibility: LabelListVisibility::Show,
+            message_visibility: MessageListVisibility::Show,
+            color: None,
+        });
+        // labels.patch is not in Google's table: labels.update's cost.
+        let patch = GmailRequest::PatchLabel {
+            id: LabelId("Label_1".into()),
+            patch: LabelPatch::default(),
+        };
+        let delete = GmailRequest::DeleteLabel {
+            id: LabelId("Label_1".into()),
+        };
+        for request in [create, patch, delete] {
+            assert_eq!(cost(&request), QuotaUnits(5), "{request:?}");
+        }
+        assert_eq!(cost(&GmailRequest::ListLabels), QuotaUnits(1));
     }
 
     #[test]
