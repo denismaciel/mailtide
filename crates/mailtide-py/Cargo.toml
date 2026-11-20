@@ -14,11 +14,11 @@ name = "_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-mailtide = { path = "../mailtide", version = "0.2.1" }
-mailtide-gmail = { path = "../mailtide-gmail", version = "0.2.1" }
-mailtide-io = { path = "../mailtide-io", version = "0.2.1" }
-mailtide-mime = { path = "../mailtide-mime", version = "0.2.1" }
-mailtide-store = { path = "../mailtide-store", version = "0.2.1" }
+mailtide = { path = "../mailtide", version = "0.3.0" }
+mailtide-gmail = { path = "../mailtide-gmail", version = "0.3.0" }
+mailtide-io = { path = "../mailtide-io", version = "0.3.0" }
+mailtide-mime = { path = "../mailtide-mime", version = "0.3.0" }
+mailtide-store = { path = "../mailtide-store", version = "0.3.0" }
 getrandom = "0.4"
 serde_json = "1"
 tracing = "0.1"

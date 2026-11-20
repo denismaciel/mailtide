@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "mailtide"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "mailtide-gmail"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "jsonwebtoken",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "mailtide-io"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "mailtide-mime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "encodify",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "mailtide-py"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.4.3",
  "mailtide",
@@ -1330,14 +1330,14 @@ dependencies = [
 
 [[package]]
 name = "mailtide-sim"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "mailtide",
 ]
 
 [[package]]
 name = "mailtide-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "mailtide",
  "pollster",
