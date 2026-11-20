@@ -1386,6 +1386,17 @@ impl AccountMirror {
         crate::revision::ChangeFeed::Page(self.changes(since, limit))
     }
 
+    /// The content stored for an import entry's message, if it is still here.
+    fn imported_content(&self, change: &Change) -> Option<StoredContent> {
+        let Change::MessageImported { id, .. } = change else {
+            return None;
+        };
+        match &self.messages.get(id)?.content {
+            Content::Imported(stored) => Some((**stored).clone()),
+            Content::Pending => None,
+        }
+    }
+
     /// Changes after `since` (no compaction check; see [`Self::feed`]).
     #[must_use]
     pub fn changes(&self, since: StateSeq, limit: u32) -> ChangePage {
@@ -1413,6 +1424,7 @@ impl AccountMirror {
                 state: *seq,
                 index,
                 change: change.clone(),
+                content: self.imported_content(change),
             });
         }
         ChangePage {

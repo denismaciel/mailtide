@@ -317,6 +317,9 @@ mod _core {
         internal_date_ms: i64,
         blob: String,
         size: u64,
+        /// What the mirror stores for the message (its envelope), read with
+        /// the feed; `None` once the message is deleted.
+        content: Option<Py<MessageContent>>,
     }
 
     /// Gmail's labels for the message changed.
@@ -410,6 +413,11 @@ mod _core {
                     internal_date_ms: internal_date.0,
                     blob: blob.0.clone(),
                     size: *size,
+                    content: entry
+                        .content
+                        .clone()
+                        .map(|stored| message_content(py, stored))
+                        .transpose()?,
                 },
             )?
             .into_any(),
@@ -510,26 +518,33 @@ mod _core {
         content: Option<Py<MessageContent>>,
     }
 
+    fn message_content(
+        py: Python<'_>,
+        stored: mailtide::mirror::StoredContent,
+    ) -> PyResult<Py<MessageContent>> {
+        Py::new(
+            py,
+            MessageContent {
+                blob: stored.blob.0,
+                size: stored.size,
+                internal_date_ms: stored.internal_date.0,
+                rfc822_message_id: stored.headers.rfc822_message_id,
+                in_reply_to: stored.headers.in_reply_to,
+                references: stored.headers.references,
+                sender: stored.headers.from,
+                to: stored.headers.to,
+                cc: stored.headers.cc,
+                subject: stored.headers.subject,
+                snippet: stored.headers.snippet,
+            },
+        )
+    }
+
     fn message_view(py: Python<'_>, view: mailtide::mirror::MessageView) -> PyResult<MessageView> {
-        let content = match view.content {
-            None => None,
-            Some(stored) => Some(Py::new(
-                py,
-                MessageContent {
-                    blob: stored.blob.0,
-                    size: stored.size,
-                    internal_date_ms: stored.internal_date.0,
-                    rfc822_message_id: stored.headers.rfc822_message_id,
-                    in_reply_to: stored.headers.in_reply_to,
-                    references: stored.headers.references,
-                    sender: stored.headers.from,
-                    to: stored.headers.to,
-                    cc: stored.headers.cc,
-                    subject: stored.headers.subject,
-                    snippet: stored.headers.snippet,
-                },
-            )?),
-        };
+        let content = view
+            .content
+            .map(|stored| message_content(py, stored))
+            .transpose()?;
         Ok(MessageView {
             labels: names(&view.labels),
             observed_labels: names(&view.observed_labels),

@@ -8,6 +8,7 @@
 
 use crate::ids::{BlobRef, MessageId, ThreadId, Timestamp};
 use crate::labels::LabelSet;
+use crate::mirror::StoredContent;
 
 /// A position in an account's change log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -188,6 +189,12 @@ pub struct ChangeEntry {
     pub index: u32,
     /// What changed.
     pub change: Change,
+    /// For a [`Change::MessageImported`] entry, the content the mirror
+    /// stores for its message (where the raw content is and its header
+    /// facts), so a consumer needs no second read. Read with the feed, not
+    /// kept in the log: entries recorded before it existed carry it too.
+    /// `None` once the message is deleted, and for every other kind.
+    pub content: Option<StoredContent>,
 }
 
 /// What reading the change feed produced.

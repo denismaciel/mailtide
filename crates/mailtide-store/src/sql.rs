@@ -1076,7 +1076,21 @@ impl SqlStore {
                 state: StateSeq(uint("seq", seq)?),
                 index: u32::try_from(idx).map_err(|e| corrupt("idx", e))?,
                 change: parse::<Change>("change", &change)?,
+                content: None,
             });
+        }
+        let imported: Vec<MessageId> = changes
+            .iter()
+            .filter_map(|entry| match &entry.change {
+                Change::MessageImported { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut contents = self.contents(account, &imported).await?;
+        for entry in &mut changes {
+            if let Change::MessageImported { id, .. } = &entry.change {
+                entry.content = contents.remove(id);
+            }
         }
         let next = StateSeq(uint("seq", cutoff)?);
         Ok(ChangePage {
@@ -1086,6 +1100,42 @@ impl SqlStore {
             next,
             has_more,
         })
+    }
+
+    /// The stored content of those of `ids` that are imported and still
+    /// held: one query per chunk of ids (a page holds whole commits, and one
+    /// commit can import tens of thousands of messages).
+    async fn contents(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<BTreeMap<MessageId, StoredContent>, StoreError> {
+        let mut contents = BTreeMap::new();
+        for chunk in ids.chunks(VIEW_CHUNK) {
+            let placeholders = (2..chunk.len() + 2)
+                .map(|n| format!("${n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Only numbered placeholders are interpolated; ids are bound.
+            let sql = format!(
+                "SELECT id, content FROM mailtide_messages
+                 WHERE account = $1 AND id IN ({placeholders}) AND content IS NOT NULL"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?
+            {
+                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
+                let text: String = row.try_get("content").map_err(|e| corrupt("content", e))?;
+                contents.insert(id, parse::<StoredContent>("content", &text)?);
+            }
+        }
+        Ok(contents)
     }
 }
 
@@ -1702,6 +1752,6 @@ impl crate::Store for SqlStore {
     }
 }
 
-/// Ids per `IN (...)` query when reading views (well under every backend's
-/// bind-parameter limit).
+/// Ids per `IN (...)` query when reading views and feed content (well under
+/// every backend's bind-parameter limit).
 const VIEW_CHUNK: usize = 500;

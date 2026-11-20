@@ -143,7 +143,11 @@ The store keeps, per account:
   `version`, `state` (`pending | delivered | blocked`), attempts and error.
 - **change log** (for consumers): an append-only list of
   `(state_seq, object_type, object_id, kind)`, so host features can ask "what
-  changed since state S" [J]. The state string encodes `state_seq`.
+  changed since state S" [J]. The state string encodes `state_seq`. An import
+  entry is read together with the envelope its message row holds (header
+  facts and blob) instead of keeping a copy in the log: a message's content
+  never changes in Gmail, so the row matches the entry, and older entries
+  carry it too.
 
 ## 5. Gmail facts the design relies on
 
@@ -442,8 +446,10 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `claim_jobs(account, epoch, limit, now, attempt)`: refused for an older
   epoch; `Deliver` jobs carry their pending changes.
 - `changes(account, since, limit)`: the change feed (`ChangeFeed::Page` of
-  `ChangeEntry { state, index, change }`, whole commits only, or `TooOld`
-  after compaction); `compact(account, through)`;
+  `ChangeEntry { state, index, change, content }`, whole commits only, or
+  `TooOld` after compaction; `content` is the stored content of a
+  `MessageImported` entry's message, loaded in chunks of ids, `None` once it
+  is deleted); `compact(account, through)`;
   `message_ids(account, after, limit)` to rebuild a consumer.
 - `messages(account, ids)`: `MessageView`s for hosts.
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
@@ -482,8 +488,10 @@ uses one at a time. Build one runner per process, after forking:
   `LabelDefinitionsChanged` feed entry means: read them again;
 - `await changes(account, since) -> ChangePage | StateTooOld`: typed entries,
   each with a stable `(state, index)` identity: `MessageDiscovered`,
-  `MessageImported` (once per message, with its labels then, e.g. `SENT`, and
-  its blob), `LabelsChanged` (added/removed), `OverlayChanged`,
+  `MessageImported` (once per message, with its labels then, e.g. `SENT`, its
+  blob, and `content`: the `MessageContent` `messages` returns, so a message
+  list needs no second call; `None` once the message is deleted),
+  `LabelsChanged` (added/removed), `OverlayChanged`,
   `MessageDeleted` (last thread and labels), `LabelDefinitionsChanged`;
   `await compact(account, through)`; `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;

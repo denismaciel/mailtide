@@ -124,7 +124,10 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                     "snippet": "hi",
                 }
                 if query.get("format") == "raw":
-                    raw = f"Subject: Message {mid}\r\n\r\nBody of {mid}\r\n".encode()
+                    raw = (
+                        f"Message-ID: <{mid}@example.com>\r\nFrom: sender-{mid}@example.com\r\n"
+                        f"Subject: Message {mid}\r\n\r\nBody of {mid}\r\n"
+                    ).encode()
                     body["raw"] = base64.urlsafe_b64encode(raw).decode().rstrip("=")
                 return self.reply(200, body)
             return self.reply(404, {"error": {"code": 404, "message": "not found"}})

@@ -5,6 +5,7 @@ from typing import assert_never
 import mailtide
 from conftest import make_config, tokens
 from fake_gmail import Mailbox
+from mailtide.testing import FakeGmail
 
 ACCOUNT = "alice@example.com"
 
@@ -64,6 +65,30 @@ def test_the_feed_tells_a_pipeline_what_happened(gmail: tuple[Mailbox, str]) -> 
     assert "labels_changed" in kinds
     removed = [c for c in later if isinstance(c, mailtide.LabelsChanged) and c.id == "in1"]
     assert removed[-1].removed == ["UNREAD"]
+
+
+def test_imports_carry_their_envelope() -> None:
+    with FakeGmail() as gmail:
+        gmail.add("in1", ["INBOX"])
+        gmail.add("in2", ["INBOX"])
+        runner = mailtide.BlockingRunner(make_config(gmail.origin), tokens)
+        runner.migrate()
+        runner.track(ACCOUNT)
+        runner.run(ACCOUNT, budget_s=30)
+
+        page = runner.changes(ACCOUNT)
+        assert isinstance(page, mailtide.ChangePage)
+        imported = {c.id: c for c in page.changes if isinstance(c, mailtide.MessageImported)}
+        assert set(imported) == {"in1", "in2"}
+        # A message list renders from the feed alone: no second read.
+        for view in runner.messages(ACCOUNT, ["in1", "in2"]):
+            content, stored = imported[view.id].content, view.content
+            assert content is not None and stored is not None
+            assert content.subject == stored.subject == f"Message {view.id}"
+            assert content.sender == stored.sender == f"sender-{view.id}@example.com"
+            assert content.rfc822_message_id == stored.rfc822_message_id
+            assert content.rfc822_message_id == f"<{view.id}@example.com>"
+            assert content.blob == imported[view.id].blob
 
 
 def test_compaction_and_rebuilding(gmail: tuple[Mailbox, str]) -> None:

@@ -66,6 +66,7 @@ class MessageImported:
     internal_date_ms: int
     blob: str
     size: int
+    content: MessageContent | None
 
 @final
 class LabelsChanged:

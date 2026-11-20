@@ -9,10 +9,10 @@ use std::future::Future;
 use mailtide::commit::{
     Commit, CommitOutcome, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
-use mailtide::gmail::{Label, LabelKind, MessageObservation};
+use mailtide::gmail::{HeaderFacts, Label, LabelKind, MessageObservation};
 use mailtide::ids::{
-    AccountId, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId, ThreadId,
-    Timestamp,
+    AccountId, BlobRef, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId,
+    ThreadId, Timestamp,
 };
 use mailtide::jobs::{AttemptId, JobKind, JobOp, JobOutcome};
 use mailtide::labels::{LabelSet, set};
@@ -119,6 +119,12 @@ where
         ("label definitions read back as last synced", |s| {
             Box::pin(label_definitions(s))
         }),
+        ("imported entries carry the stored envelope", |s| {
+            Box::pin(imports_carry_envelopes(s))
+        }),
+        ("a commit of many imports is hydrated in full", |s| {
+            Box::pin(large_import_commits(s))
+        }),
     ];
     let mut results = Vec::new();
     for (name, case) in cases {
@@ -165,6 +171,27 @@ fn commit(snapshot: &StoreSnapshot, seq: u64) -> Commit {
         job_plan: plan(),
         jobs: Vec::new(),
         intents: Vec::new(),
+    }
+}
+
+/// The import of `id` with header facts derived from it.
+fn import(id: &str, labels: &[&str], checkpoint: u64) -> MessageOp {
+    MessageOp::MarkImported {
+        observation: MessageObservation {
+            id: MessageId(id.into()),
+            thread_id: ThreadId("t".into()),
+            labels: set(labels.iter().copied()),
+            checkpoint: HistoryId(checkpoint),
+        },
+        blob: BlobRef(format!("{id}.eml")),
+        size: 100,
+        internal_date: Timestamp(1_700_000_000_000),
+        headers: Box::new(HeaderFacts {
+            rfc822_message_id: Some(format!("<{id}@example.com>")),
+            from: Some(format!("{id}@example.com")),
+            subject: Some(format!("Subject {id}")),
+            ..HeaderFacts::default()
+        }),
     }
 }
 
@@ -1286,5 +1313,90 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
     expect(
         labels(store, &stranger).await?.is_empty(),
         "labels belong to their account",
+    )
+}
+
+/// The feed's import entries, by message, with their content.
+fn imports(
+    page: &mailtide::revision::ChangePage,
+) -> Vec<(&str, Option<&mailtide::mirror::StoredContent>)> {
+    page.changes
+        .iter()
+        .filter_map(|entry| match &entry.change {
+            Change::MessageImported { id, .. } => Some((id.0.as_str(), entry.content.as_ref())),
+            Change::MessageDiscovered { .. }
+            | Change::LabelsChanged { .. }
+            | Change::OverlayChanged { .. }
+            | Change::MessageDeleted { .. }
+            | Change::LabelDefinitionsChanged => None,
+        })
+        .collect()
+}
+
+async fn imports_carry_envelopes<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![import("a", &["INBOX"], 1), import("b", &["INBOX"], 2)];
+    apply(store, &c).await?;
+    let mut deleted = commit(&snapshot, 1);
+    deleted.messages = vec![MessageOp::Tombstone {
+        id: MessageId("b".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(3) },
+    }];
+    apply(store, &deleted).await?;
+    let page = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let views = store
+        .messages(&account(), &[MessageId("a".into())])
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let stored = views.first().and_then(|view| view.content.as_ref());
+    expect(
+        stored.is_some_and(|content| content.headers.subject.as_deref() == Some("Subject a")),
+        "the import is stored with its header facts",
+    )?;
+    expect(
+        imports(&page) == vec![("a", stored), ("b", None)],
+        "an import carries what the mirror stores, nothing once deleted",
+    )?;
+    expect(
+        page.changes
+            .iter()
+            .filter(|entry| !matches!(entry.change, Change::MessageImported { .. }))
+            .all(|entry| entry.content.is_none()),
+        "other kinds carry no content",
+    )
+}
+
+async fn large_import_commits<S: Store>(store: &S) -> Result<(), String> {
+    // More imports than one chunk of ids, in one commit: a page holds it whole.
+    const COUNT: u64 = 1_200;
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = (0..COUNT)
+        .map(|n| import(&format!("m{n:04}"), &["INBOX"], n + 1))
+        .collect();
+    apply(store, &c).await?;
+    let page = store
+        .changes(&account(), StateSeq(0), 1)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let entries = imports(&page);
+    expect(
+        u64::try_from(entries.len()) == Ok(COUNT) && !page.has_more && page.next == page.head,
+        "the whole commit arrives in one page",
+    )?;
+    expect(
+        entries.iter().all(|(id, content)| {
+            content.is_some_and(|content| {
+                content.headers.subject.as_deref() == Some(format!("Subject {id}").as_str())
+                    && content.blob.0 == format!("{id}.eml")
+            })
+        }),
+        "every import carries its own envelope",
     )
 }

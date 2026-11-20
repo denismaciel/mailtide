@@ -53,7 +53,7 @@ await runner.track("alice@example.com")  # only tracked accounts sync
 outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
 await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from request paths
 status = await runner.status("alice@example.com")  # never preempts a running sync
-page = await runner.changes("alice@example.com", since=None)  # typed feed: match on entries
+page = await runner.changes("alice@example.com", since=None)  # typed feed; imports carry headers
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
 ```
