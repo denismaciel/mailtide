@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mailtide::EngineConfig;
@@ -51,6 +53,30 @@ pub enum Fault {
     Status(u16),
     /// Act, but answer a write with the draft id only.
     NoIds,
+    /// Act, but answer a draft read without its raw content.
+    NoRaw,
+    /// Act and compute the answer, then hold it until the test releases
+    /// it: the request reached Gmail, its answer is still on the way.
+    Held(Hold),
+}
+
+/// A request held in flight by [`Fault::Held`].
+#[derive(Debug, Clone, Default)]
+pub struct Hold {
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Hold {
+    /// Wait until the held request has reached Gmail.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let its answer go.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 /// The fake's mailbox.
@@ -170,6 +196,34 @@ impl Mailbox {
         Some((sent, stored.thread))
     }
 
+    /// Gmail's drafts, as `(draft id, message id)`.
+    #[must_use]
+    pub fn draft_list(&self) -> Vec<(String, String)> {
+        self.drafts
+            .iter()
+            .map(|(draft, message)| (draft.clone(), message.clone()))
+            .collect()
+    }
+
+    /// The ids of the messages carrying `label`.
+    #[must_use]
+    pub fn labelled(&self, label: &str) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter(|(_, m)| m.labels.iter().any(|l| l == label))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The Message-ID Gmail's copy of a message carries.
+    #[must_use]
+    pub fn rfc822_message_id(&self, message: &str) -> Option<String> {
+        let raw = String::from_utf8_lossy(&self.messages.get(message)?.raw).into_owned();
+        raw.split("\r\n")
+            .find_map(|line| line.strip_prefix("Message-ID: "))
+            .map(str::to_owned)
+    }
+
     fn draft_json(&self, draft: &str, raw: bool) -> Option<Value> {
         let id = self.drafts.get(draft)?;
         let message = self.messages.get(id)?;
@@ -181,9 +235,13 @@ impl Mailbox {
     }
 }
 
-/// The fake, shared with the test that drives it.
+/// The fake, shared with the test that drives it: the mailbox of
+/// [`account`] and that of [`other_account`], told apart by access token.
 #[derive(Debug, Clone, Default)]
-pub struct FakeGmail(pub Arc<Mutex<Mailbox>>);
+pub struct FakeGmail {
+    mailbox: Arc<Mutex<Mailbox>>,
+    other: Arc<Mutex<Mailbox>>,
+}
 
 fn answer(status: u16, body: &Value) -> HttpResponse {
     HttpResponse {
@@ -213,13 +271,38 @@ impl FakeGmail {
     ///
     /// If a test panicked while holding it.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Mailbox> {
-        self.0.lock().expect("lock")
+        self.mailbox.lock().expect("lock")
+    }
+
+    /// The mailbox of [`other_account`].
+    ///
+    /// # Panics
+    ///
+    /// If a test panicked while holding it.
+    pub fn lock_other(&self) -> std::sync::MutexGuard<'_, Mailbox> {
+        self.other.lock().expect("lock")
     }
 
     /// The next request starting with `key` (`"PUT drafts"`, `"POST drafts/send"`)
     /// meets `fault`.
     pub fn fail_next(&self, key: &str, fault: Fault) {
         self.lock().faults.push_back((key.to_owned(), fault));
+    }
+
+    /// The bytes of every draft create and update Gmail was sent, in order.
+    #[must_use]
+    pub fn saved_raw(&self) -> Vec<Vec<u8>> {
+        self.lock().saved_bodies.iter().map(decode_raw).collect()
+    }
+
+    /// How many times the drafts were listed (`drafts.list`).
+    #[must_use]
+    pub fn listings(&self) -> usize {
+        self.lock()
+            .requests
+            .iter()
+            .filter(|r| *r == "GET drafts")
+            .count()
     }
 
     /// Requests sent so far that start with `prefix`.
@@ -322,7 +405,8 @@ impl FakeGmail {
                 )
             }
             (Method::Get, ["drafts", draft]) => {
-                let raw = query.get("format").map(String::as_str) == Some("raw");
+                let raw = query.get("format").map(String::as_str) == Some("raw")
+                    && !matches!(fault, Some(Fault::NoRaw));
                 match mailbox.draft_json(draft, raw) {
                     Some(body) => answer(200, &body),
                     // An id that is a message's is not a draft's: 404.
@@ -385,9 +469,30 @@ impl GmailTransport for FakeGmail {
     async fn send(
         &self,
         request: HttpRequest,
-        _token: &AccessToken,
+        token: &AccessToken,
     ) -> Result<HttpResponse, TransportError> {
-        let mut mailbox = self.lock();
+        let (answer, held) = {
+            let mut mailbox = if token.secret == OTHER_TOKEN {
+                self.lock_other()
+            } else {
+                self.lock()
+            };
+            Self::serve(&mut mailbox, &request)
+        };
+        if let Some(hold) = held {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
+        answer
+    }
+}
+
+impl FakeGmail {
+    /// Answer one request, and say whether the answer is held.
+    fn serve(
+        mailbox: &mut Mailbox,
+        request: &HttpRequest,
+    ) -> (Result<HttpResponse, TransportError>, Option<Hold>) {
         let query: BTreeMap<String, String> = request.query.iter().cloned().collect();
         let path = request
             .path
@@ -410,22 +515,42 @@ impl GmailTransport for FakeGmail {
         match fault {
             Some(Fault::Lost { applied }) => {
                 if applied {
-                    let _ = Self::respond(&mut mailbox, request.method, &path, &query, &body, None);
+                    let _ = Self::respond(mailbox, request.method, &path, &query, &body, None);
                 }
-                Err(TransportError::OutcomeUnknown("timed out".into()))
+                (
+                    Err(TransportError::OutcomeUnknown("timed out".into())),
+                    None,
+                )
             }
-            Some(Fault::Status(status)) => Ok(answer(
-                status,
-                &json!({"error": {"code": status, "message": "refused", "errors": [{"reason": if status == 403 { "insufficientPermissions" } else { "badRequest" }}]}}),
-            )),
-            fault => Ok(Self::respond(
-                &mut mailbox,
-                request.method,
-                &path,
-                &query,
-                &body,
-                fault.as_ref(),
-            )),
+            Some(Fault::Status(status)) => (
+                Ok(answer(
+                    status,
+                    &json!({"error": {"code": status, "message": "refused", "errors": [{"reason": if status == 403 { "insufficientPermissions" } else { "badRequest" }}]}}),
+                )),
+                None,
+            ),
+            Some(Fault::Held(hold)) => (
+                Ok(Self::respond(
+                    mailbox,
+                    request.method,
+                    &path,
+                    &query,
+                    &body,
+                    None,
+                )),
+                Some(hold),
+            ),
+            fault => (
+                Ok(Self::respond(
+                    mailbox,
+                    request.method,
+                    &path,
+                    &query,
+                    &body,
+                    fault.as_ref(),
+                )),
+                None,
+            ),
         }
     }
 }
@@ -442,6 +567,19 @@ pub type TestRunner = Runner<MemoryStore, ObjectBlobs, FakeGmail, LocalGate, Sta
 pub fn account() -> AccountId {
     AccountId::parse("alice@example.com").expect("account")
 }
+
+/// A second account, whose mailbox is [`FakeGmail::lock_other`].
+///
+/// # Panics
+///
+/// Never: the address is valid.
+#[must_use]
+pub fn other_account() -> AccountId {
+    AccountId::parse("bob@example.com").expect("account")
+}
+
+/// The access token of [`other_account`]: the fake serves its mailbox.
+const OTHER_TOKEN: &str = "other-token";
 
 /// A token for `X-Mailtide-Id`.
 #[must_use]
@@ -493,15 +631,31 @@ pub struct Setup {
 /// host clock (no waiting: deferrals come back at once).
 #[must_use]
 pub fn runner_with(access: Access, budget: Budget) -> (TestRunner, Setup) {
+    runner_writing(access, budget, WriteSettings::default())
+}
+
+/// [`runner_with`] with its own write settings (a small
+/// `max_message_bytes`, say).
+///
+/// # Panics
+///
+/// Never: the account addresses are valid.
+#[must_use]
+pub fn runner_writing(
+    access: Access,
+    budget: Budget,
+    writes: WriteSettings,
+) -> (TestRunner, Setup) {
     let gmail = FakeGmail::default();
     let clock = TestClock(Arc::new(AtomicI64::new(1_700_000_000_000)));
-    let tokens = StaticTokens(BTreeMap::from([(
-        account(),
-        AccessToken {
-            secret: "test-token".into(),
-            expires_at: Timestamp(i64::MAX),
-        },
-    )]));
+    let token = |secret: &str| AccessToken {
+        secret: secret.into(),
+        expires_at: Timestamp(i64::MAX),
+    };
+    let tokens = StaticTokens(BTreeMap::from([
+        (account(), token("test-token")),
+        (other_account(), token(OTHER_TOKEN)),
+    ]));
     let shared = clock.clone();
     let runner = Runner::new(
         MemoryStore::new(),
@@ -514,7 +668,7 @@ pub fn runner_with(access: Access, budget: Budget) -> (TestRunner, Setup) {
             engine: EngineConfig::default(),
             watch: WatchMode::Disabled,
             log_accounts: LogAccounts::Hashed,
-            writes: WriteSettings::default(),
+            writes,
         },
     )
     .with_clock(mailtide_io::Clock::from_fn(move || shared.now()));

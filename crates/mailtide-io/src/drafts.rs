@@ -370,7 +370,9 @@ where
                     mailtide_mime::TRACKING_HEADER
                 )));
             }
+            // A stale row may be behind Gmail: Gmail is asked below.
             if let Some(expected) = &if_message_id
+                && row.state == DraftStatus::Saved
                 && *expected != row.message_id
             {
                 return Err(DraftError::Conflict {
@@ -386,6 +388,19 @@ where
             if let Some(expected) = &if_message_id
                 && *expected != current.message
             {
+                // The index is behind Gmail: mark the row stale (a listing
+                // repoints it), so a retry naming Gmail's message is
+                // checked against Gmail, not refused from the index.
+                if row
+                    .as_ref()
+                    .is_some_and(|r| r.message_id != current.message)
+                {
+                    let write = DraftWrite::Stale {
+                        draft: draft_id.clone(),
+                        refresh_at: self.refresh_at(),
+                    };
+                    self.record_answer(account, &write).await;
+                }
                 return Err(DraftError::Conflict {
                     current: current.message,
                 });
