@@ -1142,6 +1142,16 @@ where
             (_, WatchMode::Topic(topic)) => topic.clone(),
             (_, WatchMode::Disabled) => String::new(),
         };
+        // A listing reports the label generation read before it is sent:
+        // a local label write after this read makes it stale (SPEC §6.6).
+        let generation = match call.request {
+            GmailRequest::ListLabels => self
+                .store
+                .label_generation(&call.account)
+                .await
+                .map_err(RunError::Store)?,
+            _ => 0,
+        };
         let lease = match self
             .quota
             .admit(&call.account, call.cost, call.priority, self.clock.now())
@@ -1166,7 +1176,14 @@ where
         };
         let sent = Instant::now();
         let outcome = self
-            .perform(&call.account, command, &call.request, &topic, report)
+            .perform(
+                &call.account,
+                command,
+                &call.request,
+                &topic,
+                generation,
+                report,
+            )
             .await;
         let lease = held.lease.take().unwrap_or(lease);
         let duration_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1219,6 +1236,7 @@ where
         command: CommandId,
         gmail_request: &GmailRequest,
         topic: &str,
+        generation: u64,
         report: &mut SyncReport,
     ) -> Outcome {
         let token = match self.tokens.token(account).await {
@@ -1291,7 +1309,11 @@ where
                 Err(error) => Err(error),
             },
             GmailRequest::ListLabels => {
-                decode::labels_list(body).map(|labels| EventKind::LabelsListed { command, labels })
+                decode::labels_list(body).map(|labels| EventKind::LabelsListed {
+                    command,
+                    labels,
+                    generation,
+                })
             }
             GmailRequest::Watch => decode::watch(body).map(|expiration| EventKind::WatchRenewed {
                 command,

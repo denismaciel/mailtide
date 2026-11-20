@@ -14,7 +14,7 @@ use crate::commit::{
 };
 use crate::gmail::{HeaderFacts, Label, MessageFacts, MessageObservation};
 use crate::ids::{
-    AccountId, BlobRef, EngineVersion, Epoch, HistoryId, MessageId, ThreadId, Timestamp,
+    AccountId, BlobRef, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
     stable_hash,
 };
 use crate::jobs::{
@@ -171,7 +171,18 @@ pub struct AccountRecord {
     /// Which incarnation of the account this is: set when it is tracked, so
     /// feed positions from before a forget are recognisably stale.
     pub generation: u64,
+    /// Bumped by every local label write ([`AccountMirror::record_label`]):
+    /// a listing sent under an older value is stale and not applied.
+    pub label_generation: u64,
+    /// Labels known to be deleted, with when: no observation may put them
+    /// back on a row. Kept for [`DELETED_LABEL_MEMORY`]; a listing that
+    /// names one again restores it.
+    pub deleted_labels: BTreeMap<LabelId, Timestamp>,
 }
+
+/// How long a deleted label's id is remembered: longer than Gmail keeps
+/// history, so no replayed record can carry it after that (SPEC §6.6).
+pub const DELETED_LABEL_MEMORY: std::time::Duration = std::time::Duration::from_hours(30 * 24);
 
 impl AccountRecord {
     /// A freshly tracked account: no cursor, bootstrapping.
@@ -189,6 +200,8 @@ impl AccountRecord {
             labels_refreshed_at: None,
             log_floor: StateSeq(0),
             generation,
+            label_generation: 0,
+            deleted_labels: BTreeMap::new(),
         }
     }
 }
@@ -701,6 +714,55 @@ pub fn settles(intent: &Intent, confirmation: AttemptId) -> bool {
     }
 }
 
+/// `op` with the labels remembered as deleted taken out of what it would
+/// store: a fetch, an import or a history record from before a deletion
+/// must not put the id back on a row.
+fn without_deleted(op: &MessageOp, deleted: &BTreeMap<LabelId, Timestamp>) -> MessageOp {
+    let keep = |labels: &LabelSet| -> LabelSet {
+        labels
+            .iter()
+            .filter(|label| !deleted.contains_key(*label))
+            .cloned()
+            .collect()
+    };
+    match op {
+        MessageOp::Observe(observation) => MessageOp::Observe(MessageObservation {
+            labels: keep(&observation.labels),
+            ..observation.clone()
+        }),
+        MessageOp::PatchLabels {
+            id,
+            add,
+            remove,
+            checkpoint,
+        } => MessageOp::PatchLabels {
+            id: id.clone(),
+            add: keep(add),
+            remove: remove.clone(),
+            checkpoint: *checkpoint,
+        },
+        MessageOp::MarkImported {
+            observation,
+            blob,
+            size,
+            internal_date,
+            headers,
+        } => MessageOp::MarkImported {
+            observation: MessageObservation {
+                labels: keep(&observation.labels),
+                ..observation.clone()
+            },
+            blob: blob.clone(),
+            size: *size,
+            internal_date: *internal_date,
+            headers: headers.clone(),
+        },
+        MessageOp::Tombstone { .. }
+        | MessageOp::Listed { .. }
+        | MessageOp::FinishReconcile { .. } => op.clone(),
+    }
+}
+
 /// Put label definitions in the order stores return them: by id, byte-wise
 /// (never a database collation, so every store agrees).
 pub fn sort_labels(labels: &mut [Label]) {
@@ -900,14 +962,7 @@ impl AccountMirror {
             self.record.cursor = Some(cursor.to);
         }
         for op in &commit.labels {
-            match op {
-                LabelOp::ReplaceAll(labels) => {
-                    if !same_labels(&self.labels, labels) {
-                        self.labels.clone_from(labels);
-                        self.log.push((seq, Change::LabelDefinitionsChanged));
-                    }
-                }
-            }
+            self.apply_label(op, seq);
         }
         for op in &commit.account_ops {
             match op {
@@ -979,6 +1034,110 @@ impl AccountMirror {
             }
         }
         skipped
+    }
+
+    /// Apply one label definition change (see [`LabelOp`]).
+    fn apply_label(&mut self, op: &LabelOp, seq: StateSeq) {
+        match op {
+            LabelOp::ReplaceAll {
+                labels,
+                generation,
+                at,
+            } => {
+                // A local write since the listing was sent: it is stale.
+                if *generation != self.record.label_generation {
+                    return;
+                }
+                let cutoff = at.minus(DELETED_LABEL_MEMORY);
+                let deleted = &mut self.record.deleted_labels;
+                deleted.retain(|_, deleted_at| *deleted_at > cutoff);
+                for label in labels {
+                    deleted.remove(&label.id);
+                }
+                let listed: BTreeSet<&LabelId> = labels.iter().map(|label| &label.id).collect();
+                let gone: Vec<LabelId> = self
+                    .labels
+                    .iter()
+                    .filter(|label| !listed.contains(&label.id))
+                    .map(|label| label.id.clone())
+                    .collect();
+                if !same_labels(&self.labels, labels) {
+                    self.labels.clone_from(labels);
+                    self.log.push((seq, Change::LabelDefinitionsChanged));
+                }
+                for id in gone {
+                    self.forget_label(&id, *at, seq);
+                }
+            }
+            LabelOp::Upsert(label) => {
+                self.record.deleted_labels.remove(&label.id);
+                match self.labels.iter_mut().find(|stored| stored.id == label.id) {
+                    Some(stored) if stored == label => {}
+                    Some(stored) => {
+                        stored.clone_from(label);
+                        self.log.push((seq, Change::LabelDefinitionsChanged));
+                    }
+                    None => {
+                        self.labels.push(label.clone());
+                        self.log.push((seq, Change::LabelDefinitionsChanged));
+                    }
+                }
+            }
+            LabelOp::Remove { id, at } => {
+                let before = self.labels.len();
+                self.labels.retain(|label| &label.id != id);
+                if self.labels.len() != before {
+                    self.log.push((seq, Change::LabelDefinitionsChanged));
+                }
+                self.forget_label(id, *at, seq);
+            }
+        }
+    }
+
+    /// A label is gone from Gmail: it leaves every row, trusted or
+    /// unverified, without moving a checkpoint (Gmail's own `labelsRemoved`
+    /// records then change nothing), its intents are dropped as a deleted
+    /// message's are, and its id is remembered as deleted from `at`.
+    fn forget_label(&mut self, id: &LabelId, at: Timestamp, seq: StateSeq) {
+        self.record.deleted_labels.insert(id.clone(), at);
+        let carrying: Vec<MessageId> = self
+            .messages
+            .values()
+            .filter(|record| record.labels.contains(id))
+            .map(|record| record.id.clone())
+            .collect();
+        for message in carrying {
+            if let Some(previous) = self.messages.get(&message) {
+                let mut record = previous.clone();
+                record.labels.remove(id);
+                for change in row_changes(Some(previous), &record) {
+                    self.log.push((seq, change));
+                }
+                self.messages.insert(message, record);
+            }
+        }
+        let affected: BTreeSet<MessageId> = self
+            .intents
+            .keys()
+            .filter(|(_, label)| label == id)
+            .map(|(message, _)| message.clone())
+            .collect();
+        self.intents.retain(|(_, label), _| label != id);
+        for message in affected {
+            self.log_overlay(&message, seq);
+        }
+    }
+
+    /// Record the answer of a local label write (a create, a patch or a
+    /// delete the driver made): outside any engine, like
+    /// [`Self::admit_action`], since a label write must survive a sync
+    /// superseding another. Bumps the label generation, so a listing sent
+    /// before it is not applied.
+    pub fn record_label(&mut self, op: &LabelOp) {
+        self.seq = StateSeq(self.seq.0 + 1);
+        let seq = self.seq;
+        self.apply_label(op, seq);
+        self.record.label_generation += 1;
     }
 
     /// An unverified row keeps a verification queued until one settles it
@@ -1129,7 +1288,13 @@ impl AccountMirror {
                     let Some(record) = self.messages.get(&target) else {
                         continue;
                     };
-                    let new = admit(record, &self.intents_of(&target), action);
+                    // A change to a label remembered as deleted is not
+                    // admitted: Gmail would refuse to add it, and removing
+                    // it changes nothing.
+                    let new: Vec<Intent> = admit(record, &self.intents_of(&target), action)
+                        .into_iter()
+                        .filter(|intent| !self.record.deleted_labels.contains_key(&intent.label))
+                        .collect();
                     if new.is_empty() {
                         continue;
                     }
@@ -1198,6 +1363,13 @@ impl AccountMirror {
 
     /// Apply one message operation; `false` if its condition didn't hold.
     fn apply_message(&mut self, op: &MessageOp, plan: &JobPlan, seq: StateSeq) -> bool {
+        let filtered;
+        let op = if self.record.deleted_labels.is_empty() {
+            op
+        } else {
+            filtered = without_deleted(op, &self.record.deleted_labels);
+            &filtered
+        };
         let decision = match op {
             MessageOp::Observe(observation) => observe(
                 self.messages.get(&observation.id),
@@ -1278,19 +1450,32 @@ impl AccountMirror {
                 decision
             }
             MessageOp::FinishReconcile { baseline } => {
-                let seen = std::mem::take(&mut self.seen);
-                let decisions: Vec<Decision> = self
-                    .messages
-                    .values()
-                    .map(|record| finish_reconcile(record, seen.get(&record.id), *baseline, plan))
-                    .collect();
-                for decision in decisions {
-                    self.realize(decision, seq);
-                }
+                self.finish_reconciliation(*baseline, plan, seq);
                 return true;
             }
         };
         self.realize(decision, seq)
+    }
+
+    /// [`MessageOp::FinishReconcile`]: every row, with the scopes it was
+    /// listed in.
+    fn finish_reconciliation(&mut self, baseline: HistoryId, plan: &JobPlan, seq: StateSeq) {
+        let mut seen = std::mem::take(&mut self.seen);
+        // A label deleted since it was enumerated lists nothing.
+        for scopes in seen.values_mut() {
+            scopes.retain(|scope| match scope {
+                ListScope::All => true,
+                ListScope::Label(label) => !self.record.deleted_labels.contains_key(label),
+            });
+        }
+        let decisions: Vec<Decision> = self
+            .messages
+            .values()
+            .map(|record| finish_reconcile(record, seen.get(&record.id), baseline, plan))
+            .collect();
+        for decision in decisions {
+            self.realize(decision, seq);
+        }
     }
 
     /// Carry out a decision; `false` if it was a skip.
@@ -3056,5 +3241,318 @@ mod tests {
                 .and_then(|content| content.facts.as_ref())
                 .is_some_and(|facts| facts.version == 1)
         }));
+    }
+
+    // ------------------------------------------------------------ label definitions
+
+    fn defined(id: &str, name: &str) -> Label {
+        let kind = if id.starts_with("Label_") {
+            crate::gmail::LabelKind::User
+        } else {
+            crate::gmail::LabelKind::System
+        };
+        Label::plain(LabelId(id.into()), name, kind)
+    }
+
+    fn listed(mirror: &mut AccountMirror, labels: &[&str], at: i64) {
+        let mut c = commit(mirror);
+        c.labels = vec![LabelOp::ReplaceAll {
+            labels: labels.iter().map(|id| defined(id, id)).collect(),
+            generation: mirror.record.label_generation,
+            at: Timestamp(at),
+        }];
+        assert!(matches!(mirror.apply(&c), CommitOutcome::Applied { .. }));
+    }
+
+    fn entries(mirror: &AccountMirror) -> Vec<Change> {
+        mirror
+            .log
+            .iter()
+            .filter(|(seq, _)| *seq == mirror.seq)
+            .map(|(_, change)| change.clone())
+            .collect()
+    }
+
+    fn labels_of(mirror: &AccountMirror, id: &str) -> LabelSet {
+        mirror.messages[&MessageId(id.into())].labels.clone()
+    }
+
+    const DAY: i64 = 24 * 60 * 60 * 1_000;
+
+    #[test]
+    fn a_removed_label_leaves_every_message_and_logs_each_change() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        applied(
+            &mut mirror,
+            vec![
+                MessageOp::Observe(observation("a", &["INBOX", "Label_1"], 10)),
+                MessageOp::Observe(observation("b", &["Label_1"], 10)),
+                MessageOp::Observe(observation("c", &["INBOX"], 10)),
+            ],
+        );
+        mirror
+            .messages
+            .get_mut(&MessageId("b".into()))
+            .expect("b")
+            .unverified = Some(HistoryId(12));
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(100),
+        });
+        assert_eq!(labels_of(&mirror, "a"), set(["INBOX"]));
+        assert_eq!(labels_of(&mirror, "b"), set([]));
+        assert_eq!(labels_of(&mirror, "c"), set(["INBOX"]));
+        let b = &mirror.messages[&MessageId("b".into())];
+        assert_eq!(
+            (b.checkpoint, b.unverified),
+            (Some(HistoryId(10)), Some(HistoryId(12))),
+            "no checkpoint moves: an unverified row stays unverified"
+        );
+        let removed = |id: &str| Change::LabelsChanged {
+            id: MessageId(id.into()),
+            thread_id: ThreadId("t".into()),
+            added: LabelSet::new(),
+            removed: set(["Label_1"]),
+        };
+        assert_eq!(
+            entries(&mirror),
+            vec![Change::LabelDefinitionsChanged, removed("a"), removed("b")]
+        );
+        assert_eq!(mirror.label_definitions(), vec![defined("INBOX", "INBOX")]);
+        assert_eq!(
+            mirror.record.deleted_labels,
+            BTreeMap::from([(LabelId("Label_1".into()), Timestamp(100))])
+        );
+        // A history record of the same deletion changes nothing more.
+        let mut c = commit(&mirror);
+        c.messages = vec![MessageOp::PatchLabels {
+            id: MessageId("a".into()),
+            add: LabelSet::new(),
+            remove: set(["Label_1"]),
+            checkpoint: HistoryId(11),
+        }];
+        mirror.apply(&c);
+        assert_eq!(labels_of(&mirror, "a"), set(["INBOX"]));
+        assert!(entries(&mirror).is_empty());
+    }
+
+    #[test]
+    fn a_removed_label_drops_its_intents() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "STARRED", "Label_1"], 0);
+        applied(
+            &mut mirror,
+            vec![
+                MessageOp::Observe(observation("a", &["INBOX"], 1)),
+                MessageOp::Observe(observation("b", &["INBOX"], 1)),
+                MessageOp::Observe(observation("c", &["INBOX", "Label_1"], 1)),
+            ],
+        );
+        let change = |ids: &[&str], add: &[&str], remove: &[&str]| ActionRequest::Messages {
+            ids: ids.iter().map(|id| MessageId((*id).into())).collect(),
+            action: outbox::Action::ChangeLabels(
+                outbox::LabelDelta::new(
+                    add.iter().map(|l| LabelId((*l).into())).collect(),
+                    remove.iter().map(|l| LabelId((*l).into())).collect(),
+                )
+                .expect("a valid change"),
+            ),
+        };
+        mirror.admit_action(&change(&["a"], &["Label_1", "STARRED"], &[]), Timestamp(0));
+        mirror.admit_action(&change(&["b"], &["Label_1"], &[]), Timestamp(0));
+        mirror.admit_action(&change(&["c"], &[], &["Label_1"]), Timestamp(0));
+        // One delivered and one blocked: every state goes with the label.
+        let key = |id: &str| (MessageId(id.into()), LabelId("Label_1".into()));
+        mirror.intents.get_mut(&key("b")).expect("b").state = IntentState::Delivered {
+            at: Timestamp(0),
+            attempt: AttemptId(1),
+        };
+        mirror.intents.get_mut(&key("c")).expect("c").state =
+            IntentState::Blocked(crate::retry::BlockingFailure {
+                class: crate::retry::Blocking::Permanent,
+                detail: String::new(),
+            });
+        listed(&mut mirror, &["INBOX", "STARRED"], 5);
+        assert_eq!(
+            mirror
+                .intents
+                .keys()
+                .map(|(m, l)| (m.0.as_str(), l.0.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "STARRED")]
+        );
+        let overlays: Vec<MessageId> = entries(&mirror)
+            .into_iter()
+            .filter_map(|change| match change {
+                Change::OverlayChanged { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(overlays, ids(&["a", "b", "c"]));
+        // b's delivery finds nothing to send; a's sends the star alone.
+        let claimed_jobs = mirror
+            .claim_jobs(mirror.record.epoch, 10, Timestamp(0), AttemptId(9))
+            .expect("claim");
+        let work: Vec<&ClaimedWork> = claimed_jobs
+            .iter()
+            .map(|job| &job.work)
+            .filter(|work| matches!(work, ClaimedWork::Deliver(..)))
+            .collect();
+        assert!(matches!(
+            work[0],
+            ClaimedWork::Deliver(_, crate::jobs::Delivery::Send(group))
+                if group.add == vec![LabelId("STARRED".into())]
+        ));
+        assert!(matches!(
+            work[1],
+            ClaimedWork::Deliver(_, crate::jobs::Delivery::Settled)
+        ));
+    }
+
+    #[test]
+    fn an_observation_naming_a_deleted_label_is_stored_without_it() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(observation("a", &["INBOX"], 10))],
+        );
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(100),
+        });
+        // A fetch from before the deletion, and a replayed labelsAdded.
+        applied(
+            &mut mirror,
+            vec![
+                MessageOp::Observe(observation("a", &["INBOX", "Label_1"], 11)),
+                MessageOp::PatchLabels {
+                    id: MessageId("a".into()),
+                    add: set(["Label_1", "STARRED"]),
+                    remove: LabelSet::new(),
+                    checkpoint: HistoryId(12),
+                },
+                MessageOp::MarkImported {
+                    observation: observation("b", &["Label_1"], 12),
+                    blob: BlobRef("b".into()),
+                    size: 1,
+                    internal_date: Timestamp(0),
+                    headers: Box::default(),
+                },
+            ],
+        );
+        assert_eq!(labels_of(&mirror, "a"), set(["INBOX", "STARRED"]));
+        assert_eq!(labels_of(&mirror, "b"), set([]));
+        assert!(crate::invariants::check_state(&mirror).is_empty());
+    }
+
+    #[test]
+    fn a_listing_that_names_a_deleted_label_restores_it() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(100),
+        });
+        listed(&mut mirror, &["INBOX", "Label_1"], 200);
+        assert!(mirror.record.deleted_labels.is_empty());
+        assert_eq!(
+            mirror.label_definitions(),
+            vec![defined("INBOX", "INBOX"), defined("Label_1", "Label_1")]
+        );
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(observation("a", &["Label_1"], 10))],
+        );
+        assert_eq!(labels_of(&mirror, "a"), set(["Label_1"]));
+    }
+
+    #[test]
+    fn the_deleted_memory_is_pruned_after_thirty_days() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(DAY),
+        });
+        listed(&mut mirror, &["INBOX"], 30 * DAY);
+        assert!(
+            mirror
+                .record
+                .deleted_labels
+                .contains_key(&LabelId("Label_1".into())),
+            "29 days on"
+        );
+        listed(&mut mirror, &["INBOX"], 31 * DAY + 1);
+        assert!(mirror.record.deleted_labels.is_empty(), "past 30 days");
+    }
+
+    #[test]
+    fn a_listing_sent_before_a_local_label_write_is_not_applied() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_3"], 0);
+        let sent_under = mirror.record.label_generation;
+        mirror.record_label(&LabelOp::Upsert(defined("Label_2", "New")));
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_3".into()),
+            at: Timestamp(10),
+        });
+        let mut stale = commit(&mirror);
+        stale.labels = vec![LabelOp::ReplaceAll {
+            labels: vec![defined("INBOX", "INBOX"), defined("Label_3", "Label_3")],
+            generation: sent_under,
+            at: Timestamp(20),
+        }];
+        assert!(matches!(
+            mirror.apply(&stale),
+            CommitOutcome::Applied { .. }
+        ));
+        assert!(entries(&mirror).is_empty());
+        assert_eq!(
+            mirror.label_definitions(),
+            vec![defined("INBOX", "INBOX"), defined("Label_2", "New")],
+            "the label just created stays, the one just deleted does not return"
+        );
+        assert!(
+            mirror
+                .record
+                .deleted_labels
+                .contains_key(&LabelId("Label_3".into()))
+        );
+        listed(&mut mirror, &["INBOX", "Label_2"], 30);
+        assert_eq!(
+            mirror.label_definitions(),
+            vec![defined("INBOX", "INBOX"), defined("Label_2", "Label_2")],
+            "a listing sent after the writes applies"
+        );
+    }
+
+    #[test]
+    fn a_rename_changes_no_message_row() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["Label_1"], 0);
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(observation("a", &["Label_1"], 10))],
+        );
+        let before = mirror.messages.clone();
+        mirror.record_label(&LabelOp::Upsert(defined("Label_1", "Renamed")));
+        assert_eq!(entries(&mirror), vec![Change::LabelDefinitionsChanged]);
+        assert_eq!(mirror.messages, before);
+        assert_eq!(
+            mirror.label_definitions(),
+            vec![defined("Label_1", "Renamed")]
+        );
+    }
+
+    #[test]
+    fn an_upsert_equal_to_the_stored_label_logs_nothing() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["Label_1"], 0);
+        let generation = mirror.record.label_generation;
+        mirror.record_label(&LabelOp::Upsert(defined("Label_1", "Label_1")));
+        assert!(entries(&mirror).is_empty());
+        assert_eq!(mirror.record.label_generation, generation + 1);
     }
 }

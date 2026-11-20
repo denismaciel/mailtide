@@ -6,7 +6,7 @@
 //! ground truth.
 
 use crate::commit::{Commit, CommitOutcome};
-use crate::ids::{HistoryId, MessageId};
+use crate::ids::{HistoryId, LabelId, MessageId};
 use crate::jobs::{JobKind, JobOp, JobState};
 use crate::mirror::{AccountMirror, Content};
 use crate::quota::Priority;
@@ -90,6 +90,25 @@ pub enum Violation {
         acknowledged: StateSeq,
         /// A commit at or before it still in the log.
         kept: StateSeq,
+    },
+    /// Two label definitions share an id.
+    DuplicateLabel {
+        /// The id.
+        label: LabelId,
+    },
+    /// A message row carries a label remembered as deleted (SPEC §6.6).
+    DeletedLabelOnMessage {
+        /// The message.
+        message: MessageId,
+        /// The label.
+        label: LabelId,
+    },
+    /// An intent names a label remembered as deleted.
+    DeletedLabelInIntent {
+        /// The intent's message.
+        message: MessageId,
+        /// The label.
+        label: LabelId,
     },
     /// A rejected commit changed something.
     RejectedCommitChangedState,
@@ -281,7 +300,7 @@ fn lowered(before: &AccountMirror, after: &AccountMirror, finished: &[&JobKind])
 /// Check what must hold in every state.
 #[must_use]
 pub fn check_state(mirror: &AccountMirror) -> Vec<Violation> {
-    let mut violations = Vec::new();
+    let mut violations = check_labels(mirror);
     for id in mirror.messages.keys() {
         if mirror.tombstones.contains_key(id) {
             violations.push(Violation::Resurrected {
@@ -308,4 +327,112 @@ pub fn check_state(mirror: &AccountMirror) -> Vec<Violation> {
         }
     }
     violations
+}
+
+/// The label invariants (SPEC §6.6): definition ids are unique, and no row
+/// and no intent names a label remembered as deleted.
+fn check_labels(mirror: &AccountMirror) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut defined = std::collections::BTreeSet::new();
+    for label in &mirror.labels {
+        if !defined.insert(&label.id) {
+            violations.push(Violation::DuplicateLabel {
+                label: label.id.clone(),
+            });
+        }
+    }
+    let deleted = &mirror.record.deleted_labels;
+    for (id, record) in &mirror.messages {
+        for label in record.labels.iter().filter(|l| deleted.contains_key(*l)) {
+            violations.push(Violation::DeletedLabelOnMessage {
+                message: id.clone(),
+                label: label.clone(),
+            });
+        }
+    }
+    for (message, label) in mirror.intents.keys() {
+        if deleted.contains_key(label) {
+            violations.push(Violation::DeletedLabelInIntent {
+                message: message.clone(),
+                label: label.clone(),
+            });
+        }
+    }
+    violations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gmail::{HeaderFacts, Label, LabelKind};
+    use crate::ids::{AccountId, BlobRef, ThreadId, Timestamp};
+    use crate::labels::set;
+    use crate::mirror::{MessageRecord, StoredContent};
+    use crate::outbox::{Intent, IntentState, IntentVersion, LabelChange};
+
+    #[test]
+    fn no_row_or_intent_names_a_deleted_label() {
+        let mut mirror = AccountMirror::new(AccountId("a@example.com".into()), 1);
+        let gone = LabelId("Label_1".into());
+        let message = MessageId("m".into());
+        mirror.messages.insert(
+            message.clone(),
+            MessageRecord {
+                id: message.clone(),
+                thread_id: ThreadId("t".into()),
+                labels: set(["INBOX", "Label_1"]),
+                checkpoint: Some(HistoryId(1)),
+                unverified: None,
+                content: Content::Imported(Box::new(StoredContent {
+                    blob: BlobRef("k".into()),
+                    size: 1,
+                    internal_date: Timestamp(0),
+                    headers: HeaderFacts::default(),
+                })),
+            },
+        );
+        mirror.intents.insert(
+            (message.clone(), gone.clone()),
+            Intent {
+                message: message.clone(),
+                label: gone.clone(),
+                change: LabelChange::Remove,
+                version: IntentVersion(1),
+                base_checkpoint: None,
+                state: IntentState::Pending,
+            },
+        );
+        let inbox = Label::plain(LabelId("INBOX".into()), "INBOX", LabelKind::System);
+        mirror.labels = vec![inbox.clone(), inbox];
+        assert_eq!(
+            check_state(&mirror),
+            vec![Violation::DuplicateLabel {
+                label: LabelId("INBOX".into())
+            }],
+            "a label in use is not deleted"
+        );
+        mirror.labels.pop();
+        mirror
+            .record
+            .deleted_labels
+            .insert(gone.clone(), Timestamp(0));
+        assert_eq!(
+            check_state(&mirror),
+            vec![
+                Violation::DeletedLabelOnMessage {
+                    message: message.clone(),
+                    label: gone.clone(),
+                },
+                Violation::DeletedLabelInIntent {
+                    message: message.clone(),
+                    label: gone.clone(),
+                },
+            ]
+        );
+        mirror.intents.clear();
+        if let Some(record) = mirror.messages.get_mut(&message) {
+            record.labels.remove(&gone);
+        }
+        assert!(check_state(&mirror).is_empty());
+    }
 }

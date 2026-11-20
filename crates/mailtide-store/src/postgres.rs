@@ -1,6 +1,6 @@
 //! Postgres store: mailtide's tables inside the host database.
 
-use mailtide::commit::{Commit, CommitOutcome};
+use mailtide::commit::{Commit, CommitOutcome, LabelOp};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
@@ -189,6 +189,14 @@ impl Store for PostgresStore {
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         crate::Store::labels(&self.inner, account).await
+    }
+
+    async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {
+        crate::Store::record_label(&self.inner, account, op).await
+    }
+
+    async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
+        crate::Store::label_generation(&self.inner, account).await
     }
 }
 

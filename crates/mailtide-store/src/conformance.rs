@@ -9,7 +9,10 @@ use std::future::Future;
 use mailtide::commit::{
     Commit, CommitOutcome, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
-use mailtide::gmail::{HeaderFacts, Label, LabelKind, MessageFacts, MessageObservation};
+use mailtide::gmail::{
+    HeaderFacts, Label, LabelColor, LabelKind, LabelListVisibility, MessageFacts,
+    MessageListVisibility, MessageObservation,
+};
 use mailtide::ids::{
     AccountId, BlobRef, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId,
     ThreadId, Timestamp,
@@ -135,6 +138,7 @@ where
     cases.extend(consumer_cases());
     cases.extend(search_cases());
     cases.extend(message_facts_cases());
+    cases.extend(label_edit_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -259,6 +263,20 @@ fn message_facts_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
         (
             "import and refresh entries carry the current content",
             |s| Box::pin(import_and_refresh_entries_carry_the_current_content(s)),
+        ),
+    ]
+}
+
+/// The cases of label attributes and local label writes.
+fn label_edit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        (
+            "label attributes round-trip; local label writes record, fence and strip",
+            |s| Box::pin(label_attributes_and_writes(s)),
+        ),
+        (
+            "removing a label finds exactly the rows that carry it",
+            |s| Box::pin(removing_a_label_finds_exactly_the_rows_that_carry_it(s)),
         ),
     ]
 }
@@ -1961,10 +1979,15 @@ async fn tracking<S: Store>(store: &S) -> Result<(), String> {
 }
 
 fn label(id: &str, name: &str, kind: LabelKind) -> Label {
-    Label {
-        id: LabelId(id.into()),
-        name: name.into(),
-        kind,
+    Label::plain(LabelId(id.into()), name, kind)
+}
+
+/// A listing made under label generation 0 (no local label write yet).
+fn listing(labels: Vec<Label>) -> LabelOp {
+    LabelOp::ReplaceAll {
+        labels,
+        generation: 0,
+        at: Timestamp(0),
     }
 }
 
@@ -1984,7 +2007,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
         "no labels before the first label sync",
     )?;
     let mut first = commit(&snapshot, 0);
-    first.labels = vec![LabelOp::ReplaceAll(vec![
+    first.labels = vec![listing(vec![
         label("Label_2", "Receipts", LabelKind::User),
         label("INBOX", "INBOX", LabelKind::System),
         label("Label_1", "Travel", LabelKind::User),
@@ -2000,7 +2023,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
         "labels round-trip in id order",
     )?;
     let mut refresh = commit(&snapshot, 1);
-    refresh.labels = vec![LabelOp::ReplaceAll(vec![
+    refresh.labels = vec![listing(vec![
         label("INBOX", "INBOX", LabelKind::System),
         label("Label_2", "Invoices", LabelKind::User),
     ])];
@@ -2045,7 +2068,7 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
         label("Label_1", "Travel", LabelKind::User),
     ];
     let mut first = commit(&snapshot, 0);
-    first.labels = vec![LabelOp::ReplaceAll(listed.clone())];
+    first.labels = vec![listing(listed.clone())];
     first.account_ops = vec![mailtide::commit::AccountOp::SetLabelsRefreshedAt(
         Timestamp(5_000),
     )];
@@ -2062,7 +2085,7 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
     let mut same = commit(&snapshot, 0);
     let mut reordered = listed.clone();
     reordered.reverse();
-    same.labels = vec![LabelOp::ReplaceAll(reordered)];
+    same.labels = vec![listing(reordered)];
     same.account_ops = vec![mailtide::commit::AccountOp::SetLabelsRefreshedAt(
         Timestamp(9_000),
     )];
@@ -3147,5 +3170,266 @@ async fn import_and_refresh_entries_carry_the_current_content<S: Store>(
     expect(
         entries(&feed) == vec![None, None],
         "nothing once the message is deleted",
+    )
+}
+
+/// A user label with both visibilities and a colour.
+fn styled(id: &str, name: &str) -> Label {
+    Label {
+        list_visibility: Some(LabelListVisibility::ShowIfUnread),
+        message_visibility: Some(MessageListVisibility::Hide),
+        color: Some(LabelColor {
+            text: "#ffffff".into(),
+            background: "#16a766".into(),
+        }),
+        ..label(id, name, LabelKind::User)
+    }
+}
+
+async fn record_label<S: Store>(store: &S, op: &LabelOp) -> Result<(), String> {
+    store
+        .record_label(&account(), op)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+async fn label_generation<S: Store>(store: &S, account: &AccountId) -> Result<u64, String> {
+    store
+        .label_generation(account)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Every store keeps both visibilities and the colour; `record_label`
+/// writes Gmail's answer to a local write (definition, strip, feed entries)
+/// in one go and bumps the generation, which fences a listing sent before
+/// it; `forget` deletes all of it.
+async fn label_attributes_and_writes<S: Store>(store: &S) -> Result<(), String> {
+    let stranger = AccountId("stranger@example.com".into());
+    expect(
+        store
+            .record_label(&stranger, &LabelOp::Upsert(styled("Label_1", "A")))
+            .await
+            == Err(StoreError::NotTracked),
+        "an untracked account records nothing",
+    )?;
+    expect(
+        label_generation(store, &stranger).await? == 0,
+        "an untracked account is at generation 0",
+    )?;
+    let snapshot = claim(store).await?;
+    let inbox = Label {
+        list_visibility: Some(LabelListVisibility::Show),
+        message_visibility: Some(MessageListVisibility::Show),
+        ..label("INBOX", "INBOX", LabelKind::System)
+    };
+    let mut first = commit(&snapshot, 0);
+    first.labels = vec![listing(vec![
+        inbox.clone(),
+        styled("Label_1", "Travel"),
+        label("Label_2", "Receipts", LabelKind::User),
+    ])];
+    first.messages = vec![observe("a", &["INBOX", "Label_2"], 1)];
+    apply(store, &first).await?;
+    expect(
+        labels(store, &account()).await?
+            == vec![
+                inbox.clone(),
+                styled("Label_1", "Travel"),
+                label("Label_2", "Receipts", LabelKind::User),
+            ],
+        "visibility and colour round-trip; none reads as none",
+    )?;
+    let generation = label_generation(store, &account()).await?;
+    expect(generation == 0, "no local write yet")?;
+    let created = Label {
+        color: None,
+        ..styled("Label_3", "New")
+    };
+    record_label(store, &LabelOp::Upsert(created.clone())).await?;
+    record_label(
+        store,
+        &LabelOp::Remove {
+            id: LabelId("Label_2".into()),
+            at: Timestamp(10),
+        },
+    )
+    .await?;
+    expect(
+        label_generation(store, &account()).await? == 2,
+        "each local write bumps the generation",
+    )?;
+    expect(
+        view(store, "a").await?.labels == set(["INBOX"]),
+        "a deleted label leaves the rows that carried it",
+    )?;
+    // A listing sent before the writes: stale, not applied.
+    let mut stale = commit(&snapshot, 1);
+    stale.labels = vec![listing(vec![
+        inbox.clone(),
+        label("Label_2", "Receipts", LabelKind::User),
+    ])];
+    apply(store, &stale).await?;
+    let current = vec![inbox.clone(), styled("Label_1", "Travel"), created.clone()];
+    expect(
+        labels(store, &account()).await? == current,
+        "a stale listing neither removes a new label nor restores a deleted one",
+    )?;
+    // An observation from before the deletion keeps it off the row.
+    let mut late = commit(&snapshot, 2);
+    late.messages = vec![observe("a", &["INBOX", "Label_2"], 2)];
+    apply(store, &late).await?;
+    expect(
+        view(store, "a").await?.labels == set(["INBOX"]),
+        "a remembered-deleted id is not stored again",
+    )?;
+    let page = store
+        .changes(&account(), StateSeq(0).into(), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let kinds: Vec<&Change> = page.changes.iter().map(|e| &e.change).collect();
+    expect(
+        kinds
+            .iter()
+            .filter(|c| ***c == Change::LabelDefinitionsChanged)
+            .count()
+            == 3,
+        "the listing and both writes changed the definitions",
+    )?;
+    expect(
+        kinds.iter().any(
+            |c| matches!(c, Change::LabelsChanged { removed, .. } if *removed == set(["Label_2"])),
+        ),
+        "the strip is in the feed",
+    )?;
+    forgetting_drops_the_label_state(store).await
+}
+
+/// After [`label_attributes_and_writes`]: forget deletes the definitions,
+/// the generation and the deleted memory with the account.
+async fn forgetting_drops_the_label_state<S: Store>(store: &S) -> Result<(), String> {
+    store
+        .forget(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    store
+        .track(&account(), GENERATION + 1)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        labels(store, &account()).await?.is_empty()
+            && label_generation(store, &account()).await? == 0,
+        "forget deletes the definitions and the generation",
+    )?;
+    let snapshot = claim(store).await?;
+    let mut again = commit(&snapshot, 0);
+    again.messages = vec![observe("a", &["Label_2"], 1)];
+    apply(store, &again).await?;
+    expect(
+        view(store, "a").await?.labels == set(["Label_2"]),
+        "and the deleted memory",
+    )
+}
+
+/// The SQL store finds the rows a removal touches by a text match on the
+/// labels column; each is confirmed by the shared rule, so `Label_1` is
+/// stripped and `Label_10`, `LabelX1` (`_` is a `LIKE` wildcard) and
+/// `label_1` (`SQLite` compares ASCII case-insensitively) are not. Intents
+/// on the label go, also on a row that does not carry it.
+async fn removing_a_label_finds_exactly_the_rows_that_carry_it<S: Store>(
+    store: &S,
+) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut first = commit(&snapshot, 0);
+    first.labels = vec![listing(
+        ["INBOX", "Label_1", "Label_10", "LabelX1", "label_1"]
+            .into_iter()
+            .map(|id| label(id, id, LabelKind::User))
+            .collect(),
+    )];
+    first.messages = vec![
+        observe("a", &["Label_1"], 1),
+        observe("b", &["Label_10"], 1),
+        observe("c", &["LabelX1"], 1),
+        observe("d", &["label_1"], 1),
+        observe("e", &["Label_1", "Label_10"], 1),
+        observe("f", &["INBOX"], 1),
+    ];
+    apply(store, &first).await?;
+    let add_label_1 = ActionRequest::Messages {
+        ids: vec![MessageId("f".into())],
+        action: Action::ChangeLabels(
+            mailtide::outbox::LabelDelta::new(vec![LabelId("Label_1".into())], Vec::new())
+                .map_err(|e| e.to_string())?,
+        ),
+    };
+    store
+        .admit(&account(), &add_label_1, Timestamp(0))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        view(store, "f").await?.labels == set(["INBOX", "Label_1"]),
+        "the action overlays",
+    )?;
+    record_label(
+        store,
+        &LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(5),
+        },
+    )
+    .await?;
+    let labels_of = |views: &[MessageView]| -> Vec<(String, LabelSet)> {
+        views
+            .iter()
+            .map(|v| (v.id.0.clone(), v.labels.clone()))
+            .collect()
+    };
+    let views = store
+        .messages(&account(), &ids(&["a", "b", "c", "d", "e", "f"]))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        labels_of(&views)
+            == vec![
+                ("a".into(), set([])),
+                ("b".into(), set(["Label_10"])),
+                ("c".into(), set(["LabelX1"])),
+                ("d".into(), set(["label_1"])),
+                ("e".into(), set(["Label_10"])),
+                ("f".into(), set(["INBOX"])),
+            ],
+        "exactly the rows carrying Label_1 lose it",
+    )?;
+    expect(
+        views.iter().all(|v| v.pending_actions == 0),
+        "the intent on the deleted label went",
+    )?;
+    // A listing sent after the write that lacks a label removes it the
+    // same way.
+    let mut later = commit(&snapshot, 1);
+    later.labels = vec![LabelOp::ReplaceAll {
+        labels: ["INBOX", "LabelX1", "label_1"]
+            .into_iter()
+            .map(|id| label(id, id, LabelKind::User))
+            .collect(),
+        generation: label_generation(store, &account()).await?,
+        at: Timestamp(6),
+    }];
+    apply(store, &later).await?;
+    let views = store
+        .messages(&account(), &ids(&["b", "c", "d", "e"]))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        labels_of(&views)
+            == vec![
+                ("b".into(), set([])),
+                ("c".into(), set(["LabelX1"])),
+                ("d".into(), set(["label_1"])),
+                ("e".into(), set([])),
+            ],
+        "a label the listing lacks leaves exactly its rows",
     )
 }

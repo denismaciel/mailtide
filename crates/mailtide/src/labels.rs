@@ -35,6 +35,19 @@ pub mod system {
     pub const DRAFT: &str = "DRAFT";
     /// A Chat message.
     pub const CHAT: &str = "CHAT";
+
+    /// Whether `id` is one of Gmail's fixed system labels (the ones above,
+    /// and the `CATEGORY_*` tabs): ids every mailbox has, which a modify is
+    /// never refused for as unknown. A user label (`Label_…`) can be
+    /// deleted, and an id nobody created is refused like one.
+    #[must_use]
+    pub fn is_system(id: &str) -> bool {
+        [
+            INBOX, UNREAD, STARRED, IMPORTANT, SPAM, TRASH, SENT, DRAFT, CHAT,
+        ]
+        .contains(&id)
+            || id.starts_with("CATEGORY_")
+    }
 }
 
 /// Whether an update observed at `incoming` may replace state stored at

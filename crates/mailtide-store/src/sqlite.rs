@@ -1,6 +1,6 @@
 //! `SQLite` store: the reference store for open-source users and tests.
 
-use mailtide::commit::{Commit, CommitOutcome};
+use mailtide::commit::{Commit, CommitOutcome, LabelOp};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
@@ -190,6 +190,14 @@ impl Store for SqliteStore {
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         crate::Store::labels(&self.inner, account).await
     }
+
+    async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {
+        crate::Store::record_label(&self.inner, account, op).await
+    }
+
+    async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
+        crate::Store::label_generation(&self.inner, account).await
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +341,18 @@ mod tests {
         refused("threads", store.threads(account, &threads).await.err());
         refused("locate", store.locate(account, &ids).await.err());
         refused("labels", store.labels(account).await.err());
+        let write = mailtide::commit::LabelOp::Remove {
+            id: mailtide::ids::LabelId("Label_1".into()),
+            at: now,
+        };
+        refused(
+            "record_label",
+            store.record_label(account, &write).await.err(),
+        );
+        refused(
+            "label_generation",
+            store.label_generation(account).await.err(),
+        );
     }
 
     /// Reads refuse a schema this build doesn't match as writes do: one
@@ -573,8 +593,10 @@ mod tests {
             .expect("claim");
         assert_eq!(snapshot.sync, mailtide::state::SyncState::Live);
         assert_eq!(snapshot.labels_refreshed_at, None);
-        // The documented downgrade, after forgetting the later migrations
-        // (version-only, or an index that migrating again keeps).
+        // The documented downgrade, after reverting the later migrations
+        // (label editing's columns) and forgetting the rest (version-only, or
+        // an index that migrating again keeps).
+        run(label_editing_rollback()).await;
         run(vec![
             "DELETE FROM mailtide_schema WHERE version > 4".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at".to_owned(),
@@ -612,15 +634,16 @@ mod tests {
             .await
             .expect("store");
         store.migrate().await.expect("migrate");
-        // The documented downgrade, after forgetting the later migrations
-        // (what they add, migrating again keeps).
-        for statement in [
-            "DELETE FROM mailtide_schema WHERE version > 5",
-            "DELETE FROM mailtide_schema WHERE version = 5",
-        ] {
+        // The documented downgrade, after reverting label editing (its
+        // columns) and forgetting the other later migrations (what they add,
+        // migrating again keeps).
+        for statement in label_editing_rollback().into_iter().chain([
+            "DELETE FROM mailtide_schema WHERE version > 5".to_owned(),
+            "DELETE FROM mailtide_schema WHERE version = 5".to_owned(),
+        ]) {
             store
                 .inner
-                .execute_for_tests(statement)
+                .execute_for_tests(&statement)
                 .await
                 .expect("revert");
         }
@@ -716,7 +739,9 @@ mod tests {
             Ok(0),
             "no consumer and no bound: nothing"
         );
-        // The documented downgrade, after the later migrations.
+        // The documented downgrade, after reverting label editing (its
+        // columns) and forgetting the other later migrations.
+        run(label_editing_rollback()).await;
         run(vec![
             format!("DELETE FROM mailtide_schema WHERE version > {version}"),
             "DROP TABLE mailtide_consumers".to_owned(),
@@ -859,6 +884,104 @@ mod tests {
         (all[..index].to_vec(), all[index].clone())
     }
 
+    /// The label-editing migration, by its statements (its number is
+    /// assigned when it lands), and the migrations before it.
+    fn label_editing_migration() -> (Vec<crate::sql::Migration>, crate::sql::Migration) {
+        let all = crate::sql::migrations();
+        let index = all
+            .iter()
+            .position(|m| m.statements.iter().any(|s| s.contains("COLUMN attrs")))
+            .expect("the label-editing migration");
+        (all[..index].to_vec(), all[index].clone())
+    }
+
+    /// The label-editing migration's documented rollback (SPEC §11).
+    fn label_editing_rollback() -> Vec<String> {
+        let (_, migration) = label_editing_migration();
+        vec![
+            "ALTER TABLE mailtide_labels DROP COLUMN attrs".to_owned(),
+            "ALTER TABLE mailtide_accounts DROP COLUMN label_generation".to_owned(),
+            "ALTER TABLE mailtide_accounts DROP COLUMN deleted_labels".to_owned(),
+            format!(
+                "DELETE FROM mailtide_schema WHERE version = {}",
+                migration.version
+            ),
+        ]
+    }
+
+    /// The label-editing migration adds columns only: a label row from
+    /// before it reads with no visibility or colour, an account with no
+    /// local label write and nothing remembered as deleted. Its rollback
+    /// takes the database back a version, and migrating again restores it.
+    #[tokio::test]
+    async fn the_label_editing_migration_is_additive_and_revertible() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState};
+        use mailtide::gmail::{Label, LabelKind};
+        use mailtide::ids::LabelId;
+        let (before, migration) = label_editing_migration();
+        assert_eq!(
+            migration.statements[1..],
+            [
+                "ALTER TABLE mailtide_labels ADD COLUMN attrs TEXT".to_owned(),
+                "ALTER TABLE mailtide_accounts ADD COLUMN label_generation BIGINT NOT NULL DEFAULT 0"
+                    .to_owned(),
+                "ALTER TABLE mailtide_accounts ADD COLUMN deleted_labels TEXT".to_owned(),
+                format!(
+                    "INSERT INTO mailtide_schema (version) VALUES ({})",
+                    migration.version
+                ),
+            ]
+        );
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        run_statements(&store, &before).await;
+        // An account and a label as the version before stored them.
+        for statement in [
+            "INSERT INTO mailtide_accounts
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity,
+                cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at)
+             VALUES ('a@example.com', 1, 1, 7, '\"Live\"', NULL, NULL, NULL, 0, 0, 0, 1, 5000)",
+            "INSERT INTO mailtide_labels (account, id, name, kind)
+             VALUES ('a@example.com', 'Label_1', 'Travel', 'user')",
+        ] {
+            store
+                .inner
+                .execute_for_tests(statement)
+                .await
+                .expect("statement");
+        }
+        store.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        let travel = vec![Label::plain(
+            LabelId("Label_1".into()),
+            "Travel",
+            LabelKind::User,
+        )];
+        assert_eq!(store.labels(&account).await, Ok(travel.clone()));
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.labels_refreshed_at, Some(Timestamp(5_000)));
+        for statement in label_editing_rollback() {
+            store
+                .inner
+                .execute_for_tests(&statement)
+                .await
+                .expect("rollback");
+        }
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: migration.version - 1,
+                expected: SCHEMA_VERSION
+            }
+        );
+        store.migrate().await.expect("migrate again");
+        assert_eq!(store.labels(&account).await, Ok(travel));
+    }
+
     async fn run_statements(store: &SqliteStore, migrations: &[crate::sql::Migration]) {
         for statement in migrations.iter().flat_map(|m| &m.statements) {
             store
@@ -983,9 +1106,9 @@ mod tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].message_count, 3);
         assert_eq!(read[1].labels.len(), 0, "the archive overlays");
-        // After forgetting the later migrations (what they add, migrating
-        // again keeps).
-        for statement in [
+        // After reverting label editing (its columns) and forgetting the
+        // other later migrations (what they add, migrating again keeps).
+        for statement in label_editing_rollback().into_iter().chain([
             format!(
                 "DELETE FROM mailtide_schema WHERE version > {}",
                 migration.version
@@ -995,7 +1118,7 @@ mod tests {
                 "DELETE FROM mailtide_schema WHERE version = {}",
                 migration.version
             ),
-        ] {
+        ]) {
             store
                 .inner
                 .execute_for_tests(&statement)

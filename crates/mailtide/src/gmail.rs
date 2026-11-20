@@ -474,8 +474,103 @@ pub enum LabelKind {
 pub struct Label {
     /// The label id.
     pub id: LabelId,
-    /// Its display name.
+    /// Its display name. Gmail nests labels by `/` in the name.
     pub name: String,
     /// System or user.
     pub kind: LabelKind,
+    /// Whether it shows in the label list (`labelListVisibility`); `None`
+    /// when Gmail omits it (most system labels) or before a listing filled
+    /// it.
+    pub list_visibility: Option<LabelListVisibility>,
+    /// Whether messages show under it (`messageListVisibility`); `None` as
+    /// above.
+    pub message_visibility: Option<MessageListVisibility>,
+    /// Its colour; `None` for no colour (and for system labels).
+    pub color: Option<LabelColor>,
+}
+
+impl Label {
+    /// A definition with no visibility or colour known, as Gmail lists most
+    /// system labels.
+    #[must_use]
+    pub fn plain(id: LabelId, name: impl Into<String>, kind: LabelKind) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind,
+            list_visibility: None,
+            message_visibility: None,
+            color: None,
+        }
+    }
+}
+
+/// Whether a label shows in the label list (`labelListVisibility`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LabelListVisibility {
+    /// `labelShow`.
+    Show,
+    /// `labelShowIfUnread`: only while it has unread messages.
+    ShowIfUnread,
+    /// `labelHide`.
+    Hide,
+}
+
+impl LabelListVisibility {
+    /// Gmail's spelling.
+    #[must_use]
+    pub fn gmail_name(self) -> &'static str {
+        match self {
+            Self::Show => "labelShow",
+            Self::ShowIfUnread => "labelShowIfUnread",
+            Self::Hide => "labelHide",
+        }
+    }
+
+    /// The value Gmail spells `name`, if it is one.
+    #[must_use]
+    pub fn from_gmail_name(name: &str) -> Option<Self> {
+        [Self::Show, Self::ShowIfUnread, Self::Hide]
+            .into_iter()
+            .find(|value| value.gmail_name() == name)
+    }
+}
+
+/// Whether messages show under a label (`messageListVisibility`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MessageListVisibility {
+    /// `show`.
+    Show,
+    /// `hide`.
+    Hide,
+}
+
+impl MessageListVisibility {
+    /// Gmail's spelling.
+    #[must_use]
+    pub fn gmail_name(self) -> &'static str {
+        match self {
+            Self::Show => "show",
+            Self::Hide => "hide",
+        }
+    }
+
+    /// The value Gmail spells `name`, if it is one.
+    #[must_use]
+    pub fn from_gmail_name(name: &str) -> Option<Self> {
+        [Self::Show, Self::Hide]
+            .into_iter()
+            .find(|value| value.gmail_name() == name)
+    }
+}
+
+/// A label's colour: Gmail's text and background pair (`#rrggbb`), as Gmail
+/// reports it. A colour a caller sets is checked against Google's palette
+/// before it is sent (`mailtide_gmail::labels::palette_color`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LabelColor {
+    /// `textColor`.
+    pub text: String,
+    /// `backgroundColor`.
+    pub background: String,
 }

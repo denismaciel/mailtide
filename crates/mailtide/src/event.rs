@@ -87,6 +87,10 @@ pub enum EventKind {
         command: CommandId,
         /// All label definitions.
         labels: Vec<Label>,
+        /// The account's label generation, read from the store before the
+        /// request was sent (`Store::label_generation`): the listing is
+        /// applied only if no local label write happened since.
+        generation: u64,
     },
     /// `users.watch` succeeded.
     WatchRenewed {

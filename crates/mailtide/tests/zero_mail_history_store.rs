@@ -735,6 +735,7 @@ fn durable_gmail_history_checkpoints_resumes_full_reconciliation_after_restart_a
     host.handle(EventKind::LabelsListed {
         command: labels,
         labels: Vec::new(),
+        generation: 0,
     });
     let profile = host.only_call(&GmailRequest::GetProfile);
     host.handle(EventKind::ProfileFetched {

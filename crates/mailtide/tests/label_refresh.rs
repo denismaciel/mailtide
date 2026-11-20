@@ -39,15 +39,15 @@ fn account() -> AccountId {
 }
 
 fn label(id: &str, name: &str) -> Label {
-    Label {
-        id: LabelId(id.into()),
-        name: name.into(),
-        kind: if id.starts_with("Label_") {
+    Label::plain(
+        LabelId(id.into()),
+        name,
+        if id.starts_with("Label_") {
             LabelKind::User
         } else {
             LabelKind::System
         },
-    }
+    )
 }
 
 fn stored_labels() -> Vec<Label> {
@@ -98,7 +98,11 @@ fn live_mirror() -> AccountMirror {
         expected: None,
         to: HistoryId(100),
     });
-    c.labels = vec![LabelOp::ReplaceAll(stored_labels())];
+    c.labels = vec![LabelOp::ReplaceAll {
+        labels: stored_labels(),
+        generation: 0,
+        at: Timestamp(0),
+    }];
     c.account_ops = vec![AccountOp::SetLabelsRefreshedAt(Timestamp(LISTED))];
     assert!(matches!(mirror.apply(&c), CommitOutcome::Applied { .. }));
     mirror
@@ -325,6 +329,7 @@ fn a_refresh_is_due_from_the_persisted_refresh_time_across_restarts() {
     host.handle(EventKind::LabelsListed {
         command: call,
         labels: renamed.clone(),
+        generation: 0,
     });
     assert_eq!(host.mirror.label_definitions(), {
         let mut sorted = renamed;
@@ -358,6 +363,7 @@ fn a_long_running_engine_refreshes_when_its_timer_fires() {
     host.handle(EventKind::LabelsListed {
         command: call,
         labels: stored_labels(),
+        generation: 0,
     });
     assert_eq!(host.mirror.record.labels_refreshed_at, Some(due));
 }
@@ -373,6 +379,7 @@ fn an_unchanged_listing_adds_no_feed_entry() {
     host.handle(EventKind::LabelsListed {
         command: call,
         labels: reordered,
+        generation: 0,
     });
     assert_eq!(
         host.mirror.log.len(),
@@ -406,6 +413,7 @@ fn reconciliation_listing_unchanged_labels_adds_no_feed_entry_either() {
     host.handle(EventKind::LabelsListed {
         command: call,
         labels: stored_labels(),
+        generation: 0,
     });
     assert_eq!(host.definitions_changes(), before);
     assert_eq!(
@@ -479,6 +487,7 @@ fn unknown_label_ids_coalesce_into_one_throttled_refresh() {
     host.handle(EventKind::LabelsListed {
         command: call,
         labels: listed,
+        generation: 0,
     });
     assert_eq!(
         host.timers.get(&TimerKind::Labels),
@@ -516,6 +525,7 @@ fn unknown_label_ids_coalesce_into_one_throttled_refresh() {
     host.handle(EventKind::LabelsListed {
         command: call,
         labels: listed,
+        generation: 0,
     });
     host.at(LISTED + 11 * MINUTE)
         .handle(EventKind::PushReceived {
@@ -634,6 +644,7 @@ fn a_failed_refresh_neither_blocks_sync_nor_moves_the_cursor() {
     host.handle(EventKind::LabelsListed {
         command: labels,
         labels: stored_labels(),
+        generation: 0,
     });
     // No label commit ever touched the cursor.
     for commit in &host.commits {
@@ -677,6 +688,7 @@ fn an_unknown_label_seen_during_a_listing_is_asked_about_once_more() {
     host.handle(EventKind::LabelsListed {
         command: labels,
         labels: stored_labels(),
+        generation: 0,
     });
     let again = Timestamp(start).plus(UNKNOWN_LABEL_GAP);
     assert_eq!(host.timers.get(&TimerKind::Labels), Some(&again));

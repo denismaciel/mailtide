@@ -321,9 +321,13 @@ impl Engine {
                 command,
                 message_id,
             } => self.on_not_found(command, message_id, now),
-            EventKind::LabelsListed { command, labels } => match self.waiting.remove(&command) {
-                Some(Waiting::Labels) => self.on_labels(labels, now),
-                Some(Waiting::LabelRefresh) => self.on_label_refresh(labels, now),
+            EventKind::LabelsListed {
+                command,
+                labels,
+                generation,
+            } => match self.waiting.remove(&command) {
+                Some(Waiting::Labels) => self.on_labels(labels, generation, now),
+                Some(Waiting::LabelRefresh) => self.on_label_refresh(labels, generation, now),
                 Some(_) | None => Vec::new(),
             },
             EventKind::WatchRenewed {
@@ -679,11 +683,15 @@ impl Engine {
     }
 
     /// Reconciliation listed the labels: store them, then fix the baseline.
-    fn on_labels(&mut self, labels: Vec<Label>, now: Timestamp) -> Vec<Command> {
+    fn on_labels(&mut self, labels: Vec<Label>, generation: u64, now: Timestamp) -> Vec<Command> {
         self.label_ids = labels.iter().map(|label| label.id.clone()).collect();
         let mut out = self.labels_listed(&labels, now);
         let mut commit = self.commit(now, Priority::Backfill);
-        commit.labels = vec![LabelOp::ReplaceAll(labels)];
+        commit.labels = vec![LabelOp::ReplaceAll {
+            labels,
+            generation,
+            at: now,
+        }];
         commit.account_ops = vec![AccountOp::SetLabelsRefreshedAt(now)];
         out.insert(0, self.send_commit(commit, AfterCommit::Bookkeeping));
         // The baseline must be captured before anything is listed.
@@ -698,11 +706,21 @@ impl Engine {
     // ------------------------------------------------------------ label definitions (SPEC §6.6)
 
     /// A refresh listed the labels: store them. The store logs a change
-    /// only if they differ from the stored ones; the cursor never moves.
-    fn on_label_refresh(&mut self, labels: Vec<Label>, now: Timestamp) -> Vec<Command> {
+    /// only if they differ from the stored ones, and skips a listing a local
+    /// label write made stale; the cursor never moves.
+    fn on_label_refresh(
+        &mut self,
+        labels: Vec<Label>,
+        generation: u64,
+        now: Timestamp,
+    ) -> Vec<Command> {
         let mut out = self.labels_listed(&labels, now);
         let mut commit = self.commit(now, Priority::Live);
-        commit.labels = vec![LabelOp::ReplaceAll(labels)];
+        commit.labels = vec![LabelOp::ReplaceAll {
+            labels,
+            generation,
+            at: now,
+        }];
         commit.account_ops = vec![AccountOp::SetLabelsRefreshedAt(now)];
         out.insert(0, self.send_commit(commit, AfterCommit::Bookkeeping));
         out
@@ -755,6 +773,27 @@ impl Engine {
         if !fresh {
             return Vec::new();
         }
+        let at = schedule::unknown_label_refresh(
+            self.state.labels_refreshed_at,
+            now,
+            self.config.label_refresh,
+        );
+        let at = self
+            .labels
+            .not_before
+            .map_or(at, |not_before| at.max(not_before));
+        self.labels.due = Some(self.labels.due.map_or(at, |due| due.min(at)));
+        self.pump_labels(now)
+    }
+
+    /// Labels a delivery was refused for, which may be deleted: list the
+    /// definitions soon (as for an unknown id), even though they hold them.
+    fn recheck_labels(&mut self, ids: LabelSet, now: Timestamp) -> Vec<Command> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.labels.unlisted.retain(|id| !ids.contains(id));
+        self.labels.unknown.extend(ids);
         let at = schedule::unknown_label_refresh(
             self.state.labels_refreshed_at,
             now,
@@ -1275,14 +1314,37 @@ impl Engine {
             (Blocking::Account(_), _) => self.block(blocking.clone(), now),
             (Blocking::Permanent, Waiting::Job(job)) => match job.kind() {
                 // This change can't be applied: block its intents (they stop
-                // overlaying) and finish the job.
+                // overlaying) and finish the job. Gmail refuses a whole
+                // modify for one add naming a label it does not have (a
+                // deleted one), without saying which: when the group adds
+                // labels that may be gone beside other changes, only those
+                // adds are blocked, and the rest, still pending, goes again
+                // on its own. The labels are listed soon, which removes a
+                // deleted one with its blocked intents.
                 JobKind::Deliver(_) => {
-                    let versions = job.delivery_versions();
+                    let doubtful = job.group().map(doubtful_adds).unwrap_or_default();
+                    let (adds, rest): (Vec<_>, Vec<_>) = job
+                        .delivery_versions()
+                        .into_iter()
+                        .partition(|delivery| doubtful.contains(&delivery.label));
+                    let versions = if adds.is_empty() || rest.is_empty() {
+                        adds.into_iter().chain(rest).collect()
+                    } else {
+                        adds
+                    };
                     let intents = vec![IntentOp::Block {
                         versions,
                         failure: blocking.clone(),
                     }];
-                    vec![self.finish_job_with(&job, JobOutcome::Done, Vec::new(), intents, now)]
+                    let mut out = vec![self.finish_job_with(
+                        &job,
+                        JobOutcome::Done,
+                        Vec::new(),
+                        intents,
+                        now,
+                    )];
+                    out.extend(self.recheck_labels(doubtful, now));
+                    out
                 }
                 JobKind::Import(_) | JobKind::Verify(_) | JobKind::BlobCleanup(_) => {
                     vec![self.finish_job(
@@ -1564,6 +1626,17 @@ impl Engine {
     }
 }
 
+/// The labels a modify group adds that Gmail may refuse it for as unknown:
+/// every add but a fixed system label's.
+fn doubtful_adds(group: &crate::outbox::ModifyGroup) -> LabelSet {
+    group
+        .add
+        .iter()
+        .filter(|label| !crate::labels::system::is_system(&label.0))
+        .cloned()
+        .collect()
+}
+
 /// The label ids a history record names, if any.
 fn record_labels(record: &HistoryRecord) -> Option<&LabelSet> {
     match record {
@@ -1680,6 +1753,128 @@ mod tests {
             jobs,
             next_due: mirror.next_due(),
         })
+    }
+
+    /// Gmail refuses a whole modify with 400 `labelId not found` when one
+    /// add names a deleted label (`label-edit-modify-deleted-label`): only
+    /// the adds of labels that may be gone are blocked, the message's other
+    /// changes go again on their own, and the labels are listed soon.
+    /// A store holding message `m` (in the inbox) with `actions` admitted.
+    fn mirror_with_actions(actions: Vec<crate::outbox::Action>) -> crate::mirror::AccountMirror {
+        let mut mirror =
+            crate::mirror::AccountMirror::new(AccountId("alice@example.com".into()), 1);
+        mirror.claim(ENGINE_VERSION).expect("claim");
+        let id = MessageId("m".into());
+        mirror.messages.insert(
+            id.clone(),
+            crate::mirror::MessageRecord {
+                id: id.clone(),
+                thread_id: crate::ids::ThreadId("t".into()),
+                labels: crate::labels::set(["INBOX"]),
+                checkpoint: Some(HistoryId(50)),
+                unverified: None,
+                content: crate::mirror::Content::Pending,
+            },
+        );
+        for action in actions {
+            let request = crate::outbox::ActionRequest::Messages {
+                ids: vec![id.clone()],
+                action,
+            };
+            mirror.admit_action(&request, Timestamp(0));
+        }
+        mirror
+    }
+
+    /// The modify among `commands`: its command, adds and removes.
+    fn modify_of(commands: &[Command]) -> Option<(CommandId, Vec<LabelId>, Vec<LabelId>)> {
+        commands.iter().find_map(|c| match &c.kind {
+            CommandKind::Gmail(GmailCall {
+                request: GmailRequest::Modify(group),
+                ..
+            }) => Some((c.id, group.add.clone(), group.remove.clone())),
+            _ => None,
+        })
+    }
+
+    /// Gmail refuses a whole modify with 400 `labelId not found` when one
+    /// add names a deleted label (`label-edit-modify-deleted-label`): only
+    /// the adds of labels that may be gone are blocked, the message's other
+    /// changes go again on their own, and the labels are listed soon.
+    #[test]
+    fn a_refused_add_of_a_user_label_blocks_it_alone_and_the_rest_is_delivered() {
+        use crate::outbox::{Action, IntentState, LabelDelta, StarState};
+        let gone = LabelId("Label_9".into());
+        let mut mirror = mirror_with_actions(vec![
+            Action::ChangeLabels(LabelDelta::new(vec![gone], Vec::new()).expect("valid")),
+            Action::SetStar(StarState::Starred),
+            Action::Archive,
+        ]);
+        let mut engine = live(100);
+        let claim = engine.claim_jobs(Timestamp(0));
+        let sent = engine.handle(claim_from(&mut mirror, &claim));
+        let (command, add, remove) = modify_of(&sent).expect("a delivery");
+        assert_eq!(
+            (add.len(), remove),
+            (2, vec![LabelId("INBOX".into())]),
+            "one request carries every change"
+        );
+        let refused = engine.handle(event(EventKind::RequestFailed {
+            command,
+            failure: Failure::Blocking(BlockingFailure {
+                class: Blocking::Permanent,
+                detail: "400 invalidArgument labelId not found".into(),
+            }),
+        }));
+        let commit = first_commit(refused.clone()).expect("a commit");
+        assert!(matches!(
+            mirror.apply(&commit),
+            crate::commit::CommitOutcome::Applied { .. }
+        ));
+        let states: Vec<(&str, bool)> = mirror
+            .intents
+            .values()
+            .map(|intent| {
+                (
+                    intent.label.0.as_str(),
+                    matches!(intent.state, IntentState::Blocked(_)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [("INBOX", false), ("Label_9", true), ("STARRED", false)]
+        );
+        assert!(
+            gmail_requests(&refused).contains(&&GmailRequest::ListLabels),
+            "the labels are listed to learn whether it was deleted"
+        );
+        let next = engine.handle(event(EventKind::CommitApplied { commit: commit.id }));
+        let sent = engine.handle(claim_from(&mut mirror, &next));
+        let (_, add, remove) = modify_of(&sent).expect("the rest, again");
+        assert_eq!(
+            (add, remove),
+            (
+                vec![LabelId("STARRED".into())],
+                vec![LabelId("INBOX".into())]
+            )
+        );
+        // Refused again, it has no doubtful add left: all of it blocks.
+        let (command, ..) = modify_of(&sent).expect("the rest");
+        let refused = engine.handle(event(EventKind::RequestFailed {
+            command,
+            failure: Failure::Blocking(BlockingFailure {
+                class: Blocking::Permanent,
+                detail: "400".into(),
+            }),
+        }));
+        mirror.apply(&first_commit(refused).expect("a commit"));
+        assert!(
+            mirror
+                .intents
+                .values()
+                .all(|intent| matches!(intent.state, IntentState::Blocked(_)))
+        );
     }
 
     /// A user opens a message while the gate holds Backfill back: the

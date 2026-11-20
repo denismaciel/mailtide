@@ -4,7 +4,7 @@ use base64::Engine as _;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use mailtide::gmail::{
-    HistoryPage, HistoryRecord, Label, LabelKind, ListPage, MessageObservation, MessageRef,
+    HistoryPage, HistoryRecord, Label, ListPage, MessageObservation, MessageRef,
 };
 use mailtide::ids::{HistoryId, LabelId, MessageId, PageToken, ThreadId, Timestamp};
 use mailtide::labels::LabelSet;
@@ -27,7 +27,7 @@ pub enum DecodeError {
     },
 }
 
-fn json<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, DecodeError> {
+pub(crate) fn json<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, DecodeError> {
     serde_json::from_slice(body).map_err(|e| DecodeError::InvalidJson(e.to_string()))
 }
 
@@ -337,39 +337,25 @@ pub fn profile(body: &[u8]) -> Result<HistoryId, DecodeError> {
 }
 
 #[derive(Deserialize)]
-struct WireLabel {
-    id: String,
-    name: String,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct WireLabels {
     #[serde(default)]
-    labels: Vec<WireLabel>,
+    labels: Vec<crate::labels::WireLabel>,
 }
 
-fn label(wire: WireLabel) -> Label {
-    Label {
-        kind: match wire.kind.as_deref() {
-            Some("system") => LabelKind::System,
-            Some(_) | None => LabelKind::User,
-        },
-        id: LabelId(wire.id),
-        name: wire.name,
-    }
-}
-
-/// `labels.get`: one label's definition.
+/// `labels.get`: one label's definition (see [`crate::labels::label`]).
 pub fn label_get(body: &[u8]) -> Result<Label, DecodeError> {
-    json::<WireLabel>(body).map(label)
+    crate::labels::label(body)
 }
 
-/// `labels.list`.
+/// `labels.list`: every definition with its visibility and colour (see
+/// [`crate::labels::label`]). One label Gmail sent without an id or a name
+/// refuses the whole listing: a partial one would read as deletions.
 pub fn labels_list(body: &[u8]) -> Result<Vec<Label>, DecodeError> {
     let wire: WireLabels = json(body)?;
-    Ok(wire.labels.into_iter().map(label).collect())
+    wire.labels
+        .into_iter()
+        .map(crate::labels::WireLabel::decode)
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -390,6 +376,7 @@ pub fn watch(body: &[u8]) -> Result<Timestamp, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailtide::gmail::LabelKind;
     use mailtide::labels::set;
 
     #[test]

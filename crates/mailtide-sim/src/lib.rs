@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use mailtide::EngineConfig;
 use mailtide::command::{Command, CommandKind, GmailRequest};
-use mailtide::commit::CommitOutcome;
+use mailtide::commit::{CommitOutcome, LabelOp};
 use mailtide::engine::Engine;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{
@@ -203,8 +203,30 @@ pub enum UserOp {
         /// Which label.
         pick: usize,
     },
-    /// The n-th user label is deleted: Gmail removes it from its messages.
+    /// The n-th user label is deleted: Gmail removes it from its messages,
+    /// with one `labelsRemoved` record each.
     DeleteLabel {
+        /// Which label.
+        pick: usize,
+    },
+    /// The n-th user label is deleted and its messages lose it without a
+    /// history record (the other answer to `label-edit-delete-history`).
+    /// Only for a label the mirror's definitions hold: Gmail records every
+    /// deletion, and what a listing proves is about labels it defined.
+    DeleteLabelQuietly {
+        /// Which label.
+        pick: usize,
+    },
+    /// The host creates a user label through the driver: Gmail creates it,
+    /// and the driver records the answer, unless it crashes in between.
+    HostCreateLabel,
+    /// The host renames the n-th user label through the driver.
+    HostRenameLabel {
+        /// Which label.
+        pick: usize,
+    },
+    /// The host deletes the n-th user label through the driver.
+    HostDeleteLabel {
         /// Which label.
         pick: usize,
     },
@@ -274,6 +296,14 @@ pub struct Stats {
     pub deliveries: u64,
     /// Label definitions created, renamed or deleted in Gmail.
     pub label_edits: u64,
+    /// Of those, the ones the host made through the driver and recorded.
+    pub label_writes_recorded: u64,
+    /// Of those, the ones whose record a crash lost.
+    pub label_writes_lost: u64,
+    /// Label deletions that left no history record.
+    pub quiet_label_deletes: u64,
+    /// Deliveries Gmail refused because an add named a label it lacks.
+    pub refused_deliveries: u64,
     /// `labels.list` calls Gmail answered.
     pub label_listings: u64,
     /// Messages users opened in the host.
@@ -364,6 +394,16 @@ struct GmailMessage {
     date: Timestamp,
 }
 
+/// What `messages.modify` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Modified {
+    Done,
+    /// A message doesn't exist (404).
+    NotFound,
+    /// An add names a label the mailbox lacks (400).
+    UnknownLabel,
+}
+
 #[derive(Debug, Clone)]
 struct Gmail {
     messages: BTreeMap<MessageId, GmailMessage>,
@@ -428,14 +468,19 @@ impl Gmail {
         id
     }
 
-    /// `messages.modify`: `false` if a message doesn't exist.
-    fn modify(&mut self, group: &ModifyGroup) -> bool {
+    /// `messages.modify`. Gmail refuses the whole request when an add names
+    /// a label it does not have (400 `labelId not found`); removing one is
+    /// accepted and changes nothing (`label-edit-modify-deleted-label`).
+    fn modify(&mut self, group: &ModifyGroup) -> Modified {
         if group
             .messages
             .iter()
             .any(|id| !self.messages.contains_key(id))
         {
-            return false;
+            return Modified::NotFound;
+        }
+        if group.add.iter().any(|label| !self.defines(label)) {
+            return Modified::UnknownLabel;
         }
         for id in &group.messages {
             let current = self.messages[id].labels.clone();
@@ -473,7 +518,12 @@ impl Gmail {
                 message.modified = HistoryId(self.last_history);
             }
         }
-        true
+        Modified::Done
+    }
+
+    /// Whether the mailbox has the label `id`.
+    fn defines(&self, id: &LabelId) -> bool {
+        LABELS.contains(&id.0.as_str()) || id.0 == "DRAFT" || self.user_labels.contains_key(id)
     }
 
     fn delete(&mut self, id: &MessageId) {
@@ -542,12 +592,39 @@ impl Gmail {
                     name.push('+');
                 }
             }
-            UserOp::DeleteLabel { pick } => {
+            UserOp::DeleteLabel { pick } | UserOp::HostDeleteLabel { pick } => {
                 if let Some(id) = self.user_label(*pick) {
-                    self.delete_label(&id);
+                    self.delete_label(&id, true);
+                }
+            }
+            UserOp::DeleteLabelQuietly { pick } => {
+                if let Some(id) = self.user_label(*pick) {
+                    self.delete_label(&id, false);
+                }
+            }
+            UserOp::HostCreateLabel => {
+                self.next_label += 1;
+                let id = LabelId(format!("Label_{}", self.next_label));
+                self.user_labels
+                    .insert(id, format!("host label {}", self.next_label));
+            }
+            UserOp::HostRenameLabel { pick } => {
+                if let Some(name) = self
+                    .user_label(*pick)
+                    .and_then(|id| self.user_labels.get_mut(&id))
+                {
+                    name.push('*');
                 }
             }
         }
+    }
+
+    /// The definition of user label `id`, as `labels.create` or
+    /// `labels.patch` answers it.
+    fn user_label_definition(&self, id: &LabelId) -> Option<Label> {
+        self.user_labels
+            .get(id)
+            .map(|name| Label::plain(id.clone(), name.clone(), LabelKind::User))
     }
 
     fn user_label(&self, pick: usize) -> Option<LabelId> {
@@ -556,9 +633,15 @@ impl Gmail {
     }
 
     /// Delete a user label: it leaves every message carrying it, and those
-    /// removals are recorded as history.
-    fn delete_label(&mut self, label: &LabelId) {
+    /// removals are recorded as history when `recorded`.
+    fn delete_label(&mut self, label: &LabelId, recorded: bool) {
         self.user_labels.remove(label);
+        if !recorded {
+            for message in self.messages.values_mut() {
+                message.labels.remove(label);
+            }
+            return;
+        }
         let carrying: Vec<MessageId> = self
             .messages
             .iter()
@@ -697,16 +780,12 @@ impl Gmail {
         let mut labels: Vec<Label> = LABELS
             .iter()
             .chain(["DRAFT"].iter())
-            .map(|id| Label {
-                id: LabelId((*id).to_owned()),
-                name: (*id).to_owned(),
-                kind: LabelKind::System,
-            })
-            .chain(self.user_labels.iter().map(|(id, name)| Label {
-                id: id.clone(),
-                name: name.clone(),
-                kind: LabelKind::User,
-            }))
+            .map(|id| Label::plain(LabelId((*id).to_owned()), *id, LabelKind::System))
+            .chain(
+                self.user_labels
+                    .iter()
+                    .map(|(id, name)| Label::plain(id.clone(), name.clone(), LabelKind::User)),
+            )
             .collect();
         mailtide::mirror::sort_labels(&mut labels);
         labels
@@ -1183,13 +1262,53 @@ impl Sim {
             self.host_open(pick);
             return;
         }
+        let op = match op {
+            // Only a label the mirror defined is deleted without a record.
+            UserOp::DeleteLabelQuietly { pick } => match self.gmail.user_label(pick) {
+                Some(id) if self.mirror.labels.iter().any(|label| label.id == id) => {
+                    self.stats.quiet_label_deletes += 1;
+                    op
+                }
+                Some(_) | None => UserOp::DeleteLabel { pick },
+            },
+            other => other,
+        };
         if matches!(
             op,
-            UserOp::CreateLabel | UserOp::RenameLabel { .. } | UserOp::DeleteLabel { .. }
+            UserOp::CreateLabel
+                | UserOp::RenameLabel { .. }
+                | UserOp::DeleteLabel { .. }
+                | UserOp::DeleteLabelQuietly { .. }
+                | UserOp::HostCreateLabel
+                | UserOp::HostRenameLabel { .. }
+                | UserOp::HostDeleteLabel { .. }
         ) {
             self.stats.label_edits += 1;
         }
+        // The label a host write names, before Gmail applies it.
+        let target = match &op {
+            UserOp::HostCreateLabel => {
+                Some(LabelId(format!("Label_{}", self.gmail.next_label + 1)))
+            }
+            UserOp::HostRenameLabel { pick } | UserOp::HostDeleteLabel { pick } => {
+                self.gmail.user_label(*pick)
+            }
+            _ => None,
+        };
         self.gmail.apply(&op);
+        // What the driver records of Gmail's answer.
+        let record = match (&op, target) {
+            (UserOp::HostCreateLabel | UserOp::HostRenameLabel { .. }, Some(id)) => {
+                self.gmail.user_label_definition(&id).map(LabelOp::Upsert)
+            }
+            (UserOp::HostDeleteLabel { .. }, Some(id)) => {
+                Some(LabelOp::Remove { id, at: self.now })
+            }
+            _ => None,
+        };
+        if let Some(record) = record {
+            self.record_label(&record);
+        }
         if !self.rng.chance(self.faults.push_dropped) {
             let push = Event {
                 now: self.now,
@@ -1201,6 +1320,25 @@ impl Sim {
                 self.deliveries.push(push.clone());
             }
             self.deliveries.push(push);
+        }
+    }
+
+    /// The driver records Gmail's answer to a label write, outside the
+    /// engine, unless the host crashes between the answer and the record
+    /// (the next listing then brings the change).
+    fn record_label(&mut self, op: &LabelOp) {
+        if self.rng.chance(self.faults.crash) {
+            self.stats.label_writes_lost += 1;
+            return;
+        }
+        self.stats.label_writes_recorded += 1;
+        self.note(&format!("record {op:?}"));
+        self.mirror.record_label(op);
+        for violation in invariants::check_state(&self.mirror) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
         }
     }
 
@@ -1311,10 +1449,14 @@ impl Sim {
                 }
             }
             8 => UserOp::Delete { pick },
-            _ => match self.rng.below(3) {
+            _ => match self.rng.below(7) {
                 0 => UserOp::CreateLabel,
                 1 => UserOp::RenameLabel { pick },
-                _ => UserOp::DeleteLabel { pick },
+                2 => UserOp::DeleteLabel { pick },
+                3 => UserOp::DeleteLabelQuietly { pick },
+                4 => UserOp::HostCreateLabel,
+                5 => UserOp::HostRenameLabel { pick },
+                _ => UserOp::HostDeleteLabel { pick },
             },
         }
     }
@@ -1519,6 +1661,7 @@ impl Sim {
                 EventKind::LabelsListed {
                     command,
                     labels: self.gmail.labels(),
+                    generation: self.mirror.record.label_generation,
                 }
             }
             GmailRequest::Watch => EventKind::WatchRenewed {
@@ -1526,11 +1669,24 @@ impl Sim {
                 expiration: self.now.plus(Duration::from_hours(168)),
             },
             GmailRequest::Modify(group) => {
-                if !self.gmail.modify(group) {
-                    return EventKind::MessageNotFound {
-                        command,
-                        message_id: group.messages[0].clone(),
-                    };
+                match self.gmail.modify(group) {
+                    Modified::Done => {}
+                    Modified::NotFound => {
+                        return EventKind::MessageNotFound {
+                            command,
+                            message_id: group.messages[0].clone(),
+                        };
+                    }
+                    Modified::UnknownLabel => {
+                        self.stats.refused_deliveries += 1;
+                        return EventKind::RequestFailed {
+                            command,
+                            failure: Failure::Blocking(BlockingFailure {
+                                class: Blocking::Permanent,
+                                detail: "400 invalidArgument labelId not found".into(),
+                            }),
+                        };
+                    }
                 }
                 self.stats.deliveries += 1;
                 // Gmail notifies about our own changes too.
@@ -1996,6 +2152,63 @@ mod tests {
             refreshed += result.stats.facts_refreshed;
         }
         assert!(refreshed > 100, "refreshes applied: {refreshed}");
+    }
+
+    #[test]
+    fn labels_edited_here_and_elsewhere_converge_under_faults() {
+        // Other seeds than the general campaign: labels created, renamed and
+        // deleted by the host through the driver (some records lost to a
+        // crash) and by another client (some deletions without history),
+        // beside actions adding labels Gmail no longer has.
+        let results: Vec<RunResult> = (600..800).map(|seed| run(seed, 400)).collect();
+        let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
+        assert!(
+            failures.is_empty(),
+            "{} failing seeds, first: {:#?}",
+            failures.len(),
+            failures.first()
+        );
+        let total = |stat: fn(&Stats) -> u64| results.iter().map(|r| stat(&r.stats)).sum::<u64>();
+        assert!(
+            total(|s| s.label_writes_recorded) > 0,
+            "host writes recorded"
+        );
+        assert!(total(|s| s.label_writes_lost) > 0, "host writes lost");
+        assert!(
+            total(|s| s.quiet_label_deletes) > 0,
+            "deletions without history"
+        );
+        assert!(
+            total(|s| s.refused_deliveries) > 0,
+            "adds of deleted labels refused"
+        );
+        // A script: an action adds a label another client deletes before it
+        // is delivered, the host deletes and recreates labels.
+        let script = [
+            UserOp::Receive { thread: None },
+            UserOp::HostAction {
+                pick: 0,
+                action: Action::ChangeLabels(
+                    LabelDelta::new(vec![LabelId("Label_1".into())], Vec::new())
+                        .expect("a valid change"),
+                ),
+                whole_thread: false,
+            },
+            UserOp::DeleteLabel { pick: 0 },
+            UserOp::HostCreateLabel,
+            UserOp::HostAction {
+                pick: 1,
+                action: Action::SetStar(StarState::Starred),
+                whole_thread: false,
+            },
+            UserOp::HostDeleteLabel { pick: 0 },
+            UserOp::HostCreateLabel,
+            UserOp::DeleteLabelQuietly { pick: 0 },
+        ];
+        for seed in 0..50 {
+            let result = replay(seed, &script);
+            assert!(result.passed(), "{result:#?}");
+        }
     }
 
     #[test]

@@ -1162,17 +1162,24 @@ mod _core {
         })
     }
 
-    /// A label definition: what a label id on a message is called.
+    /// A label definition: what a label id on a message is called, and how
+    /// Gmail shows it.
     #[pyclass(frozen, get_all)]
     struct Label {
         id: String,
         name: String,
         /// `system` (`INBOX`, `UNREAD`, …) or `user`.
         kind: &'static str,
+        /// `show`, `show_if_unread`, `hide`, or `None` when Gmail gave none.
+        list_visibility: Option<&'static str>,
+        /// `show`, `hide`, or `None` when Gmail gave none.
+        message_visibility: Option<&'static str>,
+        color: Option<LabelColor>,
     }
 
     impl From<mailtide::gmail::Label> for Label {
         fn from(label: mailtide::gmail::Label) -> Self {
+            use mailtide::gmail::{LabelListVisibility, MessageListVisibility};
             Self {
                 id: label.id.0,
                 name: label.name,
@@ -1180,7 +1187,40 @@ mod _core {
                     mailtide::gmail::LabelKind::System => "system",
                     mailtide::gmail::LabelKind::User => "user",
                 },
+                list_visibility: label.list_visibility.map(|v| match v {
+                    LabelListVisibility::Show => "show",
+                    LabelListVisibility::ShowIfUnread => "show_if_unread",
+                    LabelListVisibility::Hide => "hide",
+                }),
+                message_visibility: label.message_visibility.map(|v| match v {
+                    MessageListVisibility::Show => "show",
+                    MessageListVisibility::Hide => "hide",
+                }),
+                color: label.color.map(|color| LabelColor {
+                    text: color.text,
+                    background: color.background,
+                }),
             }
+        }
+    }
+
+    /// A label's colour: Gmail's text and background pair (`#rrggbb`).
+    #[pyclass(frozen, get_all, eq)]
+    #[derive(Clone, PartialEq, Eq)]
+    struct LabelColor {
+        text: String,
+        background: String,
+    }
+
+    #[pymethods]
+    impl LabelColor {
+        #[new]
+        fn new(text: String, background: String) -> Self {
+            Self { text, background }
+        }
+
+        fn __repr__(&self) -> String {
+            format!("LabelColor({:?}, {:?})", self.text, self.background)
         }
     }
 

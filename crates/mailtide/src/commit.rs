@@ -11,7 +11,7 @@
 
 use crate::gmail::{HeaderFacts, Label, MessageFacts, MessageObservation};
 use crate::ids::{
-    AccountId, BlobRef, CommitId, EngineVersion, Epoch, HistoryId, MessageId, Timestamp,
+    AccountId, BlobRef, CommitId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, Timestamp,
 };
 use crate::jobs::{JobClaim, JobOp};
 use crate::labels::LabelSet;
@@ -199,12 +199,37 @@ pub enum MessageOp {
     },
 }
 
-/// A label definition change.
+/// A label definition change (SPEC §6.6). A label that goes leaves every
+/// message and intent, and its id is remembered as deleted, so no later
+/// observation puts it back on a row ([`crate::mirror`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LabelOp {
-    /// Replace all label definitions with Gmail's current list. A list equal
-    /// to the stored one (in any order) changes nothing and logs nothing.
-    ReplaceAll(Vec<Label>),
+    /// Gmail's current list, made at `at`. Applied only while the account's
+    /// label generation is still `generation`, the one read before the
+    /// listing was sent: a local label write since then makes the listing
+    /// stale, and the next one applies. A list equal to the stored one (in
+    /// any order) changes no definition and logs nothing; a stored label it
+    /// lacks is removed as by [`LabelOp::Remove`]; a remembered-deleted id it
+    /// names is restored.
+    ReplaceAll {
+        /// Every definition Gmail listed.
+        labels: Vec<Label>,
+        /// The label generation read before the listing was sent.
+        generation: u64,
+        /// When it was listed.
+        at: Timestamp,
+    },
+    /// Gmail's answer to a local create or patch: the definition as it is
+    /// now.
+    Upsert(Label),
+    /// Gmail deleted the label (its answer to a local delete, or a 404 to
+    /// one) at `at`.
+    Remove {
+        /// The label.
+        id: LabelId,
+        /// When.
+        at: Timestamp,
+    },
 }
 
 /// The result of applying a commit.

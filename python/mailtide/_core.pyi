@@ -268,10 +268,21 @@ class ThreadView:
     participants: list[str]
 
 @final
+class LabelColor:
+    """A label's colour: Gmail's text and background pair (``#rrggbb``)."""
+
+    text: str
+    background: str
+    def __init__(self, text: str, background: str) -> None: ...
+
+@final
 class Label:
     id: str
     name: str
     kind: Literal["system", "user"]
+    list_visibility: Literal["show", "show_if_unread", "hide"] | None
+    message_visibility: Literal["show", "hide"] | None
+    color: LabelColor | None
 
 Action = Literal[
     "mark_read",

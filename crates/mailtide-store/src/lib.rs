@@ -11,7 +11,7 @@
 
 use std::future::Future;
 
-use mailtide::commit::{Commit, CommitOutcome};
+use mailtide::commit::{Commit, CommitOutcome, LabelOp};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
@@ -253,4 +253,26 @@ pub trait Store: Send + Sync {
         &self,
         account: &AccountId,
     ) -> impl Future<Output = Result<Vec<Label>, StoreError>> + Send;
+
+    /// Record Gmail's answer to a local label write (`Upsert` after a create
+    /// or a patch, `Remove` after a delete or its 404; see
+    /// [`mailtide::mirror::AccountMirror::record_label`]): the definition,
+    /// a removed label's strip from every row and intent, and their feed
+    /// entries, in one transaction that also bumps the label generation.
+    /// Not fenced by an epoch, like `admit`: a label write must survive a
+    /// sync superseding another. `NotTracked` for an untracked account.
+    fn record_label(
+        &self,
+        account: &AccountId,
+        op: &LabelOp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The account's label generation, which every local label write bumps:
+    /// read it before sending `labels.list` and report it with the listing,
+    /// so a listing older than a local write is not applied. 0 for an
+    /// untracked account.
+    fn label_generation(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 }

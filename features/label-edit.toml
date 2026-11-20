@@ -115,6 +115,36 @@ path = "crates/mailtide-store/src/conformance.rs"
 change = "modify"
 role = "Conformance cases for label attributes, record_label, the generation fence and label removal"
 
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "record_label and label_generation; both in the every-call-refused list; the migration's own test (additive, revertible), and the earlier migrations' tests revert it first"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "record_label and label_generation"
+
+[[file]]
+path = "crates/mailtide/tests/label_refresh.rs"
+change = "modify"
+role = "LabelsListed reports a generation; ReplaceAll carries its generation and time"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_history_store.rs"
+change = "modify"
+role = "LabelsListed reports a generation"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_cleanup_store.rs"
+change = "modify"
+role = "LabelsListed reports a generation"
+
+[[file]]
+path = "tests/test_migrations_clock.py"
+change = "modify"
+role = "SCHEMA_VERSION is the label-editing migration's; the label methods are in the every-database-call list"
+
 # ---------------------------------------------------------------------- driver
 
 [[file]]
@@ -615,7 +645,12 @@ covers = "Invariant checked after every commit in the simulator"
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
 name = "label_attributes_and_writes"
-covers = "Every store: visibility and colour round-trip, rows from before the migration read as unknown, record_label upserts and removes in one transaction with its feed entries, the generation fences an older listing, forget deletes it all"
+covers = "Every store: visibility and colour round-trip (none reads as none), record_label upserts and removes in one transaction with its feed entries and bumps the generation, the generation fences an older listing, a remembered-deleted id is not stored again, forget deletes it all; untracked accounts record nothing. Rows from before the migration are the SQL store's: the_label_editing_migration_is_additive_and_revertible"
+
+[[test]]
+target = "crates/mailtide-store/src/sqlite.rs"
+name = "the_label_editing_migration_is_additive_and_revertible"
+covers = "A label row and an account from before the migration read with no visibility or colour, no local write and nothing remembered; the documented rollback takes the database back a version and migrating again restores it"
 
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"

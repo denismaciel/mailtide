@@ -506,6 +506,7 @@ fn durable_spam_cleanup_resumes_discovery_and_delivery_without_changing_the_enum
     host.handle(EventKind::LabelsListed {
         command,
         labels: Vec::new(),
+        generation: 0,
     });
     let command = call(&mut host);
     host.handle(EventKind::ProfileFetched {

@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mailtide::commit::{Commit, CommitOutcome, MessageOp, Rejection};
-use mailtide::gmail::{Label, LabelKind};
+use mailtide::commit::{Commit, CommitOutcome, LabelOp, MessageOp, Rejection};
+use mailtide::gmail::{Label, LabelColor, LabelKind, LabelListVisibility, MessageListVisibility};
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
@@ -111,7 +111,16 @@ const MIGRATIONS: &[&[&str]] = &[&[
 // FactsRefreshed feed entry. Version only: nothing to migrate, but an older
 // build would drop the facts from every row it rewrites and cannot read the
 // entry, so it must see this database as ahead.
-&[]];
+&[],
+// 9: label editing. Each definition's visibility and colour (JSON; NULL:
+// unknown until the next listing), and on the account the label generation
+// (bumped by every local label write, it fences older listings) and the
+// deleted-label memory (JSON: id to when it was deleted; NULL: none).
+&[
+    "ALTER TABLE mailtide_labels ADD COLUMN attrs TEXT",
+    "ALTER TABLE mailtide_accounts ADD COLUMN label_generation BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE mailtide_accounts ADD COLUMN deleted_labels TEXT",
+]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
@@ -539,7 +548,8 @@ impl SqlStore {
         lock: &'static str,
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
-            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at
+            "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at,
+               label_generation, deleted_labels
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -560,6 +570,9 @@ impl SqlStore {
         let cooldown: Option<String> = row
             .try_get("cooldown")
             .map_err(|e| corrupt("cooldown", e))?;
+        let deleted_labels: Option<String> = row
+            .try_get("deleted_labels")
+            .map_err(|e| corrupt("deleted_labels", e))?;
         let record = AccountRecord {
             epoch: Epoch(uint("epoch", get_i("epoch")?)?),
             engine_version: EngineVersion(
@@ -580,6 +593,15 @@ impl SqlStore {
             labels_refreshed_at: get_oi("labels_refreshed_at")?.map(Timestamp),
             log_floor: StateSeq(uint("log_floor", get_i("log_floor")?)?),
             generation: uint("generation", get_i("generation")?)?,
+            label_generation: uint("label_generation", get_i("label_generation")?)?,
+            deleted_labels: deleted_labels
+                .as_deref()
+                .map(|text| parse::<BTreeMap<LabelId, i64>>("deleted_labels", text))
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, at)| (id, Timestamp(at)))
+                .collect(),
         };
         Ok(Some((record, StateSeq(uint("seq", get_i("seq")?)?))))
     }
@@ -592,14 +614,16 @@ impl SqlStore {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO mailtide_accounts
-               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at,
+                label_generation, deleted_labels)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
              ON CONFLICT (account) DO UPDATE SET
                epoch = excluded.epoch, engine_version = excluded.engine_version, cursor = excluded.cursor,
                sync = excluded.sync, watch_expiration = excluded.watch_expiration,
                last_activity = excluded.last_activity, cooldown = excluded.cooldown,
                rng_seed = excluded.rng_seed, seq = excluded.seq, log_floor = excluded.log_floor,
-               generation = excluded.generation, labels_refreshed_at = excluded.labels_refreshed_at",
+               generation = excluded.generation, labels_refreshed_at = excluded.labels_refreshed_at,
+               label_generation = excluded.label_generation, deleted_labels = excluded.deleted_labels",
         )
         .bind(account.as_str())
         .bind(int("epoch", record.epoch.0)?)
@@ -614,6 +638,20 @@ impl SqlStore {
         .bind(int("log_floor", record.log_floor.0)?)
         .bind(int("generation", record.generation)?)
         .bind(record.labels_refreshed_at.map(|t| t.0))
+        .bind(int("label_generation", record.label_generation)?)
+        .bind(
+            (!record.deleted_labels.is_empty())
+                .then(|| {
+                    json(
+                        &record
+                            .deleted_labels
+                            .iter()
+                            .map(|(id, at)| (id, at.0))
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                })
+                .transpose()?,
+        )
         .execute(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -702,6 +740,15 @@ impl SqlStore {
                 }
             }
         }
+        // A label that goes leaves every row that carries it and every
+        // intent on it: load those too (and the definitions, which a listing
+        // is compared with).
+        if !commit.labels.is_empty() {
+            mirror.labels = load_labels(&mut **tx, account).await?;
+            for id in removed_labels(&mirror.labels, &commit.labels) {
+                ids.extend(carrying(tx, account, id).await?);
+            }
+        }
         if let Some(baseline) = finish_baseline {
             let rows = sqlx::query(
                 "SELECT id FROM mailtide_messages WHERE account = $1 AND (checkpoint IS NULL OR checkpoint < $2)
@@ -718,10 +765,6 @@ impl SqlStore {
         }
         let ids: Vec<MessageId> = ids.into_iter().collect();
         Self::load_rows(tx, account, &ids, &mut mirror).await?;
-        // A label refresh compares with the stored definitions.
-        if !commit.labels.is_empty() {
-            mirror.labels = load_labels(&mut **tx, account).await?;
-        }
         Ok(mirror)
     }
 
@@ -895,12 +938,13 @@ impl SqlStore {
                     LabelKind::User => "user",
                 };
                 sqlx::query(
-                    "INSERT INTO mailtide_labels (account, id, name, kind) VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO mailtide_labels (account, id, name, kind, attrs) VALUES ($1, $2, $3, $4, $5)",
                 )
                 .bind(account)
                 .bind(label.id.0.as_str())
                 .bind(label.name.as_str())
                 .bind(kind)
+                .bind(LabelAttrs::of(label).map(|attrs| json(&attrs)).transpose()?)
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| unavailable(&e))?;
@@ -1026,6 +1070,74 @@ impl SqlStore {
             }
         }
         Ok(outcome)
+    }
+
+    /// [`crate::Store::record_label`].
+    pub(crate) async fn record_label(
+        &self,
+        account: &AccountId,
+        op: &LabelOp,
+    ) -> Result<(), StoreError> {
+        self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let (record, seq) = self
+            .load_account(&mut tx, account)
+            .await?
+            .ok_or(StoreError::NotTracked)?;
+        // The rows the write touches, loaded as for a commit carrying it.
+        let carrier = Commit {
+            id: mailtide::ids::CommitId {
+                epoch: record.epoch,
+                seq: 0,
+            },
+            account: account.clone(),
+            epoch: record.epoch,
+            engine_version: record.engine_version,
+            cursor: None,
+            claim: None,
+            sync: None,
+            messages: Vec::new(),
+            labels: vec![op.clone()],
+            account_ops: Vec::new(),
+            job_plan: mailtide::commit::JobPlan {
+                priority: Priority::Foreground,
+                import_due_at: Timestamp(0),
+                draft_import_due_at: Timestamp(0),
+                verify_due_at: Timestamp(0),
+                cleanup_due_at: Timestamp(0),
+                deliver_due_at: Timestamp(0),
+                confirm_due_at: Timestamp(0),
+            },
+            jobs: Vec::new(),
+            intents: Vec::new(),
+        };
+        let mut mirror = self
+            .load_partial(&mut tx, account, record, seq, &carrier)
+            .await?;
+        let before = mirror.clone();
+        mirror.record_label(op);
+        Self::write_diff(&mut tx, &before, &mirror).await?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))
+    }
+
+    /// [`crate::Store::label_generation`].
+    pub(crate) async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
+        self.ensure_schema().await?;
+        let row = sqlx::query("SELECT label_generation FROM mailtide_accounts WHERE account = $1")
+            .bind(account.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        match row {
+            None => Ok(0),
+            Some(row) => uint(
+                "label_generation",
+                row.try_get("label_generation")
+                    .map_err(|e| corrupt("label_generation", e))?,
+            ),
+        }
     }
 
     pub(crate) async fn claim_jobs(
@@ -1256,6 +1368,58 @@ impl SqlStore {
         }
         Ok(contents)
     }
+}
+
+/// The labels `ops` may remove: those a listing lacks, and those removed by
+/// name.
+fn removed_labels<'a>(stored: &'a [Label], ops: &'a [LabelOp]) -> BTreeSet<&'a LabelId> {
+    ops.iter()
+        .flat_map(|op| -> Vec<&LabelId> {
+            match op {
+                LabelOp::ReplaceAll { labels, .. } => stored
+                    .iter()
+                    .map(|label| &label.id)
+                    .filter(|id| labels.iter().all(|listed| &listed.id != *id))
+                    .collect(),
+                LabelOp::Remove { id, .. } => vec![id],
+                LabelOp::Upsert(_) => Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// The messages whose row may carry `label`, or that have an intent on it.
+/// The `labels` column is matched as text, which may find more rows than
+/// carry it (`SQLite` compares ASCII case-insensitively); the shared rule
+/// checks each row it is given, so those are left as they are.
+async fn carrying(
+    tx: &mut Transaction<'static, Any>,
+    account: &AccountId,
+    label: &LabelId,
+) -> Result<Vec<MessageId>, StoreError> {
+    // The id as the column's JSON spells it, with LIKE's wildcards escaped.
+    let quoted = json(&label.0)?;
+    let mut pattern = String::from("%");
+    for c in quoted.chars() {
+        if matches!(c, '!' | '%' | '_') {
+            pattern.push('!');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    let rows = sqlx::query(
+        "SELECT id FROM mailtide_messages WHERE account = $1 AND labels LIKE $2 ESCAPE '!'
+         UNION SELECT message AS id FROM mailtide_intents WHERE account = $1 AND label = $3",
+    )
+    .bind(account.as_str())
+    .bind(pattern)
+    .bind(label.0.as_str())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| unavailable(&e))?;
+    rows.iter()
+        .map(|row| Ok(MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?)))
+        .collect()
 }
 
 async fn load_intents(
@@ -2189,6 +2353,14 @@ impl crate::Store for SqlStore {
         self.ensure_schema().await?;
         load_labels(&self.pool, account).await
     }
+
+    async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {
+        Self::record_label(self, account, op).await
+    }
+
+    async fn label_generation(&self, account: &AccountId) -> Result<u64, StoreError> {
+        Self::label_generation(self, account).await
+    }
 }
 
 /// An account's label definitions, in id order.
@@ -2196,7 +2368,7 @@ async fn load_labels<'e, E>(executor: E, account: &AccountId) -> Result<Vec<Labe
 where
     E: sqlx::Executor<'e, Database = Any>,
 {
-    let rows = sqlx::query("SELECT id, name, kind FROM mailtide_labels WHERE account = $1")
+    let rows = sqlx::query("SELECT id, name, kind, attrs FROM mailtide_labels WHERE account = $1")
         .bind(account.as_str())
         .fetch_all(executor)
         .await
@@ -2205,19 +2377,85 @@ where
         .iter()
         .map(|row| {
             let kind: String = row.try_get("kind").map_err(|e| corrupt("kind", e))?;
-            Ok(Label {
-                id: LabelId(row.try_get("id").map_err(|e| corrupt("id", e))?),
-                name: row.try_get("name").map_err(|e| corrupt("name", e))?,
-                kind: match kind.as_str() {
+            let attrs: Option<String> = row.try_get("attrs").map_err(|e| corrupt("attrs", e))?;
+            let label = Label::plain(
+                LabelId(row.try_get("id").map_err(|e| corrupt("id", e))?),
+                row.try_get::<String, _>("name")
+                    .map_err(|e| corrupt("name", e))?,
+                match kind.as_str() {
                     "system" => LabelKind::System,
                     "user" => LabelKind::User,
                     other => return Err(corrupt("label kind", other)),
                 },
-            })
+            );
+            match attrs {
+                None => Ok(label),
+                Some(text) => parse::<LabelAttrs>("label attrs", &text)?.apply(label),
+            }
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
     mailtide::mirror::sort_labels(&mut labels);
     Ok(labels)
+}
+
+/// A definition's visibility and colour as `mailtide_labels.attrs` holds
+/// them (migration 7), in Gmail's spellings; `NULL` when none is known.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LabelAttrs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background: Option<String>,
+}
+
+impl LabelAttrs {
+    /// What `label` stores, or `None` when it knows neither visibility nor
+    /// a colour.
+    fn of(label: &Label) -> Option<Self> {
+        let attrs = Self {
+            list: label.list_visibility.map(|v| v.gmail_name().to_owned()),
+            message: label.message_visibility.map(|v| v.gmail_name().to_owned()),
+            text: label.color.as_ref().map(|c| c.text.clone()),
+            background: label.color.as_ref().map(|c| c.background.clone()),
+        };
+        (attrs.list.is_some() || attrs.message.is_some() || attrs.text.is_some()).then_some(attrs)
+    }
+
+    /// `label` with these attributes. A spelling this build does not know
+    /// is corrupt: only this build's own spellings are ever written.
+    fn apply(self, label: Label) -> Result<Label, StoreError> {
+        Ok(Label {
+            list_visibility: self
+                .list
+                .map(|v| {
+                    LabelListVisibility::from_gmail_name(&v)
+                        .ok_or_else(|| corrupt("label list visibility", v))
+                })
+                .transpose()?,
+            message_visibility: self
+                .message
+                .map(|v| {
+                    MessageListVisibility::from_gmail_name(&v)
+                        .ok_or_else(|| corrupt("message list visibility", v))
+                })
+                .transpose()?,
+            color: match (self.text, self.background) {
+                (Some(text), Some(background)) => Some(LabelColor { text, background }),
+                (None, None) => None,
+                (text, background) => {
+                    return Err(corrupt(
+                        "label colour",
+                        format!("{text:?} on {background:?}"),
+                    ));
+                }
+            },
+            ..label
+        })
+    }
 }
 
 /// Ids per `IN (...)` query when reading views and feed content (well under
