@@ -250,4 +250,28 @@ mod tests {
             Failure::Blocking(_)
         ));
     }
+
+    /// PUT, PATCH and DELETE answers are classified like any other: a
+    /// conflict or a bad field is refused for good, a 404 is the resource
+    /// missing, and a 5xx may be retried.
+    #[test]
+    fn answers_to_writes_classify_like_reads() {
+        assert_eq!(classify(&response(404, "notFound", "x")), Failure::NotFound);
+        for (status, reason) in [(409, "alreadyExists"), (400, "invalidArgument")] {
+            assert!(
+                matches!(
+                    classify(&response(status, reason, "x")),
+                    Failure::Blocking(BlockingFailure {
+                        class: Blocking::Permanent,
+                        ..
+                    })
+                ),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            class(&classify(&response(500, "backendError", "x"))),
+            Some(Retryable::Transient)
+        );
+    }
 }

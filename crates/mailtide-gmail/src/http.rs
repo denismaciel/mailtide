@@ -9,6 +9,12 @@ pub enum Method {
     Get,
     /// POST.
     Post,
+    /// PUT: replaces a resource whole (e.g. `drafts.update`).
+    Put,
+    /// PATCH: changes only the fields it names (e.g. `labels.patch`).
+    Patch,
+    /// DELETE: Gmail answers 204 with an empty body.
+    Delete,
 }
 
 impl Method {
@@ -18,6 +24,9 @@ impl Method {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
         }
     }
 }
@@ -34,7 +43,7 @@ pub struct HttpRequest {
     pub path: String,
     /// Query parameters, in order (unencoded).
     pub query: Vec<(String, String)>,
-    /// JSON body, if any.
+    /// JSON body, if any, whatever the method.
     pub body: Option<Vec<u8>>,
 }
 
@@ -116,5 +125,40 @@ mod tests {
             request.path_and_query(),
             "/gmail/v1/users/me/messages?q=a%20b%2Fc"
         );
+    }
+
+    #[test]
+    fn methods_have_their_wire_names() {
+        let names: Vec<&str> = [
+            Method::Get,
+            Method::Post,
+            Method::Put,
+            Method::Patch,
+            Method::Delete,
+        ]
+        .into_iter()
+        .map(Method::as_str)
+        .collect();
+        assert_eq!(names, ["GET", "POST", "PUT", "PATCH", "DELETE"]);
+    }
+
+    #[test]
+    fn an_empty_answer_to_a_delete_is_a_success() {
+        let request = HttpRequest {
+            method: Method::Delete,
+            path: format!("/gmail/v1/users/me/labels/{}", encode("Label 1")),
+            query: Vec::new(),
+            body: None,
+        };
+        assert_eq!(
+            request.path_and_query(),
+            "/gmail/v1/users/me/labels/Label%201"
+        );
+        let answer = HttpResponse {
+            status: 204,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(answer.is_success());
     }
 }

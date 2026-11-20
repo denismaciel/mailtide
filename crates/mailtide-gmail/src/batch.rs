@@ -92,12 +92,12 @@ pub fn encode(plan: &BatchPlan) -> EncodedBatch {
             request.path_and_query()
         );
         match (&request.method, &request.body) {
-            (Method::Post, Some(json)) => {
+            (Method::Get, _) | (_, None) => body.push_str("\r\n"),
+            (Method::Post | Method::Put | Method::Patch | Method::Delete, Some(json)) => {
                 body.push_str("Content-Type: application/json\r\n\r\n");
                 body.push_str(&String::from_utf8_lossy(json));
                 body.push_str("\r\n");
             }
-            (Method::Post | Method::Get, _) => body.push_str("\r\n"),
         }
     }
     let _ = write!(body, "--{BOUNDARY}--\r\n");
@@ -225,6 +225,29 @@ mod tests {
         let body = String::from_utf8(encoded.body).expect("utf8");
         assert!(body.contains("Content-ID: <item-0>\r\n\r\nGET /a?format=minimal HTTP/1.1"));
         assert!(body.contains("Content-ID: <item-1>"));
+        assert!(body.ends_with(&format!("--{BOUNDARY}--\r\n")));
+    }
+
+    #[test]
+    fn a_body_goes_with_any_method_but_get() {
+        let patch = HttpRequest {
+            method: Method::Patch,
+            path: "/l".into(),
+            query: Vec::new(),
+            body: Some(b"{\"name\":\"x\"}".to_vec()),
+        };
+        let delete = HttpRequest {
+            method: Method::Delete,
+            path: "/d".into(),
+            query: Vec::new(),
+            body: None,
+        };
+        let plan = BatchPlan::new(vec![patch, delete]).expect("valid");
+        let body = String::from_utf8(encode(&plan).body).expect("utf8");
+        assert!(body.contains(
+            "PATCH /l HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"x\"}\r\n"
+        ));
+        assert!(body.contains("DELETE /d HTTP/1.1\r\n\r\n--"));
         assert!(body.ends_with(&format!("--{BOUNDARY}--\r\n")));
     }
 
