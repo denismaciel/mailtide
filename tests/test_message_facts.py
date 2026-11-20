@@ -1,9 +1,11 @@
 """Message facts: envelope fields and the attachment summary at import."""
 
+import asyncio
 import sqlite3
 from pathlib import Path
 
 import mailtide
+import pytest
 from conftest import make_config, tokens
 from fake_gmail import Mailbox
 from mailtide.config import Blobs, Config, Database, Http
@@ -156,3 +158,51 @@ def test_parse_addresses_and_decode_header(gmail: tuple[Mailbox, str]) -> None:
     assert content.subject is not None
     assert mailtide.decode_header(content.subject) == "Café report"
     assert mailtide.decode_header("plain") == "plain"
+
+
+def pdf_part(content: mailtide.MessageContent | None) -> str:
+    assert content is not None and content.attachments is not None
+    [pdf] = [a for a in content.attachments if a.content_type == "application/pdf"]
+    return pdf.part
+
+
+def test_read_part_returns_one_attachment(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    runner = synced(mailbox, origin)
+    [view] = runner.messages(ACCOUNT, ["m1"])
+    part = pdf_part(view.content)
+    assert runner.read_part(ACCOUNT, "m1", part) == b"%PDF-1.4\n"
+
+    async def main() -> bytes:
+        r = mailtide.Runner(make_config(origin), tokens)
+        await r.migrate()
+        await r.track(ACCOUNT)
+        await r.run(ACCOUNT, budget_s=30)
+        [view] = await r.messages(ACCOUNT, ["m1"])
+        parts = await r.parts(ACCOUNT, "m1")
+        assert [p.role for p in parts] == ["html", "inline", "attached"]
+        assert parts[2].part == pdf_part(view.content)
+        return await r.read_part(ACCOUNT, "m1", pdf_part(view.content), max_bytes=9)
+
+    assert asyncio.run(main()) == b"%PDF-1.4\n"
+
+
+def test_part_errors_are_typed(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    runner = synced(mailbox, origin)
+    [view] = runner.messages(ACCOUNT, ["m1"])
+    part = pdf_part(view.content)
+    with pytest.raises(mailtide.PartTooLarge, match="open_part"):
+        runner.read_part(ACCOUNT, "m1", part, max_bytes=8)
+    for bad in ("not a reference", "1.2.b.3", part + "0"):
+        with pytest.raises(mailtide.PartNotFound):
+            runner.read_part(ACCOUNT, "m1", bad)
+    offset, length, encoding, size, total = part.split(".")
+    stale = ".".join([offset, length, encoding, size, str(int(total) + 1)])
+    with pytest.raises(mailtide.PartNotFound, match="another length|bytes"):
+        runner.read_part(ACCOUNT, "m1", stale)
+    with pytest.raises(mailtide.BlobNotFound):
+        runner.read_part(ACCOUNT, "m-unknown", part)
+    with pytest.raises(mailtide.BlobNotFound):
+        runner.parts(ACCOUNT, "m-unknown")
+    assert issubclass(mailtide.PartNotFound, mailtide.MailtideError)

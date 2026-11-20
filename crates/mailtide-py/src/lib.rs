@@ -24,6 +24,7 @@ mod _core {
     use pyo3::prelude::*;
     use pyo3::types::{PyBytes, PyDict};
 
+    use mailtide::gmail::PartRef;
     use mailtide::ids::{AccountId, LabelId, MessageId, ThreadId, Timestamp};
     use mailtide::outbox::{
         Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
@@ -39,6 +40,7 @@ mod _core {
     use mailtide_io::auth::CachedTokens;
     use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
     use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
+    use mailtide_io::parts::PartError;
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
     use mailtide_io::search::{self as runner_search, SearchError};
@@ -133,6 +135,18 @@ mod _core {
     );
     create_exception!(
         _core,
+        PartNotFound,
+        MailtideError,
+        "The part reference names no part of that message: unreadable, outside it, or made for other content."
+    );
+    create_exception!(
+        _core,
+        PartTooLarge,
+        MailtideError,
+        "The part is larger than max_bytes; refused before any read. Stream it with open_part."
+    );
+    create_exception!(
+        _core,
         Superseded,
         MailtideError,
         "A newer mailtide version already wrote to this account; this one must not."
@@ -205,6 +219,8 @@ mod _core {
         m.add("PageTokenRejected", py.get_type::<PageTokenRejected>())?;
         m.add("GmailUnavailable", py.get_type::<GmailUnavailable>())?;
         m.add("AccountBlocked", py.get_type::<AccountBlocked>())?;
+        m.add("PartNotFound", py.get_type::<PartNotFound>())?;
+        m.add("PartTooLarge", py.get_type::<PartTooLarge>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -240,7 +256,25 @@ mod _core {
             BlobError::Unavailable(detail) => BlobUnavailable::new_err(detail),
             BlobError::Misconfigured(detail) => PyValueError::new_err(detail),
             BlobError::NotFound => BlobNotFound::new_err("no stored content for that message"),
+            BlobError::OutOfRange { total } => {
+                PartNotFound::new_err(format!("outside the stored content ({total} bytes)"))
+            }
         }
+    }
+
+    fn part_error(error: PartError) -> PyErr {
+        match error {
+            PartError::BlobNotFound => BlobNotFound::new_err("no stored content for that message"),
+            PartError::BlobUnavailable(detail) => BlobUnavailable::new_err(detail),
+            PartError::InvalidPart(detail) => PartNotFound::new_err(detail),
+            PartError::TooLarge { size, limit } => PartTooLarge::new_err(format!(
+                "the part is {size} bytes, over max_bytes={limit}: use open_part"
+            )),
+        }
+    }
+
+    fn part_ref(part: &str) -> PyResult<PartRef> {
+        PartRef::parse(part).map_err(|e| PartNotFound::new_err(e.to_string()))
     }
 
     fn run_error(error: RunError) -> PyErr {
@@ -722,6 +756,48 @@ mod _core {
         /// The declared `Content-Disposition`, lowercased.
         disposition: Option<String>,
         content_id: Option<String>,
+    }
+
+    /// One leaf part of a stored message (`Runner.parts`).
+    #[pyclass(frozen, get_all)]
+    struct PartInfo {
+        /// Its reference; `None` inside a transfer-encoded attached message.
+        part: Option<String>,
+        /// `text`, `html`, `attached`, `inline` or `protocol` (a signature
+        /// or encryption part).
+        role: &'static str,
+        content_type: String,
+        filename: Option<String>,
+        size: u64,
+        content_id: Option<String>,
+        charset: Option<String>,
+        /// The reference of the attached message it is in, if any.
+        container: Option<String>,
+        /// How many attached messages deep it is (0: the message itself).
+        depth: u32,
+    }
+
+    impl From<mailtide_mime::PartInfo> for PartInfo {
+        fn from(info: mailtide_mime::PartInfo) -> Self {
+            use mailtide_mime::PartRole;
+            Self {
+                part: info.part.map(|part| part.to_string()),
+                role: match info.role {
+                    PartRole::Text => "text",
+                    PartRole::Html => "html",
+                    PartRole::Attached => "attached",
+                    PartRole::Inline => "inline",
+                    PartRole::Protocol => "protocol",
+                },
+                content_type: info.content_type,
+                filename: info.filename,
+                size: info.size,
+                content_id: info.content_id,
+                charset: info.charset,
+                container: info.container.map(|part| part.to_string()),
+                depth: info.depth,
+            }
+        }
     }
 
     /// A message as the host should show it.
@@ -2291,6 +2367,34 @@ mod _core {
                 .map_err(blob_error)?;
             Ok(Python::attach(|py| PyBytes::new(py, &bytes).unbind()))
         }
+
+        async fn parts(
+            self: Arc<Self>,
+            account: AccountId,
+            message: MessageId,
+        ) -> PyResult<Vec<PartInfo>> {
+            let parts = self
+                .inner
+                .parts(&account, &message)
+                .await
+                .map_err(part_error)?;
+            Ok(parts.into_iter().map(PartInfo::from).collect())
+        }
+
+        async fn read_part(
+            self: Arc<Self>,
+            account: AccountId,
+            message: MessageId,
+            part: PartRef,
+            max_bytes: u64,
+        ) -> PyResult<Py<PyBytes>> {
+            let bytes = self
+                .inner
+                .read_part(&account, &message, &part, max_bytes)
+                .await
+                .map_err(part_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &bytes).unbind()))
+        }
     }
 
     /// The async runner core (`mailtide.Runner` wraps it in coroutines).
@@ -2704,6 +2808,42 @@ mod _core {
                     .read_blob(account_id(account)?, MessageId(message_id.to_owned())),
             )
         }
+
+        fn parts<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_id: &str,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .parts(account_id(account)?, MessageId(message_id.to_owned())),
+            )
+        }
+
+        #[pyo3(signature = (account, message_id, part, max_bytes=DEFAULT_MAX_PART_BYTES))]
+        fn read_part<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_id: &str,
+            part: &str,
+            max_bytes: u64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().read_part(
+                    account_id(account)?,
+                    MessageId(message_id.to_owned()),
+                    part_ref(part)?,
+                    max_bytes,
+                ),
+            )
+        }
     }
 
     #[pymethods]
@@ -3101,7 +3241,50 @@ mod _core {
                     .read_blob(account_id(account)?, MessageId(message_id.to_owned())),
             )
         }
+
+        /// Every leaf part of an imported message, with its reference and
+        /// role (the blob is read and parsed in Rust; metadata only).
+        fn parts(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_id: &str,
+        ) -> PyResult<Vec<PartInfo>> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .parts(account_id(account)?, MessageId(message_id.to_owned())),
+            )
+        }
+
+        /// The decoded bytes of one part, by its reference: one ranged read.
+        #[pyo3(signature = (account, message_id, part, max_bytes=DEFAULT_MAX_PART_BYTES))]
+        fn read_part(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_id: &str,
+            part: &str,
+            max_bytes: u64,
+        ) -> PyResult<Py<PyBytes>> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().read_part(
+                    account_id(account)?,
+                    MessageId(message_id.to_owned()),
+                    part_ref(part)?,
+                    max_bytes,
+                ),
+            )
+        }
     }
+
+    /// `read_part` refuses larger parts unless told otherwise: 25 MiB, as
+    /// large as a part Gmail lets a sender attach.
+    const DEFAULT_MAX_PART_BYTES: u64 = 25 * 1024 * 1024;
 
     // ------------------------------------------------------------ functions
 

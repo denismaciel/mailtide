@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod blobs;
+pub mod parts;
 pub mod quota_gate;
 pub mod runner;
 pub mod search;

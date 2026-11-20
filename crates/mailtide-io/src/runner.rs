@@ -1185,9 +1185,10 @@ where
                 report.last_failure = Some("blob_store");
                 tracing::warn!(
                     request = request_kind(&call.request),
-                    error = match error {
-                        BlobError::Unavailable(_) | BlobError::NotFound => "unavailable",
-                        BlobError::Misconfigured(_) => "misconfigured",
+                    error = if matches!(error, BlobError::Misconfigured(_)) {
+                        "misconfigured"
+                    } else {
+                        "unavailable"
                     },
                     "blob write failed"
                 );
@@ -1386,12 +1387,14 @@ fn transient(detail: String) -> Failure {
 /// A blob write that failed after Gmail answered. A store that can't work
 /// as configured fails the run: retrying each import can't fix it, and the
 /// host must hear about it. Otherwise the request is retried after backoff
-/// (a write can't miss an object: not found counts as unavailable).
+/// (a write can't miss an object or a range: those count as unavailable).
 fn blob_failure(error: BlobError) -> Result<Failure, RunError> {
     match error {
         BlobError::Misconfigured(detail) => Err(RunError::Blobs(detail)),
         BlobError::Unavailable(detail) => Ok(transient(format!("blob write failed: {detail}"))),
-        BlobError::NotFound => Ok(transient("blob write failed: not found".to_owned())),
+        BlobError::NotFound | BlobError::OutOfRange { .. } => {
+            Ok(transient("blob write failed: not found".to_owned()))
+        }
     }
 }
 

@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::ops::Range;
 use std::sync::Arc;
 
 use mailtide::ids::{AccountId, BlobRef, MessageId};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload};
 
 /// A blob store failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,32 @@ pub enum BlobError {
     /// No content at that key (never written, or cleaned up after the
     /// message was deleted).
     NotFound,
+    /// The range asked for is not inside the content, which is `total`
+    /// bytes long.
+    OutOfRange {
+        /// The content's length.
+        total: u64,
+    },
+}
+
+/// One range of a blob, read with the length of the whole blob (so a reader
+/// can tell the blob is the one it computed the range against).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeRead {
+    /// The bytes of the range.
+    pub bytes: Vec<u8>,
+    /// The length of the whole blob.
+    pub total: u64,
+}
+
+/// `range` of `whole`, the way a store without ranged reads serves it.
+fn slice(whole: &[u8], range: Range<u64>) -> Result<RangeRead, BlobError> {
+    let total = u64::try_from(whole.len()).unwrap_or(u64::MAX);
+    let outside = BlobError::OutOfRange { total };
+    let start = usize::try_from(range.start).map_err(|_| outside.clone())?;
+    let end = usize::try_from(range.end).map_err(|_| outside.clone())?;
+    let bytes = whole.get(start..end).ok_or(outside)?.to_vec();
+    Ok(RangeRead { bytes, total })
 }
 
 /// Where raw content lives.
@@ -30,6 +57,16 @@ pub trait BlobStore: Send + Sync {
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
     /// Read the content at `key`.
     fn get(&self, key: &BlobRef) -> impl Future<Output = Result<Vec<u8>, BlobError>> + Send;
+    /// Read `range` of the content at `key`, with its whole length. The
+    /// default reads the whole content and slices it; a store that serves
+    /// ranges reads only the range.
+    fn get_range(
+        &self,
+        key: &BlobRef,
+        range: Range<u64>,
+    ) -> impl Future<Output = Result<RangeRead, BlobError>> + Send {
+        async move { slice(&self.get(key).await?, range) }
+    }
     /// Delete the content at `key`; deleting a missing key is fine.
     fn delete(&self, key: &BlobRef) -> impl Future<Output = Result<(), BlobError>> + Send;
     /// Delete everything stored for `account`; returns how many objects.
@@ -109,6 +146,15 @@ impl ObjectBlobs {
         }
     }
 
+    /// The length of the object at `path`.
+    async fn length(&self, path: &Path) -> Result<u64, BlobError> {
+        match self.store.head(path).await {
+            Ok(meta) => Ok(meta.size),
+            Err(object_store::Error::NotFound { .. }) => Err(BlobError::NotFound),
+            Err(e) => Err(unavailable(&e)),
+        }
+    }
+
     fn path(&self, key: &BlobRef) -> Path {
         key.0
             .split('/')
@@ -140,6 +186,47 @@ impl BlobStore for ObjectBlobs {
             .await
             .map(|b| b.to_vec())
             .map_err(|e| unavailable(&e))
+    }
+
+    async fn get_range(&self, key: &BlobRef, range: Range<u64>) -> Result<RangeRead, BlobError> {
+        let path = self.path(key);
+        // An empty range is no request object_store serves: ask its length.
+        if range.is_empty() {
+            let total = self.length(&path).await?;
+            return if range.start <= total {
+                Ok(RangeRead {
+                    bytes: Vec::new(),
+                    total,
+                })
+            } else {
+                Err(BlobError::OutOfRange { total })
+            };
+        }
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(range.clone())),
+            ..GetOptions::default()
+        };
+        match self.store.get_opts(&path, options).await {
+            // A range past the end comes back cut short.
+            Ok(result) if result.range != range => Err(BlobError::OutOfRange {
+                total: result.meta.size,
+            }),
+            Ok(result) => {
+                let total = result.meta.size;
+                let bytes = result.bytes().await.map_err(|e| unavailable(&e))?;
+                Ok(RangeRead {
+                    bytes: bytes.to_vec(),
+                    total,
+                })
+            }
+            Err(object_store::Error::NotFound { .. }) => Err(BlobError::NotFound),
+            // Backends report a range starting past the end in their own
+            // words: tell it apart from a failure by the length.
+            Err(error) => match self.length(&path).await? {
+                total if range.end > total => Err(BlobError::OutOfRange { total }),
+                _ => Err(unavailable(&error)),
+            },
+        }
     }
 
     async fn delete_account(&self, account: &AccountId) -> Result<u64, BlobError> {

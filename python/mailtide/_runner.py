@@ -23,6 +23,7 @@ from mailtide._core import (
     Label,
     MessageView,
     NotifyResult,
+    PartInfo,
     PrioritiseResult,
     Progress,
     ResumeResult,
@@ -367,3 +368,19 @@ class Runner:
     async def read_blob(self, account: str, message_id: str) -> bytes:
         """The raw RFC 822 bytes of an imported message."""
         return await self._core.read_blob(account, message_id)
+
+    async def parts(self, account: str, message_id: str) -> list[PartInfo]:
+        """Every leaf part of an imported message, nested messages included, with
+        its reference and role. The blob is read and parsed in Rust; only the
+        metadata crosses over."""
+        return await self._core.parts(account, message_id)
+
+    async def read_part(
+        self, account: str, message_id: str, part: str, max_bytes: int = 26_214_400
+    ) -> bytes:
+        """The decoded bytes of one part, by the reference from ``attachments`` or
+        ``parts``: one ranged read of the stored blob, no Gmail call. Raises
+        ``PartTooLarge`` above ``max_bytes`` before reading (stream it with
+        ``open_part``), ``PartNotFound`` for a reference that names no part of
+        the message, ``BlobNotFound`` when the content is gone."""
+        return await self._core.read_part(account, message_id, part, max_bytes)
