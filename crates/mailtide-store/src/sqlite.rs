@@ -811,7 +811,9 @@ mod tests {
         let content = views[0].content.clone().expect("imported");
         assert_eq!(content.headers.subject.as_deref(), Some("hi"));
         assert_eq!(content.facts, None);
-        // The documented downgrade, after forgetting the later migrations.
+        // The documented downgrade, after reverting label editing (its
+        // columns) and forgetting the other later migrations.
+        run(label_editing_rollback()).await;
         run(vec![
             r#"INSERT INTO mailtide_changes (account, seq, idx, change)
                VALUES ('a@example.com', 1, 0, '{"FactsRefreshed":{"id":"m1","thread_id":"t1"}}')"#

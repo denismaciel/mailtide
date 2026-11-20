@@ -2254,7 +2254,18 @@ mod tests {
         // deleted by the host through the driver (some records lost to a
         // crash) and by another client (some deletions without history),
         // beside actions adding labels Gmail no longer has.
-        let results: Vec<RunResult> = (600..800).map(|seed| run(seed, 400)).collect();
+        let results: Vec<RunResult> = (600..800)
+            .map(|seed| {
+                // Some crashes in every run: a crash between Gmail's answer
+                // and the record is one of the paths.
+                let mut rng = Rng(seed);
+                let faults = Faults {
+                    crash: Probability::new(0.02).expect("valid"),
+                    ..Faults::swarm(&mut rng)
+                };
+                Sim::new(rng, faults, None).run(seed, 400)
+            })
+            .collect();
         let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
         assert!(
             failures.is_empty(),

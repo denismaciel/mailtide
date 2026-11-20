@@ -108,6 +108,7 @@ async fn main() {
                     size: 1_000,
                     internal_date: Timestamp(0),
                     headers: Box::default(),
+                    facts: None,
                 }
             })
             .collect();

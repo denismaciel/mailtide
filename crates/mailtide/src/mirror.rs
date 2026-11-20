@@ -747,6 +747,7 @@ fn without_deleted(op: &MessageOp, deleted: &BTreeMap<LabelId, Timestamp>) -> Me
             size,
             internal_date,
             headers,
+            facts,
         } => MessageOp::MarkImported {
             observation: MessageObservation {
                 labels: keep(&observation.labels),
@@ -756,6 +757,7 @@ fn without_deleted(op: &MessageOp, deleted: &BTreeMap<LabelId, Timestamp>) -> Me
             size: *size,
             internal_date: *internal_date,
             headers: headers.clone(),
+            facts: facts.clone(),
         },
         MessageOp::Tombstone { .. }
         | MessageOp::Listed { .. }
@@ -3493,6 +3495,7 @@ mod tests {
                     size: 1,
                     internal_date: Timestamp(0),
                     headers: Box::default(),
+                    facts: None,
                 },
             ],
         );

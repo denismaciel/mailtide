@@ -397,6 +397,7 @@ mod tests {
                     size: 1,
                     internal_date: Timestamp(0),
                     headers: HeaderFacts::default(),
+                    facts: None,
                 })),
             },
         );
