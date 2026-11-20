@@ -59,8 +59,8 @@ inform the design. No code is copied from them.
   mirror holds. mailtide parses no query and keeps no results.
 - Message parsing inside the sync core. Parsing is a separate crate the
   driver uses at import (§5.5).
-- Sending mail, draft authoring, label creation/rename/delete. These come
-  later; the design leaves room for them.
+- Sending mail and draft authoring. These come later; the design leaves
+  room for them. (Label definitions are written: §6.6.)
 - A JMAP server.
 
 ## 2. Glossary
@@ -131,8 +131,15 @@ The store keeps, per account:
   `sync_phase` (`bootstrapping | reconciling | live | blocked`),
   `notification_revision`, `processed_revision`, poll timestamps, retry and
   backoff state, and the reconciliation progress record (§6.3).
-- **label**: `label_id`, `name`, `type` (system/user), `visibility`, `color`.
-  Synced from `labels.list`. Small and refreshed periodically.
+- **label**: `label_id`, `name`, `type` (system/user), list and message
+  visibility, `color` (a text and background pair from Gmail's palette);
+  the last three are unknown when Gmail omits them (most system labels) and
+  until a listing fills them (migration 8). Synced from `labels.list`, and
+  written by the host's label calls (§6.6). Small and refreshed
+  periodically. A label's parent is derived from its name (`A/B` is under
+  `A`), never stored. The account row also keeps the **label generation**,
+  bumped by every local label write, and the ids of labels known to be
+  deleted with when (§6.6).
 - **message**: `message_id`, `thread_id`, `label_ids` (a set, stored as Gmail
   ids), `checkpoint`, `internal_date`, `size_estimate`, `blob_ref` (nullable
   until imported), `import_state` (`pending | imported | failed | blocked`),
@@ -437,6 +444,34 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   refusal or a 404 doesn't block the account, and the next periodic listing
   tries again.
 - Store label ids, never names, on messages. Renames are a label-table update.
+- **A label that goes leaves every message.** When the mirror learns a
+  label is gone (a listing lacks a stored id, or the host's own delete was
+  answered, or answered 404) it strips the id from every row, trusted or
+  unverified, without moving a checkpoint (Gmail's own `labelsRemoved`
+  records, one per message, then change nothing), drops the intents on it
+  in every state, and logs `LabelDefinitionsChanged` and one
+  `LabelsChanged` per row, in one commit. One listing is proof: Gmail's
+  listing reflects every create and delete that returned before it.
+- **A deleted id cannot come back.** It is remembered as deleted for 30
+  days (longer than Gmail keeps history), pruned at an applied listing:
+  observations, history deltas, imports, a finishing reconciliation's
+  scopes and new admissions are stored without it, so a fetch in flight
+  across the deletion, or history read from a cursor behind it, cannot put
+  it back on a row. A listing that names it again restores it.
+- **Local label writes** (`Runner.create_label`, `update_label`,
+  `delete_label`) are direct calls (§8) whose answer the driver records at
+  once with `Store::record_label`, unfenced like an admission: the
+  definition, a deletion's strip, their feed entries, and a bump of the
+  label generation. The driver reads the generation before every
+  `labels.list` and reports it with the listing; a listing sent before a
+  local write is not applied (the next one is), so it can neither remove a
+  label just created nor restore one just deleted. Gmail renames and
+  deletes only the label it is asked to: a rename moves the sublabels
+  first and the label last (a retry finishes a half-done one), a delete
+  refuses while sublabels exist unless asked to delete them, deepest
+  first. Names are compared as Gmail compares them (case-insensitively,
+  surrounding space ignored); colours are checked against Gmail's palette
+  and sent lower-cased. Read-only mode refuses the writes before any call.
 
 ## 7. Actions (write path)
 
@@ -469,7 +504,13 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
    `Delivered` for exactly the versions sent (I8) and queues a confirmation
    `get` after `confirm_timeout`. Changes admitted meanwhile are delivered
    next. A transport error retries (idempotent); a permanent refusal blocks
-   the intents; a 404 tombstones the message.
+   the intents; a 404 tombstones the message. Gmail refuses a whole modify
+   with 400 when an add names a label it does not have (deleted, or never
+   created), without naming it, and accepts removing one: so when a group
+   refused for good adds labels that are not Gmail's fixed system labels
+   *beside other changes*, only those adds are blocked, the rest is
+   delivered again on its own, and a label listing is asked for (§6.6),
+   which drops a deleted label's blocked intent.
 4. **Overlay.** `Store::messages` returns observed labels **and** effective
    labels (pending, delivered and unresolved intents applied in version
    order), plus counts of pending and blocked actions.
@@ -503,6 +544,7 @@ Per-call costs [G]:
 | `getProfile` | 1 |
 | `labels.list` | 1 |
 | `labels.get` | 1 |
+| `labels.create` / `labels.patch` / `labels.delete` | 5 (`patch` is not in Google's table: declared as `labels.update`) |
 | `watch` | 100 |
 | `messages.insert` / `import` | 25 |
 | `messages.send` | 100 |
@@ -575,6 +617,8 @@ detection in production (§13).
   within a bounded number of steps.
 - **I10 Determinism.** The same event sequence produces the same command
   sequence.
+- **I11 Deleted labels stay deleted.** Label definition ids are unique, and
+  no message row and no intent names a label remembered as deleted (§6.6).
 
 ## 10. Engine interface
 
@@ -591,9 +635,12 @@ engine's epoch, so results meant for a dead engine are ignored).
 - Gmail results: `ProfileFetched`, `HistoryFetched{page}`, `HistoryExpired`,
   `MessagesListed{page}`, `MessageFetched{observation}`,
   `MessageImported{message}` (after the blob is stored), `MessageNotFound`,
-  `LabelsListed`, `WatchRenewed{expiration}`, `LabelsModified`, and
+  `LabelsListed{labels, generation}` (the label generation the host read
+  before sending it), `WatchRenewed{expiration}`, `LabelsModified`, and
   `Searched{listing}`, which answers the driver's own search request and
-  which the engine ignores.
+  which the engine ignores. The driver's own label requests answer
+  `LabelFetched{label}`, `LabelSaved{label}`, `LabelNameTaken` (a 409) and
+  `LabelDeleted`; the engine issues none.
 - Store results: `CommitApplied`, `CommitRejected{reason}`,
   `JobsClaimed{jobs}`, `BlobDeleted`.
 - Failures: `RequestFailed{failure}` (retryable with class and
@@ -623,6 +670,9 @@ engine's epoch, so results meant for a dead engine are ignored).
   epoch; `Deliver` jobs carry their pending changes.
 - `admit(account, request, now)` and `prioritise(account, ids, now)`:
   unfenced writes for users' actions (§7.1) and opened messages (§6.4).
+- `record_label(account, op)` (an `Upsert` or a `Remove`): the unfenced
+  record of a local label write, bumping the label generation;
+  `label_generation(account)` reads it (0 for an untracked account) (§6.6).
 - `changes(account, since: FeedCursor, limit)`: the change feed
   (`ChangeFeed::Page` of `ChangeEntry { state, index, change, content }`, or
   `TooOld` after compaction). The store reads the first `limit + 1` entries
@@ -658,8 +708,9 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `locate(account, ids)`: per id (at most 500), a row with or without its
   content, a tombstone, or nothing; a read by primary key that claims
   nothing (what a search marks its hits with).
-- `labels(account)`: the label definitions (`Label { id, name, kind }`) as
-  last synced, in id order; empty before the first label sync.
+- `labels(account)`: the label definitions (`Label { id, name, kind,
+  list_visibility, message_visibility, color }`) as last synced or written,
+  in id order; empty before the first label sync.
 - `refresh_facts(account, updates)`: bring stored message facts up to date
   in one transaction. Not fenced by an epoch (like `admit`: it neither
   supersedes a running sync nor is rejected by one) but conditional per row:
@@ -686,7 +737,7 @@ examined, refreshed, unreadable, next }`; `next == None` ends the pass. A
 missing blob is named in `unreadable`; a store failure rolls the batch back
 (call again from the same `after`).
 
-The conformance suite (`mailtide_store::conformance`, 58 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 60 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -770,11 +821,27 @@ runner per process, after forking:
   `rfc822msgid:` term for the `Message-ID` Gmail stored, which is not the one
   a client wrote on a message sent or a draft saved through the API;
 - `await labels(account) -> list[Label]`: the label definitions (`id`,
-  `name`, `kind`: `system` or `user`) as the mirror last synced them, in id
-  order, to show label ids as names; empty before the first label sync.
-  They are listed again at least every `Engine.label_refresh_s` (default
-  900 s, §6.6). A `LabelDefinitionsChanged` feed entry (logged only when
-  they changed) means: read them again;
+  `name`, `kind`: `system` or `user`, `list_visibility`,
+  `message_visibility`, `color`: a `LabelColor(text, background)` or
+  `None`, and `parent_id`: the nearest label above it by name) as the
+  mirror last synced them, in id order, to show label ids as names; empty
+  before the first label sync. They are listed again at least every
+  `Engine.label_refresh_s` (default 900 s, §6.6). A
+  `LabelDefinitionsChanged` feed entry (logged only when they changed)
+  means: read them again;
+- `await create_label(account, name, *, list_visibility="show",
+  message_visibility="show", color=None) -> Label`, `await
+  update_label(account, label_id, *, name=None, list_visibility=None,
+  message_visibility=None, color="keep", sublabels="follow") ->
+  LabelUpdate` (`color=None` clears it) and `await delete_label(account,
+  label_id, *, sublabels="refuse") -> LabelDeletion` (`deleted`,
+  `already_gone`): Gmail's label writes, recorded at once (§6.6), each with
+  a `budget_s` for the quota gate. They raise `LabelNotFound`,
+  `LabelNameTaken` (`existing`: the label holding the name), `InvalidLabel`
+  (before any call), `LabelHasSublabels` (`ids`), `LabelRefused`,
+  `GmailUnavailable`, `QuotaDeferred`, `WriteOutcomeUnknown` and
+  `ReadOnlyMode`; one that stopped half-way carries `done`, and the same
+  call again finishes it;
 - `await changes(account, since, limit=500) -> ChangePage | StateTooOld`:
   at most `limit` entries per page (at most 5,000), continuing from
   `page.next` while `page.has_more`. Pages hold whole commits, ending at the
@@ -843,7 +910,7 @@ runner per process, after forking:
   have, and its answer was lost: it may or may not have been applied),
   `SearchRefused` and its subclass `UnknownLabel` (`label_id`),
   `InvalidPageToken` and its subclass `PageTokenRejected`,
-  `GmailUnavailable`, `AccountBlocked`,
+  `GmailUnavailable`, `AccountBlocked`, the label errors above,
   `Superseded`, `InvalidPush`, and `DelegationRevoked` (raised by the token source
   to block an account; the block is committed, and later runs make no
   credential calls), `InvalidPush`, `BlobNotFound`, `PartNotFound` (a
@@ -864,7 +931,7 @@ advisory lock; hosts that run migrations with their own tool execute
 `schema()` reports `current`, `behind` or `ahead`. Every call that reads or
 writes the database refuses with `SchemaOutOfDate` unless it is current:
 `run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, `search`,
-`search_threads`, and the reads too (`changes`, `messages`, `threads`,
+`search_threads`, the label writes, and the reads too (`changes`, `messages`, `threads`,
 `labels`, `message_ids`, `compact`, `ack`, `consumers`, `drop_consumer`,
 `status`, `accounts`, `resume`,
 `forget`), so a build that is too old
@@ -943,6 +1010,24 @@ rows the older build rewrites, and the refresh entries; after the next
 upgrade, `refresh_facts` finds those rows and restores their facts from the
 blobs. Part references a host holds stay valid: they name bytes in a blob.
 
+Migration 9 adds the nullable `mailtide_labels.attrs` (visibility and
+colour, JSON) and, on `mailtide_accounts`, `label_generation` and the
+nullable `deleted_labels` (the deleted-label memory, JSON), §6.6. A build
+from before it sees the database as `ahead`, so it never writes a label
+row without its attributes, applies a listing past the generation fence,
+or stores a remembered-deleted id again. No feed entry kind and no job
+kind is new. Reverting it loses the attributes (the first listing after
+the next upgrade refills them) and the memory (a replayed history record
+or a late import may then put a deleted id back on a row, until that
+message is fetched again):
+
+```sql
+ALTER TABLE mailtide_labels DROP COLUMN attrs;                -- SQLite ≥ 3.35
+ALTER TABLE mailtide_accounts DROP COLUMN label_generation;
+ALTER TABLE mailtide_accounts DROP COLUMN deleted_labels;
+DELETE FROM mailtide_schema WHERE version = 9;
+```
+
 Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach
 retries, cleanups and confirmations without sleeping.
@@ -980,8 +1065,11 @@ Status: unit tests per rule; the simulator (`mailtide-sim`) runs the real
 engine and the shared mirror rules against a fake Gmail with swarm-sampled
 faults, including users acting through the engine, users opening messages
 whose bodies are still queued (`prioritise`, §6.4), label definitions
-created, renamed and deleted in Gmail, and facts refreshes run beside the
-engine (checked to change nothing but facts), and checks invariants after every
+created, renamed and deleted in Gmail by another client (deletions with
+and without history records) and by the host through the driver (a crash
+may lose the record), actions adding labels Gmail no longer has, and facts
+refreshes run beside the engine (checked to change nothing but facts), and
+checks invariants after every
 commit and every open (also that no job's class goes down outside a claim's
 finish) and convergence after healing (message sets, labels, thread ids and
 thread views), label definitions within the refresh
@@ -1076,3 +1164,4 @@ Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4
 | — | Unverified rows: deltas never advance an unverified row's checkpoint (§6.5) | **Yes** |
 | — | Actions send every implied change, even ones the mirror already shows (§7) | **Yes** |
 | — | Delivery runs as durable per-message jobs, not a coalescing timer | **Yes** |
+| — | Label definitions are written by direct calls recorded at once, not intents; a label that goes leaves every row and its id is remembered as deleted for 30 days (§6.6, `docs/features/label-edit.md`) | **Yes** |

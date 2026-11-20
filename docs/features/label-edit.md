@@ -212,9 +212,9 @@ history record or a late import can put a deleted id back on a row, where it
 stays until that message is fetched again: what a build without this feature
 does anyway.
 
-`Store::record_label(account, Upsert(label) | Remove(id), now)` writes the
-answer of a local call: definition, generation bump, strip and feed entries
-in one transaction. Like `admit` it is **not fenced by an epoch**: a label
+`Store::record_label(account, &LabelOp)` (an `Upsert(label)` or a
+`Remove { id, at }`) writes the answer of a local call: definition,
+generation bump, strip and feed entries in one transaction. Like `admit` it is **not fenced by an epoch**: a label
 write must survive a concurrent sync superseding another.
 `Store::label_generation(account)` reads the counter.
 

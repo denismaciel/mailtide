@@ -167,7 +167,7 @@ role = "Labels in the fake Gmail: created, renamed and deleted here and elsewher
 [[file]]
 path = "crates/mailtide-py/src/lib.rs"
 change = "modify"
-role = "Runner and BlockingRunner label methods; Label gains list_visibility, message_visibility, color and parent_id; exceptions. Shared groundwork: the QuotaDeferred exception is added by whichever of drafts, identities, label-edit, purge, search lands first"
+role = "Runner and BlockingRunner label methods (create_label and update_label take their keywords as **options, checked against the stubs' signature, so no binding needs more than seven arguments); Label gains list_visibility, message_visibility, color (LabelColor) and parent_id; LabelUpdate, LabelDeletion; the label exceptions and GmailUnavailable; the Rust-to-Python conversion of QuotaDeferred (until_ms) and WriteOutcomeUnknown"
 
 [[file]]
 path = "python/mailtide/_runner.py"
@@ -188,6 +188,11 @@ role = "Re-export LabelColor and the label exceptions"
 path = "python/mailtide/testing.py"
 change = "modify"
 role = "FakeGmail labels endpoints (create, patch, delete, 409 on a taken name) and helpers to rename or delete a label as another client"
+
+[[file]]
+path = "README.md"
+change = "modify"
+role = "The quick start shows a label's colour and parent, and create_label"
 
 [[file]]
 path = "SPEC.md"

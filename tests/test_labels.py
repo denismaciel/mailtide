@@ -119,3 +119,39 @@ def test_blocking_labels(gmail: tuple[Mailbox, str]) -> None:
     ]
     with pytest.raises(ValueError, match="invalid account"):
         runner.labels("not an account")
+
+
+def test_labels_carry_colour_visibility_and_parent(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    mailbox.label(
+        "Label_1",
+        "Work",
+        labelListVisibility="labelShowIfUnread",
+        messageListVisibility="hide",
+        color={"textColor": "#ffffff", "backgroundColor": "#16a766"},
+    )
+    mailbox.label("Label_2", "Work/2026")
+    mailbox.label("Label_3", "Work/2026/Q1")
+    mailbox.label("Label_4", "Work/Old/Deep")
+    mailbox.label("Label_5", "Workshop")
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    runner.track(ACCOUNT)
+    runner.run(ACCOUNT, budget_s=30)
+    by_id = {label.id: label for label in runner.labels(ACCOUNT)}
+    work = by_id["Label_1"]
+    assert (work.list_visibility, work.message_visibility) == ("show_if_unread", "hide")
+    assert work.color == mailtide.LabelColor("#ffffff", "#16a766")
+    assert (work.color.text, work.color.background) == ("#ffffff", "#16a766")
+    inbox = by_id["INBOX"]
+    assert (inbox.list_visibility, inbox.message_visibility, inbox.color) == (None, None, None)
+    # Nesting is in the names: the nearest existing label above, at a slash.
+    parents = {lid: label.parent_id for lid, label in by_id.items()}
+    assert parents == {
+        "INBOX": None,
+        "Label_1": None,
+        "Label_2": "Label_1",
+        "Label_3": "Label_2",
+        "Label_4": "Label_1",
+        "Label_5": None,
+    }

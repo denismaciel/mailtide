@@ -58,7 +58,8 @@ page = await runner.changes("alice@example.com", since=None)  # bounded pages; i
 await runner.ack("alice@example.com", "indexer", page.next)  # after processing a page
 await runner.compact("alice@example.com")  # drops what every live consumer has acknowledged
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
-labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
+labels = await runner.labels("alice@example.com")  # ids to names, colours, parents
+label = await runner.create_label("alice@example.com", "Work/2026")  # Gmail's id, recorded
 threads = await runner.threads("alice@example.com", ["18c…"])  # thread views, in one call
 hits = await runner.search("alice@example.com", "from:bob has:attachment")  # Gmail's own search
 content = views[0].content  # sender, dates, list headers, an attachment summary

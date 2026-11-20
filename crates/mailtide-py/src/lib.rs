@@ -40,6 +40,7 @@ mod _core {
     use mailtide_io::auth::CachedTokens;
     use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
     use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
+    use mailtide_io::labels::{LabelError, SublabelDeletion, Sublabels};
     use mailtide_io::parts::PartError;
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
@@ -193,6 +194,36 @@ mod _core {
         MailtideError,
         "The account is blocked until an operator acts (see `status`); nothing was sent."
     );
+    create_exception!(
+        _core,
+        LabelNotFound,
+        MailtideError,
+        "Gmail has no label with that id."
+    );
+    create_exception!(
+        _core,
+        LabelNameTaken,
+        MailtideError,
+        "Another label holds the name (Gmail compares names case-insensitively): `existing` is that label, or None if a listing could not tell. Nothing was written."
+    );
+    create_exception!(
+        _core,
+        InvalidLabel,
+        MailtideError,
+        "Refused before any request: a blank name, a control character, a colour off Gmail's palette, a system label, or nothing to change."
+    );
+    create_exception!(
+        _core,
+        LabelHasSublabels,
+        MailtideError,
+        "The label has sublabels (`ids`, deepest first) and the delete was asked to refuse then: pass sublabels=\"delete\" to delete them too."
+    );
+    create_exception!(
+        _core,
+        LabelRefused,
+        MailtideError,
+        "Gmail refused the label write for good (another 400, or a 403 such as a scope the token lacks): the caller's error; nothing was recorded and the account is not blocked."
+    );
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -221,6 +252,11 @@ mod _core {
         m.add("AccountBlocked", py.get_type::<AccountBlocked>())?;
         m.add("PartNotFound", py.get_type::<PartNotFound>())?;
         m.add("PartTooLarge", py.get_type::<PartTooLarge>())?;
+        m.add("LabelNotFound", py.get_type::<LabelNotFound>())?;
+        m.add("LabelNameTaken", py.get_type::<LabelNameTaken>())?;
+        m.add("InvalidLabel", py.get_type::<InvalidLabel>())?;
+        m.add("LabelHasSublabels", py.get_type::<LabelHasSublabels>())?;
+        m.add("LabelRefused", py.get_type::<LabelRefused>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -341,6 +377,211 @@ mod _core {
             SearchError::AccountBlocked(reason) => AccountBlocked::new_err(describe(&reason)),
             SearchError::NotTracked => store_error(StoreError::NotTracked),
             SearchError::Run(error) => run_error(error),
+        }
+    }
+
+    /// A label write's failure as its exception; `existing` is the label a
+    /// `NameTaken` names, as the host reads labels. A write that stopped
+    /// half-way raises its cause with `done`, the ids already changed.
+    fn label_error(error: LabelError, existing: Option<Label>) -> PyErr {
+        let (error, done) = match error {
+            LabelError::Partial { done, error } => (*error, Some(done)),
+            other => (other, None),
+        };
+        Python::attach(|py| {
+            let raised = match error {
+                LabelError::NotFound => LabelNotFound::new_err("Gmail has no label with that id"),
+                LabelError::NameTaken { .. } => with_attribute(
+                    LabelNameTaken::new_err("another label holds that name"),
+                    "existing",
+                    existing,
+                    py,
+                ),
+                LabelError::Invalid(detail) => InvalidLabel::new_err(detail),
+                LabelError::HasSublabels { ids } => with_attribute(
+                    LabelHasSublabels::new_err(
+                        "the label has sublabels: pass sublabels=\"delete\" to delete them too",
+                    ),
+                    "ids",
+                    ids.into_iter().map(|id| id.0).collect::<Vec<_>>(),
+                    py,
+                ),
+                // A cause is never partial itself.
+                LabelError::Partial { .. } => {
+                    MailtideError::new_err("label write stopped half-way")
+                }
+                LabelError::Deferred(deferred) => quota_deferred(deferred),
+                LabelError::ReadOnly => ReadOnlyMode::new_err(
+                    "this runner is read-only (config access=\"read_only\"): label writes are refused",
+                ),
+                LabelError::Refused(refusal) => LabelRefused::new_err(describe(&refusal)),
+                LabelError::Retryable(failure) => GmailUnavailable::new_err(failure.detail),
+                LabelError::OutcomeUnknown(detail) => WriteOutcomeUnknown::new_err(detail),
+                LabelError::Run(error) => run_error(error),
+            };
+            match done {
+                Some(done) => with_attribute(
+                    raised,
+                    "done",
+                    done.into_iter().map(|id| id.0).collect::<Vec<_>>(),
+                    py,
+                ),
+                None => raised,
+            }
+        })
+    }
+
+    fn list_visibility(value: &str) -> PyResult<mailtide::gmail::LabelListVisibility> {
+        use mailtide::gmail::LabelListVisibility;
+        match value {
+            "show" => Ok(LabelListVisibility::Show),
+            "show_if_unread" => Ok(LabelListVisibility::ShowIfUnread),
+            "hide" => Ok(LabelListVisibility::Hide),
+            other => Err(PyValueError::new_err(format!(
+                "list_visibility must be show, show_if_unread or hide, not {other:?}"
+            ))),
+        }
+    }
+
+    fn message_visibility(value: &str) -> PyResult<mailtide::gmail::MessageListVisibility> {
+        use mailtide::gmail::MessageListVisibility;
+        match value {
+            "show" => Ok(MessageListVisibility::Show),
+            "hide" => Ok(MessageListVisibility::Hide),
+            other => Err(PyValueError::new_err(format!(
+                "message_visibility must be show or hide, not {other:?}"
+            ))),
+        }
+    }
+
+    /// Refuse a keyword a label method does not take (its signature is in
+    /// the stubs), as Python would.
+    fn check_keywords(given: &Bound<'_, PyDict>, method: &str, takes: &[&str]) -> PyResult<()> {
+        for key in given.keys() {
+            let key: String = key.extract()?;
+            if !takes.contains(&key.as_str()) {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{method}() got an unexpected keyword argument {key:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Keyword `key`, if given and not None.
+    fn keyword<'py, T>(given: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
+    where
+        T: for<'a> FromPyObject<'a, 'py>,
+    {
+        match given.get_item(key)? {
+            Some(value) if !value.is_none() => value.extract().map(Some).map_err(Into::into),
+            Some(_) | None => Ok(None),
+        }
+    }
+
+    /// The `budget_s` keyword, 30 s by default.
+    fn budget(given: &Bound<'_, PyDict>) -> PyResult<Duration> {
+        seconds(keyword(given, "budget_s")?.unwrap_or(30.0), "budget_s")
+    }
+
+    fn label_color(color: &LabelColor) -> mailtide::gmail::LabelColor {
+        mailtide::gmail::LabelColor {
+            text: color.text.clone(),
+            background: color.background.clone(),
+        }
+    }
+
+    /// `create_label`'s keywords: the label to create, and the budget.
+    fn new_label(
+        name: String,
+        given: &Bound<'_, PyDict>,
+    ) -> PyResult<(mailtide::gmail::NewLabel, Duration)> {
+        check_keywords(
+            given,
+            "create_label",
+            &["list_visibility", "message_visibility", "color", "budget_s"],
+        )?;
+        let visibility = |key: &str| -> PyResult<String> {
+            Ok(keyword::<String>(given, key)?.unwrap_or_else(|| "show".into()))
+        };
+        let label = mailtide::gmail::NewLabel {
+            name,
+            list_visibility: list_visibility(&visibility("list_visibility")?)?,
+            message_visibility: message_visibility(&visibility("message_visibility")?)?,
+            color: match given.get_item("color")? {
+                Some(value) if !value.is_none() => {
+                    let color: PyRef<'_, LabelColor> = value.extract()?;
+                    Some(label_color(&color))
+                }
+                Some(_) | None => None,
+            },
+        };
+        Ok((label, budget(given)?))
+    }
+
+    /// `update_label`'s keywords: the patch, what the sublabels do, and the
+    /// budget. `color` is kept unless given: `None` clears it.
+    fn label_patch(
+        given: &Bound<'_, PyDict>,
+    ) -> PyResult<(mailtide::gmail::LabelPatch, Sublabels, Duration)> {
+        use mailtide::gmail::{ColorChange, LabelPatch};
+        check_keywords(
+            given,
+            "update_label",
+            &[
+                "name",
+                "list_visibility",
+                "message_visibility",
+                "color",
+                "sublabels",
+                "budget_s",
+            ],
+        )?;
+        let color = match given.get_item("color")? {
+            None => ColorChange::Keep,
+            Some(value) if value.is_none() => ColorChange::Clear,
+            Some(value) => match value.extract::<String>() {
+                Ok(word) if word == "keep" => ColorChange::Keep,
+                Ok(other) => {
+                    return Err(PyValueError::new_err(format!(
+                        "color must be a LabelColor, None (clear it) or \"keep\", not {other:?}"
+                    )));
+                }
+                Err(_) => {
+                    let color: PyRef<'_, LabelColor> = value.extract()?;
+                    ColorChange::Set(label_color(&color))
+                }
+            },
+        };
+        let patch = LabelPatch {
+            name: keyword(given, "name")?,
+            list_visibility: keyword::<String>(given, "list_visibility")?
+                .map(|v| list_visibility(&v))
+                .transpose()?,
+            message_visibility: keyword::<String>(given, "message_visibility")?
+                .map(|v| message_visibility(&v))
+                .transpose()?,
+            color,
+        };
+        let sublabels = match keyword::<String>(given, "sublabels")?.as_deref() {
+            None | Some("follow") => Sublabels::Follow,
+            Some("leave") => Sublabels::Leave,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "sublabels must be follow or leave, not {other:?}"
+                )));
+            }
+        };
+        Ok((patch, sublabels, budget(given)?))
+    }
+
+    fn sublabel_deletion(value: &str) -> PyResult<SublabelDeletion> {
+        match value {
+            "refuse" => Ok(SublabelDeletion::Refuse),
+            "delete" => Ok(SublabelDeletion::Delete),
+            other => Err(PyValueError::new_err(format!(
+                "sublabels must be refuse or delete, not {other:?}"
+            ))),
         }
     }
 
@@ -1165,6 +1406,7 @@ mod _core {
     /// A label definition: what a label id on a message is called, and how
     /// Gmail shows it.
     #[pyclass(frozen, get_all)]
+    #[derive(Clone)]
     struct Label {
         id: String,
         name: String,
@@ -1175,12 +1417,19 @@ mod _core {
         /// `show`, `hide`, or `None` when Gmail gave none.
         message_visibility: Option<&'static str>,
         color: Option<LabelColor>,
+        /// The nearest label above it by name (`Work` for `Work/2026`).
+        parent_id: Option<String>,
     }
 
-    impl From<mailtide::gmail::Label> for Label {
-        fn from(label: mailtide::gmail::Label) -> Self {
+    impl Label {
+        /// `label`, its parent taken from `parents`.
+        fn new(
+            label: mailtide::gmail::Label,
+            parents: &std::collections::BTreeMap<LabelId, LabelId>,
+        ) -> Self {
             use mailtide::gmail::{LabelListVisibility, MessageListVisibility};
             Self {
+                parent_id: parents.get(&label.id).map(|parent| parent.0.clone()),
                 id: label.id.0,
                 name: label.name,
                 kind: match label.kind {
@@ -1202,6 +1451,22 @@ mod _core {
                 }),
             }
         }
+    }
+
+    /// What `update_label` changed: the label, and the sublabels moved with
+    /// it.
+    #[pyclass(frozen, get_all)]
+    struct LabelUpdate {
+        label: Label,
+        sublabels: Vec<Label>,
+    }
+
+    /// What `delete_label` removed: the labels Gmail deleted (sublabels
+    /// first), and those already gone.
+    #[pyclass(frozen, get_all)]
+    struct LabelDeletion {
+        deleted: Vec<String>,
+        already_gone: Vec<String>,
     }
 
     /// A label's colour: Gmail's text and background pair (`#rrggbb`).
@@ -2459,7 +2724,115 @@ mod _core {
 
         async fn labels(self: Arc<Self>, account: AccountId) -> PyResult<Vec<Label>> {
             let labels = self.inner.labels(&account).await.map_err(run_error)?;
-            Ok(labels.into_iter().map(Label::from).collect())
+            let parents = mailtide::label_names::parents(&labels);
+            Ok(labels
+                .into_iter()
+                .map(|label| Label::new(label, &parents))
+                .collect())
+        }
+
+        /// `labels` as the host reads them, each with its parent among the
+        /// mirror's definitions (and `labels` themselves).
+        async fn described(
+            &self,
+            account: &AccountId,
+            labels: Vec<mailtide::gmail::Label>,
+        ) -> PyResult<Vec<Label>> {
+            let mut known = self.inner.labels(account).await.map_err(run_error)?;
+            for label in &labels {
+                if known.iter().all(|stored| stored.id != label.id) {
+                    known.push(label.clone());
+                }
+            }
+            let parents = mailtide::label_names::parents(&known);
+            Ok(labels
+                .into_iter()
+                .map(|label| Label::new(label, &parents))
+                .collect())
+        }
+
+        /// A label write's failure, raised; `NameTaken`'s label described.
+        async fn label_failure(&self, account: &AccountId, error: LabelError) -> PyErr {
+            let cause = match &error {
+                LabelError::Partial { error, .. } => error.as_ref(),
+                other => other,
+            };
+            let taken = match cause {
+                LabelError::NameTaken { existing } => existing.clone(),
+                _ => None,
+            };
+            let existing = match taken {
+                Some(label) => match self.described(account, vec![label]).await {
+                    Ok(mut described) => described.pop(),
+                    Err(error) => return error,
+                },
+                None => None,
+            };
+            label_error(error, existing)
+        }
+
+        async fn create_label(
+            self: Arc<Self>,
+            account: AccountId,
+            label: mailtide::gmail::NewLabel,
+            budget: Duration,
+        ) -> PyResult<Label> {
+            match self.inner.create_label(&account, label, budget).await {
+                Ok(label) => Ok(self.described(&account, vec![label]).await?.remove(0)),
+                Err(error) => Err(self.label_failure(&account, error).await),
+            }
+        }
+
+        async fn update_label(
+            self: Arc<Self>,
+            account: AccountId,
+            id: LabelId,
+            patch: mailtide::gmail::LabelPatch,
+            sublabels: Sublabels,
+            budget: Duration,
+        ) -> PyResult<LabelUpdate> {
+            match self
+                .inner
+                .update_label(&account, &id, patch, sublabels, budget)
+                .await
+            {
+                Ok(update) => {
+                    let mut labels = self
+                        .described(
+                            &account,
+                            std::iter::once(update.label)
+                                .chain(update.sublabels)
+                                .collect(),
+                        )
+                        .await?;
+                    let label = labels.remove(0);
+                    Ok(LabelUpdate {
+                        label,
+                        sublabels: labels,
+                    })
+                }
+                Err(error) => Err(self.label_failure(&account, error).await),
+            }
+        }
+
+        async fn delete_label(
+            self: Arc<Self>,
+            account: AccountId,
+            id: LabelId,
+            sublabels: SublabelDeletion,
+            budget: Duration,
+        ) -> PyResult<LabelDeletion> {
+            match self
+                .inner
+                .delete_label(&account, &id, sublabels, budget)
+                .await
+            {
+                Ok(deletion) => Ok(LabelDeletion {
+                    deleted: deletion.deleted.into_iter().map(|id| id.0).collect(),
+                    already_gone: deletion.already_gone.into_iter().map(|id| id.0).collect(),
+                }),
+                Err(error) => Err(self.label_failure(&account, error).await),
+            }
         }
 
         async fn messages(
@@ -2963,6 +3336,75 @@ mod _core {
             )
         }
 
+        /// Create a user label in Gmail and record it; see
+        /// `mailtide.Runner.create_label`.
+        #[pyo3(signature = (account, name, **options))]
+        fn create_label<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            name: String,
+            options: Option<Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let (label, budget) = new_label(name, &options)?;
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .create_label(account_id(account)?, label, budget),
+            )
+        }
+
+        /// Change a label in Gmail and record it; see
+        /// `mailtide.Runner.update_label`.
+        #[pyo3(signature = (account, label_id, **options))]
+        fn update_label<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            label_id: String,
+            options: Option<Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let (patch, sublabels, budget) = label_patch(&options)?;
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().update_label(
+                    account_id(account)?,
+                    LabelId(label_id),
+                    patch,
+                    sublabels,
+                    budget,
+                ),
+            )
+        }
+
+        /// Delete a label in Gmail and record it; see
+        /// `mailtide.Runner.delete_label`.
+        #[pyo3(signature = (account, label_id, *, sublabels="refuse", budget_s=30.0))]
+        fn delete_label<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            label_id: String,
+            sublabels: &str,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().delete_label(
+                    account_id(account)?,
+                    LabelId(label_id),
+                    sublabel_deletion(sublabels)?,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
         fn messages<'py>(
             &self,
             py: Python<'py>,
@@ -3438,6 +3880,75 @@ mod _core {
                 py,
                 &self.shared,
                 self.shared.clone().labels(account_id(account)?),
+            )
+        }
+
+        /// Create a user label in Gmail and record it; see
+        /// `mailtide.Runner.create_label`.
+        #[pyo3(signature = (account, name, **options))]
+        fn create_label(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            name: String,
+            options: Option<Bound<'_, PyDict>>,
+        ) -> PyResult<Label> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let (label, budget) = new_label(name, &options)?;
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .create_label(account_id(account)?, label, budget),
+            )
+        }
+
+        /// Change a label in Gmail and record it; see
+        /// `mailtide.Runner.update_label`.
+        #[pyo3(signature = (account, label_id, **options))]
+        fn update_label(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            label_id: String,
+            options: Option<Bound<'_, PyDict>>,
+        ) -> PyResult<LabelUpdate> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let (patch, sublabels, budget) = label_patch(&options)?;
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().update_label(
+                    account_id(account)?,
+                    LabelId(label_id),
+                    patch,
+                    sublabels,
+                    budget,
+                ),
+            )
+        }
+
+        /// Delete a label in Gmail and record it; see
+        /// `mailtide.Runner.delete_label`.
+        #[pyo3(signature = (account, label_id, *, sublabels="refuse", budget_s=30.0))]
+        fn delete_label(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            label_id: String,
+            sublabels: &str,
+            budget_s: f64,
+        ) -> PyResult<LabelDeletion> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().delete_label(
+                    account_id(account)?,
+                    LabelId(label_id),
+                    sublabel_deletion(sublabels)?,
+                    seconds(budget_s, "budget_s")?,
+                ),
             )
         }
 

@@ -40,6 +40,18 @@ class ComposeError(ValueError):
     index: int | None
     reason: str
 
+class LabelNotFound(MailtideError): ...
+
+class LabelNameTaken(MailtideError):
+    existing: Label | None
+
+class InvalidLabel(MailtideError): ...
+
+class LabelHasSublabels(MailtideError):
+    ids: list[str]
+
+class LabelRefused(MailtideError): ...
+
 SCHEMA_VERSION: int
 
 @final
@@ -283,6 +295,20 @@ class Label:
     list_visibility: Literal["show", "show_if_unread", "hide"] | None
     message_visibility: Literal["show", "hide"] | None
     color: LabelColor | None
+    parent_id: str | None
+
+@final
+class LabelUpdate:
+    label: Label
+    sublabels: list[Label]
+
+@final
+class LabelDeletion:
+    deleted: list[str]
+    already_gone: list[str]
+
+ListVisibility = Literal["show", "show_if_unread", "hide"]
+MessageVisibility = Literal["show", "hide"]
 
 Action = Literal[
     "mark_read",
@@ -591,6 +617,36 @@ class Runner:
         budget_s: float = 10.0,
     ) -> Awaitable[ThreadSearchPage]: ...
     def labels(self, account: str) -> Awaitable[list[Label]]: ...
+    def create_label(
+        self,
+        account: str,
+        name: str,
+        *,
+        list_visibility: ListVisibility = "show",
+        message_visibility: MessageVisibility = "show",
+        color: LabelColor | None = None,
+        budget_s: float = 30.0,
+    ) -> Awaitable[Label]: ...
+    def update_label(
+        self,
+        account: str,
+        label_id: str,
+        *,
+        name: str | None = None,
+        list_visibility: ListVisibility | None = None,
+        message_visibility: MessageVisibility | None = None,
+        color: LabelColor | Literal["keep"] | None = "keep",
+        sublabels: Literal["follow", "leave"] = "follow",
+        budget_s: float = 30.0,
+    ) -> Awaitable[LabelUpdate]: ...
+    def delete_label(
+        self,
+        account: str,
+        label_id: str,
+        *,
+        sublabels: Literal["refuse", "delete"] = "refuse",
+        budget_s: float = 30.0,
+    ) -> Awaitable[LabelDeletion]: ...
     def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
     def threads(self, account: str, thread_ids: list[str]) -> Awaitable[list[ThreadView]]: ...
     def changes(
@@ -695,6 +751,36 @@ class BlockingRunner:
         budget_s: float = 10.0,
     ) -> ThreadSearchPage: ...
     def labels(self, account: str) -> list[Label]: ...
+    def create_label(
+        self,
+        account: str,
+        name: str,
+        *,
+        list_visibility: ListVisibility = "show",
+        message_visibility: MessageVisibility = "show",
+        color: LabelColor | None = None,
+        budget_s: float = 30.0,
+    ) -> Label: ...
+    def update_label(
+        self,
+        account: str,
+        label_id: str,
+        *,
+        name: str | None = None,
+        list_visibility: ListVisibility | None = None,
+        message_visibility: MessageVisibility | None = None,
+        color: LabelColor | Literal["keep"] | None = "keep",
+        sublabels: Literal["follow", "leave"] = "follow",
+        budget_s: float = 30.0,
+    ) -> LabelUpdate: ...
+    def delete_label(
+        self,
+        account: str,
+        label_id: str,
+        *,
+        sublabels: Literal["refuse", "delete"] = "refuse",
+        budget_s: float = 30.0,
+    ) -> LabelDeletion: ...
     def messages(self, account: str, message_ids: list[str]) -> list[MessageView]: ...
     def threads(self, account: str, thread_ids: list[str]) -> list[ThreadView]: ...
     def changes(

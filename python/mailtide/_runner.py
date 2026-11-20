@@ -22,6 +22,9 @@ from mailtide._core import (
     ForgetResult,
     Health,
     Label,
+    LabelColor,
+    LabelDeletion,
+    LabelUpdate,
     MessageView,
     NotifyResult,
     PartInfo,
@@ -40,6 +43,8 @@ from mailtide._core import (
 from mailtide.config import Config
 
 TokenSource = Callable[[str], tuple[str, int] | Awaitable[tuple[str, int]]]
+ListVisibility = Literal["show", "show_if_unread", "hide"]
+MessageVisibility = Literal["show", "hide"]
 Action = Literal[
     "mark_read",
     "mark_unread",
@@ -308,8 +313,80 @@ class Runner:
     async def labels(self, account: str) -> list[Label]:
         """``account``'s label definitions as the mirror last synced them, in id
         order (empty before the first label sync): turns the label ids on
-        messages into names. Read again after a ``LabelDefinitionsChanged``."""
+        messages into names, with each label's visibility, colour and
+        ``parent_id`` (Gmail nests by ``/`` in the name). Read again after a
+        ``LabelDefinitionsChanged``."""
         return await self._core.labels(account)
+
+    async def create_label(
+        self,
+        account: str,
+        name: str,
+        *,
+        list_visibility: ListVisibility = "show",
+        message_visibility: MessageVisibility = "show",
+        color: LabelColor | None = None,
+        budget_s: float = 30.0,
+    ) -> Label:
+        """Create a user label in Gmail (``Parent/Child`` nests it) and record
+        it: the returned label carries Gmail's id, ready for ``act``, and
+        ``labels()`` shows it before any run. ``color`` must be on Gmail's
+        palette. Raises ``LabelNameTaken`` (with ``existing``) when another
+        label holds the name in any case: after a ``WriteOutcomeUnknown``, the
+        label the lost attempt created."""
+        return await self._core.create_label(
+            account,
+            name,
+            list_visibility=list_visibility,
+            message_visibility=message_visibility,
+            color=color,
+            budget_s=budget_s,
+        )
+
+    async def update_label(
+        self,
+        account: str,
+        label_id: str,
+        *,
+        name: str | None = None,
+        list_visibility: ListVisibility | None = None,
+        message_visibility: MessageVisibility | None = None,
+        color: LabelColor | Literal["keep"] | None = "keep",
+        sublabels: Literal["follow", "leave"] = "follow",
+        budget_s: float = 30.0,
+    ) -> LabelUpdate:
+        """Change a label: only the fields given are sent (``color=None``
+        clears it). A rename moves its sublabels (``Work/x`` follows ``Work``)
+        unless ``sublabels="leave"``; every name it needs is checked first,
+        then the sublabels move and the label last. If it stops half-way, the
+        exception carries ``done`` and the same call again finishes it."""
+        return await self._core.update_label(
+            account,
+            label_id,
+            name=name,
+            list_visibility=list_visibility,
+            message_visibility=message_visibility,
+            color=color,
+            sublabels=sublabels,
+            budget_s=budget_s,
+        )
+
+    async def delete_label(
+        self,
+        account: str,
+        label_id: str,
+        *,
+        sublabels: Literal["refuse", "delete"] = "refuse",
+        budget_s: float = 30.0,
+    ) -> LabelDeletion:
+        """Delete a label in Gmail and record it: it leaves every mirrored
+        message at once (``LabelsChanged`` entries), and its pending actions
+        go. A label with sublabels raises ``LabelHasSublabels`` unless
+        ``sublabels="delete"`` (deepest first). A label already gone is
+        reported in ``already_gone``: safe to retry."""
+        return await self._core.delete_label(
+            account, label_id, sublabels=sublabels, budget_s=budget_s
+        )
 
     async def messages(self, account: str, message_ids: list[str]) -> list[MessageView]:
         """How these messages should look; unknown ids are left out."""

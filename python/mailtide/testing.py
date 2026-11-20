@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 PREFIX = "/gmail/v1/users/me/"
 
@@ -35,6 +35,7 @@ class Mailbox:
         self.search_refusal: tuple[int, str] | None = None  # (status, reason) searches get
         self.searches: list[dict[str, list[str]]] = []  # each search's parameters
         self.withheld: set[str] = set()  # raw fetches of these ids answer 503
+        self.next_label = 0
 
     def add(
         self,
@@ -72,9 +73,48 @@ class Mailbox:
         ref = {"id": mid, "threadId": m["thread"]}
         self.history.append({"id": str(self.history_id), "messagesDeleted": [{"message": ref}]})
 
-    def label(self, lid: str, name: str, kind: str = "user") -> None:
-        """Create a label definition, or rename it (no history record, as in Gmail)."""
-        self.labels[lid] = {"id": lid, "name": name, "type": kind}
+    def label(self, lid: str, name: str, kind: str = "user", **attrs: object) -> None:
+        """Create a label definition, or rename it (no history record, as in Gmail).
+        ``attrs`` are Gmail's fields: ``labelListVisibility``,
+        ``messageListVisibility``, ``color``."""
+        self.labels[lid] = {"id": lid, "name": name, "type": kind, **attrs}
+
+    def create_label(self, name: str) -> str:
+        """Another client creates a user label; returns its id."""
+        self.next_label += 1
+        lid = f"Label_{self.next_label}"
+        while lid in self.labels:
+            self.next_label += 1
+            lid = f"Label_{self.next_label}"
+        self.label(lid, name, labelListVisibility="labelShow", messageListVisibility="show")
+        return lid
+
+    def rename_label(self, lid: str, name: str) -> None:
+        """Another client renames a label (no history record, as in Gmail)."""
+        self.labels[lid]["name"] = name
+
+    def delete_label(self, lid: str, *, history: bool = True) -> None:
+        """A label is deleted: it leaves its messages, with one ``labelsRemoved``
+        record each as Gmail writes them, or none if ``history`` is false."""
+        del self.labels[lid]
+        for mid, m in self.messages.items():
+            if lid in m["labels"]:
+                if history:
+                    self.modify(mid, [], [lid])
+                else:
+                    m["labels"] = [label for label in m["labels"] if label != lid]
+
+    def holder(self, name: str, other_than: str | None = None) -> str | None:
+        """The label whose name Gmail would take ``name`` for (case and
+        surrounding space ignored)."""
+        wanted = name.strip().lower()
+        for lid, label in self.labels.items():
+            if lid != other_than and label["name"].strip().lower() == wanted:
+                return lid
+        return None
+
+    def defines(self, lid: str) -> bool:
+        return lid in self.labels or not lid.startswith("Label_")
 
     def search_page(self, query: dict[str, list[str]], threads: bool) -> tuple[int, dict]:
         """One page of the scripted results for ``q``, paged by
@@ -151,6 +191,55 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             with mailbox.lock:
                 self._post()
 
+        def do_PATCH(self) -> None:  # noqa: N802
+            with mailbox.lock:
+                self._patch()
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            with mailbox.lock:
+                self._delete()
+
+        def refuse(self, status: int, reason: str, message: str) -> None:
+            error = {"code": status, "message": message, "errors": [{"reason": reason}]}
+            self.reply(status, {"error": error})
+
+        def label_id(self) -> str | None:
+            parts = urlparse(self.path).path.removeprefix(PREFIX).split("/")
+            return unquote(parts[1]) if len(parts) == 2 and parts[0] == "labels" else None
+
+        def body(self) -> dict:
+            length = int(self.headers.get("content-length", "0"))
+            return json.loads(self.rfile.read(length) or b"{}")
+
+        def _patch(self) -> None:
+            assert self.headers["authorization"] == "Bearer test-token"
+            body = self.body()
+            lid = self.label_id()
+            if lid is None or lid not in mailbox.labels:
+                return self.reply(404, {"error": {"code": 404, "message": "not found"}})
+            if "name" in body and mailbox.holder(body["name"], other_than=lid):
+                return self.refuse(409, "aborted", "Label name exists or conflicts")
+            label = mailbox.labels[lid]
+            for key in ("name", "labelListVisibility", "messageListVisibility"):
+                if key in body:
+                    label[key] = body[key]
+            if "color" in body:
+                if body["color"] is None:
+                    label.pop("color", None)
+                else:
+                    label["color"] = body["color"]
+            return self.reply(200, label)
+
+        def _delete(self) -> None:
+            assert self.headers["authorization"] == "Bearer test-token"
+            lid = self.label_id()
+            if lid is None or lid not in mailbox.labels:
+                return self.reply(404, {"error": {"code": 404, "message": "not found"}})
+            mailbox.delete_label(lid)
+            self.send_response(204)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
         def _get(self) -> None:
             assert self.headers["authorization"] == "Bearer test-token"
             url = urlparse(self.path)
@@ -219,8 +308,18 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             parts = urlparse(self.path).path.removeprefix(PREFIX).split("/")
             if len(parts) == 3 and parts[0] == "messages" and parts[2] == "modify":
                 add, remove = body.get("addLabelIds", []), body.get("removeLabelIds", [])
+                if not all(mailbox.defines(label) for label in add):
+                    # Gmail refuses the whole request for one unknown add.
+                    return self.refuse(400, "invalidArgument", "labelId not found")
                 mailbox.modify(parts[1], add, remove)
                 return self.reply(200, {"id": parts[1]})
+            if parts == ["labels"]:
+                if mailbox.holder(body.get("name", "")):
+                    return self.refuse(409, "aborted", "Label name exists or conflicts")
+                fields = {k: v for k, v in body.items() if k != "name"}
+                lid = mailbox.create_label(body["name"])
+                mailbox.labels[lid].update(fields)
+                return self.reply(200, mailbox.labels[lid])
             return self.reply(404, {"error": {"code": 404, "message": "not found"}})
 
     return Handler
@@ -240,9 +339,12 @@ class FakeGmail:
 
     ``with FakeGmail() as gmail:`` starts it; ``gmail.origin`` is the URL to
     configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``delete``,
-    ``label``, ``expire_history``, ``refuse``, ``delay_s``, ``requests``,
-    ``withheld``, and for searches ``search_results``, ``search_refusal``,
-    ``searches``).
+    ``label``, ``create_label``, ``rename_label``, ``delete_label``,
+    ``expire_history``, ``refuse``, ``delay_s``, ``requests``, ``withheld``,
+    and for searches ``search_results``, ``search_refusal``, ``searches``).
+    It serves the labels API as Gmail does: a name another label holds, in
+    any case, is a 409; a modify adding a label it lacks is a 400 for the
+    whole request.
     """
 
     def __init__(self) -> None:
