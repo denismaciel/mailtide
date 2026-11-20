@@ -25,7 +25,7 @@ mod _core {
     use pyo3::types::{PyBytes, PyDict};
 
     use mailtide::gmail::PartRef;
-    use mailtide::ids::{AccountId, LabelId, MessageId, ThreadId, Timestamp};
+    use mailtide::ids::{AccountId, DraftId, LabelId, MessageId, ThreadId, Timestamp};
     use mailtide::outbox::{
         Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
     };
@@ -40,6 +40,7 @@ mod _core {
     use mailtide_io::auth::CachedTokens;
     use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
     use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
+    use mailtide_io::drafts::{Deleted, DraftError};
     use mailtide_io::labels::{LabelError, SublabelDeletion, Sublabels};
     use mailtide_io::parts::PartError;
     use mailtide_io::purge::{PurgeError, Stale};
@@ -110,6 +111,48 @@ mod _core {
         WriteOutcomeUnknown,
         MailtideError,
         "A write reached Gmail, or may have, and its answer was lost (a timeout, a dropped connection): it may or may not have been applied."
+    );
+    create_exception!(
+        _core,
+        DraftNotFound,
+        MailtideError,
+        "Gmail has no such draft (deleted or sent), or, for send_draft, the draft index does not know it."
+    );
+    create_exception!(
+        _core,
+        DraftConflict,
+        MailtideError,
+        "The draft holds another message than the caller saw: it changed. `current_message_id`: the message it holds."
+    );
+    create_exception!(
+        _core,
+        DraftTooLarge,
+        MailtideError,
+        "The message is above the size limit; nothing was sent. `limit`: the limit, in bytes."
+    );
+    create_exception!(
+        _core,
+        DraftRefused,
+        MailtideError,
+        "Gmail refused the draft call for good (400, 403); the account is not blocked."
+    );
+    create_exception!(
+        _core,
+        DraftRetryable,
+        MailtideError,
+        "The draft call failed and nothing was applied: worth trying again later."
+    );
+    create_exception!(
+        _core,
+        SendInProgress,
+        MailtideError,
+        "Another send of the draft may still be in flight; nothing was sent. `retry_after_ms`: when a retry may read the draft."
+    );
+    create_exception!(
+        _core,
+        SendUnconfirmed,
+        MailtideError,
+        "A send's answer was lost and the draft is gone: it was sent at most once. A DraftSent or DraftRemoved(send_unconfirmed) feed entry settles it."
     );
     create_exception!(
         _core,
@@ -263,6 +306,13 @@ mod _core {
         m.add("QuotaGateError", py.get_type::<QuotaGateError>())?;
         m.add("QuotaDeferred", py.get_type::<QuotaDeferred>())?;
         m.add("WriteOutcomeUnknown", py.get_type::<WriteOutcomeUnknown>())?;
+        m.add("DraftNotFound", py.get_type::<DraftNotFound>())?;
+        m.add("DraftConflict", py.get_type::<DraftConflict>())?;
+        m.add("DraftTooLarge", py.get_type::<DraftTooLarge>())?;
+        m.add("DraftRefused", py.get_type::<DraftRefused>())?;
+        m.add("DraftRetryable", py.get_type::<DraftRetryable>())?;
+        m.add("SendInProgress", py.get_type::<SendInProgress>())?;
+        m.add("SendUnconfirmed", py.get_type::<SendUnconfirmed>())?;
         m.add("Superseded", py.get_type::<Superseded>())?;
         m.add("SchemaOutOfDate", py.get_type::<SchemaOutOfDate>())?;
         m.add("ReadOnlyMode", py.get_type::<ReadOnlyMode>())?;
@@ -652,6 +702,38 @@ mod _core {
         }
     }
 
+    fn draft_error(error: DraftError) -> PyErr {
+        match error {
+            DraftError::NotFound => DraftNotFound::new_err("no such draft"),
+            DraftError::Conflict { current } => Python::attach(|py| {
+                let error =
+                    DraftConflict::new_err(format!("the draft now holds message {}", current.0));
+                with_attribute(error, "current_message_id", current.0, py)
+            }),
+            DraftError::TooLarge { limit } => Python::attach(|py| {
+                let error = DraftTooLarge::new_err(format!("the message is above {limit} bytes"));
+                with_attribute(error, "limit", limit, py)
+            }),
+            DraftError::Invalid(detail) => PyValueError::new_err(detail),
+            DraftError::Deferred(deferred) => quota_deferred(deferred),
+            DraftError::ReadOnly => ReadOnlyMode::new_err(
+                "this runner is read-only (config access=\"read_only\"): draft writes are refused",
+            ),
+            DraftError::Refused(failure) => DraftRefused::new_err(describe(&failure)),
+            DraftError::Retryable(failure) => DraftRetryable::new_err(failure.detail),
+            DraftError::OutcomeUnknown(detail) => WriteOutcomeUnknown::new_err(detail),
+            DraftError::SendInProgress { retry_after } => Python::attach(|py| {
+                let error =
+                    SendInProgress::new_err("another send of the draft may still be in flight");
+                with_attribute(error, "retry_after_ms", retry_after.0, py)
+            }),
+            DraftError::SendUnconfirmed => SendUnconfirmed::new_err(
+                "a send's answer was lost and the draft is gone: it was sent at most once",
+            ),
+            DraftError::Run(error) => run_error(error),
+        }
+    }
+
     fn account_id(account: &str) -> PyResult<AccountId> {
         AccountId::parse(account)
             .map_err(|e| PyValueError::new_err(format!("invalid account {account:?}: {e:?}")))
@@ -745,8 +827,8 @@ mod _core {
     struct ChangePage {
         /// The changes, oldest first: `MessageDiscovered`, `MessageImported`,
         /// `LabelsChanged`, `OverlayChanged`, `MessageDeleted`,
-        /// `LabelDefinitionsChanged` or `FactsRefreshed` (match on the class
-        /// or on `kind`).
+        /// `LabelDefinitionsChanged`, `FactsRefreshed`, `DraftSaved`,
+        /// `DraftRemoved` or `DraftSent` (match on the class or on `kind`).
         changes: Vec<Py<PyAny>>,
         /// The state string to ask from next (opaque; it may point inside a
         /// commit).
@@ -2697,6 +2779,86 @@ mod _core {
         detail: Option<String>,
     }
 
+    /// A draft and the message it holds after a save: the draft id is
+    /// stable, the message id changes with every save.
+    #[pyclass(frozen, get_all)]
+    struct DraftRef {
+        #[pyo3(name = "draft_id")]
+        draft: String,
+        #[pyo3(name = "message_id")]
+        message: String,
+        thread_id: String,
+    }
+
+    impl From<mailtide::drafts::ListedDraft> for DraftRef {
+        fn from(draft: mailtide::drafts::ListedDraft) -> Self {
+            Self {
+                draft: draft.id.0,
+                message: draft.message.0,
+                thread_id: draft.thread_id.0,
+            }
+        }
+    }
+
+    /// A draft of the mirror's draft index.
+    #[pyclass(frozen, get_all)]
+    struct DraftView {
+        draft_id: String,
+        /// Its current message.
+        message_id: String,
+        thread_id: String,
+        /// The `X-Mailtide-Id` of the bytes mailtide saved in it (`None` for
+        /// a draft only another client saved).
+        tracking_id: Option<String>,
+        /// The Message-ID Gmail's copy carries, once the current message is
+        /// imported (Gmail assigns a new one on every save and on send).
+        rfc822_message_id: Option<String>,
+        /// `saved`, `stale` (its message was deleted in Gmail and the next
+        /// listing settles it), `sending` or `send_unconfirmed`.
+        state: &'static str,
+        /// While `sending`: when another send may read the draft.
+        retry_after_ms: Option<i64>,
+    }
+
+    impl From<mailtide::drafts::DraftView> for DraftView {
+        fn from(view: mailtide::drafts::DraftView) -> Self {
+            use mailtide::drafts::DraftStatus;
+            let (state, retry_after_ms) = match view.state {
+                DraftStatus::Saved => ("saved", None),
+                DraftStatus::Stale => ("stale", None),
+                DraftStatus::Sending { retry_at } => ("sending", Some(retry_at.0)),
+                DraftStatus::SendUnconfirmed => ("send_unconfirmed", None),
+            };
+            Self {
+                draft_id: view.draft_id.0,
+                message_id: view.message_id.0,
+                thread_id: view.thread_id.0,
+                tracking_id: view.tracking_id,
+                rfc822_message_id: view.rfc822_message_id,
+                state,
+                retry_after_ms,
+            }
+        }
+    }
+
+    /// The message a draft became when it was sent.
+    #[pyclass(frozen, get_all)]
+    struct SentDraft {
+        /// The sent message: a new id, labelled `SENT`.
+        message_id: String,
+        thread_id: String,
+    }
+
+    /// A draft's message as Gmail stores it.
+    #[pyclass(frozen, get_all)]
+    struct DraftContent {
+        draft_id: String,
+        message_id: String,
+        thread_id: String,
+        /// The RFC 5322 bytes (Gmail's copy: its own Message-ID and Date).
+        raw: Py<PyBytes>,
+    }
+
     fn action_request(
         action: &str,
         message_ids: Option<Vec<String>>,
@@ -3158,6 +3320,119 @@ mod _core {
                 .await
                 .map_err(run_error)?;
             Python::attach(|py| views.into_iter().map(|v| thread_view(py, v)).collect())
+        }
+
+        async fn create_draft(
+            self: Arc<Self>,
+            account: AccountId,
+            raw: Vec<u8>,
+            thread_id: Option<ThreadId>,
+            budget: Duration,
+        ) -> PyResult<DraftRef> {
+            self.inner
+                .create_draft(&account, raw, thread_id, budget)
+                .await
+                .map(DraftRef::from)
+                .map_err(draft_error)
+        }
+
+        async fn update_draft(
+            self: Arc<Self>,
+            account: AccountId,
+            draft_id: DraftId,
+            raw: Vec<u8>,
+            thread_id: Option<ThreadId>,
+            if_message_id: Option<MessageId>,
+            budget: Duration,
+        ) -> PyResult<DraftRef> {
+            self.inner
+                .update_draft(&account, &draft_id, raw, thread_id, if_message_id, budget)
+                .await
+                .map(DraftRef::from)
+                .map_err(draft_error)
+        }
+
+        async fn delete_draft(
+            self: Arc<Self>,
+            account: AccountId,
+            draft_id: DraftId,
+            budget: Duration,
+        ) -> PyResult<&'static str> {
+            let deleted = self
+                .inner
+                .delete_draft(&account, &draft_id, budget)
+                .await
+                .map_err(draft_error)?;
+            Ok(match deleted {
+                Deleted::Deleted => "deleted",
+                Deleted::AlreadyGone => "already_gone",
+            })
+        }
+
+        async fn send_draft(
+            self: Arc<Self>,
+            account: AccountId,
+            draft_id: DraftId,
+            if_message_id: Option<MessageId>,
+            budget: Duration,
+        ) -> PyResult<SentDraft> {
+            let sent = self
+                .inner
+                .send_draft(&account, &draft_id, if_message_id, budget)
+                .await
+                .map_err(draft_error)?;
+            Ok(SentDraft {
+                message_id: sent.message_id.0,
+                thread_id: sent.thread_id.0,
+            })
+        }
+
+        async fn drafts(
+            self: Arc<Self>,
+            account: AccountId,
+            after: Option<DraftId>,
+            limit: u32,
+        ) -> PyResult<Vec<DraftView>> {
+            let views = self
+                .inner
+                .drafts(&account, after.as_ref(), limit)
+                .await
+                .map_err(run_error)?;
+            Ok(views.into_iter().map(DraftView::from).collect())
+        }
+
+        async fn draft(
+            self: Arc<Self>,
+            account: AccountId,
+            draft_id: DraftId,
+        ) -> PyResult<Option<DraftView>> {
+            let view = self
+                .inner
+                .draft(&account, &draft_id)
+                .await
+                .map_err(run_error)?;
+            Ok(view.map(DraftView::from))
+        }
+
+        async fn read_draft(
+            self: Arc<Self>,
+            account: AccountId,
+            draft_id: DraftId,
+            fresh: bool,
+            budget: Duration,
+        ) -> PyResult<DraftContent> {
+            let content = self
+                .inner
+                .read_draft(&account, &draft_id, fresh, budget)
+                .await
+                .map_err(draft_error)?;
+            let draft = content.draft;
+            Ok(DraftContent {
+                draft_id: draft.id.0,
+                message_id: draft.message.0,
+                thread_id: draft.thread_id.0,
+                raw: Python::attach(|py| PyBytes::new(py, &content.raw).unbind()),
+            })
         }
 
         async fn changes(
@@ -3774,6 +4049,147 @@ mod _core {
             )
         }
 
+        #[pyo3(signature = (account, raw, *, thread_id=None, budget_s=60.0))]
+        fn create_draft<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            raw: &[u8],
+            thread_id: Option<String>,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().create_draft(
+                    account_id(account)?,
+                    raw.to_vec(),
+                    thread_id.map(ThreadId),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        // `slf` stands for `&self` and `py`, which would be one argument
+        // too many.
+        #[pyo3(signature = (account, draft_id, raw, *, thread_id=None, if_message_id=None, budget_s=60.0))]
+        fn update_draft<'py>(
+            slf: &Bound<'py, Self>,
+            account: &str,
+            draft_id: String,
+            raw: &[u8],
+            thread_id: Option<String>,
+            if_message_id: Option<String>,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let shared = &slf.get().shared;
+            future(
+                slf.py(),
+                shared,
+                shared.clone().update_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    raw.to_vec(),
+                    thread_id.map(ThreadId),
+                    if_message_id.map(MessageId),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, draft_id, *, budget_s=60.0))]
+        fn delete_draft<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            draft_id: String,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().delete_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, draft_id, *, if_message_id=None, budget_s=60.0))]
+        fn send_draft<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            draft_id: String,
+            if_message_id: Option<String>,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().send_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    if_message_id.map(MessageId),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, *, after=None, limit=100))]
+        fn drafts<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            after: Option<String>,
+            limit: u32,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .drafts(account_id(account)?, after.map(DraftId), limit),
+            )
+        }
+
+        fn draft<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            draft_id: String,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .draft(account_id(account)?, DraftId(draft_id)),
+            )
+        }
+
+        #[pyo3(signature = (account, draft_id, *, fresh=false, budget_s=60.0))]
+        fn read_draft<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            draft_id: String,
+            fresh: bool,
+            budget_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().read_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    fresh,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
         #[pyo3(signature = (account, since=None, limit=500))]
         fn changes<'py>(
             &self,
@@ -4367,6 +4783,156 @@ mod _core {
                 py,
                 &self.shared,
                 self.shared.clone().threads(account_id(account)?, ids),
+            )
+        }
+
+        /// Save a new draft; see `mailtide.Runner.create_draft`.
+        #[pyo3(signature = (account, raw, *, thread_id=None, budget_s=60.0))]
+        fn create_draft(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            raw: &[u8],
+            thread_id: Option<String>,
+            budget_s: f64,
+        ) -> PyResult<DraftRef> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().create_draft(
+                    account_id(account)?,
+                    raw.to_vec(),
+                    thread_id.map(ThreadId),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        /// Replace a draft's message; see `mailtide.Runner.update_draft`.
+        // `slf` stands for `&self` and `py`, which would be one argument
+        // too many.
+        #[pyo3(signature = (account, draft_id, raw, *, thread_id=None, if_message_id=None, budget_s=60.0))]
+        fn update_draft(
+            slf: &Bound<'_, Self>,
+            account: &str,
+            draft_id: String,
+            raw: &[u8],
+            thread_id: Option<String>,
+            if_message_id: Option<String>,
+            budget_s: f64,
+        ) -> PyResult<DraftRef> {
+            let shared = &slf.get().shared;
+            block(
+                slf.py(),
+                shared,
+                shared.clone().update_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    raw.to_vec(),
+                    thread_id.map(ThreadId),
+                    if_message_id.map(MessageId),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        /// Delete a draft for good; see `mailtide.Runner.delete_draft`.
+        #[pyo3(signature = (account, draft_id, *, budget_s=60.0))]
+        fn delete_draft(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            draft_id: String,
+            budget_s: f64,
+        ) -> PyResult<&'static str> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().delete_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        /// Send a draft at most once; see `mailtide.Runner.send_draft`.
+        #[pyo3(signature = (account, draft_id, *, if_message_id=None, budget_s=60.0))]
+        fn send_draft(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            draft_id: String,
+            if_message_id: Option<String>,
+            budget_s: f64,
+        ) -> PyResult<SentDraft> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().send_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    if_message_id.map(MessageId),
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        /// Up to `limit` drafts of the index after `after`, in draft id
+        /// order (no Gmail call).
+        #[pyo3(signature = (account, *, after=None, limit=100))]
+        fn drafts(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            after: Option<String>,
+            limit: u32,
+        ) -> PyResult<Vec<DraftView>> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .drafts(account_id(account)?, after.map(DraftId), limit),
+            )
+        }
+
+        /// One draft of the index, `None` if it has none (no Gmail call).
+        fn draft(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            draft_id: String,
+        ) -> PyResult<Option<DraftView>> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .draft(account_id(account)?, DraftId(draft_id)),
+            )
+        }
+
+        /// A draft's message as Gmail stores it; see
+        /// `mailtide.Runner.read_draft`.
+        #[pyo3(signature = (account, draft_id, *, fresh=false, budget_s=60.0))]
+        fn read_draft(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            draft_id: String,
+            fresh: bool,
+            budget_s: f64,
+        ) -> PyResult<DraftContent> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().read_draft(
+                    account_id(account)?,
+                    DraftId(draft_id),
+                    fresh,
+                    seconds(budget_s, "budget_s")?,
+                ),
             )
         }
 

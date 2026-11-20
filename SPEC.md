@@ -59,8 +59,8 @@ inform the design. No code is copied from them.
   mirror holds. mailtide parses no query and keeps no results.
 - Message parsing inside the sync core. Parsing is a separate crate the
   driver uses at import (§5.5).
-- Sending mail and draft authoring. These come later; the design leaves
-  room for them. (Label definitions are written: §6.6.)
+- Sending mail without a draft. It comes later; the design leaves room
+  for it. (Label definitions are written: §6.6; drafts are §7a.)
 - A JMAP server.
 
 ## 2. Glossary
@@ -194,6 +194,13 @@ The store keeps, per account:
   dedupe key, priority class, attempts, `next_attempt_at` and last error.
 - **intent** (phase 6): `(message_id, label_id)`, `op` (`add | remove`),
   `version`, `state` (`pending | delivered | blocked`), attempts and error.
+- **draft** (§7a): `draft_id` (Gmail's, stable for the draft's life),
+  `message_id` (its current message; a new one on every save),
+  `thread_id`, `tracking_id` (the `X-Mailtide-Id` of the bytes mailtide
+  saved, `None` for a draft only seen in Gmail's list), `state` (`saved |
+  stale | sending | send_unconfirmed`) and when it last changed. One row per
+  draft, one draft per message. The account keeps a draft generation (bumped
+  by every change outside a listing) and when the drafts were last listed.
 - **change log** (for consumers): an append-only list of
   `(state_seq, object_type, object_id, kind)`, so host features can ask "what
   changed since state S" [J]. Entries are numbered within their commit, and
@@ -541,8 +548,64 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
    or delivered is not sent again. Pending intents are always delivered.
 6. Message deletion drops its intents and cancels its delivery (I5).
 
-Sending and drafts reuse the same command and confirm-by-Gmail pattern
-later.
+Drafts are not intents: a draft write is a direct call (§7a), and only a
+send whose answer was lost is confirmed by Gmail.
+
+## 7a. Drafts
+
+A host saves, updates, deletes, sends and reads Gmail drafts with direct
+calls (§8) and reads the mirror's **draft index**, which the calls' answers
+and the sync keep true.
+
+1. **Writes are direct calls** (`Runner::create_draft`, `update_draft`,
+   `delete_draft`, `send_draft`): one quota-gated request each, Foreground,
+   Gmail's answer recorded at once by an unfenced store write
+   (`Store::record_draft`, like `admit`), so `drafts` shows a saved draft
+   before history does. mailtide never retries a draft write on its own.
+   Read-only mode refuses the four writes before any call; a 400 or 403 is
+   the caller's and blocks nothing.
+2. **The bytes carry the identity.** Gmail replaces the `Message-ID` and
+   `Date` on every save and on send, and keeps other headers byte for byte.
+   A draft's bytes must carry exactly one valid `X-Mailtide-Id` (16 to 64
+   characters of `A-Za-z0-9_-`); anything else is refused before any call,
+   never repaired. The row keeps the token; an update carrying another is
+   refused. A draft's `rfc822_message_id` is what Gmail's copy says, read
+   from the import of its current message.
+3. **One size limit.** The message always goes in the JSON body; one above
+   `max_message_bytes` (34 MiB, shared with sending) is refused with
+   `TooLarge` before any call: Gmail stores larger drafts but does not
+   deliver larger sends.
+4. **Updates keep their thread.** An update always sends a thread id (the
+   caller's, else the index's, else one read with `drafts.get`): Gmail
+   moves a reply draft updated without one out of its thread.
+   `if_message_id` refuses an update or send of a draft that holds another
+   message (from the index if it already shows one, else after a
+   `drafts.get`).
+5. **The index follows Gmail.** A `DRAFT` message no row names, a
+   tombstone under a row (which turns `stale`) and the end of a
+   reconciliation enqueue the account-level `RefreshDrafts` job, due
+   `draft_refresh_delay` (10 s) later; the engine also enqueues it while
+   live once the persisted last listing is `draft_refresh_every` (15 min)
+   old, by the rule of §6.6. It pages `drafts.list` and commits one
+   reconcile, applied only if the draft generation is still the one its
+   claim read and it names no message the mirror knows is deleted;
+   otherwise it lists again. Listed drafts are upserted, missing ones
+   removed. Our own saves seen again in history ask for nothing.
+6. **A send is at most once.** The row goes `saved → sending` by
+   compare-and-set before the call (a second send, in any process, gets
+   `SendInProgress`); a retry is accepted only once the first request's
+   timeout has passed, and reads the draft first (gone: `SendUnconfirmed`,
+   nothing sent; another message: conflict). A lost answer or a 5xx leaves
+   the row `sending`; the sync settles it: the import of a `SENT` message
+   carrying the row's tracking id emits `DraftSent` (in whatever thread);
+   a listing claimed after the request's timeout that still shows the draft
+   returns it to `saved`; a draft gone from the list is `send_unconfirmed`,
+   and ends as `DraftRemoved{send_unconfirmed}` once the cursor has moved
+   past the attempt and `draft_send_grace` (1 h) has passed.
+7. **Feed entries**: `DraftSaved{draft_id, message_id, thread_id, origin}`
+   (`local` or `remote`), `DraftRemoved{draft_id, last_message_id, reason}`
+   (`deleted`, `gone`, `send_unconfirmed`), `DraftSent{draft_id, message_id,
+   thread_id}`. The messages themselves come as any message's entries.
 
 ### 7a. Purge: permanent delete (a call, not an intent)
 
@@ -629,6 +692,11 @@ Per-call costs [G]:
 | `messages.send` | 100 |
 | `messages.delete` | 10 |
 | `messages.batchDelete` | 50 |
+| `drafts.create` / `drafts.delete` | 10 |
+| `drafts.update` | 15 |
+| `drafts.send` | 100 |
+| `drafts.get` (minimal / raw) | 20 / 60 |
+| `drafts.list` | 5 |
 
 - Every engine command declares `cost_units` and a `priority`
   (`foreground | live | backfill`).
@@ -734,11 +802,13 @@ engine's epoch, so results meant for a dead engine are ignored).
   `MessagesListed{page}`, `MessageFetched{observation}`,
   `MessageImported{message}` (after the blob is stored), `MessageNotFound`,
   `LabelsListed{labels, generation}` (the label generation the host read
-  before sending it), `WatchRenewed{expiration}`, `LabelsModified`, and
-  `Searched{listing}` and `MessagesDeleted{ids}`, which answer the driver's
-  own search and delete requests and which the engine ignores. The driver's own label requests answer
+  before sending it), `WatchRenewed{expiration}`, `LabelsModified`,
+  `DraftsListed{page}`, and `Searched{listing}` and `MessagesDeleted{ids}`,
+  which answer the driver's own search and delete requests and which the
+  engine ignores. The driver's own label requests answer
   `LabelFetched{label}`, `LabelSaved{label}`, `LabelNameTaken` (a 409) and
-  `LabelDeleted`; the engine issues none.
+  `LabelDeleted`, and its draft calls `DraftFetched`, `DraftSaved`,
+  `DraftDeleted`, `DraftSent` and `DraftNotFound`; the engine issues none.
 - Store results: `CommitApplied`, `CommitRejected{reason}`,
   `JobsClaimed{jobs}`, `BlobDeleted`.
 - Failures: `RequestFailed{failure}` (retryable with class and
@@ -827,6 +897,10 @@ engine's epoch, so results meant for a dead engine are ignored).
   (or the blob's length differs from that size); the row's facts and size
   are set, nothing else. Applied updates log `FactsRefreshed` under one new
   state.
+- `record_draft(account, write, now)`: a draft call's answer, unfenced like
+  `admit`; `BeginSend` is a compare-and-set with one winner across
+  processes. `drafts(account, after, limit)` and `draft(account, id)`:
+  `DraftView`s of the index (§7a).
 - The SQL store refuses every one of these with
   `StoreError::SchemaOutOfDate { applied, expected }`, before reading or
   writing, while the database's schema is behind this build (migrations
@@ -845,7 +919,7 @@ examined, refreshed, unreadable, next }`; `next == None` ends the pass. A
 missing blob is named in `unreadable`; a store failure rolls the batch back
 (call again from the same `after`).
 
-The conformance suite (`mailtide_store::conformance`, 62 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 64 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -995,6 +1069,19 @@ runner per process, after forking:
   `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
+- drafts (§7a): `await create_draft(account, raw, *, thread_id=None)
+  -> DraftRef`, `await update_draft(account, draft_id, raw, *,
+  thread_id=None, if_message_id=None) -> DraftRef`, `await
+  delete_draft(account, draft_id) -> "deleted" | "already_gone"`, `await
+  send_draft(account, draft_id, *, if_message_id=None) -> SentDraft`,
+  `await read_draft(account, draft_id, *, fresh=False) -> DraftContent`
+  (each with `budget_s`), and the index reads `await drafts(account, *,
+  after=None, limit=100) -> list[DraftView]` and `await draft(account,
+  draft_id) -> DraftView | None`. Feed entries `DraftSaved`, `DraftRemoved`,
+  `DraftSent`. Bytes without exactly one valid `X-Mailtide-Id` raise
+  `ValueError`. `Config.max_message_bytes` (34 MiB) bounds a draft;
+  `Engine.draft_refresh_delay_s`, `draft_refresh_every_s` and
+  `draft_send_grace_s` tune the index;
 - message facts on `MessageContent` (§4): `facts_version` (0 when not
   extracted), `bcc`, `reply_to`, `sent_at_ms` and `sent_at_offset_min`,
   `sender_name`, `sender_email`, `list_id`, `list_unsubscribe`,
@@ -1040,6 +1127,9 @@ runner per process, after forking:
   `InvalidPageToken` and its subclass `PageTokenRejected`,
   `GmailUnavailable`, `AccountBlocked`, the label errors above, `PurgeDisabled`,
   `PurgeScopeRequired`, `MirrorStale`, `TooManyMessages`,
+  `DraftNotFound`, `DraftConflict` (`current_message_id`), `DraftTooLarge`
+  (`limit`), `DraftRefused`, `DraftRetryable`, `SendInProgress`
+  (`retry_after_ms`), `SendUnconfirmed`,
   `Superseded`, `InvalidPush`, and `DelegationRevoked` (raised by the token source
   to block an account; the block is committed, and later runs make no
   credential calls), `InvalidPush`, `BlobNotFound`, `PartNotFound` (a
@@ -1060,9 +1150,10 @@ advisory lock; hosts that run migrations with their own tool execute
 `schema()` reports `current`, `behind` or `ahead`. Every call that reads or
 writes the database refuses with `SchemaOutOfDate` unless it is current:
 `run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, `search`,
-`search_threads`, the label writes, `purge`, `empty`, and the reads too (`changes`, `messages`, `threads`,
-`labels`, `message_ids`, `compact`, `ack`, `consumers`, `drop_consumer`,
-`status`, `accounts`, `resume`,
+`search_threads`, the label writes, `purge`, `empty`, the draft calls, and
+the reads too (`changes`, `messages`, `threads`, `labels`, `drafts`, `draft`,
+`message_ids`, `compact`, `ack`, `consumers`, `drop_consumer`, `status`,
+`accounts`, `resume`,
 `forget`), so a build that is too old
 refuses instead of misreading. Only `schema`, `migrate`, `health` and
 `read_blob` (blob storage only) answer whatever the schema. The SQL store
@@ -1157,6 +1248,26 @@ ALTER TABLE mailtide_accounts DROP COLUMN deleted_labels;
 DELETE FROM mailtide_schema WHERE version = 9;
 ```
 
+Migration 10 adds the draft index (§7a): the table `mailtide_drafts`
+(unique on `(account, message)`, indexed on `(account, tracking_id)`) and
+the columns `mailtide_accounts.drafts_generation` and
+`drafts_refreshed_at`. Draft feed entries, `RefreshDrafts` jobs (kind 4,
+empty message key) are new too, so a build from before it sees the database as `ahead` and refuses to sync;
+its `changes()` fails with `CorruptState` on a draft entry rather than skip
+it. Reverting it loses the index (the next listing rebuilds it) and any
+`sending` marker (such a send is never reported as `DraftSent`; its `SENT`
+message still arrives); drafts in Gmail are untouched:
+
+```sql
+DELETE FROM mailtide_jobs WHERE kind = 4;
+DELETE FROM mailtide_changes WHERE change LIKE '{"DraftSaved"%'
+    OR change LIKE '{"DraftRemoved"%' OR change LIKE '{"DraftSent"%';
+DROP TABLE mailtide_drafts;
+ALTER TABLE mailtide_accounts DROP COLUMN drafts_generation;  -- SQLite ≥ 3.35
+ALTER TABLE mailtide_accounts DROP COLUMN drafts_refreshed_at;
+DELETE FROM mailtide_schema WHERE version = 10;
+```
+
 Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach
 retries, cleanups and confirmations without sleeping.
@@ -1199,12 +1310,15 @@ faults, including users acting through the engine, users opening messages
 whose bodies are still queued (`prioritise`, §6.4), label definitions
 created, renamed and deleted in Gmail by another client (deletions with
 and without history records) and by the host through the driver (a crash
-may lose the record), actions adding labels Gmail no longer has, and facts
+may lose the record), actions adding labels Gmail no longer has, facts
 refreshes run beside the engine (checked to change nothing but facts), and
-checks invariants after every
-commit and every open (also that no job's class goes down outside a claim's
-finish) and convergence after healing (message sets, labels, thread ids and
-thread views), label definitions within the refresh
+drafts saved, edited, deleted and sent both elsewhere and through the
+host's draft calls (whose record a crash may lose after Gmail acted), and
+checks invariants after every commit, every draft record (one row per
+draft, one draft per message) and every open (also that no job's class
+goes down outside a claim's finish) and convergence after healing (message
+sets, labels, thread ids, thread views, and the draft index equal to
+Gmail's drafts), label definitions within the refresh
 interval; two named feed readers take one page of a random limit (1 to 8)
 between steps and acknowledge it while the log is compacted at random
 steps (§4, consumer cursors): the steady one must never be cut off
@@ -1286,11 +1400,12 @@ metrics or OpenTelemetry dependency.
 | 3 Production hardening | Drift metrics, status, observability; first host running in shadow mode | 7 days in shadow on one mailbox with zero drift |
 | 4 Read API | Change feed and message views for host UIs: labels, threads, read state | A host can render a full mailbox from the mirror |
 | 6 Actions | Intents, delivery, confirmation (§7): read, archive, star, labels, trash/spam | Simulation holds I7 and I8; live canary passes |
-| 7 Send + drafts | Composition in `mailtide-mime` (§5.5); send and draft authoring through the same pattern | — |
+| 7 Send + drafts | Composition in `mailtide-mime` (§5.5); draft calls and the draft index (§7a); send | — |
 | OSS | Publish under `denismaciel` (MIT OR Apache-2.0) | Timing: open question |
 
 Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4
-(`changes`, `messages`, `labels`, `threads`). Phase 3 needs a production host.
+(`changes`, `messages`, `labels`, `threads`), and of phase 7 composition and
+drafts (§7a). Phase 3 needs a production host.
 
 ## 15. Decisions
 

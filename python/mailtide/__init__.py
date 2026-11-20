@@ -24,6 +24,17 @@ from mailtide._core import (
     ConsumerCursor,
     CorruptState,
     DelegationRevoked,
+    DraftConflict,
+    DraftContent,
+    DraftNotFound,
+    DraftRef,
+    DraftRefused,
+    DraftRemoved,
+    DraftRetryable,
+    DraftSaved,
+    DraftSent,
+    DraftTooLarge,
+    DraftView,
     DriftResult,
     EmptyOutcome,
     FactsRefresh,
@@ -78,6 +89,9 @@ from mailtide._core import (
     SearchHit,
     SearchPage,
     SearchRefused,
+    SendInProgress,
+    SendUnconfirmed,
+    SentDraft,
     StateTooOld,
     Status,
     StoreUnavailable,
@@ -114,6 +128,9 @@ Change = (
     | MessageDeleted
     | LabelDefinitionsChanged
     | FactsRefreshed
+    | DraftSaved
+    | DraftRemoved
+    | DraftSent
 )
 
 __all__ = [
@@ -134,6 +151,17 @@ __all__ = [
     "ConsumerCursor",
     "CorruptState",
     "DelegationRevoked",
+    "DraftConflict",
+    "DraftContent",
+    "DraftNotFound",
+    "DraftRef",
+    "DraftRefused",
+    "DraftRemoved",
+    "DraftRetryable",
+    "DraftSaved",
+    "DraftSent",
+    "DraftTooLarge",
+    "DraftView",
     "DriftResult",
     "EmptyOutcome",
     "FactsRefresh",
@@ -190,6 +218,9 @@ __all__ = [
     "SearchHit",
     "SearchPage",
     "SearchRefused",
+    "SendInProgress",
+    "SendUnconfirmed",
+    "SentDraft",
     "StateTooOld",
     "Status",
     "StoreUnavailable",

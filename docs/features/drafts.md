@@ -98,9 +98,11 @@ than the draft's), `Deferred { until }`, `ReadOnly`, `Refused` (400/403),
 
 Python `Runner` and `BlockingRunner` get the same seven methods (`raw: bytes`,
 keyword options), frozen dataclasses for the four result types, and the
-exceptions `DraftNotFound`, `DraftConflict`, `DraftTooLarge`, `QuotaDeferred` (`until_ms`),
-`WriteOutcomeUnknown`, `SendInProgress`, `SendUnconfirmed`; `ReadOnlyMode`
-exists; `Invalid` is a `ValueError`.
+exceptions `DraftNotFound`, `DraftConflict` (`current_message_id`),
+`DraftTooLarge` (`limit`), `DraftRefused` (400/403), `DraftRetryable`,
+`QuotaDeferred` (`until_ms`), `WriteOutcomeUnknown`, `SendInProgress`
+(`retry_after_ms`), `SendUnconfirmed`; `ReadOnlyMode` exists; `Invalid` is
+a `ValueError`. `delete_draft` answers `"deleted"` or `"already_gone"`.
 
 - **The bytes carry the identity.** Gmail replaces a client's `Message-ID`
   and `Date` on every save and on send, and keeps an `X-` header byte for

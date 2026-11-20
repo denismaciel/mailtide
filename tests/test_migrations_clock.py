@@ -20,7 +20,7 @@ def test_host_applied_migrations_are_current(tmp_path: Path) -> None:
         for migration in mailtide.migrations():
             for statement in migration.statements:
                 db.execute(statement)
-    assert mailtide.SCHEMA_VERSION == 9  # 9: label visibility, colour and edits
+    assert mailtide.SCHEMA_VERSION == 10  # 10: the draft index (mailtide_drafts)
     assert [m.version for m in mailtide.migrations()] == list(range(1, mailtide.SCHEMA_VERSION + 1))
     config = Config(Database(f"sqlite:{path}"), Blobs("memory:///"))
     runner = mailtide.BlockingRunner(config, tokens)
@@ -65,6 +65,8 @@ def every_database_call(
         "delete_label": lambda: runner.delete_label(ACCOUNT, "Label_1"),
         "messages": lambda: runner.messages(ACCOUNT, ["m1"]),
         "threads": lambda: runner.threads(ACCOUNT, ["t-m1"]),
+        "drafts": lambda: runner.drafts(ACCOUNT),
+        "draft": lambda: runner.draft(ACCOUNT, "r1"),
         "changes": lambda: runner.changes(ACCOUNT),
         "compact": lambda: runner.compact(ACCOUNT, state),
         "ack": lambda: runner.ack(ACCOUNT, "indexer", state),

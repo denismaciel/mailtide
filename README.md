@@ -65,7 +65,19 @@ hits = await runner.search("alice@example.com", "from:bob has:attachment")  # Gm
 content = views[0].content  # sender, dates, list headers, an attachment summary
 pdf = await runner.read_part("alice@example.com", "18c…", content.attachments[0].part)
 await runner.refresh_facts("alice@example.com")  # facts for mail imported before them
+
+raw = mailtide.compose_message(message, purpose="draft").raw  # carries X-Mailtide-Id
+draft = await runner.create_draft("alice@example.com", raw)  # Gmail's draft id at once
+draft = await runner.update_draft("alice@example.com", draft.draft_id, raw)  # autosave
+sent = await runner.send_draft("alice@example.com", draft.draft_id)  # at most once
+drafts = await runner.drafts("alice@example.com")  # the index; DraftSaved/DraftSent in changes
 ```
+
+Drafts are saved from RFC 5322 bytes carrying exactly one `X-Mailtide-Id`
+(Gmail replaces the Message-ID on every save; that header survives) and
+read back from the mirror's draft index, which follows drafts changed in
+other clients. A send whose answer was lost is never sent again: the sync
+settles it (`DraftSent` once the sent message is imported). See SPEC §7a.
 
 A thread view (`ThreadView`) is folded from the mirror on every read: its
 messages oldest first, the label union of its non-draft messages with pending

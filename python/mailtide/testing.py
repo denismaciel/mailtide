@@ -26,6 +26,8 @@ class Mailbox:
         self.history_id = 0
         self.history_floor = 0  # history requests from before it answer 404
         self.messages: dict[str, dict] = {}
+        self.drafts: dict[str, str] = {}  # draft id -> its current message id
+        self.next_id = 0
         self.history: list[dict] = []
         self.labels: dict[str, dict] = {"INBOX": {"id": "INBOX", "name": "INBOX", "type": "system"}}
         # Search results by query, as message ids in Gmail's order. Like
@@ -70,6 +72,53 @@ class Mailbox:
         }
         ref = {"id": mid, "threadId": self.messages[mid]["thread"], "labelIds": labels}
         self.history.append({"id": str(self.history_id), "messagesAdded": [{"message": ref}]})
+
+    def stored(self, raw: bytes, labels: list[str], thread: str | None) -> str:
+        """A new message with these bytes (Gmail's own Message-ID in place of
+        the client's, as on every draft save and send) and a new id."""
+        self.next_id += 1
+        mid = f"m-{self.next_id:04d}"
+        head, sep, body = raw.partition(b"\r\n\r\n")
+        kept = [line for line in head.split(b"\r\n") if not line.lower().startswith(b"message-id:")]
+        stamp = f"Message-ID: <gmail-{self.next_id:04d}@mail.gmail.com>".encode()
+        self.add(mid, labels, thread=thread)
+        self.messages[mid]["raw"] = b"\r\n".join([stamp, *kept]) + sep + body
+        return mid
+
+    def create_draft(self, raw: bytes, thread: str | None = None) -> tuple[str, str]:
+        """Save a new draft (any client): ``(draft id, message id)``."""
+        message = self.stored(raw, ["DRAFT"], thread)
+        draft = f"r-{self.next_id:04d}"
+        self.drafts[draft] = message
+        return draft, message
+
+    def update_draft(self, draft: str, raw: bytes, thread: str | None = None) -> str | None:
+        """Replace a draft's message (any client): a new message id, ``None``
+        if there is no such draft. Without ``thread`` the draft leaves its
+        thread, as Gmail does."""
+        if draft not in self.drafts:
+            return None
+        self.delete(self.drafts[draft])
+        self.drafts[draft] = self.stored(raw, ["DRAFT"], thread)
+        return self.drafts[draft]
+
+    def delete_draft(self, draft: str) -> bool:
+        """Delete a draft for good (any client); ``False`` if there is none."""
+        if draft not in self.drafts:
+            return False
+        self.delete(self.drafts.pop(draft))
+        return True
+
+    def send_draft(self, draft: str) -> tuple[str, str] | None:
+        """Send a draft (any client): the draft goes, a new SENT message in its
+        thread comes. ``(message id, thread id)``, ``None`` if there is none."""
+        if draft not in self.drafts:
+            return None
+        mid = self.drafts.pop(draft)
+        old = self.messages[mid]
+        self.delete(mid)
+        sent = self.stored(old["raw"], ["SENT"], old["thread"])
+        return sent, old["thread"]
 
     def delete(self, mid: str) -> None:
         """The message is deleted forever."""
@@ -169,6 +218,11 @@ class Mailbox:
         m["history_id"] = self.history_id
 
 
+def decode(raw: str) -> bytes:
+    """Unpadded base64url, as Gmail's ``raw`` fields carry it."""
+    return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+
+
 def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args: object) -> None:
@@ -204,7 +258,14 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             with mailbox.lock:
                 self._patch()
 
+        def do_PUT(self) -> None:
+            # drafts.update: `_post` hands every drafts route to `_drafts`.
+            self.do_POST()
+
         def do_DELETE(self) -> None:
+            parts = urlparse(self.path).path.removeprefix(PREFIX).split("/")
+            if parts[0] == "drafts":
+                return self.do_POST()
             with mailbox.lock:
                 self._delete()
 
@@ -302,6 +363,8 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                     return self.reply(404, {"error": {"code": 404, "message": "not found"}})
                 records = [h for h in mailbox.history if int(h["id"]) > start]
                 return self.reply(200, {"history": records, "historyId": str(mailbox.history_id)})
+            if parts[0] == "drafts":
+                return self._drafts(parts, query, {})
             if parts == ["messages"]:
                 label = query.get("labelIds")
                 ids = [
@@ -346,6 +409,8 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("content-length", "0"))
             body = json.loads(self.rfile.read(length) or b"{}")
             parts = urlparse(self.path).path.removeprefix(PREFIX).split("/")
+            if parts[0] == "drafts":
+                return self._drafts(parts, {}, body)
             if len(parts) == 3 and parts[0] == "messages" and parts[2] == "modify":
                 add, remove = body.get("addLabelIds", []), body.get("removeLabelIds", [])
                 if not all(mailbox.defines(label) for label in add):
@@ -374,6 +439,54 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                 return self.reply(200, mailbox.labels[lid])
             return self.reply(404, {"error": {"code": 404, "message": "not found"}})
 
+        def _draft(self, draft: str, *, raw: bool = False) -> None:
+            """A draft as drafts.get answers it, or 404."""
+            if draft not in mailbox.drafts:
+                error = {"code": 404, "message": "Requested entity was not found."}
+                return self.reply(404, {"error": error})
+            mid = mailbox.drafts[draft]
+            m = mailbox.messages[mid]
+            message = {"id": mid, "threadId": m["thread"], "labelIds": m["labels"]}
+            if raw:
+                message["raw"] = base64.urlsafe_b64encode(m["raw"]).decode().rstrip("=")
+            return self.reply(200, {"id": draft, "message": message})
+
+        def _drafts(self, parts: list[str], query: dict[str, str], body: dict) -> None:
+            """The users.drafts routes."""
+            method = self.command
+            message = body.get("message", {})
+            thread = message.get("threadId")
+            if method == "GET" and parts == ["drafts"]:
+                # Like Gmail, drafts in spam or trash only when asked for.
+                hidden = set() if query.get("includeSpamTrash") == "true" else {"SPAM", "TRASH"}
+                drafts = [
+                    {"id": draft, "message": {"id": mid, "threadId": m["thread"]}}
+                    for draft, mid in mailbox.drafts.items()
+                    if not hidden & set((m := mailbox.messages[mid])["labels"])
+                ]
+                return self.reply(200, {"drafts": drafts, "resultSizeEstimate": len(drafts)})
+            if method == "GET" and len(parts) == 2:
+                return self._draft(parts[1], raw=query.get("format") == "raw")
+            if method == "POST" and parts == ["drafts"]:
+                draft, _ = mailbox.create_draft(decode(message["raw"]), thread)
+                return self._draft(draft)
+            if method == "PUT" and len(parts) == 2:
+                mailbox.update_draft(parts[1], decode(message["raw"]), thread)
+                return self._draft(parts[1])  # 404 if there was none
+            if method == "DELETE" and len(parts) == 2:
+                if not mailbox.delete_draft(parts[1]):
+                    return self._draft(parts[1])  # 404
+                self.send_response(204)
+                self.send_header("content-length", "0")
+                return self.end_headers()
+            if method == "POST" and parts == ["drafts", "send"]:
+                sent = mailbox.send_draft(body.get("id", ""))
+                if sent is None:
+                    return self._draft(body.get("id", ""))  # 404
+                mid, thread_id = sent
+                return self.reply(200, {"id": mid, "threadId": thread_id, "labelIds": ["SENT"]})
+            return self.reply(404, {"error": {"code": 404, "message": "not found"}})
+
     return Handler
 
 
@@ -393,13 +506,18 @@ class FakeGmail:
     configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``delete``,
     ``label``, ``create_label``, ``rename_label``, ``delete_label``,
     ``expire_history``, ``refuse``, ``delay_s``, ``requests``, ``withheld``,
-    ``restore``, and for searches ``search_results``, ``search_refusal``,
-    ``searches``; for permanent deletion ``deletes``, the ids of each delete
-    call applied, and ``full_scope = False``, a token without
-    ``https://mail.google.com/``, which deletes answer with 403).
+    ``restore``, ``drafts``, and for searches ``search_results``,
+    ``search_refusal``, ``searches``; for permanent deletion ``deletes``, the
+    ids of each delete call applied, and ``full_scope = False``, a token
+    without ``https://mail.google.com/``, which deletes answer with 403).
     It serves the labels API as Gmail does: a name another label holds, in
     any case, is a 409; a modify adding a label it lacks is a 400 for the
-    whole request.
+    whole request. It serves ``users.drafts`` as Gmail does: every save gets
+    a new message id and a Message-ID of Gmail's own, ``X-`` headers are
+    kept, a send consumes the draft and adds a new ``SENT`` message in its
+    thread, and history records each change. ``create_draft``,
+    ``update_draft``, ``delete_draft`` and ``send_draft`` act as another
+    client would.
     """
 
     def __init__(self) -> None:
@@ -446,6 +564,35 @@ class FakeGmail:
         (threads: their ``t-<id>`` threads)."""
         with self.mailbox.lock:
             self.mailbox.search_results[query] = message_ids
+
+    def create_draft(self, raw: bytes, *, thread: str | None = None) -> tuple[str, str]:
+        """Another client saves a new draft: ``(draft id, message id)``."""
+        with self.mailbox.lock:
+            return self.mailbox.create_draft(raw, thread)
+
+    def update_draft(self, draft_id: str, raw: bytes, *, thread: str | None = None) -> str:
+        """Another client replaces a draft's message: the new message id.
+        Without ``thread`` the draft leaves its thread, as in Gmail."""
+        with self.mailbox.lock:
+            message = self.mailbox.update_draft(draft_id, raw, thread)
+        if message is None:
+            raise KeyError(draft_id)
+        return message
+
+    def delete_draft(self, draft_id: str) -> None:
+        """Another client deletes a draft."""
+        with self.mailbox.lock:
+            if not self.mailbox.delete_draft(draft_id):
+                raise KeyError(draft_id)
+
+    def send_draft(self, draft_id: str) -> tuple[str, str]:
+        """Another client sends a draft: ``(message id, thread id)`` of the
+        new ``SENT`` message."""
+        with self.mailbox.lock:
+            sent = self.mailbox.send_draft(draft_id)
+        if sent is None:
+            raise KeyError(draft_id)
+        return sent
 
 
 class ManualClock:

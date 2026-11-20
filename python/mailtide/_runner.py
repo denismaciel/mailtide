@@ -17,6 +17,9 @@ from mailtide._core import (
     AccountStatus,
     ChangePage,
     ConsumerCursor,
+    DraftContent,
+    DraftRef,
+    DraftView,
     DriftResult,
     EmptyOutcome,
     FactsRefresh,
@@ -37,6 +40,7 @@ from mailtide._core import (
     RunOutcome,
     SchemaStatus,
     SearchPage,
+    SentDraft,
     StateTooOld,
     ThreadSearchPage,
     ThreadView,
@@ -456,6 +460,106 @@ class Runner:
         ``latest`` and counts. Threads with no mirrored message are left out.
         Collect the thread ids of a ``changes`` page and read them in one call."""
         return await self._core.threads(account, thread_ids)
+
+    async def create_draft(
+        self,
+        account: str,
+        raw: bytes,
+        *,
+        thread_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> DraftRef:
+        """Save a new draft from RFC 5322 bytes; ``thread_id`` puts a reply in
+        its thread. The bytes must carry exactly one ``X-Mailtide-Id`` (16 to 64
+        characters of ``A-Za-z0-9_-``; ``compose_message`` writes it), else
+        ``ValueError`` before any call: Gmail replaces Message-ID on every save
+        and send, and that header is what identifies the draft's sent message.
+        The draft is in ``drafts()`` at once. ``DraftTooLarge`` above
+        ``Config.max_message_bytes``; ``QuotaDeferred`` if the quota gate would
+        hold it past ``budget_s``; ``WriteOutcomeUnknown`` if the answer was
+        lost (a listing then brings a draft Gmail did create into the index;
+        retrying may leave a second draft, never a second send)."""
+        return await self._core.create_draft(account, raw, thread_id=thread_id, budget_s=budget_s)
+
+    async def update_draft(
+        self,
+        account: str,
+        draft_id: str,
+        raw: bytes,
+        *,
+        thread_id: str | None = None,
+        if_message_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> DraftRef:
+        """Replace a draft's message: Gmail gives it a new message id, the draft
+        id stays. The bytes must carry the draft's ``X-Mailtide-Id``. The thread
+        is kept unless ``thread_id`` names another. With ``if_message_id`` (the
+        message id the caller last saw) it raises ``DraftConflict`` if the
+        draft has changed since. ``DraftNotFound`` if Gmail has no such draft;
+        ``SendInProgress`` or ``SendUnconfirmed`` while it is being sent.
+        Retrying after ``WriteOutcomeUnknown`` is safe: an update replaces."""
+        return await self._core.update_draft(
+            account,
+            draft_id,
+            raw,
+            thread_id=thread_id,
+            if_message_id=if_message_id,
+            budget_s=budget_s,
+        )
+
+    async def delete_draft(
+        self, account: str, draft_id: str, *, budget_s: float = 60.0
+    ) -> Literal["deleted", "already_gone"]:
+        """Delete a draft for good (Gmail does not move it to trash).
+        ``already_gone`` if Gmail had no such draft, so a retry is safe. A
+        draft being sent is not deleted (``SendInProgress``)."""
+        return await self._core.delete_draft(account, draft_id, budget_s=budget_s)
+
+    async def send_draft(
+        self,
+        account: str,
+        draft_id: str,
+        *,
+        if_message_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> SentDraft:
+        """Send a draft of the index as it was last saved, at most once: the
+        draft is gone afterwards and ``SentDraft`` names the new ``SENT``
+        message. A second call while one may be in flight raises
+        ``SendInProgress``; a lost answer raises ``WriteOutcomeUnknown`` and is
+        never resent: the sync settles it with ``DraftSent`` (or
+        ``DraftRemoved`` with reason ``send_unconfirmed``). With
+        ``if_message_id`` the draft is read first (``DraftConflict`` if it
+        changed). ``DraftNotFound`` if the index does not know the draft."""
+        return await self._core.send_draft(
+            account, draft_id, if_message_id=if_message_id, budget_s=budget_s
+        )
+
+    async def drafts(
+        self, account: str, *, after: str | None = None, limit: int = 100
+    ) -> list[DraftView]:
+        """Up to ``limit`` drafts of the mirror's draft index after draft id
+        ``after``, in draft id order (no Gmail call). The index follows saves
+        made here at once and other clients' through the sync."""
+        return await self._core.drafts(account, after=after, limit=limit)
+
+    async def draft(self, account: str, draft_id: str) -> DraftView | None:
+        """One draft of the index, ``None`` if it has none (no Gmail call)."""
+        return await self._core.draft(account, draft_id)
+
+    async def read_draft(
+        self,
+        account: str,
+        draft_id: str,
+        *,
+        fresh: bool = False,
+        budget_s: float = 60.0,
+    ) -> DraftContent:
+        """A draft's message as Gmail stores it (its own Message-ID and Date).
+        Read from the mirror once the current message is imported (content
+        never changes for a message id); otherwise, or with ``fresh``, asked of
+        Gmail. ``DraftNotFound`` for a sent or deleted draft. Allowed read-only."""
+        return await self._core.read_draft(account, draft_id, fresh=fresh, budget_s=budget_s)
 
     async def changes(
         self, account: str, since: str | None = None, limit: int = 500

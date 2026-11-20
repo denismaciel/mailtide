@@ -252,9 +252,39 @@ change = "new"
 role = "The two provider-neutral draft tests of Zero's IMAP driver suite"
 
 [[file]]
+path = "crates/mailtide-io/tests/fake_gmail/mod.rs"
+change = "new"
+role = "The fake Gmail with drafts the driver tests share: saves get Gmail's own Message-ID, X- headers kept, history for every save, delete and send; faults (a lost answer, a status, an answer without ids or raw content, a request held for interleaving); a second account"
+
+[[file]]
 path = "crates/mailtide-io/tests/drafts.rs"
 change = "new"
 role = "Driver tests against a fake Gmail: lifecycle, conflicts, timeouts, drafts changed elsewhere"
+
+[[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "Sum the draft statistics"
+
+[[file]]
+path = "crates/mailtide-io/tests/end_to_end.rs"
+change = "modify"
+role = "The fake answers drafts.list (a reconciliation ends with one); RunnerConfig.writes"
+
+[[file]]
+path = "crates/mailtide-io/tests/zero_gmail_quota_auth.rs"
+change = "modify"
+role = "The fake answers drafts.list, charged 5 units; RunnerConfig.writes"
+
+[[file]]
+path = "crates/mailtide-io/tests/zero_mail_asset_cache.rs"
+change = "modify"
+role = "The fake answers drafts.list; RunnerConfig.writes"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_history_store.rs"
+change = "modify"
+role = "Fixtures record the drafts as listed, so no periodic listing runs in the test; JobKind::RefreshDrafts in an exhaustive match"
 
 [[file]]
 path = "tests/test_drafts.py"

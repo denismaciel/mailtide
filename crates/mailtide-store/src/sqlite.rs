@@ -843,8 +843,7 @@ mod tests {
             Ok(Vec::new())
         );
     }
-    /// SPEC §11's rollback of migration 9 (the draft index), as written
-    /// there.
+
     /// The draft index's migration, and the ones before it.
     fn drafts_migration() -> (Vec<crate::sql::Migration>, crate::sql::Migration) {
         let all = crate::sql::migrations();
@@ -859,7 +858,7 @@ mod tests {
         (all[..index].to_vec(), all[index].clone())
     }
 
-    /// The draft index migration's documented rollback (SPEC §11).
+    /// SPEC §11's rollback of the draft index migration, as written there.
     fn drafts_rollback() -> Vec<String> {
         let (_, migration) = drafts_migration();
         [

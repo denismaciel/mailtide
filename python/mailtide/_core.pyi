@@ -16,6 +16,21 @@ class QuotaDeferred(MailtideError):
     until_ms: int
 
 class WriteOutcomeUnknown(MailtideError): ...
+class DraftNotFound(MailtideError): ...
+
+class DraftConflict(MailtideError):
+    current_message_id: str
+
+class DraftTooLarge(MailtideError):
+    limit: int
+
+class DraftRefused(MailtideError): ...
+class DraftRetryable(MailtideError): ...
+
+class SendInProgress(MailtideError):
+    retry_after_ms: int
+
+class SendUnconfirmed(MailtideError): ...
 class Superseded(MailtideError): ...
 class SchemaOutOfDate(MailtideError): ...
 class ReadOnlyMode(MailtideError): ...
@@ -155,6 +170,34 @@ class FactsRefreshed:
     thread_id: str
     content: MessageContent | None
 
+@final
+class DraftSaved:
+    kind: Literal["draft_saved"]
+    state: str
+    index: int
+    draft_id: str
+    message_id: str
+    thread_id: str
+    origin: Literal["local", "remote"]
+
+@final
+class DraftRemoved:
+    kind: Literal["draft_removed"]
+    state: str
+    index: int
+    draft_id: str
+    last_message_id: str
+    reason: Literal["deleted", "gone", "send_unconfirmed"]
+
+@final
+class DraftSent:
+    kind: Literal["draft_sent"]
+    state: str
+    index: int
+    draft_id: str
+    message_id: str
+    thread_id: str
+
 Change = (
     MessageDiscovered
     | MessageImported
@@ -163,6 +206,9 @@ Change = (
     | MessageDeleted
     | LabelDefinitionsChanged
     | FactsRefreshed
+    | DraftSaved
+    | DraftRemoved
+    | DraftSent
 )
 
 @final
@@ -569,6 +615,34 @@ class Health:
     database: Literal["ok", "unavailable"]
     detail: str | None
 
+@final
+class DraftRef:
+    draft_id: str
+    message_id: str
+    thread_id: str
+
+@final
+class DraftView:
+    draft_id: str
+    message_id: str
+    thread_id: str
+    tracking_id: str | None
+    rfc822_message_id: str | None
+    state: Literal["saved", "stale", "sending", "send_unconfirmed"]
+    retry_after_ms: int | None
+
+@final
+class SentDraft:
+    message_id: str
+    thread_id: str
+
+@final
+class DraftContent:
+    draft_id: str
+    message_id: str
+    thread_id: str
+    raw: bytes
+
 TokenSource = Callable[[str], tuple[str, int] | Awaitable[tuple[str, int]]]
 
 @final
@@ -695,6 +769,47 @@ class Runner:
     ) -> Awaitable[LabelDeletion]: ...
     def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
     def threads(self, account: str, thread_ids: list[str]) -> Awaitable[list[ThreadView]]: ...
+    def create_draft(
+        self,
+        account: str,
+        raw: bytes,
+        *,
+        thread_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> Awaitable[DraftRef]: ...
+    def update_draft(
+        self,
+        account: str,
+        draft_id: str,
+        raw: bytes,
+        *,
+        thread_id: str | None = None,
+        if_message_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> Awaitable[DraftRef]: ...
+    def delete_draft(
+        self, account: str, draft_id: str, *, budget_s: float = 60.0
+    ) -> Awaitable[Literal["deleted", "already_gone"]]: ...
+    def send_draft(
+        self,
+        account: str,
+        draft_id: str,
+        *,
+        if_message_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> Awaitable[SentDraft]: ...
+    def drafts(
+        self, account: str, *, after: str | None = None, limit: int = 100
+    ) -> Awaitable[list[DraftView]]: ...
+    def draft(self, account: str, draft_id: str) -> Awaitable[DraftView | None]: ...
+    def read_draft(
+        self,
+        account: str,
+        draft_id: str,
+        *,
+        fresh: bool = False,
+        budget_s: float = 60.0,
+    ) -> Awaitable[DraftContent]: ...
     def changes(
         self, account: str, since: str | None = None, limit: int = 500
     ) -> Awaitable[ChangePage | StateTooOld]: ...
@@ -841,6 +956,47 @@ class BlockingRunner:
     ) -> LabelDeletion: ...
     def messages(self, account: str, message_ids: list[str]) -> list[MessageView]: ...
     def threads(self, account: str, thread_ids: list[str]) -> list[ThreadView]: ...
+    def create_draft(
+        self,
+        account: str,
+        raw: bytes,
+        *,
+        thread_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> DraftRef: ...
+    def update_draft(
+        self,
+        account: str,
+        draft_id: str,
+        raw: bytes,
+        *,
+        thread_id: str | None = None,
+        if_message_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> DraftRef: ...
+    def delete_draft(
+        self, account: str, draft_id: str, *, budget_s: float = 60.0
+    ) -> Literal["deleted", "already_gone"]: ...
+    def send_draft(
+        self,
+        account: str,
+        draft_id: str,
+        *,
+        if_message_id: str | None = None,
+        budget_s: float = 60.0,
+    ) -> SentDraft: ...
+    def drafts(
+        self, account: str, *, after: str | None = None, limit: int = 100
+    ) -> list[DraftView]: ...
+    def draft(self, account: str, draft_id: str) -> DraftView | None: ...
+    def read_draft(
+        self,
+        account: str,
+        draft_id: str,
+        *,
+        fresh: bool = False,
+        budget_s: float = 60.0,
+    ) -> DraftContent: ...
     def changes(
         self, account: str, since: str | None = None, limit: int = 500
     ) -> ChangePage | StateTooOld: ...
