@@ -1893,6 +1893,148 @@ mod tests {
         )
     }
 
+    /// The drafts listing enqueued by a starting or woken engine, if any.
+    fn draft_enqueues(commands: &[Command]) -> usize {
+        commands
+            .iter()
+            .filter(|c| match &c.kind {
+                CommandKind::Commit(commit) => commit.jobs.iter().any(
+                    |op| matches!(op, JobOp::Enqueue(job) if job.kind == JobKind::RefreshDrafts),
+                ),
+                _ => false,
+            })
+            .count()
+    }
+
+    fn drafts_timer(commands: &[Command]) -> Option<Timestamp> {
+        commands.iter().find_map(|c| match c.kind {
+            CommandKind::Schedule {
+                timer: TimerKind::Drafts,
+                at,
+            } => Some(at),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_draft_index_is_refreshed_at_most_every_fifteen_minutes_while_live() {
+        let every = EngineConfig::default().draft_refresh_every;
+        let now = Timestamp(10_000_000);
+        // Never listed: at once.
+        let mut engine = live(100);
+        assert_eq!(draft_enqueues(&engine.start(now)), 1);
+        // Listed a minute ago (persisted, so a restart neither repeats nor
+        // skips it): a timer for 14 minutes on, nothing before.
+        let listed = now.minus(Duration::from_mins(1));
+        let mut engine = live(100);
+        engine.state.drafts_refreshed_at = Some(listed);
+        let started = engine.start(now);
+        assert_eq!(draft_enqueues(&started), 0);
+        assert_eq!(drafts_timer(&started), Some(listed.plus(every)));
+        let early = engine.handle(Event {
+            now: listed.plus(every).minus(Duration::from_secs(1)),
+            kind: EventKind::TimerFired {
+                timer: TimerKind::Drafts,
+            },
+        });
+        assert_eq!(draft_enqueues(&early), 0);
+        let due = listed.plus(every);
+        let fired = engine.handle(Event {
+            now: due,
+            kind: EventKind::TimerFired {
+                timer: TimerKind::Drafts,
+            },
+        });
+        assert_eq!(draft_enqueues(&fired), 1);
+        // The listing itself: 5 units a page, its time recorded, the next
+        // one an interval later.
+        let job = ClaimedJob {
+            work: ClaimedWork::RefreshDrafts {
+                generation: 3,
+                claimed_at: due,
+            },
+            priority: Priority::Live,
+            failed_attempts: 0,
+            attempt: AttemptId(9),
+        };
+        let claim = engine.claim_jobs(due);
+        let claim = claim
+            .iter()
+            .find(|c| matches!(c.kind, CommandKind::ClaimJobs { .. }))
+            .expect("a claim")
+            .id;
+        let commands = engine.handle(Event {
+            now: due,
+            kind: EventKind::JobsClaimed {
+                command: claim,
+                jobs: vec![job],
+                next_due: None,
+            },
+        });
+        let list = commands
+            .iter()
+            .find_map(|c| match &c.kind {
+                CommandKind::Gmail(call) => Some((c.id, call.clone())),
+                _ => None,
+            })
+            .expect("drafts.list");
+        assert_eq!(
+            list.1.request,
+            GmailRequest::ListDrafts { page_token: None }
+        );
+        assert_eq!(list.1.cost, quota::QuotaUnits(5));
+        let page = DraftPage {
+            drafts: Vec::new(),
+            next_page_token: None,
+        };
+        let done = engine.handle(Event {
+            now: due,
+            kind: EventKind::DraftsListed {
+                command: list.0,
+                page,
+            },
+        });
+        let commit = first_commit(done.clone()).expect("the listing's commit");
+        assert!(
+            commit
+                .account_ops
+                .contains(&AccountOp::SetDraftsRefreshedAt(due))
+        );
+        assert!(matches!(
+            commit.drafts.as_slice(),
+            [DraftOp::Reconcile(DraftReconcile { generation: 3, .. })]
+        ));
+        assert_eq!(drafts_timer(&done), Some(due.plus(every)));
+        no_periodic_listing_unless_live(now);
+    }
+
+    /// Not while bootstrapping or reconciling: they end with a listing of
+    /// their own. A blocked engine has stopped.
+    fn no_periodic_listing_unless_live(now: Timestamp) {
+        for sync in [
+            SyncState::Bootstrapping(ReconcileProgress::begin(ReconcileReason::Bootstrap)),
+            SyncState::Reconciling(ReconcileProgress::begin(ReconcileReason::HistoryExpired)),
+        ] {
+            let cursor = match sync {
+                SyncState::Bootstrapping(_) => None,
+                _ => Some(100),
+            };
+            let mut engine = engine_with(cursor, sync);
+            let started = engine.start(now);
+            assert_eq!(draft_enqueues(&started), 0);
+            assert_eq!(drafts_timer(&started), None);
+        }
+        let blocked = SyncState::Blocked {
+            reason: BlockingFailure {
+                class: Blocking::Permanent,
+                detail: String::new(),
+            },
+            resume: Box::new(SyncState::Live),
+        };
+        let mut engine = engine_with(Some(100), blocked);
+        assert_eq!(draft_enqueues(&engine.start(now)), 0);
+    }
+
     /// After the gate defers a backfill job, claims skip backfill until it
     /// reopens (instead of deferring and committing each queued job again),
     /// but still take live work.

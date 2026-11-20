@@ -28,6 +28,8 @@ fn main() {
         totals.label_listings += result.stats.label_listings;
         totals.opens += result.stats.opens;
         totals.raised += result.stats.raised;
+        totals.draft_writes += result.stats.draft_writes;
+        totals.drafts_sent += result.stats.drafts_sent;
         totals.feed_pages_split += result.stats.feed_pages_split;
         totals.compactions += result.stats.compactions;
         totals.compacted += result.stats.compacted;

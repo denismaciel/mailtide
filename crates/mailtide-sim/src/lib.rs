@@ -8,7 +8,10 @@
 //! expiry, dropped and duplicated pushes, lost commit acknowledgements and
 //! crashes (the engine is rebuilt from the store; results meant for the dead
 //! engine still arrive). Label definitions are created, renamed and deleted
-//! while the account is live. Invariants are checked after every commit. Two
+//! while the account is live. Drafts are saved, edited, deleted and sent
+//! elsewhere and through the host's draft calls (recorded outside the
+//! engine, the record sometimes lost to a crash after Gmail acted).
+//! Invariants are checked after every commit and every draft record. Two
 //! named feed readers take one page of a random limit between steps and
 //! acknowledge it, while the log is compacted at random steps: the steady
 //! one must never be cut off and must end with the whole change log; the
@@ -24,6 +27,10 @@ use std::time::Duration;
 use mailtide::EngineConfig;
 use mailtide::command::{Command, CommandKind, GmailRequest};
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
+use mailtide::drafts::{
+    DraftPage, DraftRecord, DraftRecorded, DraftState, DraftWrite, ListedDraft, RemovedReason,
+    SendEnd,
+};
 use mailtide::engine::Engine;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{
@@ -31,8 +38,8 @@ use mailtide::gmail::{
     ListPage, MessageFacts, MessageObservation, MessageRef,
 };
 use mailtide::ids::{
-    AccountId, BlobRef, CommandId, ENGINE_VERSION, HistoryId, LabelId, MessageId, PageToken,
-    ThreadId, Timestamp, splitmix64, stable_hash,
+    AccountId, BlobRef, CommandId, DraftId, ENGINE_VERSION, HistoryId, LabelId, MessageId,
+    PageToken, ThreadId, Timestamp, splitmix64, stable_hash,
 };
 use mailtide::invariants::{self, Violation};
 use mailtide::jobs::{JobKind, JobState};
@@ -140,6 +147,9 @@ pub struct Faults {
     pub facts_refresh: Probability,
     /// Gmail answers a label listing without labels, or cut short.
     pub bad_listing: Probability,
+    /// A host draft call reaches Gmail but the host crashes before it
+    /// records the answer.
+    pub draft_record_lost: Probability,
 }
 
 impl Faults {
@@ -157,6 +167,7 @@ impl Faults {
             crash: Probability::NEVER,
             facts_refresh: Probability::NEVER,
             bad_listing: Probability::NEVER,
+            draft_record_lost: Probability::NEVER,
         }
     }
 
@@ -174,6 +185,7 @@ impl Faults {
             crash: rng.probability(0.01),
             facts_refresh: rng.probability(0.05),
             bad_listing: rng.probability(0.2),
+            draft_record_lost: rng.probability(0.3),
         }
     }
 }
@@ -187,8 +199,39 @@ pub enum UserOp {
         /// Reply in the n-th existing thread, if any.
         thread: Option<usize>,
     },
-    /// A draft is saved (a new message id; the previous draft is deleted).
+    /// A draft is created elsewhere (Gmail's UI, a phone).
     SaveDraft,
+    /// The n-th draft is edited elsewhere: its message is replaced.
+    EditDraft {
+        /// Which draft.
+        pick: usize,
+    },
+    /// The n-th draft is deleted elsewhere.
+    DeleteDraft {
+        /// Which draft.
+        pick: usize,
+    },
+    /// The n-th draft is sent elsewhere.
+    SendDraft {
+        /// Which draft.
+        pick: usize,
+    },
+    /// The host saves a draft through mailtide: a new one, or the n-th of
+    /// the mirror's index.
+    HostSaveDraft {
+        /// Which draft of the index, if not a new one.
+        pick: Option<usize>,
+    },
+    /// The host deletes the n-th draft of the mirror's index.
+    HostDeleteDraft {
+        /// Which draft.
+        pick: usize,
+    },
+    /// The host sends the n-th draft of the mirror's index.
+    HostSendDraft {
+        /// Which draft.
+        pick: usize,
+    },
     /// A label is toggled on the n-th non-draft message.
     Relabel {
         /// Which message.
@@ -340,6 +383,10 @@ pub struct Stats {
     pub opens: u64,
     /// Imports those opens raised to the Foreground class.
     pub raised: u64,
+    /// Draft calls the host made that reached Gmail.
+    pub draft_writes: u64,
+    /// Drafts the host sent (Gmail sent them).
+    pub drafts_sent: u64,
     /// Feed pages the reader took that ended inside a commit (one larger
     /// than the page's limit).
     pub feed_pages_split: u64,
@@ -460,7 +507,11 @@ struct Gmail {
     expired_before: u64,
     next_message: u64,
     next_thread: u64,
-    draft: Option<MessageId>,
+    /// Drafts: draft id to its current message.
+    drafts: BTreeMap<DraftId, MessageId>,
+    next_draft: u64,
+    /// The `X-Mailtide-Id` of messages mailtide saved, kept through a send.
+    tracking: BTreeMap<MessageId, String>,
     /// User label definitions: id to name.
     user_labels: BTreeMap<LabelId, String>,
     next_label: u64,
@@ -475,7 +526,9 @@ impl Default for Gmail {
             expired_before: 0,
             next_message: 0,
             next_thread: 0,
-            draft: None,
+            drafts: BTreeMap::new(),
+            next_draft: 0,
+            tracking: BTreeMap::new(),
             user_labels: BTreeMap::from([(LabelId("Label_1".into()), "Label_1".into())]),
             next_label: 1,
         }
@@ -575,12 +628,83 @@ impl Gmail {
     }
 
     fn delete(&mut self, id: &MessageId) {
+        // Deleting a draft's message deletes the draft.
+        self.drafts.retain(|_, message| message != id);
         if self.messages.remove(id).is_some() {
             let at = self.next_id();
             self.history.push(HistoryRecord::MessageDeleted {
                 id: at,
                 message_id: id.clone(),
             });
+        }
+    }
+
+    /// Save a draft: a new one (`draft` none), or replace an existing
+    /// one's message. `None` if that draft no longer exists (404).
+    fn save_draft(
+        &mut self,
+        draft: Option<&DraftId>,
+        thread: Option<ThreadId>,
+        tracking: Option<String>,
+    ) -> Option<ListedDraft> {
+        let (id, thread) = if let Some(id) = draft {
+            let old = self.drafts.get(id)?.clone();
+            let thread = thread.unwrap_or_else(|| self.messages[&old].thread.clone());
+            self.delete(&old);
+            (id.clone(), thread)
+        } else {
+            self.next_draft += 1;
+            let thread = thread.unwrap_or_else(|| self.new_thread());
+            (DraftId(format!("r{:06}", self.next_draft)), thread)
+        };
+        let message = self.add(thread.clone(), labels::set(["DRAFT"]));
+        if let Some(tracking) = tracking {
+            self.tracking.insert(message.clone(), tracking);
+        }
+        self.drafts.insert(id.clone(), message.clone());
+        Some(ListedDraft {
+            id,
+            message,
+            thread_id: thread,
+        })
+    }
+
+    /// Send a draft: it goes, a new `SENT` message in its thread comes.
+    fn send_draft(&mut self, draft: &DraftId) -> Option<(MessageId, ThreadId)> {
+        let message = self.drafts.get(draft)?.clone();
+        let thread = self.messages[&message].thread.clone();
+        let tracking = self.tracking.get(&message).cloned();
+        self.delete(&message);
+        let sent = self.add(thread.clone(), labels::set(["SENT"]));
+        if let Some(tracking) = tracking {
+            self.tracking.insert(sent.clone(), tracking);
+        }
+        Some((sent, thread))
+    }
+
+    fn draft_at(&self, pick: usize) -> Option<DraftId> {
+        let ids: Vec<&DraftId> = self.drafts.keys().collect();
+        (!ids.is_empty()).then(|| ids[pick % ids.len()].clone())
+    }
+
+    /// `drafts.list`, three to a page (the token is the offset).
+    fn list_drafts(&self, token: Option<&PageToken>) -> DraftPage {
+        let start: usize = token.and_then(|t| t.0.parse().ok()).unwrap_or(0);
+        let drafts: Vec<ListedDraft> = self
+            .drafts
+            .iter()
+            .skip(start)
+            .take(3)
+            .map(|(id, message)| ListedDraft {
+                id: id.clone(),
+                message: message.clone(),
+                thread_id: self.messages[message].thread.clone(),
+            })
+            .collect();
+        let next = start + drafts.len();
+        DraftPage {
+            next_page_token: (next < self.drafts.len()).then(|| PageToken(next.to_string())),
+            drafts,
         }
     }
 
@@ -606,28 +730,42 @@ impl Gmail {
                 self.add(thread, labels::set(["INBOX", "UNREAD"]));
             }
             UserOp::SaveDraft => {
-                if let Some(old) = self.draft.take() {
-                    self.delete(&old);
+                self.save_draft(None, None, None);
+            }
+            UserOp::EditDraft { pick } => {
+                if let Some(id) = self.draft_at(*pick) {
+                    // Another client's bytes carry no tracking id of ours.
+                    self.save_draft(Some(&id), None, None);
                 }
-                let thread = self.new_thread();
-                self.draft = Some(self.add(thread, labels::set(["DRAFT"])));
+            }
+            UserOp::DeleteDraft { pick } => {
+                if let Some(id) = self.draft_at(*pick)
+                    && let Some(message) = self.drafts.get(&id).cloned()
+                {
+                    self.delete(&message);
+                }
+            }
+            UserOp::SendDraft { pick } => {
+                if let Some(id) = self.draft_at(*pick) {
+                    self.send_draft(&id);
+                }
             }
             UserOp::Relabel { pick, label } => self.relabel(*pick, label),
-            // Goes through the engine, not straight to Gmail.
+            // Goes through the engine or the host's draft calls.
             UserOp::HostAction { .. }
             | UserOp::HostOpen { .. }
             | UserOp::HostPurge { .. }
             | UserOp::HostEmpty { .. }
-            | UserOp::MonthPasses => {}
+            | UserOp::MonthPasses
+            | UserOp::HostSaveDraft { .. }
+            | UserOp::HostDeleteDraft { .. }
+            | UserOp::HostSendDraft { .. } => {}
             UserOp::Delete { pick } => {
                 let ids: Vec<MessageId> = self.messages.keys().cloned().collect();
                 if ids.is_empty() {
                     return;
                 }
                 let id = ids[pick % ids.len()].clone();
-                if self.draft.as_ref() == Some(&id) {
-                    self.draft = None;
-                }
                 self.delete(&id);
             }
             UserOp::CreateLabel => {
@@ -1082,6 +1220,18 @@ struct Sim {
 
 const TRACE: usize = 40;
 
+/// The simulated Gmail's answer to a driver's direct call, which the
+/// engine never makes: refused, so a bug would show as a blocked request.
+fn direct_only(command: CommandId) -> EventKind {
+    EventKind::RequestFailed {
+        command,
+        failure: Failure::Blocking(BlockingFailure {
+            class: Blocking::Permanent,
+            detail: "the engine issues no direct call".into(),
+        }),
+    }
+}
+
 impl Sim {
     fn note(&mut self, line: &str) {
         if let Some(grep) = &self.grep
@@ -1364,6 +1514,16 @@ impl Sim {
         };
         if matches!(
             op,
+            UserOp::HostSaveDraft { .. }
+                | UserOp::HostDeleteDraft { .. }
+                | UserOp::HostSendDraft { .. }
+        ) {
+            self.host_draft(&op);
+            self.notify();
+            return;
+        }
+        if matches!(
+            op,
             UserOp::CreateLabel
                 | UserOp::RenameLabel { .. }
                 | UserOp::DeleteLabel { .. }
@@ -1398,6 +1558,11 @@ impl Sim {
         if let Some(record) = record {
             self.record_label(&record);
         }
+        self.notify();
+    }
+
+    /// Gmail pushes the mailbox's position, unless the push is dropped.
+    fn notify(&mut self) {
         if !self.rng.chance(self.faults.push_dropped) {
             let push = Event {
                 now: self.now,
@@ -1801,6 +1966,126 @@ impl Sim {
         false
     }
 
+    /// A host's draft call, as the driver makes it: Gmail first, then the
+    /// answer recorded outside the engine (`record_draft`), unless the host
+    /// crashes in between.
+    fn host_draft(&mut self, op: &UserOp) {
+        let rows: Vec<DraftRecord> = self.mirror.drafts.values().cloned().collect();
+        let row = |pick: usize| (!rows.is_empty()).then(|| rows[pick % rows.len()].clone());
+        let write = match op {
+            UserOp::HostSaveDraft { pick } => {
+                let row = pick.and_then(row);
+                if row.as_ref().is_some_and(|r| r.state.attempt().is_some()) {
+                    return; // The driver refuses a draft being sent.
+                }
+                let tracking = row
+                    .as_ref()
+                    .and_then(|r| r.tracking_id.clone())
+                    .unwrap_or_else(|| format!("sim-tracking-{:010}", self.rng.below(1 << 30)));
+                let saved = self.gmail.save_draft(
+                    row.as_ref().map(|r| &r.id),
+                    row.as_ref().map(|r| r.thread_id.clone()),
+                    Some(tracking.clone()),
+                );
+                self.stats.draft_writes += 1;
+                match (saved, row) {
+                    (Some(draft), _) => Some(DraftWrite::Saved {
+                        draft,
+                        tracking_id: tracking,
+                    }),
+                    (None, Some(row)) => Some(DraftWrite::Removed {
+                        draft: row.id,
+                        reason: RemovedReason::Gone,
+                    }),
+                    (None, None) => None,
+                }
+            }
+            UserOp::HostDeleteDraft { pick } => {
+                let Some(row) = row(*pick).filter(|r| r.state.attempt().is_none()) else {
+                    return;
+                };
+                if let Some(message) = self.gmail.drafts.get(&row.id).cloned() {
+                    self.gmail.delete(&message);
+                }
+                self.stats.draft_writes += 1;
+                Some(DraftWrite::Removed {
+                    draft: row.id,
+                    reason: RemovedReason::Deleted,
+                })
+            }
+            UserOp::HostSendDraft { pick } => {
+                if let Some(row) = row(*pick) {
+                    self.host_send(&row);
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(write) = write {
+            self.record_draft(&write, true);
+        }
+    }
+
+    /// `send_draft`: mark the row, read the draft first on a retry, send,
+    /// record how it ended (unless the host crashes after Gmail sent).
+    fn host_send(&mut self, row: &DraftRecord) {
+        let begin = DraftWrite::BeginSend {
+            draft: row.id.clone(),
+            if_message: None,
+            retry_at: self.now.plus(Duration::from_mins(1)),
+        };
+        let DraftRecorded::Started { draft, retry } = self.record_draft(&begin, false) else {
+            return;
+        };
+        let Some(started) = draft.state.attempt().map(|a| a.started) else {
+            return;
+        };
+        let end = |end: SendEnd| DraftWrite::EndSend {
+            draft: draft.id.clone(),
+            started,
+            end,
+        };
+        let current = self.gmail.drafts.get(&draft.id).cloned();
+        let write = match (retry, current) {
+            (true, None) => end(SendEnd::Unconfirmed),
+            (true, Some(message)) if message != draft.message => {
+                let thread_id = self.gmail.messages[&message].thread.clone();
+                end(SendEnd::Changed { message, thread_id })
+            }
+            (_, current) => {
+                self.stats.draft_writes += 1;
+                match self.gmail.send_draft(&draft.id) {
+                    Some((message, thread_id)) => {
+                        self.stats.drafts_sent += 1;
+                        end(SendEnd::Sent { message, thread_id })
+                    }
+                    None if current.is_none() && !retry => end(SendEnd::Gone),
+                    None => end(SendEnd::Unconfirmed),
+                }
+            }
+        };
+        self.record_draft(&write, true);
+    }
+
+    /// Record a draft call's answer outside the engine, checking every
+    /// invariant after it; `may_lose` lets the host crash first.
+    fn record_draft(&mut self, write: &DraftWrite, may_lose: bool) -> DraftRecorded {
+        if may_lose && self.rng.chance(self.faults.draft_record_lost) {
+            self.note(&format!("draft record lost {write:?}"));
+            self.rebuild();
+            return DraftRecorded::Done;
+        }
+        let outcome = self.mirror.record_draft(write, self.now);
+        self.note(&format!("draft {write:?} -> {outcome:?}"));
+        for violation in invariants::check_state(&self.mirror) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+        outcome
+    }
+
     fn host_open(&mut self, pick: usize) {
         let pending: Vec<&MessageId> = self
             .mirror
@@ -1860,7 +2145,7 @@ impl Sim {
     fn random_op(&mut self) -> UserOp {
         let pick = self.rng.below(1_000);
         if self.rng.below(4) == 0 {
-            match self.rng.below(12) {
+            match self.rng.below(16) {
                 0..=3 => return UserOp::HostOpen { pick },
                 4 => {
                     return UserOp::HostPurge {
@@ -1873,6 +2158,13 @@ impl Sim {
                         spam: self.rng.below(2) == 0,
                     };
                 }
+                6..=7 => {
+                    return UserOp::HostSaveDraft {
+                        pick: (self.rng.below(2) == 0).then_some(pick),
+                    };
+                }
+                8 => return UserOp::HostSendDraft { pick },
+                9 => return UserOp::HostDeleteDraft { pick },
                 _ => {}
             }
             let action = self.random_action();
@@ -1886,7 +2178,12 @@ impl Sim {
             0..=3 => UserOp::Receive {
                 thread: pick.is_multiple_of(2).then_some(pick),
             },
-            4 => UserOp::SaveDraft,
+            4 => match self.rng.below(4) {
+                0 => UserOp::SaveDraft,
+                1 => UserOp::EditDraft { pick },
+                2 => UserOp::DeleteDraft { pick },
+                _ => UserOp::SendDraft { pick },
+            },
             5..=7 => {
                 let labels = self.gmail.assignable();
                 UserOp::Relabel {
@@ -2140,10 +2437,14 @@ impl Sim {
                             internal_date: self.gmail.messages.get(id).map_or(self.now, |m| m.date),
                             headers: HeaderFacts::default(),
                             // Some imports come from a build without facts,
-                            // for the refresh to bring up to date.
-                            facts: stable_hash(id.0.as_bytes())
-                                .is_multiple_of(2)
-                                .then(|| Box::new(MessageFacts::empty())),
+                            // for the refresh to bring up to date. A message
+                            // mailtide wrote carries its X-Mailtide-Id in them.
+                            facts: stable_hash(id.0.as_bytes()).is_multiple_of(2).then(|| {
+                                Box::new(MessageFacts {
+                                    tracking_id: self.gmail.tracking.get(id).cloned(),
+                                    ..MessageFacts::empty()
+                                })
+                            }),
                             observation,
                         }),
                     }
@@ -2195,34 +2496,18 @@ impl Sim {
             | GmailRequest::GetLabel { .. }
             | GmailRequest::CreateLabel(_)
             | GmailRequest::PatchLabel { .. }
-            | GmailRequest::DeleteLabel { .. } => EventKind::RequestFailed {
-                command,
-                failure: Failure::Blocking(BlockingFailure {
-                    class: Blocking::Permanent,
-                    detail: "the engine issues no direct call".into(),
-                }),
-            },
-            GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
-                self.deleted(command, request)
-            }
-            GmailRequest::ListDrafts { .. } => EventKind::DraftsListed {
-                command,
-                page: mailtide::drafts::DraftPage {
-                    drafts: Vec::new(),
-                    next_page_token: None,
-                },
-            },
-            // The driver's direct calls: no engine command makes them.
-            GmailRequest::GetDraft { .. }
+            | GmailRequest::DeleteLabel { .. }
+            | GmailRequest::GetDraft { .. }
             | GmailRequest::CreateDraft { .. }
             | GmailRequest::UpdateDraft { .. }
             | GmailRequest::DeleteDraft { .. }
-            | GmailRequest::SendDraft { .. } => EventKind::RequestFailed {
+            | GmailRequest::SendDraft { .. } => direct_only(command),
+            GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
+                self.deleted(command, request)
+            }
+            GmailRequest::ListDrafts { page_token } => EventKind::DraftsListed {
                 command,
-                failure: mailtide::retry::Failure::Blocking(mailtide::retry::BlockingFailure {
-                    class: mailtide::retry::Blocking::Permanent,
-                    detail: "not an engine request".into(),
-                }),
+                page: self.gmail.list_drafts(page_token.as_ref()),
             },
         }
     }
@@ -2272,6 +2557,26 @@ impl Sim {
         let gmail = self.gmail.labels();
         let mirror = self.mirror.label_definitions();
         (gmail != mirror).then(|| format!("label definitions {mirror:?} != Gmail {gmail:?}"))
+    }
+
+    /// How the draft index differs from Gmail's drafts, if it does: once
+    /// quiet, every draft has a saved row naming its current message, and
+    /// nothing else has a row.
+    fn draft_difference(&self) -> Option<String> {
+        for (id, message) in &self.gmail.drafts {
+            match self.mirror.drafts.get(id) {
+                None => return Some(format!("draft {} not in the index", id.0)),
+                Some(row) if &row.message != message || row.state != DraftState::Saved => {
+                    return Some(format!("draft {row:?} != Gmail's {}", message.0));
+                }
+                Some(_) => {}
+            }
+        }
+        self.mirror
+            .drafts
+            .keys()
+            .find(|id| !self.gmail.drafts.contains_key(*id))
+            .map(|id| format!("draft {} indexed but not in Gmail", id.0))
     }
 
     /// How a thread's view differs from the same rule restated over Gmail's
@@ -2375,6 +2680,9 @@ impl Sim {
         }
         if let Some(thread) = self.thread_difference() {
             return Some(thread);
+        }
+        if let Some(draft) = self.draft_difference() {
+            return Some(draft);
         }
         if let Some(intent) = self
             .mirror
@@ -2887,6 +3195,31 @@ mod tests {
             let result = replay(seed, &script);
             assert!(result.passed(), "{result:#?}");
         }
+    }
+
+    #[test]
+    fn drafts_changed_here_and_elsewhere_converge_under_faults() {
+        let results: Vec<RunResult> = (0..150).map(|seed| run(seed, 400)).collect();
+        let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
+        assert!(
+            failures.is_empty(),
+            "{} failing seeds, first: {:#?}",
+            failures.len(),
+            failures.first()
+        );
+        let writes: u64 = results.iter().map(|r| r.stats.draft_writes).sum();
+        let sent: u64 = results.iter().map(|r| r.stats.drafts_sent).sum();
+        assert!(
+            writes > 100,
+            "the host saved, deleted and sent drafts: {writes}"
+        );
+        assert!(sent > 10, "the host sent drafts: {sent}");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.faults.draft_record_lost != Probability::NEVER),
+            "records were lost to crashes"
+        );
     }
 
     #[test]
