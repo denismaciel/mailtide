@@ -28,6 +28,8 @@ struct WireError {
     errors: Vec<WireReason>,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    details: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -47,12 +49,29 @@ pub fn classify(response: &HttpResponse) -> Failure {
         .map(|r| r.reason.as_str())
         .collect();
     let message = body.error.message.to_lowercase();
+    let scope_reason = if response.status == 403 {
+        reasons
+            .iter()
+            .copied()
+            .find(|reason| *reason == "insufficientPermissions")
+            .or_else(|| {
+                body.error
+                    .details
+                    .iter()
+                    .any(|detail| {
+                        detail.get("reason").and_then(serde_json::Value::as_str)
+                            == Some("ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+                    })
+                    .then_some("ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+            })
+    } else {
+        None
+    };
     let detail = format!(
         "{} {} {}",
         response.status,
-        reasons
-            .first()
-            .copied()
+        scope_reason
+            .or_else(|| reasons.first().copied())
             .unwrap_or(body.error.status.as_str()),
         body.error.message.chars().take(120).collect::<String>()
     )
@@ -84,7 +103,7 @@ pub fn classify(response: &HttpResponse) -> Failure {
         429 if message.contains("bandwidth") => retryable(Retryable::AccountBandwidth),
         429 => retryable(Retryable::AccountRateLimited),
         403 if has("domainPolicy") => blocking(Blocking::Account(AccountProblem::DomainPolicy)),
-        403 if has("insufficientPermissions") || has("accessNotConfigured") || has("forbidden") => {
+        403 if scope_reason.is_some() || has("accessNotConfigured") || has("forbidden") => {
             blocking(Blocking::Account(AccountProblem::ApiAccessDenied))
         }
         403 if has("userRateLimitExceeded") => retryable(Retryable::AccountRateLimited),

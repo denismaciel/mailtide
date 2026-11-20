@@ -75,6 +75,7 @@ mod tests {
             thread_id: ThreadId("t".into()),
             labels: set(labels.iter().copied()),
             observed_labels: set(labels.iter().copied()),
+            bin_removals: LabelSet::new(),
             checkpoint: Some(HistoryId(checkpoint)),
             unverified: false,
             content: None,

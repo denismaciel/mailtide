@@ -131,7 +131,9 @@ the exceptions `PurgeDisabled`, `PurgeScopeRequired`, `MirrorStale`,
    records at or after the row's checkpoint into its observed labels, with
    the same rule the mirror uses. Actions not yet confirmed here may only
    take labels away: a restore, move to inbox or not-spam asked for here
-   (pending, or delivered and awaiting its confirmation) refuses the id.
+   (pending, or delivered and awaiting its confirmation) removes its bin
+   label, including a label seen only in the history read. An anywhere
+   call also refuses an id with an unsettled bin removal.
    They never add one: a trash or spam asked for here counts only once
    Gmail's state shows it (observed, or in history). The message is
    eligible if the result contains `TRASH` or `SPAM` (or the call is
@@ -201,7 +203,8 @@ message stays deleted in Gmail.
   `messagesDeleted` record) through the existing `tombstone` rule,
   in one transaction: the row goes, `MessageDeleted` is logged with the last
   thread and labels, the message's jobs and intents are cancelled, its blob
-  cleanup is scheduled. Like `admit` it is **not fenced by an epoch**.
+  cleanup is scheduled. An untracked account is reported separately from
+  a repeated tombstone. Like `admit` it is **not fenced by an epoch**.
   Applying a deletion ahead of the cursor is sound because deletion is final
   (I5): when the engine later reads the same history window, every record
   about that id is skipped.
@@ -233,9 +236,9 @@ That is why mailtide itself never retries: the only state a retry could
 safely reuse is the id list, and the check that made those ids eligible ages
 with every second.
 
-The existing error classification turns a 403 `insufficientPermissions` into
-an account-level block. A purge call's answer does not go through it: a
-token without the full scope must stop the purge, not the mirror.
+A 403 that names `insufficientPermissions` or
+`ACCESS_TOKEN_SCOPE_INSUFFICIENT` stops the purge without blocking the
+mirror. The exact batch scope response remains unverified.
 
 **No way around the checks.** The public `Runner::call_gmail` only reads: it
 refuses any request that changes the mailbox (`CallError::Refused`) before any token

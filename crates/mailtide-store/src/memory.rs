@@ -263,7 +263,7 @@ impl Store for MemoryStore {
         deletions: &[(MessageId, DeletionEvidence)],
         now: Timestamp,
     ) -> Result<u32, StoreError> {
-        self.on_account(account, 0, |mirror| mirror.record_deleted(deletions, now))
+        self.with_account(account, |mirror| mirror.record_deleted(deletions, now))
     }
 
     async fn message_ids_labelled(

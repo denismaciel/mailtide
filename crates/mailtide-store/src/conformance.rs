@@ -1791,9 +1791,11 @@ async fn recorded_deletions_and_ids_by_label<S: Store>(store: &S) -> Result<(), 
             &[(MessageId("a".into()), evidence)],
             Timestamp(0),
         )
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    expect(untracked == 0, "an untracked account records nothing")
+        .await;
+    expect(
+        matches!(untracked, Err(StoreError::NotTracked)),
+        "an untracked account is distinguished from a replayed deletion",
+    )
 }
 
 /// Messages a, b in TRASH (a in thread `t-a` with `Label_1`), c, d and e

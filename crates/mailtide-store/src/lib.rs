@@ -186,8 +186,8 @@ pub trait Store: Send + Sync {
     /// their feed entries and without an engine (no epoch fence, like
     /// `admit`): deletion is final, so applying it ahead of the cursor is
     /// sound. Returns how many messages it deleted (a message already
-    /// tombstoned counts nothing and logs nothing); 0 for an untracked
-    /// account.
+    /// tombstoned counts nothing and logs nothing). An untracked account
+    /// returns `StoreError::NotTracked`.
     fn record_deleted(
         &self,
         account: &AccountId,

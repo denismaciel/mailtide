@@ -2230,7 +2230,7 @@ impl crate::Store for SqlStore {
         // The account row lock serializes this with commits and claims; no
         // epoch is checked (deletion is final, see the trait).
         let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
-            return Ok(0);
+            return Err(StoreError::NotTracked);
         };
         let mut mirror = AccountMirror::new(account.clone(), record.generation);
         mirror.record = record;
@@ -2301,19 +2301,21 @@ impl crate::Store for SqlStore {
         ids: &[MessageId],
     ) -> Result<Vec<MessageView>, StoreError> {
         self.ensure_schema().await?;
-        // A view needs only the rows and their intents: two set-based
-        // queries per chunk, not a handful per message.
-        let mut records: BTreeMap<MessageId, MessageRecord> = BTreeMap::new();
-        let mut intents: BTreeMap<MessageId, Vec<Intent>> = BTreeMap::new();
-        for chunk in ids.chunks(VIEW_CHUNK) {
+        // Read each row and its intents in the same statement, so a view
+        // cannot combine an old observation with a newly cleared intent.
+        let mut records: BTreeMap<MessageId, (MessageRecord, Vec<Intent>)> = BTreeMap::new();
+        let wanted: Vec<&MessageId> = ids.iter().collect::<BTreeSet<_>>().into_iter().collect();
+        for chunk in wanted.chunks(VIEW_CHUNK) {
             let placeholders = (2..chunk.len() + 2)
                 .map(|n| format!("${n}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             // Only numbered placeholders are interpolated; ids are bound.
             let sql = format!(
-                "SELECT id, thread_id, labels, checkpoint, unverified, content FROM mailtide_messages
-                 WHERE account = $1 AND id IN ({placeholders})"
+                "SELECT m.id, m.thread_id, m.labels, m.checkpoint, m.unverified, m.content, i.intent
+                 FROM mailtide_messages m LEFT JOIN mailtide_intents i
+                 ON i.account = m.account AND i.message = m.id
+                 WHERE m.account = $1 AND m.id IN ({placeholders})"
             );
             let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
             for id in chunk {
@@ -2325,36 +2327,26 @@ impl crate::Store for SqlStore {
                 .map_err(|e| unavailable(&e))?
             {
                 let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
-                let record = message_from_row(&id, &row)?;
-                records.insert(id, record);
-            }
-            let sql = format!(
-                "SELECT message, intent FROM mailtide_intents WHERE account = $1 AND message IN ({placeholders})"
-            );
-            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
-            for id in chunk {
-                query = query.bind(id.0.as_str());
-            }
-            for row in query
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| unavailable(&e))?
-            {
-                let message: String = row.try_get("message").map_err(|e| corrupt("message", e))?;
-                let text: String = row.try_get("intent").map_err(|e| corrupt("intent", e))?;
-                intents
-                    .entry(MessageId(message))
-                    .or_default()
-                    .push(parse::<Intent>("intent", &text)?);
+                let (_, intents) = match records.entry(id) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let record = message_from_row(entry.key(), &row)?;
+                        entry.insert((record, Vec::new()))
+                    }
+                };
+                let text: Option<String> =
+                    row.try_get("intent").map_err(|e| corrupt("intent", e))?;
+                if let Some(text) = text {
+                    intents.push(parse::<Intent>("intent", &text)?);
+                }
             }
         }
-        let none = Vec::new();
         Ok(ids
             .iter()
             .filter_map(|id| {
                 records
                     .get(id)
-                    .map(|record| record.view(intents.get(id).unwrap_or(&none)))
+                    .map(|(record, intents)| record.view(intents))
             })
             .collect())
     }

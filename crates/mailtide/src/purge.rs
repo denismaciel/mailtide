@@ -298,8 +298,13 @@ impl PurgeScan {
     #[must_use]
     pub fn current_labels(&self, view: &MessageView) -> LabelSet {
         let mut current = self.folded(view);
-        current
-            .retain(|label| !view.observed_labels.contains(label) || view.labels.contains(label));
+        current.retain(|label| {
+            if is_bin(label) {
+                !view.bin_removals.contains(label)
+            } else {
+                !view.observed_labels.contains(label) || view.labels.contains(label)
+            }
+        });
         current
     }
 
@@ -324,7 +329,7 @@ impl PurgeScan {
             return Verdict::Refused(Refusal::Draft);
         }
         let in_scope = match scope {
-            Scope::Anywhere => true,
+            Scope::Anywhere => view.bin_removals.is_empty(),
             Scope::TrashOrSpam => current.iter().any(is_bin),
             Scope::Bin(bin) => current.contains(&bin.label()),
         };
@@ -617,6 +622,29 @@ mod tests {
             verdict(&mirror, &scan, "i", Scope::TrashOrSpam),
             Verdict::Refused(Refusal::NotInTrashOrSpam)
         );
+    }
+
+    #[test]
+    fn a_bin_removal_vetoes_a_bin_addition_seen_only_in_history() {
+        let mut mirror = mirror(&[("t", &["INBOX"], 10), ("s", &["INBOX"], 10)]);
+        act(
+            &mut mirror,
+            "t",
+            Action::RestoreFromTrash(RestoreDestination::Archive),
+        );
+        act(&mut mirror, "s", Action::MoveToInbox);
+        let history = scan(
+            vec![added(11, "t", &["TRASH"]), added(12, "s", &["SPAM"])],
+            12,
+        );
+        for id in ["t", "s"] {
+            for scope in [Scope::TrashOrSpam, Scope::Anywhere] {
+                assert_eq!(
+                    verdict(&mirror, &history, id, scope),
+                    Verdict::Refused(Refusal::NotInTrashOrSpam),
+                );
+            }
+        }
     }
 
     #[test]

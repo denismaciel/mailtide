@@ -145,6 +145,7 @@ mod tests {
             thread_id: t(),
             labels: set(labels.iter().copied()),
             observed_labels: set(labels.iter().copied()),
+            bin_removals: LabelSet::new(),
             checkpoint: Some(HistoryId(1)),
             unverified: false,
             content: None,

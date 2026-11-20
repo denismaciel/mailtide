@@ -2,7 +2,7 @@ id = "purge"
 title = "Purge: permanent delete, empty trash and empty spam"
 summary = "A switched-off-by-default call that permanently deletes named messages, a thread's messages, or everything the mirror holds in trash or spam: checked against Gmail's history since the mirror's cursor, sent by id only, never repeated by mailtide, and tombstoned only on Gmail's own evidence."
 roadmap = ["W1"]
-status = "done"
+status = "in_progress"
 design = "docs/features/purge.md"
 depends_on = []
 
@@ -65,7 +65,7 @@ role = "Export the purge module"
 [[file]]
 path = "crates/mailtide-store/src/lib.rs"
 change = "modify"
-role = "Store::record_deleted (unfenced, like admit; takes each id's DeletionEvidence: a history record or a single delete's 404) and Store::message_ids_labelled"
+role = "Store::record_deleted applies Gmail history evidence without an epoch fence and distinguishes absent accounts from repeated tombstones; Store::message_ids_labelled"
 
 [[file]]
 path = "crates/mailtide-store/src/memory.rs"
@@ -678,6 +678,16 @@ covers = "PurgeScopeRequired; a later run() still syncs"
 target = "tests/test_purge.py"
 name = "test_blocking_runner_has_purge_and_empty"
 covers = "BlockingRunner mirrors the async purge API"
+
+[[test]]
+target = "crates/mailtide/src/purge.rs"
+name = "a_bin_removal_vetoes_a_bin_addition_seen_only_in_history"
+covers = "An active local bin removal vetoes a bin addition absent from the observed row"
+
+[[test]]
+target = "crates/mailtide-gmail/src/purge.rs"
+name = "the_structured_scope_reason_works_without_a_legacy_reason"
+covers = "The modern Google scope reason by itself identifies a missing-scope refusal"
 
 # ------------------------------------------- Gmail behaviour assumed, to test
 

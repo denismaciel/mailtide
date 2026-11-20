@@ -45,14 +45,19 @@ pub fn batch_delete(ids: &[MessageId]) -> HttpRequest {
 
 /// Whether Gmail refused a delete because the token lacks [`FULL_SCOPE`].
 ///
-/// [`crate::errors::classify`] makes every 403 `insufficientPermissions` an
-/// [`AccountProblem::ApiAccessDenied`] refusal whose detail leads with the
-/// status and that reason. Any other refusal (a disabled API, a bad id, a
-/// rate limit, which is not a refusal at all) is not a missing scope.
+/// [`crate::errors::classify`] preserves the structured scope reason in
+/// the detail of an [`AccountProblem::ApiAccessDenied`] refusal.
 #[must_use]
 pub fn missing_scope(refusal: &BlockingFailure) -> bool {
     refusal.class == Blocking::Account(AccountProblem::ApiAccessDenied)
-        && refusal.detail.starts_with("403 insufficientPermissions")
+        && (refusal.detail.starts_with("403 insufficientPermissions ")
+            || refusal
+                .detail
+                .starts_with("403 ACCESS_TOKEN_SCOPE_INSUFFICIENT ")
+            || matches!(
+                refusal.detail.as_str(),
+                "403 insufficientPermissions" | "403 ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+            ))
 }
 
 /// Whether a transient failure of a delete came with Gmail's answer, so the
@@ -203,5 +208,18 @@ mod tests {
             let refused = refusal(&failure).expect("a refusal");
             assert!(!missing_scope(refused), "{status} {reason}");
         }
+    }
+
+    #[test]
+    fn the_structured_scope_reason_works_without_a_legacy_reason() {
+        let response = answer(
+            403,
+            &json!({"error": {
+                "status": "PERMISSION_DENIED",
+                "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]
+            }}),
+        );
+        assert!(refusal(&classify(&response)).is_some_and(missing_scope));
     }
 }

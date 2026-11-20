@@ -568,9 +568,10 @@ only the host may call again, and each call is checked afresh).
    deletes (so an action admitted here during the history read is seen).
    Each target's observed labels are folded with the records at or after
    its checkpoint (the mirror's own rule). Actions not yet confirmed here
-   may only make a message less eligible: a restore, move to inbox or
-   not-spam asked for here (pending, or delivered and awaiting
-   confirmation) refuses it, but a trash or spam asked for here counts only
+   may only make a message less eligible: active removals of TRASH or SPAM
+   subtract from the folded labels, including a bin label seen only in
+   history. An anywhere call also respects an unsettled bin removal.
+   A trash or spam asked for here counts only
    once Gmail's state shows it (observed, or in history). The view can't
    tell a pending action from a delivered one, and a delivered trash may
    since have been undone on another client and synced. A host that wants
@@ -583,7 +584,8 @@ only the host may call again, and each call is checked afresh).
    call (§8) at Foreground priority that **never waits** for the quota
    gate: a delete the gate can't admit at once is `unsent` (with
    `retry_at`), so no delete goes out long after its check. A 403
-   `insufficientPermissions` (the token lacks `https://mail.google.com/`)
+   with either structured scope reason (`insufficientPermissions` or
+   `ACCESS_TOKEN_SCOPE_INSUFFICIENT`)
    before any delete reached Gmail is `ScopeRequired`: nothing is trashed
    instead, and the account is not blocked. A deferral, a 429 or a 401
    stops the call with the rest `unsent`; a 5xx, a timeout or a lost answer
@@ -805,11 +807,13 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `record_deleted(account, [(id, evidence)], now)`: deletions a purge
   proved by a `messagesDeleted` record (§7a), through the same tombstone rule as a sync's, atomically with
   their feed entries and unfenced like `admit` (deletion is final, so a
-  record ahead of the cursor is sound); `message_ids_labelled(account,
+  record ahead of the cursor is sound). An untracked account returns
+  `NotTracked`. `message_ids_labelled(account,
   label, after, limit)`: ids whose observed labels hold exactly `label`, in
   id order (SQL: a text match on the labels column, confirmed on the parsed
   set).
-- `messages(account, ids)`: `MessageView`s for hosts.
+- `messages(account, ids)`: `MessageView`s for hosts. The SQL store reads
+  observed labels and unsettled intents from the same snapshot per message.
 - `threads(account, ids)`: `ThreadView`s (§4) in the order asked, each
   member its `messages` view; ids the mirror has no message in, and every id
   of an untracked account, are left out; no ids read nothing. The SQL store

@@ -89,6 +89,9 @@ pub struct MessageView {
     pub labels: LabelSet,
     /// What Gmail last showed.
     pub observed_labels: LabelSet,
+    /// Bin labels that an unsettled local action removes, including a
+    /// removal of a label absent from the observed row.
+    pub bin_removals: LabelSet,
     /// Where the labels were last observed in full.
     pub checkpoint: Option<HistoryId>,
     /// Whether the labels await verification.
@@ -119,6 +122,18 @@ impl MessageRecord {
             thread_id: self.thread_id.clone(),
             labels: labels::effective(&self.labels, intents),
             observed_labels: self.labels.clone(),
+            bin_removals: intents
+                .iter()
+                .filter(|intent| {
+                    intent.overlays()
+                        && intent.change == outbox::LabelChange::Remove
+                        && matches!(
+                            intent.label.0.as_str(),
+                            labels::system::TRASH | labels::system::SPAM
+                        )
+                })
+                .map(|intent| intent.label.clone())
+                .collect(),
             checkpoint: self.checkpoint,
             unverified: self.unverified.is_some(),
             content: match &self.content {
@@ -1659,8 +1674,8 @@ impl AccountMirror {
         u32::try_from(admitted).unwrap_or(u32::MAX)
     }
 
-    /// Record deletions a purge proved (a `messagesDeleted` history record,
-    /// or a single delete answered 404), outside any engine: like
+    /// Record deletions a purge proved with `messagesDeleted` history
+    /// records, outside any engine: like
     /// [`Self::admit_action`] it is not fenced by an epoch. Each goes
     /// through the same tombstone rule as a sync's: the row goes, the
     /// tombstone stays, `MessageDeleted` is logged with the last thread and
