@@ -91,6 +91,15 @@ pub enum Violation {
         /// A commit at or before it still in the log.
         kept: StateSeq,
     },
+    /// A label listing took a label off a row whose message still has it
+    /// in Gmail (the simulator checks it: an empty or truncated listing is
+    /// no proof of a deletion).
+    LiveLabelStripped {
+        /// The message.
+        message: MessageId,
+        /// The label.
+        label: LabelId,
+    },
     /// Two label definitions share an id.
     DuplicateLabel {
         /// The id.

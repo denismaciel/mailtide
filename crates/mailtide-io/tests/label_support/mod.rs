@@ -84,6 +84,8 @@ pub enum Fault {
     LostAfterApply,
     /// Answer 200 with a body that is not JSON, changing nothing.
     Undecodable,
+    /// Answer 200 with this body, changing nothing.
+    Body(&'static str),
 }
 
 /// The fake mailbox.
@@ -491,6 +493,11 @@ impl GmailTransport for FakeGmail {
                 headers: Vec::new(),
                 body: b"<html>".to_vec(),
             }),
+            Some(Fault::Body(body)) => Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.as_bytes().to_vec(),
+            }),
             None => Ok(mailbox.answer(&request)),
         }
     }
@@ -621,12 +628,32 @@ fn runner(
     clock: &Arc<AtomicI64>,
     gate: &Arc<GateState>,
 ) -> LabelRunner {
-    {
-        let mut mailbox = gmail.mailbox();
-        mailbox.system_label("INBOX");
-        mailbox.system_label("UNREAD");
-        mailbox.system_label("STARRED");
-    }
+    with_defaults(&gmail);
+    runner_over(
+        MemoryStore::tracking(&[account()]),
+        gmail,
+        access,
+        clock,
+        gate,
+    )
+}
+
+/// The system labels every fake mailbox lists.
+pub fn with_defaults(gmail: &FakeGmail) {
+    let mut mailbox = gmail.mailbox();
+    mailbox.system_label("INBOX");
+    mailbox.system_label("UNREAD");
+    mailbox.system_label("STARRED");
+}
+
+/// A runner over `store` and `transport`, on `clock`, through `gate`.
+pub fn runner_over<S: mailtide_store::Store, T: GmailTransport>(
+    store: S,
+    transport: T,
+    access: Access,
+    clock: &Arc<AtomicI64>,
+    gate: &Arc<GateState>,
+) -> Runner<S, ObjectBlobs, T, RecordingGate, StaticTokens> {
     let tokens = StaticTokens(BTreeMap::from([(
         account(),
         AccessToken {
@@ -636,9 +663,9 @@ fn runner(
     )]));
     let now = Arc::clone(clock);
     Runner::new(
-        MemoryStore::tracking(&[account()]),
+        store,
         ObjectBlobs::memory(),
-        gmail,
+        transport,
         RecordingGate {
             inner: LocalGate::new(Budget::GMAIL_DEFAULT),
             state: Arc::clone(gate),

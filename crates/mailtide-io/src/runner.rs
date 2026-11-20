@@ -1329,6 +1329,16 @@ where
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
+            // A label listing without labels is a glitch, not a mailbox
+            // (one always lists its system labels): asked again, never
+            // applied.
+            Err(error @ decode::DecodeError::MissingField("labels"))
+                if matches!(gmail_request, GmailRequest::ListLabels) =>
+            {
+                Outcome::Failed(transient(format!(
+                    "label listing without labels: {error:?}"
+                )))
+            }
             // A malformed body won't heal by waiting: refuse it for good
             // (a job blocks; a sync request blocks the account for an
             // operator) instead of re-fetching forever.

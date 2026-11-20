@@ -450,14 +450,23 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   unverified, without moving a checkpoint (Gmail's own `labelsRemoved`
   records, one per message, then change nothing), drops the intents on it
   in every state, and logs `LabelDefinitionsChanged` and one
-  `LabelsChanged` per row, in one commit. One listing is proof: Gmail's
-  listing reflects every create and delete that returned before it.
+  `LabelsChanged` per row, in one commit. One whole listing is proof:
+  Gmail's listing reflects every create and delete that returned before
+  it. Only a whole one: a listing must name `INBOX` and every system label
+  the definitions hold, an empty one, a paged one or one with an id twice
+  does not decode (an empty one is asked again), and one that falls short
+  changes nothing. Gmail's own labels are never forgotten. When
+  reconciliation lists the labels, a refresh in flight is dropped. A
+  label's ids the definitions never held are left to Gmail's
+  `labelsRemoved` records, which it writes for every message of a deleted
+  label.
 - **A deleted id cannot come back.** It is remembered as deleted for 30
   days (longer than Gmail keeps history), pruned at an applied listing:
   observations, history deltas, imports, a finishing reconciliation's
-  scopes and new admissions are stored without it, so a fetch in flight
-  across the deletion, or history read from a cursor behind it, cannot put
-  it back on a row. A listing that names it again restores it.
+  scopes, new admissions and a write's late answer are stored without it,
+  so a fetch in flight across the deletion, or history read from a cursor
+  behind it, cannot put it back on a row. A listing that names it again
+  restores it.
 - **Local label writes** (`Runner.create_label`, `update_label`,
   `delete_label`) are direct calls (§8) whose answer the driver records at
   once with `Store::record_label`, unfenced like an admission: the
@@ -469,7 +478,11 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   deletes only the label it is asked to: a rename moves the sublabels
   first and the label last (a retry finishes a half-done one), a delete
   refuses while sublabels exist unless asked to delete them, deepest
-  first. Names are compared as Gmail compares them (case-insensitively,
+  first. Recording a deletion rewrites every row that carried the label and
+  logs an entry each, in one transaction after Gmail answered (about 1.6 s
+  for 50,000 rows on `SQLite`; on Postgres a few hundred round trips): the
+  call's budget bounds its Gmail requests, not this. Names are compared
+  as Gmail compares them (case-insensitively,
   surrounding space ignored); colours are checked against Gmail's palette
   and sent lower-cased. Read-only mode refuses the writes before any call.
 
@@ -506,11 +519,13 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
    next. A transport error retries (idempotent); a permanent refusal blocks
    the intents; a 404 tombstones the message. Gmail refuses a whole modify
    with 400 when an add names a label it does not have (deleted, or never
-   created), without naming it, and accepts removing one: so when a group
-   refused for good adds labels that are not Gmail's fixed system labels
-   *beside other changes*, only those adds are blocked, the rest is
-   delivered again on its own, and a label listing is asked for (§6.6),
-   which drops a deleted label's blocked intent.
+   created), without naming it, and accepts removing one: so the first time
+   a group adding labels that are not Gmail's fixed system labels is
+   refused for good, nothing is blocked. The engine keeps the job's claim,
+   lists the labels at once (§6.6), and once that listing has been applied
+   (dropping a deleted label's intents) or has failed, finishes the job, so
+   what is still pending goes again. Refused a second time, those adds are
+   blocked and the rest goes alone; refused again, it all blocks.
 4. **Overlay.** `Store::messages` returns observed labels **and** effective
    labels (pending, delivered and unresolved intents applied in version
    order), plus counts of pending and blocked actions.
@@ -737,7 +752,7 @@ examined, refreshed, unreadable, next }`; `next == None` ends the pass. A
 missing blob is named in `unreadable`; a store failure rolls the batch back
 (call again from the same `after`).
 
-The conformance suite (`mailtide_store::conformance`, 60 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 61 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings

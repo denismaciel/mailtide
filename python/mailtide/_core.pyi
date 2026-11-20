@@ -40,17 +40,22 @@ class ComposeError(ValueError):
     index: int | None
     reason: str
 
-class LabelNotFound(MailtideError): ...
+class LabelNotFound(MailtideError):
+    done: list[str]
 
 class LabelNameTaken(MailtideError):
     existing: Label | None
+    done: list[str]
 
-class InvalidLabel(MailtideError): ...
+class InvalidLabel(MailtideError):
+    done: list[str]
 
 class LabelHasSublabels(MailtideError):
     ids: list[str]
+    done: list[str]
 
-class LabelRefused(MailtideError): ...
+class LabelRefused(MailtideError):
+    done: list[str]
 
 SCHEMA_VERSION: int
 

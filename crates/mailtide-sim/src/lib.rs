@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use mailtide::EngineConfig;
 use mailtide::command::{Command, CommandKind, GmailRequest};
-use mailtide::commit::{CommitOutcome, LabelOp};
+use mailtide::commit::{Commit, CommitOutcome, LabelOp};
 use mailtide::engine::Engine;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{
@@ -137,6 +137,8 @@ pub struct Faults {
     pub crash: Probability,
     /// The host runs a facts refresh this step (outside the engine).
     pub facts_refresh: Probability,
+    /// Gmail answers a label listing without labels, or cut short.
+    pub bad_listing: Probability,
 }
 
 impl Faults {
@@ -153,6 +155,7 @@ impl Faults {
             lost_commit_ack: Probability::NEVER,
             crash: Probability::NEVER,
             facts_refresh: Probability::NEVER,
+            bad_listing: Probability::NEVER,
         }
     }
 
@@ -169,6 +172,7 @@ impl Faults {
             lost_commit_ack: rng.probability(0.02),
             crash: rng.probability(0.01),
             facts_refresh: rng.probability(0.05),
+            bad_listing: rng.probability(0.2),
         }
     }
 }
@@ -230,6 +234,8 @@ pub enum UserOp {
         /// Which label.
         pick: usize,
     },
+    /// 31 days pass: past the deleted-label memory.
+    MonthPasses,
     /// The user acts in the host's UI on the n-th mirrored message (or
     /// its whole thread); the engine delivers it to Gmail.
     HostAction {
@@ -304,6 +310,12 @@ pub struct Stats {
     pub quiet_label_deletes: u64,
     /// Deliveries Gmail refused because an add named a label it lacks.
     pub refused_deliveries: u64,
+    /// Label listings Gmail answered without labels or cut short.
+    pub bad_listings: u64,
+    /// Listings not applied because a local label write made them stale.
+    pub fenced_listings: u64,
+    /// Deleted-label memory entries that expired.
+    pub forgotten_deletions: u64,
     /// `labels.list` calls Gmail answered.
     pub label_listings: u64,
     /// Messages users opened in the host.
@@ -566,7 +578,7 @@ impl Gmail {
             }
             UserOp::Relabel { pick, label } => self.relabel(*pick, label),
             // Goes through the engine, not straight to Gmail.
-            UserOp::HostAction { .. } | UserOp::HostOpen { .. } => {}
+            UserOp::HostAction { .. } | UserOp::HostOpen { .. } | UserOp::MonthPasses => {}
             UserOp::Delete { pick } => {
                 let ids: Vec<MessageId> = self.messages.keys().cloned().collect();
                 if ids.is_empty() {
@@ -1262,6 +1274,10 @@ impl Sim {
             self.host_open(pick);
             return;
         }
+        if op == UserOp::MonthPasses {
+            self.now = self.now.plus(Duration::from_hours(31 * 24));
+            return;
+        }
         let op = match op {
             // Only a label the mirror defined is deleted without a record.
             UserOp::DeleteLabelQuietly { pick } => match self.gmail.user_label(pick) {
@@ -1335,6 +1351,56 @@ impl Sim {
         self.note(&format!("record {op:?}"));
         self.mirror.record_label(op);
         for violation in invariants::check_state(&self.mirror) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+    }
+
+    /// After a commit carrying a label listing: no row lost a label its
+    /// message still has in Gmail (an empty or truncated listing proves no
+    /// deletion); count fenced listings and expired memory.
+    fn check_listing(&mut self, before: &AccountMirror, commit: &Commit, outcome: &CommitOutcome) {
+        let mut any = false;
+        for op in &commit.labels {
+            if let LabelOp::ReplaceAll { generation, .. } = op {
+                any = true;
+                if *generation != before.record.label_generation {
+                    self.stats.fenced_listings += 1;
+                }
+            }
+        }
+        if !any || !matches!(outcome, CommitOutcome::Applied { .. }) {
+            return;
+        }
+        let expired = before
+            .record
+            .deleted_labels
+            .keys()
+            .filter(|id| {
+                !self.mirror.record.deleted_labels.contains_key(*id)
+                    && !self.mirror.labels.iter().any(|label| &label.id == *id)
+            })
+            .count();
+        self.stats.forgotten_deletions += u64::try_from(expired).unwrap_or(u64::MAX);
+        let mut stripped = Vec::new();
+        for (id, row) in &before.messages {
+            let (Some(after), Some(gmail)) =
+                (self.mirror.messages.get(id), self.gmail.messages.get(id))
+            else {
+                continue;
+            };
+            for label in row.labels.difference(&after.labels) {
+                if gmail.labels.contains(label) {
+                    stripped.push(Violation::LiveLabelStripped {
+                        message: id.clone(),
+                        label: label.clone(),
+                    });
+                }
+            }
+        }
+        for violation in stripped {
             self.violations.push(ObservedViolation {
                 step: self.step,
                 violation,
@@ -1449,14 +1515,15 @@ impl Sim {
                 }
             }
             8 => UserOp::Delete { pick },
-            _ => match self.rng.below(7) {
+            _ => match self.rng.below(8) {
                 0 => UserOp::CreateLabel,
                 1 => UserOp::RenameLabel { pick },
                 2 => UserOp::DeleteLabel { pick },
                 3 => UserOp::DeleteLabelQuietly { pick },
                 4 => UserOp::HostCreateLabel,
                 5 => UserOp::HostRenameLabel { pick },
-                _ => UserOp::HostDeleteLabel { pick },
+                6 => UserOp::HostDeleteLabel { pick },
+                _ => UserOp::MonthPasses,
             },
         }
     }
@@ -1546,6 +1613,7 @@ impl Sim {
             CommandKind::Commit(commit) => {
                 let before = self.mirror.clone();
                 let outcome = self.mirror.apply(&commit);
+                self.check_listing(&before, &commit, &outcome);
                 for violation in invariants::check_commit(&before, &self.mirror, &commit, &outcome)
                 {
                     self.violations.push(ObservedViolation {
@@ -1608,6 +1676,34 @@ impl Sim {
         }
     }
 
+    /// `labels.list`, now and then answered without labels or cut short.
+    fn list_labels(&mut self, command: CommandId) -> EventKind {
+        self.stats.label_listings += 1;
+        let mut labels = self.gmail.labels();
+        if self.rng.chance(self.faults.bad_listing) {
+            self.stats.bad_listings += 1;
+            if self.rng.chance(Probability(0.5)) {
+                // No labels: the driver refuses to decode it and asks again
+                // later.
+                return EventKind::RequestFailed {
+                    command,
+                    failure: Failure::Retryable(RetryableFailure {
+                        class: Retryable::Transient,
+                        retry_after: None,
+                        detail: "label listing without labels".into(),
+                    }),
+                };
+            }
+            // Cut short: what it lacks was not deleted.
+            labels.truncate(self.rng.below(labels.len()));
+        }
+        EventKind::LabelsListed {
+            command,
+            labels,
+            generation: self.mirror.record.label_generation,
+        }
+    }
+
     fn gmail_result(&mut self, command: CommandId, request: &GmailRequest) -> EventKind {
         match request {
             GmailRequest::GetProfile => EventKind::ProfileFetched {
@@ -1656,14 +1752,7 @@ impl Sim {
                     message_id: id.clone(),
                 },
             },
-            GmailRequest::ListLabels => {
-                self.stats.label_listings += 1;
-                EventKind::LabelsListed {
-                    command,
-                    labels: self.gmail.labels(),
-                    generation: self.mirror.record.label_generation,
-                }
-            }
+            GmailRequest::ListLabels => self.list_labels(command),
             GmailRequest::Watch => EventKind::WatchRenewed {
                 command,
                 expiration: self.now.plus(Duration::from_hours(168)),
@@ -2187,6 +2276,12 @@ mod tests {
             total(|s| s.refused_deliveries) > 0,
             "adds of deleted labels refused"
         );
+        assert!(
+            total(|s| s.bad_listings) > 0,
+            "empty and truncated listings"
+        );
+        assert!(total(|s| s.fenced_listings) > 0, "stale listings fenced");
+        assert!(total(|s| s.forgotten_deletions) > 0, "the memory expired");
         // A script: an action adds a label another client deletes before it
         // is delivered, the host deletes and recreates labels.
         let script = [

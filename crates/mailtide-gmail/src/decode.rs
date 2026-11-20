@@ -338,8 +338,9 @@ pub fn profile(body: &[u8]) -> Result<HistoryId, DecodeError> {
 
 #[derive(Deserialize)]
 struct WireLabels {
-    #[serde(default)]
-    labels: Vec<crate::labels::WireLabel>,
+    labels: Option<Vec<crate::labels::WireLabel>>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 /// `labels.get`: one label's definition (see [`crate::labels::label`]).
@@ -348,14 +349,34 @@ pub fn label_get(body: &[u8]) -> Result<Label, DecodeError> {
 }
 
 /// `labels.list`: every definition with its visibility and colour (see
-/// [`crate::labels::label`]). One label Gmail sent without an id or a name
-/// refuses the whole listing: a partial one would read as deletions.
+/// [`crate::labels::label`]). A listing is read as proof that a label it
+/// lacks was deleted, so anything short of a whole one is refused: no
+/// `labels` (a mailbox always lists its system labels), an empty list, a
+/// page token (the method has no pages), a label without an id or a name,
+/// or an id listed twice.
 pub fn labels_list(body: &[u8]) -> Result<Vec<Label>, DecodeError> {
     let wire: WireLabels = json(body)?;
-    wire.labels
+    if wire.next_page_token.is_some() {
+        return Err(DecodeError::InvalidField {
+            field: "nextPageToken",
+            reason: "labels.list has no pages: one page is not every label".into(),
+        });
+    }
+    let labels: Vec<Label> = wire
+        .labels
+        .filter(|labels| !labels.is_empty())
+        .ok_or(DecodeError::MissingField("labels"))?
         .into_iter()
         .map(crate::labels::WireLabel::decode)
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(twice) = labels.iter().find(|label| !ids.insert(&label.id)) {
+        return Err(DecodeError::InvalidField {
+            field: "labels",
+            reason: format!("{} is listed twice", twice.id.0),
+        });
+    }
+    Ok(labels)
 }
 
 #[derive(Deserialize)]

@@ -841,3 +841,242 @@ async fn the_first_refresh_after_the_migration_fills_colour_and_visibility() {
     sync(&runner).await;
     assert!(feed_since(&runner, after).await.is_empty(), "then quiet");
 }
+
+/// What the account's mirror remembers as deleted.
+fn remembered(runner: &LabelRunner) -> Vec<String> {
+    runner
+        .store()
+        .mirror(&account())
+        .expect("tracked")
+        .record
+        .deleted_labels
+        .keys()
+        .map(|id| id.0.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_empty_or_truncated_listing_strips_no_label() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        let label = mailbox.create_label("Kept");
+        mailbox.add("m1", &["INBOX", "UNREAD", &label]);
+    })
+    .await;
+    // No labels at all, then a listing cut short (no INBOX, no UNREAD).
+    for body in [
+        "{}",
+        r#"{"labels":[]}"#,
+        r#"{"labels":[{"id":"STARRED","name":"STARRED","type":"system"}]}"#,
+    ] {
+        runner
+            .transport()
+            .mailbox()
+            .fail_next("GET labels", Fault::Body(body));
+        runner.advance(REFRESH);
+        sync(&runner).await;
+        assert_eq!(
+            view(&runner, "m1").await.labels,
+            set(["INBOX", "Label_1", "UNREAD"]),
+            "{body}"
+        );
+        assert_eq!(user_names(&runner).await["Label_1"], "Kept", "{body}");
+        assert!(remembered(&runner).is_empty(), "{body}");
+    }
+    // A delete whose own listing is cut short sends nothing.
+    runner.transport().mailbox().fail_next(
+        "GET labels",
+        Fault::Body(r#"{"labels":[{"id":"Label_1","name":"Kept","type":"user"}]}"#),
+    );
+    let deleted = runner
+        .delete_label(&account(), &id("Label_1"), SublabelDeletion::Refuse, BUDGET)
+        .await;
+    assert!(
+        matches!(deleted, Err(LabelError::Retryable(_))),
+        "{deleted:?}"
+    );
+    assert!(writes(&runner).is_empty());
+    assert_eq!(
+        view(&runner, "m1").await.labels,
+        set(["INBOX", "Label_1", "UNREAD"])
+    );
+}
+
+#[tokio::test]
+async fn a_rename_into_its_own_subtree_changes_nothing() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        mailbox.create_label("A");
+        mailbox.create_label("A/k");
+    })
+    .await;
+    let into_itself = runner
+        .update_label(
+            &account(),
+            &id("Label_1"),
+            renamed("A/x"),
+            Sublabels::Follow,
+            BUDGET,
+        )
+        .await;
+    assert!(
+        matches!(into_itself, Err(LabelError::Invalid(_))),
+        "{into_itself:?}"
+    );
+    assert!(writes(&runner).is_empty());
+    assert_eq!(
+        user_names(&runner).await.into_values().collect::<Vec<_>>(),
+        ["A", "A/k"]
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_or_system_label_id_is_refused() {
+    let runner = synced(Access::ReadWrite, |_| {}).await;
+    let unknown = runner
+        .delete_label(
+            &account(),
+            &id("Label_404"),
+            SublabelDeletion::Refuse,
+            BUDGET,
+        )
+        .await;
+    assert_eq!(unknown, Err(LabelError::NotFound));
+    assert!(remembered(&runner).is_empty(), "nothing remembered for it");
+    let sent = requests(&runner);
+    // A fixed system id is refused whatever the mirror holds.
+    let category = runner
+        .delete_label(
+            &account(),
+            &id("CATEGORY_SOCIAL"),
+            SublabelDeletion::Refuse,
+            BUDGET,
+        )
+        .await;
+    assert!(
+        matches!(category, Err(LabelError::Invalid(_))),
+        "{category:?}"
+    );
+    assert_eq!(requests(&runner), sent, "before any call");
+    // A system label only Gmail's listing names: refused from it.
+    runner.transport().mailbox().system_label("YELLOW_STAR");
+    let star = runner
+        .delete_label(
+            &account(),
+            &id("YELLOW_STAR"),
+            SublabelDeletion::Refuse,
+            BUDGET,
+        )
+        .await;
+    assert!(matches!(star, Err(LabelError::Invalid(_))), "{star:?}");
+    assert!(writes(&runner).is_empty());
+}
+
+#[tokio::test]
+async fn a_write_to_an_untracked_account_sends_nothing() {
+    let runner = synced(Access::ReadWrite, |_| {}).await;
+    let sent = requests(&runner);
+    let stranger = mailtide::ids::AccountId("bob@example.com".into());
+    let created = runner
+        .create_label(&stranger, new_label("Work"), BUDGET)
+        .await;
+    assert!(
+        matches!(
+            created,
+            Err(LabelError::Run(mailtide_io::runner::RunError::Store(
+                mailtide_store::StoreError::NotTracked
+            )))
+        ),
+        "{created:?}"
+    );
+    assert_eq!(requests(&runner), sent, "Gmail never saw it");
+}
+
+/// The fake Gmail, with another client of the store writing a label while
+/// a listing is on its way: it answers the listing as it stood when the
+/// request arrived.
+struct Racing {
+    gmail: label_support::FakeGmail,
+    store: mailtide_store::sqlite::SqliteStore,
+}
+
+impl mailtide_io::transport::GmailTransport for Racing {
+    async fn send(
+        &self,
+        request: mailtide_gmail::http::HttpRequest,
+        token: &mailtide_io::auth::AccessToken,
+    ) -> Result<mailtide_gmail::http::HttpResponse, mailtide_io::transport::TransportError> {
+        let listing = request.path.ends_with("/labels")
+            && request.method == mailtide_gmail::http::Method::Get;
+        let answer = self.gmail.send(request, token).await;
+        if listing && !self.gmail.mailbox().labels.contains_key("Label_1") {
+            // A create elsewhere lands and is recorded before the answer.
+            self.gmail.mailbox().create_label("Created meanwhile");
+            let label = mailtide::gmail::Label {
+                list_visibility: Some(LabelListVisibility::Show),
+                message_visibility: Some(MessageListVisibility::Show),
+                ..mailtide::gmail::Label::plain(
+                    id("Label_1"),
+                    "Created meanwhile",
+                    mailtide::gmail::LabelKind::User,
+                )
+            };
+            mailtide_store::Store::record_label(
+                &self.store,
+                &account(),
+                &mailtide::commit::LabelOp::Upsert(label),
+            )
+            .await
+            .expect("recorded");
+        }
+        answer
+    }
+}
+
+/// The generation is read before the listing is sent: a local write that
+/// lands while it is on its way makes it stale, so it cannot remove the
+/// label just written (read after the answer, it would).
+#[tokio::test]
+async fn a_listing_answered_after_a_local_write_is_not_applied() {
+    use mailtide_store::Store as _;
+    let store = mailtide_store::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("store");
+    store.migrate().await.expect("migrate");
+    store.track(&account(), 1).await.expect("track");
+    let gmail = label_support::FakeGmail::default();
+    label_support::with_defaults(&gmail);
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1_700_000_000_000));
+    let gate = std::sync::Arc::new(label_support::GateState::default());
+    let runner = label_support::runner_over(
+        store.clone(),
+        Racing { gmail, store },
+        Access::ReadWrite,
+        &clock,
+        &gate,
+    );
+    runner
+        .run(&account(), Duration::from_secs(30))
+        .await
+        .expect("run");
+    let defined = runner.labels(&account()).await.expect("labels");
+    assert!(
+        defined.iter().any(|label| label.id == id("Label_1")),
+        "{defined:?}"
+    );
+    // The next listing names it: nothing was remembered as deleted.
+    clock.fetch_add(
+        i64::try_from(REFRESH.as_millis()).unwrap_or(i64::MAX),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    runner
+        .run(&account(), Duration::from_secs(30))
+        .await
+        .expect("run");
+    assert!(
+        runner
+            .labels(&account())
+            .await
+            .expect("labels")
+            .iter()
+            .any(|label| label.id == id("Label_1"))
+    );
+}

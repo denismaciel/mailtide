@@ -358,4 +358,39 @@ mod tests {
             Err(DecodeError::MissingField("id"))
         ));
     }
+
+    #[test]
+    fn a_label_listing_without_labels_is_no_listing() {
+        use crate::decode::labels_list;
+        let inbox = r#"{"id":"INBOX","name":"INBOX","type":"system"}"#;
+        for body in [
+            "{}".to_owned(),
+            r#"{"labels":[]}"#.to_owned(),
+            r#"{"labels":null}"#.to_owned(),
+        ] {
+            assert_eq!(
+                labels_list(body.as_bytes()),
+                Err(DecodeError::MissingField("labels")),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            labels_list(format!(r#"{{"labels":[{inbox}],"nextPageToken":"p2"}}"#).as_bytes()),
+            Err(DecodeError::InvalidField {
+                field: "nextPageToken",
+                ..
+            })
+        ));
+        assert!(matches!(
+            labels_list(format!(r#"{{"labels":[{inbox},{inbox}]}}"#).as_bytes()),
+            Err(DecodeError::InvalidField {
+                field: "labels",
+                ..
+            })
+        ));
+        assert_eq!(
+            labels_list(format!(r#"{{"labels":[{inbox}]}}"#).as_bytes()).map(|l| l.len()),
+            Ok(1)
+        );
+    }
 }

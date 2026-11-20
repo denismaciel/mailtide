@@ -70,12 +70,6 @@ pub fn parent(name: &str) -> Option<&str> {
     name.rsplit_once(DELIMITER).map(|(parent, _)| parent)
 }
 
-/// The last level of `name` (`C` for `A/B/C`).
-#[must_use]
-pub fn leaf(name: &str) -> &str {
-    name.rsplit_once(DELIMITER).map_or(name, |(_, leaf)| leaf)
-}
-
 /// The name of `leaf` under `parent`.
 #[must_use]
 pub fn child(parent: &str, leaf: &str) -> String {
@@ -142,6 +136,10 @@ pub enum RenameConflict {
     NotFound,
     /// Another label already holds a name the rename needs.
     Taken(Label),
+    /// The new name is under the label's own (`A` to `A/x`): its sublabels
+    /// would move into the label's own subtree, and a rename that stopped
+    /// half-way would move the moved ones again.
+    UnderItself,
 }
 
 /// The sublabel renames renaming label `id` to `new` takes, checked before
@@ -159,6 +157,9 @@ pub fn plan_rename(
         .iter()
         .find(|label| &label.id == id)
         .ok_or(RenameConflict::NotFound)?;
+    if is_under(new, &label.name) {
+        return Err(RenameConflict::UnderItself);
+    }
     let renames = sublabel_renames(labels, &label.name, new);
     let moving = |candidate: &Label| {
         candidate.id == label.id || renames.iter().any(|(id, _)| id == &candidate.id)
@@ -284,5 +285,26 @@ mod tests {
         // is left, and its moved sublabel does not block it.
         let half = [label("1", "A"), label("2", "E/x")];
         assert_eq!(plan_rename(&half, &id("1"), "E"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_rename_into_its_own_subtree_is_refused() {
+        let labels = [label("1", "A"), label("2", "A/k")];
+        assert_eq!(
+            plan_rename(&labels, &id("1"), "A/x"),
+            Err(RenameConflict::UnderItself)
+        );
+        // Half-way through such a rename, retrying would move `A/x/k` to
+        // `A/x/x/k`: it is refused before anything moves, at any point.
+        let half = [label("1", "A"), label("2", "A/x/k")];
+        assert_eq!(
+            plan_rename(&half, &id("1"), "A/x"),
+            Err(RenameConflict::UnderItself)
+        );
+        assert_eq!(
+            plan_rename(&labels, &id("1"), "AB"),
+            Ok(vec![(id("2"), "AB/k".into())]),
+            "a sibling name is not under it"
+        );
     }
 }

@@ -78,15 +78,30 @@ in the mirror at once by an unfenced store call. They are not §7 intents: the
 host needs the new id before it can use the label, each write is one small
 idempotent call, and there is nothing to overlay (see Alternatives).
 
-Two rules make deletion safe whatever Gmail's history does:
+Three rules make deletion safe:
 
 1. **A removed definition leaves every message.** When the mirror learns a
    label is gone (our own delete answered 2xx or 404, or a `labels.list`
    lacks a stored id) it strips the id from every message row, drops the
    intents on it, and logs each change, in the same transaction.
 2. **A deleted id cannot come back.** The id is remembered as deleted for 30
-   days; every later observation, history delta and import is stored without
-   it. Only a `labels.list` naming the id again (Gmail's own word) restores it.
+   days; every later observation, history delta, import and late write
+   answer (an `Upsert` racing the delete) is stored without it. Only a
+   `labels.list` naming the id again (Gmail's own word) restores it.
+3. **Only a whole listing is proof.** A listing must name `INBOX` and every
+   system label the definitions hold (a mailbox always lists them), and
+   carry no page token and no id twice; an empty answer is a decode error,
+   retried. One that falls short changes nothing, and Gmail's own labels
+   are never forgotten, whatever a listing or a `Remove` says.
+
+These do not make deletion independent of history in one case: an id the
+definitions never held (a label created elsewhere, applied, and deleted
+before any listing named it) is not stripped by a listing, since a listing
+can only show what it lacks among what was stored. Its rows lose it through
+Gmail's own `labelsRemoved` records, which `label-edit-delete-history`
+confirmed Gmail writes for every message, or when each message is fetched
+again. Stripping ids no listing ever named was rejected: Gmail lists no
+definition for some ids messages carry, and such a rule would strip them.
 
 ### Public API
 
@@ -112,10 +127,12 @@ caller gives is checked against Google's palette
 `LabelError`: `NotFound`, `NameTaken { existing }`, `Invalid` (blank name,
 control character, colour outside the palette, system label),
 `HasSublabels { ids }`, `Partial { done, error }`, `Deferred { until }`,
-`ReadOnly`, `Refused` (other 400/403), `Retryable`, `OutcomeUnknown`.
+`ReadOnly`, `Refused` (other 400/403), `Retryable`, `OutcomeUnknown`, and
+`Run` (the runner's own resources: the store, the quota gate).
 
-Pure helpers in `mailtide::label_names`: `validate`, `parent`, `leaf`,
-`child`, `sublabel_renames`, and `parents(&[Label])`, which gives each label
+Pure helpers in `mailtide::label_names`, for the driver and for hosts that
+compose nested names: `validate`, `validate_leaf`, `parent`, `child`,
+`renamed`, `sublabel_renames`, `plan_rename`, and `parents(&[Label])`, which gives each label
 its parent: the longest other label name that is a prefix ending at a `/`
 (`A/B/C` under `A/B`, else under `A`, else top level; `A/Subway` is not under
 `A/Sub`). It is derived on read, never stored.
@@ -164,11 +181,18 @@ within `budget`, then returns `Deferred`: nothing sent, nothing recorded.
   last. Gmail's API renames only the label it is asked to
   (`label-edit-rename-parent`), so the sublabels are mailtide's to move. A
   failure returns `Partial`; the same call again finds the rest still under
-  the old prefix and finishes. A 409 to a patch is `NameTaken` too.
-- **Delete:** system labels are refused from the mirror's definitions before
-  any call. Then the labels are listed once: a label the listing lacks is
-  `already_gone` (one listing is proof, `label-edit-list-consistency`) and
-  is recorded as a removal without a write. With sublabels and `Refuse`,
+  the old prefix and finishes. A 409 to a patch is `NameTaken` too. A new
+  name under the label's own (`A` to `A/x`) is refused as `Invalid` before
+  anything is sent: its sublabels would move into its own subtree, and a
+  retry after a failure half-way would move the moved ones again.
+- **Delete:** one of Gmail's fixed system ids, or a system label of the
+  mirror's definitions, is refused before any call. Then the labels are
+  listed once (a listing that falls short is a `Retryable` failure, never
+  proof): a system label it names is refused; a label it lacks is
+  `already_gone` if the mirror defined it (one listing is proof,
+  `label-edit-list-consistency`) and is recorded as a removal without a
+  write, and `NotFound` if neither knows it (nothing is remembered for an
+  id nobody had). With sublabels and `Refuse`,
   `HasSublabels`; with `Delete`, deepest first, the label last. Gmail's
   `labels.delete` removes only the label it names
   (`label-edit-delete-parent`). A 404 is `already_gone` too.
@@ -220,8 +244,27 @@ write must survive a concurrent sync superseding another.
 
 In SQL a removal finds candidate rows by a text match on the `labels` column
 and confirms each in Rust (`_` is a wildcard in `LIKE`, and `Label_1` is a
-prefix of `Label_10`). It is one transaction, of the size of a
-reconciliation's last commit.
+prefix of `Label_10`): one statement for every label a commit removes, not
+one per label. It rewrites each row that carried the label and logs one
+feed entry per row, both in multi-row statements, in one transaction under
+the account lock. Measured with `crates/mailtide-store/examples/label_removal.rs`
+on 50,000 rows carrying the label (release build, Apple-silicon builder):
+
+| Store | Round trip | `record_label(Remove)`, 50,000 rows | A listing removing 4 labels, 25,000 rows |
+|---|---|---|---|
+| `SQLite` (memory) | 0.04 ms | 1.6 s | 0.8 s |
+| Postgres over a 35-40 ms link | 40 ms | 11.7 s | 5.8 s |
+
+About 330 statements make up a 50,000-row removal (one candidate scan,
+rows loaded 2,000 ids at a time, rows and feed entries written 500 a
+statement), so on Postgres it is round trips: at a host's usual sub-ms
+link it is about the `SQLite` figure. Written one row and one entry per
+statement, as the first version was, it took 1.5 s on `SQLite` and some
+100,000 round trips on Postgres (over an hour on that link; the run was
+stopped). The removal runs inside the host's `delete_label` call after
+Gmail answered: the call's `budget` bounds the Gmail requests only, so a
+removal from a very large label can outlast it. A listing that removes
+several labels scans for all of them in one statement.
 
 ### Meeting the sync engine
 
@@ -240,7 +283,9 @@ Rules in `mirror.rs`, shared by every store:
   `ReplaceAll`, for reconciliation's listing and for the §6.6 refresh alike;
   the store skips the op if a local write happened since. A stale listing can
   therefore not remove a label just created here, nor restore one just
-  deleted. The next refresh (at most `label_refresh` later) applies.
+  deleted. The next refresh (at most `label_refresh` later) applies. When
+  reconciliation lists the labels, a refresh still in flight is dropped, so
+  two listings answered out of order cannot apply the older last.
 - **Removal** strips the id from trusted and unverified rows alike without
   moving a checkpoint (if Gmail also sends `labelsRemoved`, those records
   then change nothing), and drops pending, delivered and blocked intents on
@@ -257,22 +302,26 @@ definitions differ; `LabelsChanged { removed }` per message a removal
 touches; `OverlayChanged` where an intent was dropped. A consumer that
 replays the feed needs no new rule.
 
-One engine change: **a delivery refused for an added label blocks only
-that add.** Gmail refuses a `messages.modify` (and a `batchModify`) whose
-`addLabelIds` names a deleted or never-created label with 400 `labelId not
-found`, and refuses it whole: a valid label in the same request is not
-applied either (`label-edit-modify-deleted-label`). A delivery carries all
-of one message's pending changes, so today one dead label would block the
-message's other changes (a star, an archive) for good. Now a delivery
-refused for good whose group adds a label that is not one of Gmail's fixed
-system labels *beside other changes* blocks only those adds; the other
-intents stay pending, and finishing the job enqueues their delivery, alone.
-If that is refused too, it has no such add left and blocks as before, so
-nothing loops. The engine also asks for a label refresh for the blocked
-ids (the usual throttled one), whose listing removes a deleted label and,
-with it, the blocked intent. Removing a deleted label is not refused at
-all: Gmail answers 200 and changes nothing, so such an intent is delivered
-and settles on its confirmation fetch like any other.
+One engine change: **a delivery refused for an added label waits for a
+listing, then goes again.** Gmail refuses a `messages.modify` (and a
+`batchModify`) whose `addLabelIds` names a deleted or never-created label
+with 400 `labelId not found`, and refuses it whole: a valid label in the
+same request is not applied either (`label-edit-modify-deleted-label`).
+A delivery carries all of one message's pending changes, so blocking the
+group would block a star, an archive or a valid user label with the dead
+one. So the first time a delivery whose group adds a label that is not one
+of Gmail's fixed system labels is refused for good, nothing is blocked: the
+engine keeps the job's claim, lists the labels at once, and when that
+listing has been applied (it removes a deleted label and the intents on
+it) or has failed, finishes the job, so the store enqueues what is still
+pending and it goes again. Refused a second time, the adds that may be
+gone are blocked and the rest goes alone; refused again, everything left
+blocks, so nothing loops. A run that ends while a delivery waits leaves its
+claim to the next engine, which delivers it afresh. In read-only mode,
+where the runner refuses every modify without sending it, a group with
+such adds takes one listing and three rounds to block. Removing a deleted
+label is not refused at all: Gmail answers 200 and changes nothing, so
+such an intent is delivered and settles on its confirmation fetch.
 
 The approved plan also verified a 404 answering a delivery before
 tombstoning the message, in case Gmail answered 404 for a deleted label.
@@ -365,11 +414,17 @@ Not declared: Zero `mail-label-store.test.ts` and `mail-label-policy.test.ts`
 Graph and JMAP mailbox tests (other providers; the Gmail suite has the same
 cases); jmap-client and the Stalwart server (no tests for this).
 
-Our own 46 tests add what no reference has: request shapes and the palette;
+Our own 62 tests add what no reference has: request shapes and the palette;
 the removal, filter and fence rules; the store cases (including `Label_1`
 versus `Label_10`); lost answers and resumable sublabel renames; labels
 changed elsewhere **with and without** history records; a delivery refused
-for an added label; a simulator campaign; the Python API.
+for an added label, held for a listing and retried once; empty and
+truncated listings at every layer (decode, mirror, every store, driver,
+simulator); late answers racing a delete; renames into a label's own
+subtree; ids nobody had; each safeguard a reviewer found unpinned (the
+generation read before the listing, the reconcile scope filter, the
+tracked check, the listing's system-label refusal); a simulator campaign
+with month-long gaps and fenced listings counted; the Python API.
 
 ## 6. Slices
 
@@ -422,9 +477,15 @@ store read and write. A lost answer arrives as `CallError::OutcomeUnknown`.
    records, and reconciliation verifies rows but would keep a dead id on a
    row a listing never names again. Would simplify to "history only" if
    replayed history were shown never to carry a dead id.
-3. **One listing without the id is proof of deletion** (fenced by the
-   generation). Two listings would be safer against a Gmail inconsistency
-   and slower; see `label-edit-list-consistency`.
+3. **One whole listing without the id is proof of deletion** (fenced by
+   the generation). A listing that is empty, paged, has an id twice, or
+   lacks `INBOX` or a stored system label is not whole and proves nothing.
+   A listing cut short that still names every system label is
+   indistinguishable from deletions and is trusted: Gmail answered every
+   listing whole in `label-edit-list-consistency` (always one page, never
+   missing a label). Two listings a refresh apart would cover that case at
+   the cost of a refresh interval; they would change if Gmail were ever
+   seen to answer short.
 4. **Per-message `LabelsChanged` entries for a removal**, up to one commit
    with as many entries as the label had messages. Would change to a single
    entry if `feed-pages` is not built and such commits prove too large.
@@ -447,12 +508,13 @@ store read and write. A lost answer arrives as `CallError::OutcomeUnknown`.
     would carry it until the matching `labelsRemoved` record arrives, or
     for good if history expired in between. Its cost is a JSON column read
     with the account row every commit loads anyway.
-11. **A delivery refused for an added label blocks only that add**
+11. **A delivery refused for an added label waits for a listing once**
     (`label-edit-modify-deleted-label`, refuted in one half): Gmail refuses
-    the whole modify with 400, so blocking the whole group would block a
-    message's unrelated changes for good. Which add caused the 400 is not
-    in Gmail's answer, so every non-system add of the group is blocked and
-    the rest goes again alone. The planned "verify a delivery's 404" was
+    the whole modify with 400 without naming the label, so blocking at once
+    would block a message's unrelated changes, valid user labels included.
+    The listing tells a deleted label from a live one; a second refusal
+    means the label is not the cause and blocks the doubtful adds, then the
+    rest. The planned "verify a delivery's 404" was
     dropped: Gmail never answers 404 for a label, and a 404 for the message
     is the same proof a `get`'s 404 is.
 

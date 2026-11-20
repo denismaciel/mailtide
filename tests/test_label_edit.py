@@ -59,8 +59,9 @@ def test_label_lifecycle(gmail: tuple[Mailbox, str]) -> None:
         assert names(await r.labels(ACCOUNT)) == {}
         [view] = await r.messages(ACCOUNT, ["m1"])
         assert view.labels == ["INBOX"], "a deleted label leaves the message at once"
-        again = await r.delete_label(ACCOUNT, work.id)
-        assert (again.deleted, again.already_gone) == ([], [work.id])
+        with pytest.raises(mailtide.LabelNotFound) as gone:
+            await r.delete_label(ACCOUNT, work.id)  # nobody holds it any more
+        assert gone.value.done == []
 
         later = await r.changes(ACCOUNT, since=page.next)
         assert isinstance(later, mailtide.ChangePage)
@@ -72,8 +73,12 @@ def test_label_lifecycle(gmail: tuple[Mailbox, str]) -> None:
             await r.create_label(ACCOUNT, "X", color=mailtide.LabelColor("#123456", "#ffffff"))
         with pytest.raises(mailtide.InvalidLabel, match="system label"):
             await r.update_label(ACCOUNT, "INBOX", name="Mine")
-        with pytest.raises(mailtide.LabelNotFound):
+        with pytest.raises(mailtide.LabelNotFound) as missing:
             await r.update_label(ACCOUNT, "Label_99", list_visibility="hide")
+        assert missing.value.done == []
+        top = await r.create_label(ACCOUNT, "Top")
+        with pytest.raises(mailtide.InvalidLabel, match="under the label"):
+            await r.update_label(ACCOUNT, top.id, name="Top/sub")
 
     asyncio.run(main())
 

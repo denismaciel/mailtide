@@ -34,7 +34,7 @@ role = "LabelOp::Upsert and LabelOp::Remove { id, at }; LabelOp::ReplaceAll (tod
 [[file]]
 path = "crates/mailtide/src/mirror.rs"
 change = "modify"
-role = "Label rules: a removed definition strips its id from every message row, drops its intents and is remembered as deleted; remembered ids are filtered from every later observation; a listing from an older generation is skipped; record_label for local writes"
+role = "Label rules: a removed definition strips its id from every message row, drops its intents and is remembered as deleted; remembered ids are filtered from every later observation and from a late Upsert; a listing from an older generation, or one that is not whole (complete_listing), is skipped; Gmail's own labels are never forgotten; removed_labels (what an op removes) is shared with the SQL store; record_label for local writes"
 
 [[file]]
 path = "crates/mailtide/src/command.rs"
@@ -54,7 +54,7 @@ role = "Costs of labels.create, labels.patch and labels.delete"
 [[file]]
 path = "crates/mailtide/src/engine.rs"
 change = "modify"
-role = "Pass the listing's generation and time into ReplaceAll, for reconciliation's listing and for the §6.6 refresh alike (on_labels, on_label_refresh); a delivery refused for good that adds a non-system label beside other changes blocks only those adds, the rest stays pending and goes again, and a label refresh is asked for them"
+role = "Pass the listing's generation and time into ReplaceAll, for reconciliation's listing and for the §6.6 refresh alike (on_labels, on_label_refresh); reconciliation's listing drops a refresh in flight; a delivery refused for good that adds a non-system label is held (claim kept) until a listing sent after it has been applied, then goes again; refused again, its doubtful adds block and the rest goes alone"
 
 [[file]]
 path = "crates/mailtide/src/labels.rs"
@@ -64,7 +64,7 @@ role = "system::is_system: the fixed system label ids (and CATEGORY_*), which a 
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
 change = "modify"
-role = "Label invariants: definition ids are unique; no message row and no intent names a label remembered as deleted"
+role = "Label invariants: definition ids are unique; no message row and no intent names a label remembered as deleted; LiveLabelStripped for the simulator's check that a listing never strips a label Gmail still shows"
 
 # ------------------------------------------------------------------ wire layer
 
@@ -76,7 +76,7 @@ role = "labels.create, labels.patch and labels.delete requests, Label decoding w
 [[file]]
 path = "crates/mailtide-gmail/src/decode.rs"
 change = "modify"
-role = "labels_list keeps labelListVisibility, messageListVisibility and color"
+role = "labels_list keeps labelListVisibility, messageListVisibility and color, and refuses anything short of a whole listing (no labels, an empty list, a page token, an id twice); label_get decodes as labels.rs does"
 
 [[file]]
 path = "crates/mailtide-gmail/src/request.rs"
@@ -103,7 +103,7 @@ role = "Label methods over AccountMirror"
 [[file]]
 path = "crates/mailtide-store/src/sql.rs"
 change = "modify"
-role = "The next migration: mailtide_labels.attrs (visibility and colour as JSON) and, on mailtide_accounts, label_generation and deleted_labels (the deleted-label memory as JSON), each a column of its own: nothing is added to the sync column. Strip a removed label from the rows that carry it"
+role = "The next migration: mailtide_labels.attrs (visibility and colour as JSON) and, on mailtide_accounts, label_generation and deleted_labels (the deleted-label memory as JSON), each a column of its own: nothing is added to the sync column. Strip a removed label from the rows that carry it: one candidate scan for all the labels a commit removes, and the rewritten rows and feed entries in multi-row statements (every commit's writes, chunked)"
 
 [[file]]
 path = "crates/mailtide-store/src/conformance.rs"
@@ -160,12 +160,17 @@ role = "Export the label types"
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
-role = "Labels in the fake Gmail: created, renamed and deleted here and elsewhere, with and without history records for a deletion; definitions compared at convergence"
+role = "Labels in the fake Gmail: created, renamed and deleted here and elsewhere, with and without history records for a deletion; listings answered empty or cut short; 31 days passing; after every listing no row lost a label Gmail still shows; fenced listings and expired memory counted; definitions compared at convergence"
 
 [[file]]
 path = "crates/mailtide-sim/examples/campaign.rs"
 change = "modify"
-role = "The campaign's totals count label writes recorded and lost, deletions without history records, and refused deliveries"
+role = "The campaign's totals count label writes recorded and lost, deletions without history records, refused deliveries, bad listings, fenced listings and expired memory"
+
+[[file]]
+path = "crates/mailtide-store/examples/label_removal.rs"
+change = "new"
+role = "Times record_label(Remove) and a listing removing four labels on a mailbox of N messages, on SQLite or Postgres: what the note's cost figures come from"
 
 # -------------------------------------------------------------------- bindings
 
@@ -639,8 +644,23 @@ covers = "Recording an answer the mirror already shows bumps the generation but 
 
 [[test]]
 target = "crates/mailtide/src/engine.rs"
-name = "a_refused_add_of_a_user_label_blocks_it_alone_and_the_rest_is_delivered"
-covers = "Gmail refuses a whole modify with 400 `labelId not found` when an add names a deleted label (label-edit-modify-deleted-label): the add of the user label is blocked, the message's other changes stay pending and are delivered next, on their own"
+name = "a_delivery_refused_for_a_user_label_waits_for_a_listing_and_goes_again"
+covers = "Gmail refuses a whole modify with 400 `labelId not found` when an add names a deleted label (label-edit-modify-deleted-label): the first refusal blocks nothing, the labels are listed at once, and once that listing is applied (dropping the dead label's intents) the delivery goes again with the rest, a valid user label and a star included"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_second_refusal_blocks_only_the_user_label_adds"
+covers = "Refused again after the listing, the adds that may be gone are blocked and the rest goes alone; refused once more, it blocks: each refusal sends less, so nothing loops"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_held_delivery_follows_what_changed_meanwhile"
+covers = "A delivery held for a listing goes again with what the store holds then: a newer version admitted meanwhile is sent and nothing is blocked; a message deleted meanwhile sends nothing, the held claim's finish is rejected and the engine carries on"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_reconciliation_listing_supersedes_a_refresh_in_flight"
+covers = "A refresh listing in flight when reconciliation lists the labels is dropped, so an older listing answered last is never applied"
 
 [[test]]
 target = "crates/mailtide/src/invariants.rs"
@@ -666,6 +686,66 @@ covers = "Label_1 is stripped and Label_10 and LabelX1 are not: the SQL candidat
 target = "crates/mailtide-sim/src/lib.rs"
 name = "labels_edited_here_and_elsewhere_converge_under_faults"
 covers = "Seeded campaign with label creates, renames and deletes from the driver and from another client, crashes between the Gmail call and its record, stale listings, and deletions that leave no history records: invariants hold and definitions and label sets equal Gmail's after healing"
+
+[[test]]
+target = "crates/mailtide-gmail/src/labels.rs"
+name = "a_label_listing_without_labels_is_no_listing"
+covers = "labels.list with no labels, an empty or null list, a page token, or an id twice is a decode error, never a short listing read as deletions (the driver retries one without labels)"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_listing_without_the_system_labels_proves_nothing"
+covers = "An empty listing, or one cut short (no INBOX, or lacking a stored system label), changes no definition, no row and no memory"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_system_label_is_never_forgotten"
+covers = "A Remove of a fixed system id or of a label listed as system, or a listing lacking one, strips nothing and remembers nothing"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_late_upsert_does_not_bring_a_deleted_label_back"
+covers = "A patch's answer recorded after a concurrent delete changes nothing; only a listing restores the id"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_finishing_reconciliation_lists_no_deleted_label"
+covers = "A row a reconciliation's listing created gets no scope of a label deleted before the finish"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "an_incomplete_listing_changes_nothing"
+covers = "Every store applies none of an empty or truncated listing: definitions and rows stay"
+
+[[test]]
+target = "crates/mailtide/src/label_names.rs"
+name = "a_rename_into_its_own_subtree_is_refused"
+covers = "A to A/x is refused before anything moves, also half-way through such a rename; A to AB is not under A"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "an_empty_or_truncated_listing_strips_no_label"
+covers = "A refresh answered with no labels or cut short leaves every row, definition and memory as it was; a delete whose listing is cut short is Retryable and sends nothing"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_rename_into_its_own_subtree_changes_nothing"
+covers = "update_label(A, A/x) with sublabels following is Invalid before any write"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "deleting_an_unknown_or_system_label_id_is_refused"
+covers = "An id neither the listing nor the mirror holds is NotFound with nothing remembered; a fixed system id is Invalid before any call; a system label only Gmail's listing names is Invalid with no delete sent"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_write_to_an_untracked_account_sends_nothing"
+covers = "A label write for an untracked account is NotTracked before Gmail sees it, so no answer is left unrecorded"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_listing_answered_after_a_local_write_is_not_applied"
+covers = "The runner reads the generation before sending labels.list: a create recorded while the listing is on its way makes it stale, so the label stays (read after the answer, it would be removed)"
 
 # Driver
 

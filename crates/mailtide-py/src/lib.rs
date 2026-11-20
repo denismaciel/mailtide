@@ -419,15 +419,17 @@ mod _core {
                 LabelError::OutcomeUnknown(detail) => WriteOutcomeUnknown::new_err(detail),
                 LabelError::Run(error) => run_error(error),
             };
-            match done {
-                Some(done) => with_attribute(
-                    raised,
-                    "done",
-                    done.into_iter().map(|id| id.0).collect::<Vec<_>>(),
-                    py,
-                ),
-                None => raised,
-            }
+            // Every label write's exception says what it changed: nothing,
+            // unless it stopped half-way.
+            with_attribute(
+                raised,
+                "done",
+                done.unwrap_or_default()
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect::<Vec<_>>(),
+                py,
+            )
         })
     }
 

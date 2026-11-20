@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::commit::{
     AccountOp, Commit, CommitOutcome, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
-use crate::gmail::{HeaderFacts, Label, MessageFacts, MessageObservation};
+use crate::gmail::{HeaderFacts, Label, LabelKind, MessageFacts, MessageObservation};
 use crate::ids::{
     AccountId, BlobRef, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
     stable_hash,
@@ -763,6 +763,56 @@ fn without_deleted(op: &MessageOp, deleted: &BTreeMap<LabelId, Timestamp>) -> Me
     }
 }
 
+/// Whether `label` is one of Gmail's own: listed as a system label, or one
+/// of the fixed system ids. Never forgotten, whatever a listing says.
+fn is_system_label(label: &Label) -> bool {
+    label.kind == LabelKind::System || labels::system::is_system(&label.id.0)
+}
+
+/// The labels `op` removes from the definitions `stored` while the label
+/// generation is `generation`: those a current, complete listing lacks, or
+/// the one a `Remove` names; never one of Gmail's own. Every store applies
+/// the removal with [`AccountMirror`]; a SQL store loads the rows of these.
+#[must_use]
+pub fn removed_labels(stored: &[Label], generation: u64, op: &LabelOp) -> Vec<LabelId> {
+    match op {
+        LabelOp::ReplaceAll {
+            labels,
+            generation: listed_under,
+            ..
+        } if *listed_under == generation && complete_listing(stored, labels) => stored
+            .iter()
+            .filter(|label| {
+                !is_system_label(label) && labels.iter().all(|listed| listed.id != label.id)
+            })
+            .map(|label| label.id.clone())
+            .collect(),
+        LabelOp::Remove { id, .. }
+            if !labels::system::is_system(&id.0)
+                && !stored
+                    .iter()
+                    .any(|label| &label.id == id && label.kind == LabelKind::System) =>
+        {
+            vec![id.clone()]
+        }
+        LabelOp::ReplaceAll { .. } | LabelOp::Remove { .. } | LabelOp::Upsert(_) => Vec::new(),
+    }
+}
+
+/// Whether `listed` can be a whole `labels.list` answer given the stored
+/// definitions: it names `INBOX` and every system label stored (a mailbox
+/// always lists them). An empty or truncated answer is not proof that the
+/// labels it lacks were deleted; it changes nothing.
+#[must_use]
+pub fn complete_listing(stored: &[Label], listed: &[Label]) -> bool {
+    let named = |id: &LabelId| listed.iter().any(|label| &label.id == id);
+    named(&LabelId(labels::system::INBOX.to_owned()))
+        && stored
+            .iter()
+            .filter(|label| is_system_label(label))
+            .all(|label| named(&label.id))
+}
+
 /// Put label definitions in the order stores return them: by id, byte-wise
 /// (never a database collation, so every store agrees).
 pub fn sort_labels(labels: &mut [Label]) {
@@ -1044,8 +1094,12 @@ impl AccountMirror {
                 generation,
                 at,
             } => {
-                // A local write since the listing was sent: it is stale.
-                if *generation != self.record.label_generation {
+                // A local write since the listing was sent: it is stale. A
+                // listing without Gmail's system labels is no listing at
+                // all (a mailbox always lists them): it proves nothing.
+                if *generation != self.record.label_generation
+                    || !complete_listing(&self.labels, labels)
+                {
                     return;
                 }
                 let cutoff = at.minus(DELETED_LABEL_MEMORY);
@@ -1054,13 +1108,7 @@ impl AccountMirror {
                 for label in labels {
                     deleted.remove(&label.id);
                 }
-                let listed: BTreeSet<&LabelId> = labels.iter().map(|label| &label.id).collect();
-                let gone: Vec<LabelId> = self
-                    .labels
-                    .iter()
-                    .filter(|label| !listed.contains(&label.id))
-                    .map(|label| label.id.clone())
-                    .collect();
+                let gone = removed_labels(&self.labels, self.record.label_generation, op);
                 if !same_labels(&self.labels, labels) {
                     self.labels.clone_from(labels);
                     self.log.push((seq, Change::LabelDefinitionsChanged));
@@ -1069,8 +1117,11 @@ impl AccountMirror {
                     self.forget_label(&id, *at, seq);
                 }
             }
+            // An answer that lands after the label's deletion was recorded
+            // (a patch racing a delete) must not bring it back: only a
+            // listing restores a deleted id.
+            LabelOp::Upsert(label) if self.record.deleted_labels.contains_key(&label.id) => {}
             LabelOp::Upsert(label) => {
-                self.record.deleted_labels.remove(&label.id);
                 match self.labels.iter_mut().find(|stored| stored.id == label.id) {
                     Some(stored) if stored == label => {}
                     Some(stored) => {
@@ -1083,6 +1134,9 @@ impl AccountMirror {
                     }
                 }
             }
+            // Gmail's own labels are never deleted.
+            LabelOp::Remove { .. }
+                if removed_labels(&self.labels, self.record.label_generation, op).is_empty() => {}
             LabelOp::Remove { id, at } => {
                 let before = self.labels.len();
                 self.labels.retain(|label| &label.id != id);
@@ -3531,7 +3585,7 @@ mod tests {
     #[test]
     fn a_rename_changes_no_message_row() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
         applied(
             &mut mirror,
             vec![MessageOp::Observe(observation("a", &["Label_1"], 10))],
@@ -3542,17 +3596,150 @@ mod tests {
         assert_eq!(mirror.messages, before);
         assert_eq!(
             mirror.label_definitions(),
-            vec![defined("Label_1", "Renamed")]
+            vec![defined("INBOX", "INBOX"), defined("Label_1", "Renamed")]
         );
     }
 
     #[test]
     fn an_upsert_equal_to_the_stored_label_logs_nothing() {
         let mut mirror = claimed();
-        listed(&mut mirror, &["Label_1"], 0);
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
         let generation = mirror.record.label_generation;
         mirror.record_label(&LabelOp::Upsert(defined("Label_1", "Label_1")));
         assert!(entries(&mirror).is_empty());
         assert_eq!(mirror.record.label_generation, generation + 1);
+    }
+
+    #[test]
+    fn a_listing_without_the_system_labels_proves_nothing() {
+        let mut mirror = claimed();
+        listed(
+            &mut mirror,
+            &["INBOX", "SPAM", "UNREAD", "Label_1", "Label_2"],
+            0,
+        );
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(observation(
+                "a",
+                &["INBOX", "UNREAD", "Label_1"],
+                10,
+            ))],
+        );
+        let before = (mirror.label_definitions(), mirror.messages.clone());
+        // Gmail answered with no labels, or a listing cut short: neither is
+        // proof that what it lacks was deleted.
+        for listing in [
+            &[][..],
+            &["INBOX", "Label_2"][..],
+            &["SPAM", "UNREAD", "Label_2"][..],
+        ] {
+            listed(&mut mirror, listing, 5);
+            assert!(entries(&mirror).is_empty(), "{listing:?}");
+            assert_eq!(
+                (mirror.label_definitions(), mirror.messages.clone()),
+                before,
+                "{listing:?}"
+            );
+            assert!(mirror.record.deleted_labels.is_empty(), "{listing:?}");
+        }
+        assert!(complete_listing(&[], &[defined("INBOX", "INBOX")]));
+        assert!(!complete_listing(&[], &[defined("Label_1", "Label_1")]));
+    }
+
+    #[test]
+    fn a_system_label_is_never_forgotten() {
+        let mut mirror = claimed();
+        // YELLOW_STAR is not a fixed id: its kind says it is Gmail's.
+        let mut c = commit(&mirror);
+        c.labels = vec![LabelOp::ReplaceAll {
+            labels: vec![
+                defined("INBOX", "INBOX"),
+                defined("YELLOW_STAR", "YELLOW_STAR"),
+                defined("Label_1", "Label_1"),
+            ],
+            generation: 0,
+            at: Timestamp(0),
+        }];
+        mirror.apply(&c);
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(observation(
+                "a",
+                &["INBOX", "IMPORTANT", "YELLOW_STAR"],
+                10,
+            ))],
+        );
+        for id in ["IMPORTANT", "YELLOW_STAR"] {
+            mirror.record_label(&LabelOp::Remove {
+                id: LabelId(id.into()),
+                at: Timestamp(1),
+            });
+        }
+        // A complete listing lacking it: still Gmail's own.
+        listed(&mut mirror, &["INBOX", "Label_1"], 2);
+        assert_eq!(
+            labels_of(&mirror, "a"),
+            set(["IMPORTANT", "INBOX", "YELLOW_STAR"])
+        );
+        assert!(mirror.record.deleted_labels.is_empty());
+    }
+
+    #[test]
+    fn a_late_upsert_does_not_bring_a_deleted_label_back() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        // A patch answered 200, a concurrent delete recorded first, then
+        // the patch's answer lands.
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(10),
+        });
+        mirror.record_label(&LabelOp::Upsert(defined("Label_1", "Renamed")));
+        assert!(entries(&mirror).is_empty());
+        assert_eq!(mirror.label_definitions(), vec![defined("INBOX", "INBOX")]);
+        assert!(
+            mirror
+                .record
+                .deleted_labels
+                .contains_key(&LabelId("Label_1".into()))
+        );
+        // Only a listing restores it.
+        listed(&mut mirror, &["INBOX", "Label_1"], 20);
+        assert!(mirror.record.deleted_labels.is_empty());
+    }
+
+    #[test]
+    fn a_finishing_reconciliation_lists_no_deleted_label() {
+        let mut mirror = claimed();
+        listed(&mut mirror, &["INBOX", "Label_1"], 0);
+        // A row the listing created: its labels come from the scopes it was
+        // listed in, one of them a label deleted before the finish.
+        let listing = |scope: ListScope| MessageOp::Listed {
+            id: MessageId("n".into()),
+            thread_id: ThreadId("t".into()),
+            scope,
+            baseline: HistoryId(50),
+        };
+        applied(
+            &mut mirror,
+            vec![
+                listing(ListScope::All),
+                listing(ListScope::Label(LabelId("INBOX".into()))),
+                listing(ListScope::Label(LabelId("Label_1".into()))),
+            ],
+        );
+        mirror.record_label(&LabelOp::Remove {
+            id: LabelId("Label_1".into()),
+            at: Timestamp(10),
+        });
+        applied(
+            &mut mirror,
+            vec![MessageOp::FinishReconcile {
+                baseline: HistoryId(50),
+            }],
+        );
+        assert_eq!(labels_of(&mirror, "n"), set(["INBOX"]));
+        assert!(crate::invariants::check_state(&mirror).is_empty());
     }
 }

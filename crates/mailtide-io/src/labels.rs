@@ -24,7 +24,7 @@ use mailtide::gmail::{ColorChange, Label, LabelColor, LabelKind, LabelPatch, New
 use mailtide::ids::{AccountId, LabelId};
 use mailtide::label_names::{self, RenameConflict};
 use mailtide::quota::Priority;
-use mailtide::retry::{BlockingFailure, RetryableFailure};
+use mailtide::retry::{BlockingFailure, Retryable, RetryableFailure};
 use mailtide_store::Store;
 
 use crate::auth::TokenSource;
@@ -165,6 +165,11 @@ impl From<CallError> for LabelError {
     }
 }
 
+/// Whether `id` is one of Gmail's fixed system label ids.
+fn fixed_system(id: &LabelId) -> bool {
+    mailtide::labels::system::is_system(&id.0)
+}
+
 fn store_error(error: mailtide_store::StoreError) -> LabelError {
     LabelError::Run(RunError::Store(error))
 }
@@ -272,6 +277,11 @@ where
                 match label_names::plan_rename(&listed, id, name) {
                     Ok(renames) => renames,
                     Err(RenameConflict::NotFound) => return Err(LabelError::NotFound),
+                    Err(RenameConflict::UnderItself) => {
+                        return Err(LabelError::Invalid(format!(
+                            "{name:?} is under the label's own name: its sublabels would move into themselves"
+                        )));
+                    }
                     Err(RenameConflict::Taken(holder)) => {
                         return Err(LabelError::NameTaken {
                             existing: Some(holder),
@@ -323,6 +333,18 @@ where
         let listed = self.list(account, deadline).await?;
         let mut deletion = LabelDeletion::default();
         let Some(label) = listed.iter().find(|label| &label.id == id) else {
+            // Gone if the mirror defined it; an id nobody ever had is not
+            // found, and nothing is remembered for it.
+            let known = self
+                .store()
+                .labels(account)
+                .await
+                .map_err(store_error)?
+                .iter()
+                .any(|label| &label.id == id);
+            if !known {
+                return Err(LabelError::NotFound);
+            }
             self.removed(account, id).await?;
             deletion.already_gone.push(id.clone());
             return Ok(deletion);
@@ -379,8 +401,10 @@ where
     }
 
     /// `labels.list`, for a write that needs Gmail's current definitions.
+    /// A listing that lacks Gmail's system labels (cut short) proves
+    /// nothing about what it lacks: it is asked again later, never used.
     async fn list(&self, account: &AccountId, deadline: Instant) -> Result<Vec<Label>, LabelError> {
-        match self
+        let EventKind::LabelsListed { labels: listed, .. } = self
             .call_gmail(
                 account,
                 GmailRequest::ListLabels,
@@ -388,10 +412,18 @@ where
                 deadline,
             )
             .await?
-        {
-            EventKind::LabelsListed { labels, .. } => Ok(labels),
-            _ => Err(unexpected()),
+        else {
+            return Err(unexpected());
+        };
+        let stored = self.store().labels(account).await.map_err(store_error)?;
+        if !mailtide::mirror::complete_listing(&stored, &listed) {
+            return Err(LabelError::Retryable(RetryableFailure {
+                class: Retryable::Transient,
+                retry_after: None,
+                detail: "a label listing without Gmail's system labels".into(),
+            }));
         }
+        Ok(listed)
     }
 
     /// One `labels.patch`, recorded.
@@ -448,8 +480,9 @@ where
         LabelError::NameTaken { existing }
     }
 
-    /// Refuse a system label, from `listed` or else the mirror's
-    /// definitions; an id neither knows is left to Gmail.
+    /// Refuse a system label: one of Gmail's fixed ids whatever anyone
+    /// lists, or one `listed` (or else the mirror's definitions) calls a
+    /// system label; any other id is left to Gmail.
     async fn refuse_system(
         &self,
         account: &AccountId,
@@ -461,10 +494,11 @@ where
                 .iter()
                 .any(|label| &label.id == id && label.kind == LabelKind::System)
         };
-        let refused = match listed {
-            Some(labels) => system(labels),
-            None => system(&self.store().labels(account).await.map_err(store_error)?),
-        };
+        let refused = fixed_system(id)
+            || match listed {
+                Some(labels) => system(labels),
+                None => system(&self.store().labels(account).await.map_err(store_error)?),
+            };
         if refused {
             return Err(LabelError::Invalid(format!(
                 "{} is a system label: Gmail's own, not to be renamed or deleted",

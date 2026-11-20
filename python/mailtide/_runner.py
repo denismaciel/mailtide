@@ -358,8 +358,11 @@ class Runner:
         """Change a label: only the fields given are sent (``color=None``
         clears it). A rename moves its sublabels (``Work/x`` follows ``Work``)
         unless ``sublabels="leave"``; every name it needs is checked first,
-        then the sublabels move and the label last. If it stops half-way, the
-        exception carries ``done`` and the same call again finishes it."""
+        then the sublabels move and the label last. Every exception a label
+        write raises (``GmailUnavailable``, ``QuotaDeferred`` and
+        ``WriteOutcomeUnknown`` included) carries ``done``, the ids already
+        changed: empty unless it stopped half-way, when the same call again
+        finishes it. A new name under the label's own is ``InvalidLabel``."""
         return await self._core.update_label(
             account,
             label_id,

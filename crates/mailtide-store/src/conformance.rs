@@ -278,6 +278,9 @@ fn label_edit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
             "removing a label finds exactly the rows that carry it",
             |s| Box::pin(removing_a_label_finds_exactly_the_rows_that_carry_it(s)),
         ),
+        ("a listing without the system labels changes nothing", |s| {
+            Box::pin(an_incomplete_listing_changes_nothing(s))
+        }),
     ]
 }
 
@@ -3432,4 +3435,37 @@ async fn removing_a_label_finds_exactly_the_rows_that_carry_it<S: Store>(
             ],
         "a label the listing lacks leaves exactly its rows",
     )
+}
+
+/// A listing that lacks Gmail's system labels (empty, or cut short) is no
+/// proof that what it lacks was deleted: every store applies none of it.
+async fn an_incomplete_listing_changes_nothing<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut first = commit(&snapshot, 0);
+    first.labels = vec![listing(vec![
+        label("INBOX", "INBOX", LabelKind::System),
+        label("UNREAD", "UNREAD", LabelKind::System),
+        label("Label_1", "Travel", LabelKind::User),
+    ])];
+    first.messages = vec![observe("a", &["INBOX", "UNREAD", "Label_1"], 1)];
+    apply(store, &first).await?;
+    let before = labels(store, &account()).await?;
+    for (seq, listed) in [
+        (1, Vec::new()),
+        (2, vec![label("Label_2", "Other", LabelKind::User)]),
+        (3, vec![label("INBOX", "INBOX", LabelKind::System)]),
+    ] {
+        let mut cut = commit(&snapshot, seq);
+        cut.labels = vec![listing(listed)];
+        apply(store, &cut).await?;
+        expect(
+            labels(store, &account()).await? == before,
+            "the definitions stay",
+        )?;
+        expect(
+            view(store, "a").await?.labels == set(["INBOX", "Label_1", "UNREAD"]),
+            "no row loses a label",
+        )?;
+    }
+    Ok(())
 }

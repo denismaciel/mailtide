@@ -22,6 +22,9 @@ fn main() {
         totals.label_writes_lost += result.stats.label_writes_lost;
         totals.quiet_label_deletes += result.stats.quiet_label_deletes;
         totals.refused_deliveries += result.stats.refused_deliveries;
+        totals.bad_listings += result.stats.bad_listings;
+        totals.fenced_listings += result.stats.fenced_listings;
+        totals.forgotten_deletions += result.stats.forgotten_deletions;
         totals.label_listings += result.stats.label_listings;
         totals.opens += result.stats.opens;
         totals.raised += result.stats.raised;

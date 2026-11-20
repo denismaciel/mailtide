@@ -745,9 +745,18 @@ impl SqlStore {
         // is compared with).
         if !commit.labels.is_empty() {
             mirror.labels = load_labels(&mut **tx, account).await?;
-            for id in removed_labels(&mirror.labels, &commit.labels) {
-                ids.extend(carrying(tx, account, id).await?);
-            }
+            let removed: BTreeSet<LabelId> = commit
+                .labels
+                .iter()
+                .flat_map(|op| {
+                    mailtide::mirror::removed_labels(
+                        &mirror.labels,
+                        mirror.record.label_generation,
+                        op,
+                    )
+                })
+                .collect();
+            ids.extend(carrying(tx, account, &removed).await?);
         }
         if let Some(baseline) = finish_baseline {
             let rows = sqlx::query(
@@ -777,7 +786,7 @@ impl SqlStore {
         ids: &[MessageId],
         mirror: &mut AccountMirror,
     ) -> Result<(), StoreError> {
-        for chunk in ids.chunks(VIEW_CHUNK) {
+        for chunk in ids.chunks(LOAD_CHUNK) {
             let placeholders = (2..chunk.len() + 2)
                 .map(|n| format!("${n}"))
                 .collect::<Vec<_>>()
@@ -873,10 +882,11 @@ impl SqlStore {
             .keys()
             .chain(after.messages.keys())
             .collect();
+        let mut changed = Vec::new();
         for id in ids {
             match (before.messages.get(id), after.messages.get(id)) {
                 (_, Some(record)) if before.messages.get(id) != Some(record) => {
-                    put_message(tx, account, record).await?;
+                    changed.push(record);
                 }
                 (Some(_), None) => {
                     sqlx::query("DELETE FROM mailtide_messages WHERE account = $1 AND id = $2")
@@ -889,6 +899,7 @@ impl SqlStore {
                 (_, Some(_)) | (None, None) => {}
             }
         }
+        put_messages(tx, account, &changed).await?;
         for (id, checkpoint) in &after.tombstones {
             if before.tombstones.get(id) != Some(checkpoint) {
                 sqlx::query(
@@ -950,19 +961,7 @@ impl SqlStore {
                 .map_err(|e| unavailable(&e))?;
             }
         }
-        for (idx, (seq, change)) in (0_i64..).zip(after.log.iter()) {
-            sqlx::query(
-                "INSERT INTO mailtide_changes (account, seq, idx, change) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(account)
-            .bind(int("seq", seq.0)?)
-            .bind(idx)
-            .bind(json(change)?)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| unavailable(&e))?;
-        }
-        Ok(())
+        put_changes(tx, account, &after.log).await
     }
 
     // ------------------------------------------------------------ store operations
@@ -1370,56 +1369,62 @@ impl SqlStore {
     }
 }
 
-/// The labels `ops` may remove: those a listing lacks, and those removed by
-/// name.
-fn removed_labels<'a>(stored: &'a [Label], ops: &'a [LabelOp]) -> BTreeSet<&'a LabelId> {
-    ops.iter()
-        .flat_map(|op| -> Vec<&LabelId> {
-            match op {
-                LabelOp::ReplaceAll { labels, .. } => stored
-                    .iter()
-                    .map(|label| &label.id)
-                    .filter(|id| labels.iter().all(|listed| &listed.id != *id))
-                    .collect(),
-                LabelOp::Remove { id, .. } => vec![id],
-                LabelOp::Upsert(_) => Vec::new(),
-            }
-        })
-        .collect()
-}
-
-/// The messages whose row may carry `label`, or that have an intent on it.
-/// The `labels` column is matched as text, which may find more rows than
-/// carry it (`SQLite` compares ASCII case-insensitively); the shared rule
-/// checks each row it is given, so those are left as they are.
+/// The messages whose row may carry one of `labels`, or that have an
+/// intent on one: one statement per chunk of labels, however many a listing
+/// removes. The `labels` column is matched as text, which may find more rows
+/// than carry them (`SQLite` compares ASCII case-insensitively); the shared
+/// rule checks each row it is given, so those are left as they are.
 async fn carrying(
     tx: &mut Transaction<'static, Any>,
     account: &AccountId,
-    label: &LabelId,
-) -> Result<Vec<MessageId>, StoreError> {
-    // The id as the column's JSON spells it, with LIKE's wildcards escaped.
-    let quoted = json(&label.0)?;
-    let mut pattern = String::from("%");
-    for c in quoted.chars() {
-        if matches!(c, '!' | '%' | '_') {
-            pattern.push('!');
+    labels: &BTreeSet<LabelId>,
+) -> Result<BTreeSet<MessageId>, StoreError> {
+    let labels: Vec<&LabelId> = labels.iter().collect();
+    let mut ids = BTreeSet::new();
+    for chunk in labels.chunks(VIEW_CHUNK / 2) {
+        // Each id as the column's JSON spells it, LIKE's wildcards escaped.
+        let mut patterns = Vec::with_capacity(chunk.len());
+        for label in chunk {
+            let mut pattern = String::from("%");
+            for c in json(&label.0)?.chars() {
+                if matches!(c, '!' | '%' | '_') {
+                    pattern.push('!');
+                }
+                pattern.push(c);
+            }
+            pattern.push('%');
+            patterns.push(pattern);
         }
-        pattern.push(c);
+        let n = chunk.len();
+        let likes = (2..n + 2)
+            .map(|i| format!("labels LIKE ${i} ESCAPE '!'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let names = (n + 2..2 * n + 2)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Only numbered placeholders are interpolated; values are bound.
+        let sql = format!(
+            "SELECT id FROM mailtide_messages WHERE account = $1 AND ({likes})
+             UNION SELECT message AS id FROM mailtide_intents WHERE account = $1 AND label IN ({names})"
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+        for pattern in patterns {
+            query = query.bind(pattern);
+        }
+        for label in chunk {
+            query = query.bind(label.0.as_str());
+        }
+        for row in query
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?
+        {
+            ids.insert(MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?));
+        }
     }
-    pattern.push('%');
-    let rows = sqlx::query(
-        "SELECT id FROM mailtide_messages WHERE account = $1 AND labels LIKE $2 ESCAPE '!'
-         UNION SELECT message AS id FROM mailtide_intents WHERE account = $1 AND label = $3",
-    )
-    .bind(account.as_str())
-    .bind(pattern)
-    .bind(label.0.as_str())
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|e| unavailable(&e))?;
-    rows.iter()
-        .map(|row| Ok(MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?)))
-        .collect()
+    Ok(ids)
 }
 
 async fn load_intents(
@@ -1471,31 +1476,90 @@ fn message_from_row(id: &MessageId, row: &AnyRow) -> Result<MessageRecord, Store
     })
 }
 
-async fn put_message(
+/// Append a commit's feed entries, a chunk per statement: a label removal
+/// logs one per message that carried it.
+async fn put_changes(
     tx: &mut Transaction<'static, Any>,
     account: &str,
-    record: &MessageRecord,
+    log: &[(StateSeq, Change)],
 ) -> Result<(), StoreError> {
-    let content = match &record.content {
-        Content::Pending => None,
-        Content::Imported(stored) => Some(json(stored.as_ref())?),
-    };
-    sqlx::query(
-        "INSERT INTO mailtide_messages (account, id, thread_id, labels, checkpoint, unverified, content)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (account, id) DO UPDATE SET thread_id = excluded.thread_id, labels = excluded.labels,
-           checkpoint = excluded.checkpoint, unverified = excluded.unverified, content = excluded.content",
-    )
-    .bind(account)
-    .bind(record.id.0.as_str())
-    .bind(record.thread_id.0.as_str())
-    .bind(json(&record.labels)?)
-    .bind(record.checkpoint.map(|c| int("checkpoint", c.0)).transpose()?)
-    .bind(record.unverified.map(|c| int("unverified", c.0)).transpose()?)
-    .bind(content)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| unavailable(&e))?;
+    let entries: Vec<(i64, &(StateSeq, Change))> = (0_i64..).zip(log.iter()).collect();
+    for chunk in entries.chunks(WRITE_CHUNK) {
+        let values = (0..chunk.len())
+            .map(|i| format!("($1, ${}, ${}, ${})", 3 * i + 2, 3 * i + 3, 3 * i + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Only numbered placeholders are interpolated; values are bound.
+        let mut query = sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO mailtide_changes (account, seq, idx, change) VALUES {values}"
+        )))
+        .bind(account);
+        for (idx, (seq, change)) in chunk {
+            query = query
+                .bind(int("seq", seq.0)?)
+                .bind(*idx)
+                .bind(json(change)?);
+        }
+        query
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?;
+    }
+    Ok(())
+}
+
+/// Insert or replace `records`, a chunk of rows per statement (a label
+/// removal rewrites every row that carried it).
+async fn put_messages(
+    tx: &mut Transaction<'static, Any>,
+    account: &str,
+    records: &[&MessageRecord],
+) -> Result<(), StoreError> {
+    for chunk in records.chunks(WRITE_CHUNK) {
+        let values = (0..chunk.len())
+            .map(|i| {
+                let first = 6 * i + 2;
+                let numbered: Vec<String> = (first..first + 6).map(|n| format!("${n}")).collect();
+                format!("($1, {})", numbered.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Only numbered placeholders are interpolated; values are bound.
+        let mut query = sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO mailtide_messages (account, id, thread_id, labels, checkpoint, unverified, content)
+             VALUES {values}
+             ON CONFLICT (account, id) DO UPDATE SET thread_id = excluded.thread_id, labels = excluded.labels,
+               checkpoint = excluded.checkpoint, unverified = excluded.unverified, content = excluded.content"
+        )))
+        .bind(account);
+        for record in chunk {
+            let content = match &record.content {
+                Content::Pending => None,
+                Content::Imported(stored) => Some(json(stored.as_ref())?),
+            };
+            query = query
+                .bind(record.id.0.as_str())
+                .bind(record.thread_id.0.as_str())
+                .bind(json(&record.labels)?)
+                .bind(
+                    record
+                        .checkpoint
+                        .map(|c| int("checkpoint", c.0))
+                        .transpose()?,
+                )
+                .bind(
+                    record
+                        .unverified
+                        .map(|c| int("unverified", c.0))
+                        .transpose()?,
+                )
+                .bind(content);
+        }
+        query
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?;
+    }
     Ok(())
 }
 
@@ -2461,6 +2525,17 @@ impl LabelAttrs {
 /// Ids per `IN (...)` query when reading views and feed content (well under
 /// every backend's bind-parameter limit).
 const VIEW_CHUNK: usize = 500;
+
+/// Ids per `IN (...)` query when loading the rows a commit touches: a label
+/// removal can touch every row of the account, and each query is a round
+/// trip (under every backend's bind-parameter limit: `SQLite`'s is 32,766).
+const LOAD_CHUNK: usize = 2_000;
+
+/// Rows per multi-row `INSERT` when writing a commit's rows and feed entries
+/// (six or three bound values each). Larger statements cost `SQLite` more
+/// than they save it: 2,000 rows each took a 50,000-row label removal from
+/// 1.6 s to 3.5 s (`examples/label_removal.rs`).
+const WRITE_CHUNK: usize = 500;
 
 /// The ids of a thread's rows, for thread action admission. Served by the
 /// `mailtide_messages_thread` index (migration 6).
