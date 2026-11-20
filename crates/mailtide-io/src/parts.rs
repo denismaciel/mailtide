@@ -1,7 +1,12 @@
 //! Reading one part of a stored message by its part reference (SPEC §11):
-//! a ranged read of the blob and a transfer decode. No parse, no store
-//! read, no Gmail call.
+//! a ranged read of the blob and a transfer decode, whole or streamed. No
+//! parse, no store read, no Gmail call.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use futures_util::stream::{BoxStream, Stream, StreamExt as _};
 use mailtide::gmail::PartRef;
 use mailtide::ids::{AccountId, MessageId};
 use mailtide_mime::{PartDecoder, PartInfo};
@@ -86,6 +91,118 @@ pub(crate) fn check_size(part: &PartRef, decoded: u64) -> Result<(), PartError> 
     }
 }
 
+/// The decoded bytes of one part, in chunks of at most a chosen size, as the
+/// blob store delivers the encoded range. Memory stays near one chunk (a
+/// part malformed for its encoding is decoded whole, at the end). An error
+/// item ends the stream: a failing store or a part whose bytes do not
+/// decode to its size never yields a short part silently. Dropping it stops
+/// the read.
+pub struct PartStream {
+    part: PartRef,
+    chunk_size: usize,
+    source: BoxStream<'static, Result<Bytes, BlobError>>,
+    /// The store chunk being decoded, and how far.
+    current: Bytes,
+    at: usize,
+    decoder: Option<PartDecoder>,
+    /// Decoded bytes not yet yielded.
+    out: Vec<u8>,
+    yielded: u64,
+    done: bool,
+}
+
+impl std::fmt::Debug for PartStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartStream")
+            .field("part", &self.part)
+            .field("chunk_size", &self.chunk_size)
+            .field("yielded", &self.yielded)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartStream {
+    /// The part's decoded size: what the chunks add up to.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.part.size
+    }
+
+    /// The next chunk, `None` at the end.
+    pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, PartError>> {
+        self.next().await
+    }
+
+    /// End the stream with `error`.
+    fn fail(&mut self, error: PartError) -> Poll<Option<Result<Vec<u8>, PartError>>> {
+        self.done = true;
+        self.out = Vec::new();
+        self.decoder = None;
+        Poll::Ready(Some(Err(error)))
+    }
+
+    /// Yield up to `chunk_size` decoded bytes.
+    fn emit(&mut self) -> Poll<Option<Result<Vec<u8>, PartError>>> {
+        let rest = self.out.split_off(self.out.len().min(self.chunk_size));
+        let chunk = std::mem::replace(&mut self.out, rest);
+        self.yielded += u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        Poll::Ready(Some(Ok(chunk)))
+    }
+}
+
+impl Stream for PartStream {
+    type Item = Result<Vec<u8>, PartError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        loop {
+            let decoded = this.yielded + u64::try_from(this.out.len()).unwrap_or(u64::MAX);
+            if decoded > this.part.size {
+                return this.fail(PartError::InvalidPart(
+                    "the bytes decode to more than the size the reference names".into(),
+                ));
+            }
+            if this.out.len() >= this.chunk_size || (this.decoder.is_none() && !this.out.is_empty())
+            {
+                return this.emit();
+            }
+            if this.done || this.decoder.is_none() {
+                this.done = true;
+                return Poll::Ready(None);
+            }
+            // Decode the store's chunk a slice at a time, so the decoded
+            // bytes waiting never exceed about one chunk.
+            if this.at < this.current.len() {
+                let end = this.current.len().min(this.at + this.chunk_size);
+                if let (Some(decoder), Some(slice)) =
+                    (this.decoder.as_mut(), this.current.get(this.at..end))
+                {
+                    decoder.feed(slice, &mut this.out);
+                }
+                this.at = end;
+                continue;
+            }
+            match this.source.poll_next_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.current = chunk;
+                    this.at = 0;
+                }
+                Poll::Ready(Some(Err(error))) => return this.fail(error.into()),
+                Poll::Ready(None) => {
+                    if let Some(decoder) = this.decoder.take() {
+                        decoder.finish(&mut this.out);
+                    }
+                    let decoded = this.yielded + u64::try_from(this.out.len()).unwrap_or(u64::MAX);
+                    if let Err(error) = check_size(&this.part, decoded) {
+                        return this.fail(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
 where
     S: Store,
@@ -135,5 +252,34 @@ where
         decoder.finish(&mut out);
         check_size(part, u64::try_from(out.len()).unwrap_or(u64::MAX))?;
         Ok(out)
+    }
+
+    /// Stream one part's decoded bytes in chunks of at most `chunk_size`
+    /// (at least 1), from a streamed ranged read of its encoded body. The
+    /// blob's length is checked against the reference before the first
+    /// chunk.
+    pub async fn open_part(
+        &self,
+        account: &AccountId,
+        message: &MessageId,
+        part: &PartRef,
+        chunk_size: usize,
+    ) -> Result<PartStream, PartError> {
+        let read = self
+            .blobs()
+            .get_chunks(&blob_key(account, message), part.range())
+            .await?;
+        check_length(part, read.total)?;
+        Ok(PartStream {
+            part: *part,
+            chunk_size: chunk_size.max(1),
+            source: read.chunks,
+            current: Bytes::new(),
+            at: 0,
+            decoder: Some(PartDecoder::new(part)),
+            out: Vec::new(),
+            yielded: 0,
+            done: false,
+        })
     }
 }

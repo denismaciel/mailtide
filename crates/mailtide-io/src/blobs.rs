@@ -37,6 +37,23 @@ pub struct RangeRead {
     pub total: u64,
 }
 
+/// One range of a blob as a stream of chunks, with the length of the whole
+/// blob. Dropping the stream stops the read.
+pub struct BlobChunks {
+    /// The length of the whole blob.
+    pub total: u64,
+    /// The bytes of the range, in order; an error item ends it.
+    pub chunks: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, BlobError>>,
+}
+
+impl std::fmt::Debug for BlobChunks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobChunks")
+            .field("total", &self.total)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `range` of `whole`, the way a store without ranged reads serves it.
 fn slice(whole: &[u8], range: Range<u64>) -> Result<RangeRead, BlobError> {
     let total = u64::try_from(whole.len()).unwrap_or(u64::MAX);
@@ -66,6 +83,24 @@ pub trait BlobStore: Send + Sync {
         range: Range<u64>,
     ) -> impl Future<Output = Result<RangeRead, BlobError>> + Send {
         async move { slice(&self.get(key).await?, range) }
+    }
+    /// Stream `range` of the content at `key` in chunks, with its whole
+    /// length. The default reads the range with [`Self::get_range`] and
+    /// yields it as one chunk; a store that streams yields it as it arrives.
+    fn get_chunks(
+        &self,
+        key: &BlobRef,
+        range: Range<u64>,
+    ) -> impl Future<Output = Result<BlobChunks, BlobError>> + Send {
+        async move {
+            use futures_util::StreamExt as _;
+            let read = self.get_range(key, range).await?;
+            let chunk = bytes::Bytes::from(read.bytes);
+            Ok(BlobChunks {
+                total: read.total,
+                chunks: futures_util::stream::once(async move { Ok(chunk) }).boxed(),
+            })
+        }
     }
     /// Delete the content at `key`; deleting a missing key is fine.
     fn delete(&self, key: &BlobRef) -> impl Future<Output = Result<(), BlobError>> + Send;
@@ -146,6 +181,42 @@ impl ObjectBlobs {
         }
     }
 
+    /// Start a ranged read: the object's length, and the read (`None` for
+    /// an empty range, which `object_store` does not serve).
+    async fn open_range(
+        &self,
+        key: &BlobRef,
+        range: Range<u64>,
+    ) -> Result<(u64, Option<object_store::GetResult>), BlobError> {
+        let path = self.path(key);
+        if range.is_empty() {
+            let total = self.length(&path).await?;
+            return if range.start <= total {
+                Ok((total, None))
+            } else {
+                Err(BlobError::OutOfRange { total })
+            };
+        }
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(range.clone())),
+            ..GetOptions::default()
+        };
+        match self.store.get_opts(&path, options).await {
+            // A range past the end comes back cut short.
+            Ok(result) if result.range != range => Err(BlobError::OutOfRange {
+                total: result.meta.size,
+            }),
+            Ok(result) => Ok((result.meta.size, Some(result))),
+            Err(object_store::Error::NotFound { .. }) => Err(BlobError::NotFound),
+            // Backends report a range starting past the end in their own
+            // words: tell it apart from a failure by the length.
+            Err(error) => match self.length(&path).await? {
+                total if range.end > total => Err(BlobError::OutOfRange { total }),
+                _ => Err(unavailable(&error)),
+            },
+        }
+    }
+
     /// The length of the object at `path`.
     async fn length(&self, path: &Path) -> Result<u64, BlobError> {
         match self.store.head(path).await {
@@ -189,44 +260,25 @@ impl BlobStore for ObjectBlobs {
     }
 
     async fn get_range(&self, key: &BlobRef, range: Range<u64>) -> Result<RangeRead, BlobError> {
-        let path = self.path(key);
-        // An empty range is no request object_store serves: ask its length.
-        if range.is_empty() {
-            let total = self.length(&path).await?;
-            return if range.start <= total {
-                Ok(RangeRead {
-                    bytes: Vec::new(),
-                    total,
-                })
-            } else {
-                Err(BlobError::OutOfRange { total })
-            };
-        }
-        let options = GetOptions {
-            range: Some(GetRange::Bounded(range.clone())),
-            ..GetOptions::default()
+        let (total, result) = self.open_range(key, range).await?;
+        let bytes = match result {
+            Some(result) => result.bytes().await.map_err(|e| unavailable(&e))?.to_vec(),
+            None => Vec::new(),
         };
-        match self.store.get_opts(&path, options).await {
-            // A range past the end comes back cut short.
-            Ok(result) if result.range != range => Err(BlobError::OutOfRange {
-                total: result.meta.size,
-            }),
-            Ok(result) => {
-                let total = result.meta.size;
-                let bytes = result.bytes().await.map_err(|e| unavailable(&e))?;
-                Ok(RangeRead {
-                    bytes: bytes.to_vec(),
-                    total,
-                })
-            }
-            Err(object_store::Error::NotFound { .. }) => Err(BlobError::NotFound),
-            // Backends report a range starting past the end in their own
-            // words: tell it apart from a failure by the length.
-            Err(error) => match self.length(&path).await? {
-                total if range.end > total => Err(BlobError::OutOfRange { total }),
-                _ => Err(unavailable(&error)),
-            },
-        }
+        Ok(RangeRead { bytes, total })
+    }
+
+    async fn get_chunks(&self, key: &BlobRef, range: Range<u64>) -> Result<BlobChunks, BlobError> {
+        use futures_util::StreamExt as _;
+        let (total, result) = self.open_range(key, range).await?;
+        let chunks = match result {
+            Some(result) => result
+                .into_stream()
+                .map(|chunk| chunk.map_err(|e| unavailable(&e)))
+                .boxed(),
+            None => futures_util::stream::empty().boxed(),
+        };
+        Ok(BlobChunks { total, chunks })
     }
 
     async fn delete_account(&self, account: &AccountId) -> Result<u64, BlobError> {
@@ -377,5 +429,56 @@ mod isolation_tests {
         delete_one_account(&ObjectBlobs::memory()).await;
         let scratch = Scratch::new("prefix");
         delete_one_account(&scratch.blobs()).await;
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+
+    async fn check(blobs: &ObjectBlobs) {
+        let key = BlobRef("a@example.com/m1.eml".into());
+        let content: Vec<u8> = (0..=255).collect();
+        blobs.put(&key, content.clone()).await.expect("put");
+        let read = blobs.get_range(&key, 10..20).await.expect("range");
+        assert_eq!(read.bytes, content[10..20]);
+        assert_eq!(read.total, 256);
+        let mut streamed = Vec::new();
+        let chunks = blobs.get_chunks(&key, 10..200).await.expect("chunks");
+        assert_eq!(chunks.total, 256);
+        let mut stream = chunks.chunks;
+        while let Some(chunk) = stream.next().await {
+            streamed.extend_from_slice(&chunk.expect("chunk"));
+        }
+        assert_eq!(streamed, content[10..200]);
+        let empty = blobs.get_range(&key, 256..256).await.expect("empty");
+        assert_eq!((empty.bytes.len(), empty.total), (0, 256));
+        for past in [250..300, 300..310, 257..257] {
+            assert_eq!(
+                blobs.get_range(&key, past.clone()).await,
+                Err(BlobError::OutOfRange { total: 256 }),
+                "{past:?}"
+            );
+            assert!(matches!(
+                blobs.get_chunks(&key, past).await,
+                Err(BlobError::OutOfRange { total: 256 })
+            ));
+        }
+        let missing = BlobRef("a@example.com/m2.eml".into());
+        assert_eq!(
+            blobs.get_range(&missing, 0..1).await,
+            Err(BlobError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn object_blobs_serve_ranges_from_memory_and_local_disk() {
+        check(&ObjectBlobs::memory()).await;
+        let dir = std::env::temp_dir().join(format!("mailtide-ranges-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let url = url::Url::from_directory_path(&dir).expect("url");
+        check(&ObjectBlobs::from_url(url.as_str()).expect("local blobs")).await;
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 }

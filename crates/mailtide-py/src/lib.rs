@@ -800,6 +800,108 @@ mod _core {
         }
     }
 
+    /// One part's decoded bytes, pulled one chunk at a time from a streamed
+    /// ranged read (`Runner.open_part`). An async iterator (`async for`) and a
+    /// plain iterator (`for`, blocking), and a context manager of both kinds
+    /// that closes it. Closing it, or an error, drops the read.
+    #[pyclass(frozen)]
+    struct PartStream {
+        shared: Arc<Shared>,
+        stream: Arc<tokio::sync::Mutex<Option<mailtide_io::parts::PartStream>>>,
+        /// The part's decoded size: what the chunks add up to.
+        #[pyo3(get)]
+        size: u64,
+        /// Its reference.
+        #[pyo3(get)]
+        part: String,
+    }
+
+    /// The next chunk of `stream`; `None` at its end. The read is dropped at
+    /// the end and on an error.
+    async fn next_chunk(
+        stream: &tokio::sync::Mutex<Option<mailtide_io::parts::PartStream>>,
+    ) -> PyResult<Option<Py<PyBytes>>> {
+        let mut guard = stream.lock().await;
+        let Some(open) = guard.as_mut() else {
+            return Ok(None);
+        };
+        match open.next_chunk().await {
+            Some(Ok(chunk)) => Ok(Some(Python::attach(|py| PyBytes::new(py, &chunk).unbind()))),
+            Some(Err(error)) => {
+                *guard = None;
+                Err(part_error(error))
+            }
+            None => {
+                *guard = None;
+                Ok(None)
+            }
+        }
+    }
+
+    #[pymethods]
+    impl PartStream {
+        /// Whether the read is over: ended, failed or closed.
+        #[getter]
+        fn closed(&self) -> bool {
+            self.stream.try_lock().is_ok_and(|stream| stream.is_none())
+        }
+
+        /// Stop the read and drop it.
+        fn close(&self, py: Python<'_>) {
+            py.detach(|| *self.stream.blocking_lock() = None);
+        }
+
+        fn __aiter__(slf: Py<Self>) -> Py<Self> {
+            slf
+        }
+
+        fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            let stream = Arc::clone(&self.stream);
+            future(py, &self.shared, async move {
+                next_chunk(&stream)
+                    .await?
+                    .ok_or_else(|| pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+            })
+        }
+
+        fn __iter__(slf: Py<Self>) -> Py<Self> {
+            slf
+        }
+
+        fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
+            let stream = Arc::clone(&self.stream);
+            block(py, &self.shared, async move { next_chunk(&stream).await })
+        }
+
+        fn __enter__(slf: Py<Self>) -> Py<Self> {
+            slf
+        }
+
+        #[pyo3(signature = (*_exc))]
+        fn __exit__(&self, py: Python<'_>, _exc: &Bound<'_, pyo3::types::PyTuple>) -> bool {
+            self.close(py);
+            false
+        }
+
+        fn __aenter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+            let this = slf.clone().unbind();
+            future(slf.py(), &slf.get().shared, async move { Ok(this) })
+        }
+
+        #[pyo3(signature = (*_exc))]
+        fn __aexit__<'py>(
+            &self,
+            py: Python<'py>,
+            _exc: &Bound<'_, pyo3::types::PyTuple>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let stream = Arc::clone(&self.stream);
+            future(py, &self.shared, async move {
+                *stream.lock().await = None;
+                Ok(false)
+            })
+        }
+    }
+
     /// A message as the host should show it.
     #[pyclass(frozen, get_all)]
     struct MessageView {
@@ -2381,6 +2483,26 @@ mod _core {
             Ok(parts.into_iter().map(PartInfo::from).collect())
         }
 
+        async fn open_part(
+            self: Arc<Self>,
+            account: AccountId,
+            message: MessageId,
+            part: PartRef,
+            chunk_size: usize,
+        ) -> PyResult<PartStream> {
+            let stream = self
+                .inner
+                .open_part(&account, &message, &part, chunk_size)
+                .await
+                .map_err(part_error)?;
+            Ok(PartStream {
+                size: stream.size(),
+                part: part.to_string(),
+                stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+                shared: self,
+            })
+        }
+
         async fn read_part(
             self: Arc<Self>,
             account: AccountId,
@@ -2824,6 +2946,27 @@ mod _core {
             )
         }
 
+        #[pyo3(signature = (account, message_id, part, chunk_size=DEFAULT_PART_CHUNK))]
+        fn open_part<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_id: &str,
+            part: &str,
+            chunk_size: usize,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().open_part(
+                    account_id(account)?,
+                    MessageId(message_id.to_owned()),
+                    part_ref(part)?,
+                    chunk_size,
+                ),
+            )
+        }
+
         #[pyo3(signature = (account, message_id, part, max_bytes=DEFAULT_MAX_PART_BYTES))]
         fn read_part<'py>(
             &self,
@@ -3259,6 +3402,29 @@ mod _core {
             )
         }
 
+        /// Stream one part's decoded bytes in chunks of at most
+        /// `chunk_size`; iterate it with `for`, close it with `with`.
+        #[pyo3(signature = (account, message_id, part, chunk_size=DEFAULT_PART_CHUNK))]
+        fn open_part(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_id: &str,
+            part: &str,
+            chunk_size: usize,
+        ) -> PyResult<PartStream> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().open_part(
+                    account_id(account)?,
+                    MessageId(message_id.to_owned()),
+                    part_ref(part)?,
+                    chunk_size,
+                ),
+            )
+        }
+
         /// The decoded bytes of one part, by its reference: one ranged read.
         #[pyo3(signature = (account, message_id, part, max_bytes=DEFAULT_MAX_PART_BYTES))]
         fn read_part(
@@ -3285,6 +3451,9 @@ mod _core {
     /// `read_part` refuses larger parts unless told otherwise: 25 MiB, as
     /// large as a part Gmail lets a sender attach.
     const DEFAULT_MAX_PART_BYTES: u64 = 25 * 1024 * 1024;
+
+    /// `open_part` yields chunks of at most 256 KiB unless told otherwise.
+    const DEFAULT_PART_CHUNK: usize = 256 * 1024;
 
     // ------------------------------------------------------------ functions
 

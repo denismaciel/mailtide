@@ -206,3 +206,63 @@ def test_part_errors_are_typed(gmail: tuple[Mailbox, str]) -> None:
     with pytest.raises(mailtide.BlobNotFound):
         runner.parts(ACCOUNT, "m-unknown")
     assert issubclass(mailtide.PartNotFound, mailtide.MailtideError)
+
+
+def test_open_part_streams_async_and_blocking(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    runner = synced(mailbox, origin)
+    [view] = runner.messages(ACCOUNT, ["m1"])
+    part = pdf_part(view.content)
+    with runner.open_part(ACCOUNT, "m1", part, chunk_size=4) as stream:
+        assert isinstance(stream, mailtide.PartStream)
+        assert (stream.size, stream.part) == (9, part)
+        chunks = list(stream)
+    assert chunks == [b"%PDF", b"-1.4", b"\n"]
+    assert stream.closed
+
+    async def main() -> list[bytes]:
+        r = mailtide.Runner(make_config(origin), tokens)
+        await r.migrate()
+        await r.track(ACCOUNT)
+        await r.run(ACCOUNT, budget_s=30)
+        async with await r.open_part(ACCOUNT, "m1", part, chunk_size=5) as stream:
+            return [chunk async for chunk in stream]
+
+    assert asyncio.run(main()) == [b"%PDF-", b"1.4\n"]
+
+
+def test_cancelling_a_part_stream_releases_it(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    runner = synced(mailbox, origin)
+    [view] = runner.messages(ACCOUNT, ["m1"])
+    part = pdf_part(view.content)
+    with runner.open_part(ACCOUNT, "m1", part, chunk_size=1) as stream:
+        for _ in stream:
+            break
+    assert stream.closed, "leaving the loop and its with drops the read"
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    async def main() -> mailtide.PartStream:
+        r = mailtide.Runner(make_config(origin), tokens)
+        await r.migrate()
+        await r.track(ACCOUNT)
+        await r.run(ACCOUNT, budget_s=30)
+        stream = await r.open_part(ACCOUNT, "m1", part, chunk_size=1)
+        started = asyncio.Event()
+
+        async def consume() -> None:
+            async with stream:
+                async for _ in stream:
+                    started.set()
+                    await asyncio.sleep(60)
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        assert not stream.closed
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return stream
+
+    assert asyncio.run(main()).closed, "a cancelled task drops the read"

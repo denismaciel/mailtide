@@ -3,7 +3,12 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use futures_util::stream::{BoxStream, Stream, StreamExt as _};
 
 use mailtide::EngineConfig;
 use mailtide::gmail::PartRef;
@@ -11,7 +16,7 @@ use mailtide::ids::{AccountId, BlobRef, MessageId, Timestamp};
 use mailtide::quota::Budget;
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
 use mailtide_io::auth::{AccessToken, StaticTokens};
-use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, RangeRead, blob_key};
+use mailtide_io::blobs::{BlobChunks, BlobError, BlobStore, ObjectBlobs, RangeRead, blob_key};
 use mailtide_io::parts::PartError;
 use mailtide_io::quota_gate::LocalGate;
 use mailtide_io::runner::{Runner, RunnerConfig, WatchMode};
@@ -287,4 +292,199 @@ async fn parts_lists_the_parts_of_an_attached_message_with_their_container() {
         .await
         .expect("read");
     assert_eq!(bytes, b"GIF89a");
+}
+
+/// A blob store that streams `raw` in pieces as they are pulled, counting
+/// them; it may fail after some pieces. Its streams record being dropped.
+struct Streaming {
+    raw: bytes::Bytes,
+    piece: usize,
+    fail_after: Option<usize>,
+    pulled: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Streaming {
+    fn new(raw: Vec<u8>, piece: usize, fail_after: Option<usize>) -> Self {
+        Self {
+            raw: bytes::Bytes::from(raw),
+            piece,
+            fail_after,
+            pulled: Arc::default(),
+            dropped: Arc::default(),
+        }
+    }
+}
+
+/// A stream that records being dropped.
+struct Tracked {
+    inner: BoxStream<'static, Result<bytes::Bytes, BlobError>>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Stream for Tracked {
+    type Item = Result<bytes::Bytes, BlobError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.poll_next_unpin(cx)
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl BlobStore for Streaming {
+    async fn put(&self, _key: &BlobRef, _bytes: Vec<u8>) -> Result<(), BlobError> {
+        Ok(())
+    }
+
+    async fn get(&self, _key: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        Ok(self.raw.to_vec())
+    }
+
+    async fn get_chunks(&self, _key: &BlobRef, range: Range<u64>) -> Result<BlobChunks, BlobError> {
+        let start = usize::try_from(range.start).expect("start");
+        let end = usize::try_from(range.end).expect("end");
+        let body = self.raw.slice(start..end);
+        let pieces: Vec<bytes::Bytes> = (0..body.len())
+            .step_by(self.piece)
+            .map(|at| body.slice(at..body.len().min(at + self.piece)))
+            .collect();
+        let pulled = Arc::clone(&self.pulled);
+        let fail_after = self.fail_after;
+        let inner = futures_util::stream::iter(pieces.into_iter().enumerate())
+            .map(move |(n, piece)| {
+                pulled.fetch_add(1, Ordering::SeqCst);
+                match fail_after {
+                    Some(limit) if n >= limit => {
+                        Err(BlobError::Unavailable("connection reset".into()))
+                    }
+                    _ => Ok(piece),
+                }
+            })
+            .boxed();
+        Ok(BlobChunks {
+            total: u64::try_from(self.raw.len()).expect("len"),
+            chunks: Tracked {
+                inner,
+                dropped: Arc::clone(&self.dropped),
+            }
+            .boxed(),
+        })
+    }
+
+    async fn delete(&self, _key: &BlobRef) -> Result<(), BlobError> {
+        Ok(())
+    }
+
+    async fn delete_account(&self, _account: &AccountId) -> Result<u64, BlobError> {
+        Ok(0)
+    }
+}
+
+/// A message holding one base64 attachment of `size` bytes.
+fn large(size: usize) -> (Vec<u8>, Vec<u8>) {
+    use base64::Engine as _;
+    let data: Vec<u8> = (0..size)
+        .map(|n| u8::try_from(n % 251).unwrap_or(0))
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+    let mut raw = b"Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+        --b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n\
+        --b\r\nContent-Type: application/octet-stream; name=\"big.bin\"\r\n\
+        Content-Transfer-Encoding: base64\r\n\r\n"
+        .to_vec();
+    for line in encoded.as_bytes().chunks(76) {
+        raw.extend_from_slice(line);
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"--b--\r\n");
+    (raw, data)
+}
+
+#[tokio::test]
+async fn open_part_yields_bounded_chunks_that_concatenate_to_read_part() {
+    let (raw, data) = large(30 * 1024 * 1024);
+    let part = summary(&raw)[0];
+    let runner = runner(Streaming::new(raw, 64 * 1024, None), b"").await;
+    let mut stream = runner
+        .open_part(&account(), &m1(), &part, 256 * 1024)
+        .await
+        .expect("open");
+    assert_eq!(stream.size(), u64::try_from(data.len()).expect("size"));
+    let first = stream.next_chunk().await.expect("a chunk").expect("ok");
+    assert_eq!(first.len(), 256 * 1024);
+    assert!(
+        runner.blobs().pulled.load(Ordering::SeqCst) <= 8,
+        "the read follows the consumer: nothing is buffered ahead"
+    );
+    let mut streamed = first;
+    while let Some(chunk) = stream.next_chunk().await {
+        let chunk = chunk.expect("ok");
+        assert!(!chunk.is_empty() && chunk.len() <= 256 * 1024);
+        streamed.extend_from_slice(&chunk);
+    }
+    assert_eq!(streamed, data);
+    let whole = runner
+        .read_part(&account(), &m1(), &part, u64::MAX)
+        .await
+        .expect("read");
+    assert_eq!(streamed, whole);
+}
+
+#[tokio::test]
+async fn dropping_a_part_stream_stops_the_blob_read() {
+    let (raw, _) = large(1024 * 1024);
+    let part = summary(&raw)[0];
+    let runner = runner(Streaming::new(raw, 4 * 1024, None), b"").await;
+    let mut stream = runner
+        .open_part(&account(), &m1(), &part, 4 * 1024)
+        .await
+        .expect("open");
+    stream.next_chunk().await.expect("a chunk").expect("ok");
+    let pulled = runner.blobs().pulled.load(Ordering::SeqCst);
+    assert!(!runner.blobs().dropped.load(Ordering::SeqCst));
+    drop(stream);
+    assert!(runner.blobs().dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        runner.blobs().pulled.load(Ordering::SeqCst),
+        pulled,
+        "nothing read after"
+    );
+    assert!(pulled < 10, "{pulled} pieces of about 450");
+}
+
+#[tokio::test]
+async fn a_blob_store_failure_mid_stream_ends_it_with_an_error() {
+    let (raw, data) = large(64 * 1024);
+    let part = summary(&raw)[0];
+    let runner = runner(Streaming::new(raw, 4 * 1024, Some(5)), b"").await;
+    let mut stream = runner
+        .open_part(&account(), &m1(), &part, 1024)
+        .await
+        .expect("open");
+    let mut received = Vec::new();
+    let mut failure = None;
+    while let Some(chunk) = stream.next_chunk().await {
+        match chunk {
+            Ok(chunk) => received.extend_from_slice(&chunk),
+            Err(error) => failure = Some(error),
+        }
+    }
+    assert_eq!(
+        failure,
+        Some(PartError::BlobUnavailable("connection reset".into()))
+    );
+    assert!(
+        received.len() < data.len(),
+        "the error item says the part is short"
+    );
+    assert_eq!(received, data[..received.len()]);
+    assert!(
+        stream.next_chunk().await.is_none(),
+        "the error ends the stream"
+    );
 }

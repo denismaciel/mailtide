@@ -24,6 +24,7 @@ from mailtide._core import (
     MessageView,
     NotifyResult,
     PartInfo,
+    PartStream,
     PrioritiseResult,
     Progress,
     ResumeResult,
@@ -374,6 +375,16 @@ class Runner:
         its reference and role. The blob is read and parsed in Rust; only the
         metadata crosses over."""
         return await self._core.parts(account, message_id)
+
+    async def open_part(
+        self, account: str, message_id: str, part: str, chunk_size: int = 262_144
+    ) -> PartStream:
+        """Stream one part's decoded bytes in chunks of at most ``chunk_size``:
+        ``async with await runner.open_part(...) as stream: async for chunk in
+        stream``. The read follows the loop; leaving the ``async with``, or
+        cancelling the task inside it, drops it. A failure ends the stream
+        with an exception, never a short part."""
+        return await self._core.open_part(account, message_id, part, chunk_size)
 
     async def read_part(
         self, account: str, message_id: str, part: str, max_bytes: int = 26_214_400
