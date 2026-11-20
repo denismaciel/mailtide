@@ -1,6 +1,6 @@
 # Consumer cursors: compaction that waits for feed consumers
 
-Plan: `features/consumer-cursors.toml` (roadmap S5). Status: planned.
+Plan: `features/consumer-cursors.toml` (roadmap S5). Status: in progress.
 Depends on `feed-pages` for the cursor type.
 
 ## 1. Goal and scope
