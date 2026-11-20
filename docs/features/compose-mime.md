@@ -1,6 +1,6 @@
 # Compose: RFC 5322 messages from structured input
 
-Plan: `features/compose-mime.toml` (roadmap C1). Status: in progress.
+Plan: `features/compose-mime.toml` (roadmap C1). Status: done.
 
 ## 1. Goal and scope
 
@@ -279,16 +279,19 @@ and interpreters; pimalaya's template tests and Zero's
 (an SMTP envelope parsed from raw bytes; `send` may want the first as a
 pre-flight check).
 
-Our own 39 tests add: each level of the tree and the round trip through
+Our own 45 tests add: each level of the tree and the round trip through
 `parse`; the reserved-header and injection rules for custom headers;
 `Purpose`; identical bytes for identical input and boundary collisions; the
-size limit; address syntax; id minting; the mirror's own header parse
-reading back the ids compose wrote; and the Python API.
+size limit; address syntax; id minting; the tracking id written once,
+refused when malformed or duplicated, and read back from the headers only; a
+message without a Message-ID; the mirror's own header parse reading back
+the ids compose wrote; and the Python API.
 
 ## 6. Slices
 
-1. **Types and rules.** `Address` with `parse_addresses`, `MessageId`,
-   `OutgoingMessage`, `ComposeError`, every validation; no bytes yet.
+1. **Types and rules.** `Address` with `parse_addresses`, `MessageId`, the
+   tracking id and its reader, `OutgoingMessage`, `ComposeError`, every
+   validation; no bytes yet.
 2. **Text and HTML.** The mail-builder dependency, header order, text, HTML
    and alternative, `Purpose`, boundaries; the Zero, pimalaya, himalaya and
    mail-builder header suites; `mirror_facts`.

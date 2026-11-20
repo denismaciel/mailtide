@@ -20,9 +20,9 @@ mod _core {
     use std::time::Duration;
 
     use pyo3::create_exception;
-    use pyo3::exceptions::{PyException, PyValueError};
+    use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
     use pyo3::prelude::*;
-    use pyo3::types::PyBytes;
+    use pyo3::types::{PyBytes, PyDict};
 
     use mailtide::ids::{AccountId, LabelId, MessageId, ThreadId, Timestamp};
     use mailtide::outbox::{
@@ -132,6 +132,12 @@ mod _core {
         MailtideError,
         "A newer mailtide version already wrote to this account; this one must not."
     );
+    create_exception!(
+        _core,
+        ComposeError,
+        PyValueError,
+        "compose_message refused its input: `field`, `index` (the entry of a list field, or None) and `reason` say where and why. The message never holds the offending value."
+    );
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -151,6 +157,7 @@ mod _core {
         m.add("ReadOnlyMode", py.get_type::<ReadOnlyMode>())?;
         m.add("AccountNotTracked", py.get_type::<AccountNotTracked>())?;
         m.add("BlobNotFound", py.get_type::<BlobNotFound>())?;
+        m.add("ComposeError", py.get_type::<ComposeError>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -703,13 +710,192 @@ mod _core {
         history_id: u64,
     }
 
-    /// An attachment of a parsed message.
+    /// An attachment of a parsed message, or a part of one to compose.
     #[pyclass(frozen, get_all)]
     struct Attachment {
         filename: Option<String>,
         content_type: String,
         content_id: Option<String>,
         data: Py<PyBytes>,
+    }
+
+    #[pymethods]
+    impl Attachment {
+        #[new]
+        #[pyo3(signature = (content_type, data, *, filename=None, content_id=None))]
+        fn new(
+            content_type: String,
+            data: Py<PyBytes>,
+            filename: Option<String>,
+            content_id: Option<String>,
+        ) -> Self {
+            Self {
+                filename,
+                content_type,
+                content_id,
+                data,
+            }
+        }
+    }
+
+    impl Attachment {
+        fn to_mime(&self, py: Python<'_>) -> mailtide_mime::Attachment {
+            mailtide_mime::Attachment {
+                filename: self.filename.clone(),
+                content_type: self.content_type.clone(),
+                content_id: self.content_id.clone(),
+                bytes: self.data.as_bytes(py).to_vec(),
+            }
+        }
+    }
+
+    /// A mailbox: an optional display name and an address.
+    #[pyclass(frozen, get_all, eq)]
+    #[derive(Clone, PartialEq)]
+    struct Address {
+        name: Option<String>,
+        email: String,
+    }
+
+    #[pymethods]
+    impl Address {
+        #[new]
+        #[pyo3(signature = (email, name=None))]
+        fn new(email: String, name: Option<String>) -> Self {
+            Self { name, email }
+        }
+
+        fn __repr__(&self) -> String {
+            format!("Address(email={:?}, name={:?})", self.email, self.name)
+        }
+    }
+
+    impl From<mailtide_mime::Address> for Address {
+        fn from(address: mailtide_mime::Address) -> Self {
+            Self {
+                name: address.name,
+                email: address.email,
+            }
+        }
+    }
+
+    impl From<&Address> for mailtide_mime::Address {
+        fn from(address: &Address) -> Self {
+            Self {
+                name: address.name.clone(),
+                email: address.email.clone(),
+            }
+        }
+    }
+
+    /// An `Address`, or a bare address string.
+    fn address(value: &Bound<'_, PyAny>) -> PyResult<Address> {
+        if let Ok(address) = value.cast::<Address>() {
+            return Ok(address.get().clone());
+        }
+        Ok(Address {
+            name: None,
+            email: value.extract()?,
+        })
+    }
+
+    /// A list of `Address` or bare address strings (not one string).
+    fn addresses(values: &Bound<'_, PyAny>) -> PyResult<Vec<Address>> {
+        values
+            .extract::<Vec<Bound<'_, PyAny>>>()?
+            .iter()
+            .map(address)
+            .collect()
+    }
+
+    /// A message to compose (see `compose_message`). `message_id=None` and
+    /// `tracking_id=None` mint one at each compose; `sent_at_ms=None` is the
+    /// time of the compose.
+    #[pyclass(frozen, get_all)]
+    struct OutgoingMessage {
+        from_: Address,
+        sender: Option<Address>,
+        reply_to: Vec<Address>,
+        to: Vec<Address>,
+        cc: Vec<Address>,
+        bcc: Vec<Address>,
+        subject: Option<String>,
+        sent_at_ms: Option<i64>,
+        message_id: Option<String>,
+        tracking_id: Option<String>,
+        in_reply_to: Option<String>,
+        references: Vec<String>,
+        headers: Vec<(String, String)>,
+        text: Option<String>,
+        html: Option<String>,
+        inline: Vec<Py<Attachment>>,
+        attachments: Vec<Py<Attachment>>,
+    }
+
+    #[pymethods]
+    impl OutgoingMessage {
+        /// Keyword arguments name the fields; addresses may be `Address` or
+        /// a bare address string.
+        #[new]
+        #[pyo3(signature = (from_, **fields))]
+        fn new(from_: &Bound<'_, PyAny>, fields: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+            let mut message = Self {
+                from_: address(from_)?,
+                sender: None,
+                reply_to: Vec::new(),
+                to: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: None,
+                sent_at_ms: None,
+                message_id: None,
+                tracking_id: None,
+                in_reply_to: None,
+                references: Vec::new(),
+                headers: Vec::new(),
+                text: None,
+                html: None,
+                inline: Vec::new(),
+                attachments: Vec::new(),
+            };
+            for (key, value) in fields.into_iter().flatten() {
+                let key: String = key.extract()?;
+                match key.as_str() {
+                    "sender" if value.is_none() => message.sender = None,
+                    "sender" => message.sender = Some(address(&value)?),
+                    "reply_to" => message.reply_to = addresses(&value)?,
+                    "to" => message.to = addresses(&value)?,
+                    "cc" => message.cc = addresses(&value)?,
+                    "bcc" => message.bcc = addresses(&value)?,
+                    "subject" => message.subject = value.extract()?,
+                    "sent_at_ms" => message.sent_at_ms = value.extract()?,
+                    "message_id" => message.message_id = value.extract()?,
+                    "tracking_id" => message.tracking_id = value.extract()?,
+                    "in_reply_to" => message.in_reply_to = value.extract()?,
+                    "references" => message.references = value.extract()?,
+                    "headers" => message.headers = value.extract()?,
+                    "text" => message.text = value.extract()?,
+                    "html" => message.html = value.extract()?,
+                    "inline" => message.inline = value.extract()?,
+                    "attachments" => message.attachments = value.extract()?,
+                    other => {
+                        return Err(PyTypeError::new_err(format!(
+                            "OutgoingMessage() got an unexpected keyword argument {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(message)
+        }
+    }
+
+    /// A composed message: the RFC 5322 bytes Gmail takes as `raw`.
+    #[pyclass(frozen, get_all)]
+    struct ComposedMessage {
+        raw: Py<PyBytes>,
+        message_id: Option<String>,
+        tracking_id: Option<String>,
+        recipients: Vec<String>,
     }
 
     /// A parsed RFC 822 message.
@@ -2389,5 +2575,172 @@ mod _core {
             html: parsed.html,
             attachments,
         })
+    }
+
+    /// 128 random bits, for the ids compose writes (the pure crate draws none).
+    fn entropy() -> PyResult<[u8; 16]> {
+        let mut bytes = [0; 16];
+        getrandom::fill(&mut bytes).map_err(|e| error("random source", e))?;
+        Ok(bytes)
+    }
+
+    fn compose_error(py: Python<'_>, e: &mailtide_mime::ComposeError) -> PyErr {
+        let err = ComposeError::new_err(e.to_string());
+        let value = err.value(py);
+        let set = value
+            .setattr("field", e.field)
+            .and_then(|()| value.setattr("index", e.index))
+            .and_then(|()| value.setattr("reason", e.reason.to_string()));
+        match set {
+            Ok(()) => err,
+            Err(other) => other,
+        }
+    }
+
+    fn message_id(
+        py: Python<'_>,
+        value: &str,
+        field: &'static str,
+        index: Option<usize>,
+    ) -> PyResult<mailtide_mime::MessageId> {
+        mailtide_mime::MessageId::parse(value).map_err(|reason| {
+            compose_error(
+                py,
+                &mailtide_mime::ComposeError {
+                    field,
+                    index,
+                    reason,
+                },
+            )
+        })
+    }
+
+    /// Write `message` as RFC 5322 bytes for a draft or a send.
+    ///
+    /// Pure but for the defaults: a missing `message_id` is minted on the
+    /// From domain, a missing `tracking_id` is minted, and a missing
+    /// `sent_at_ms` is now. Gmail replaces the Message-ID and the Date on
+    /// every draft save and send; `tracking_id` (the `X-Mailtide-Id` header)
+    /// is what identifies the message afterwards. Fix all three to get the
+    /// same bytes again. Raises `ComposeError` on invalid input.
+    #[pyfunction]
+    #[pyo3(signature = (message, *, purpose="send", max_bytes=None))]
+    fn compose_message(
+        py: Python<'_>,
+        message: &Bound<'_, OutgoingMessage>,
+        purpose: &str,
+        max_bytes: Option<usize>,
+    ) -> PyResult<ComposedMessage> {
+        let purpose = match purpose {
+            "send" => mailtide_mime::Purpose::Send,
+            "draft" => mailtide_mime::Purpose::Draft,
+            other => return Err(PyValueError::new_err(format!("unknown purpose {other:?}"))),
+        };
+        let message = message.get();
+        let from = mailtide_mime::Address::from(&message.from_);
+        let sent_at_ms = message.sent_at_ms.unwrap_or_else(|| mailtide_io::now().0);
+        let mut outgoing = mailtide_mime::OutgoingMessage::new(from, sent_at_ms.div_euclid(1000));
+        outgoing.message_id = Some(match &message.message_id {
+            Some(id) => message_id(py, id, "message_id", None)?,
+            None => mailtide_mime::MessageId::from_entropy(entropy()?, &outgoing.from).map_err(
+                |reason| {
+                    let e = mailtide_mime::ComposeError {
+                        field: "from",
+                        index: None,
+                        reason,
+                    };
+                    compose_error(py, &e)
+                },
+            )?,
+        });
+        outgoing.tracking_id = Some(match &message.tracking_id {
+            Some(token) => token.clone(),
+            None => mailtide_mime::new_tracking_id(entropy()?),
+        });
+        outgoing.sender = message.sender.as_ref().map(Into::into);
+        outgoing.reply_to = message.reply_to.iter().map(Into::into).collect();
+        outgoing.to = message.to.iter().map(Into::into).collect();
+        outgoing.cc = message.cc.iter().map(Into::into).collect();
+        outgoing.bcc = message.bcc.iter().map(Into::into).collect();
+        outgoing.subject.clone_from(&message.subject);
+        outgoing.in_reply_to = message
+            .in_reply_to
+            .as_deref()
+            .map(|id| message_id(py, id, "in_reply_to", None))
+            .transpose()?;
+        outgoing.references = message
+            .references
+            .iter()
+            .enumerate()
+            .map(|(index, id)| message_id(py, id, "references", Some(index)))
+            .collect::<PyResult<_>>()?;
+        outgoing.headers.clone_from(&message.headers);
+        outgoing.text.clone_from(&message.text);
+        outgoing.html.clone_from(&message.html);
+        outgoing.inline = message
+            .inline
+            .iter()
+            .map(|part| part.get().to_mime(py))
+            .collect();
+        outgoing.attachments = message
+            .attachments
+            .iter()
+            .map(|part| part.get().to_mime(py))
+            .collect();
+        let options = mailtide_mime::ComposeOptions { purpose, max_bytes };
+        let composed = py
+            .detach(|| mailtide_mime::compose(&outgoing, &options))
+            .map_err(|e| compose_error(py, &e))?;
+        Ok(ComposedMessage {
+            raw: PyBytes::new(py, &composed.raw).unbind(),
+            message_id: composed.message_id,
+            tracking_id: composed.tracking_id,
+            recipients: composed.recipients,
+        })
+    }
+
+    /// A new Message-ID, `<32 hex digits@sender's domain>`, bracketed.
+    /// Gmail replaces it on send and on draft save; it serves other
+    /// transports and keeps the message well formed.
+    #[pyfunction]
+    fn new_message_id(py: Python<'_>, sender: &str) -> PyResult<String> {
+        let sender = mailtide_mime::Address {
+            name: None,
+            email: sender.to_owned(),
+        };
+        mailtide_mime::MessageId::from_entropy(entropy()?, &sender)
+            .map(|id| id.to_string())
+            .map_err(|reason| {
+                let e = mailtide_mime::ComposeError {
+                    field: "sender",
+                    index: None,
+                    reason,
+                };
+                compose_error(py, &e)
+            })
+    }
+
+    /// A new tracking id: 128 random bits as base64url, 22 characters.
+    #[pyfunction]
+    fn new_tracking_id() -> PyResult<String> {
+        Ok(mailtide_mime::new_tracking_id(entropy()?))
+    }
+
+    /// The `X-Mailtide-Id` of raw message bytes, read from the headers only;
+    /// None when there is no valid one.
+    #[pyfunction]
+    fn tracking_id(py: Python<'_>, raw: &[u8]) -> Option<String> {
+        py.detach(|| mailtide_mime::tracking_id(raw))
+    }
+
+    /// The addresses in a header value as the mirror holds it
+    /// (`MessageContent.sender`, an entry of `to` or `cc`): groups flattened,
+    /// display names decoded, entries without an address left out.
+    #[pyfunction]
+    fn parse_addresses(value: &str) -> Vec<Address> {
+        mailtide_mime::parse_addresses(value)
+            .into_iter()
+            .map(Address::from)
+            .collect()
     }
 }

@@ -1,4 +1,4 @@
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Literal, final
 
 from mailtide.config import Config
@@ -21,6 +21,13 @@ class SchemaOutOfDate(MailtideError): ...
 class ReadOnlyMode(MailtideError): ...
 class AccountNotTracked(MailtideError): ...
 class BlobNotFound(MailtideError): ...
+
+class ComposeError(ValueError):
+    """compose_message refused its input; the message never holds the value."""
+
+    field: str
+    index: int | None
+    reason: str
 
 SCHEMA_VERSION: int
 
@@ -200,6 +207,73 @@ class Attachment:
     content_type: str
     content_id: str | None
     data: bytes
+    def __init__(
+        self,
+        content_type: str,
+        data: bytes,
+        *,
+        filename: str | None = None,
+        content_id: str | None = None,
+    ) -> None: ...
+
+@final
+class Address:
+    name: str | None
+    email: str
+    def __init__(self, email: str, name: str | None = None) -> None: ...
+
+@final
+class OutgoingMessage:
+    """A message to compose. ``message_id`` and ``tracking_id`` left ``None``
+    are minted at each compose and ``sent_at_ms`` left ``None`` is the time of
+    the compose. Gmail replaces Message-ID and Date on every draft save and
+    send; ``tracking_id`` (the ``X-Mailtide-Id`` header) survives both."""
+
+    from_: Address
+    sender: Address | None
+    reply_to: list[Address]
+    to: list[Address]
+    cc: list[Address]
+    bcc: list[Address]
+    subject: str | None
+    sent_at_ms: int | None
+    message_id: str | None
+    tracking_id: str | None
+    in_reply_to: str | None
+    references: list[str]
+    headers: list[tuple[str, str]]
+    text: str | None
+    html: str | None
+    inline: list[Attachment]
+    attachments: list[Attachment]
+    def __init__(
+        self,
+        from_: Address | str,
+        *,
+        sender: Address | str | None = None,
+        reply_to: Sequence[Address | str] = (),
+        to: Sequence[Address | str] = (),
+        cc: Sequence[Address | str] = (),
+        bcc: Sequence[Address | str] = (),
+        subject: str | None = None,
+        sent_at_ms: int | None = None,
+        message_id: str | None = None,
+        tracking_id: str | None = None,
+        in_reply_to: str | None = None,
+        references: Sequence[str] = (),
+        headers: Sequence[tuple[str, str]] = (),
+        text: str | None = None,
+        html: str | None = None,
+        inline: Sequence[Attachment] = (),
+        attachments: Sequence[Attachment] = (),
+    ) -> None: ...
+
+@final
+class ComposedMessage:
+    raw: bytes
+    message_id: str | None
+    tracking_id: str | None
+    recipients: list[str]
 
 @final
 class ParsedMessage:
@@ -436,3 +510,13 @@ def verify_push(
     now_ms: int | None = None,
 ) -> Notification: ...
 def parse_message(raw: bytes) -> ParsedMessage: ...
+def compose_message(
+    message: OutgoingMessage,
+    *,
+    purpose: Literal["send", "draft"] = "send",
+    max_bytes: int | None = None,
+) -> ComposedMessage: ...
+def new_message_id(sender: str) -> str: ...
+def new_tracking_id() -> str: ...
+def tracking_id(raw: bytes) -> str | None: ...
+def parse_addresses(value: str) -> list[Address]: ...

@@ -196,12 +196,37 @@ Facts are from **[G]** unless marked otherwise.
 9. `messages.batchModify`: up to 1,000 ids; label add/remove arrays up to 100
    ids each [Z].
 
-### 5.5 Parsing (separate crate, optional)
+### 5.5 Parsing and composition (separate crate, optional)
 
-`mailtide-mime` may wrap Stalwart `mail-parser` (Apache-2.0/MIT) to
-extract headers, text, HTML and attachments from stored raw content. The sync
-core depends only on the headers listed in §4, which it extracts with a
-minimal header parse.
+`mailtide-mime` wraps Stalwart `mail-parser` (Apache-2.0/MIT) to extract
+headers, text, HTML and attachments from stored raw content. The sync core
+depends only on the headers listed in §4, which it extracts with a minimal
+header parse.
+
+It also composes: `compose(message, options)` writes RFC 5322 bytes (what
+Gmail takes as `raw`) from a flat, JMAP-shaped `OutgoingMessage` through
+Stalwart `mail-builder` (Apache-2.0/MIT). It is pure and deterministic: no
+clock, host name or random source is read; the date, the ids and therefore
+every multipart boundary come from the input, so the same input gives the
+same bytes. Input is refused, never repaired (`ComposeError { field, index,
+reason }`, which never holds the offending value): control characters in any
+header value, file name or id (header injection), addresses that are not ASCII
+`local@domain` dot-atoms, a custom header compose writes itself or a
+`Content-*` one, inline parts without HTML or a unique content id, multipart
+attachment types, no recipient for a send, more than `max_bytes`. One tree,
+each level only when it has more than one child: `multipart/mixed` >
+[`multipart/alternative` > [text, `multipart/related` > [html, inline
+parts]], attachments]. An attached `message/rfc822` is written `7bit` when
+it is 7-bit clean and otherwise as a base64 `application/octet-stream` file.
+Bcc is a header: Gmail's send has no envelope.
+
+Gmail replaces a client's `Message-ID` and `Date` on every API send and
+every draft save, and keeps every other client header byte for byte. So the
+identity of a message mailtide writes is the private header `X-Mailtide-Id:
+<token>` (16 to 64 characters of `A-Za-z0-9_-`): `compose` writes it from
+`tracking_id`, `new_tracking_id(entropy)` mints one, and `tracking_id(raw)`
+reads it back from the header block. Message-ID stays an optional input
+written as given; Date is always written, in UTC.
 
 ## 6. Sync algorithms (read path, phases 1–3)
 
@@ -621,6 +646,18 @@ runner per process, after forking:
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
+- composition (§5.5), pure: `compose_message(message, *, purpose="send",
+  max_bytes=None) -> ComposedMessage` (`raw`, `message_id`, `tracking_id`,
+  `recipients`) over a frozen `OutgoingMessage` (`from_`, `to`, `cc`, `bcc`,
+  `reply_to`, `sender` as `Address` or a bare address string; `subject`,
+  `sent_at_ms`, `message_id`, `tracking_id`, `in_reply_to`, `references`,
+  `headers`, `text`, `html`, `inline`, `attachments` of `Attachment`, which
+  now has a constructor). The binding supplies the impure defaults: a
+  missing `message_id` or `tracking_id` is minted from 128 random bits and a
+  missing `sent_at_ms` is now. `new_message_id(sender)`, `new_tracking_id()`,
+  `tracking_id(raw)` and `parse_addresses(value) -> list[Address]` (a header
+  value as `MessageContent` holds it) go with it. Invalid input raises
+  `ComposeError`, a `ValueError` with `field`, `index` and `reason`;
 - exceptions: `MailtideError` and its subclasses `StoreUnavailable`,
   `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`, `QuotaGateError`,
   `QuotaDeferred` (a direct call, §8, that the quota gate would hold past
@@ -793,7 +830,7 @@ metrics or OpenTelemetry dependency.
 | 3 Production hardening | Drift metrics, status, observability; first host running in shadow mode | 7 days in shadow on one mailbox with zero drift |
 | 4 Read API | Change feed and message views for host UIs: labels, threads, read state | A host can render a full mailbox from the mirror |
 | 6 Actions | Intents, delivery, confirmation (§7): read, archive, star, labels, trash/spam | Simulation holds I7 and I8; live canary passes |
-| 7 Send + drafts | Send and draft authoring through the same pattern | — |
+| 7 Send + drafts | Composition in `mailtide-mime` (§5.5); send and draft authoring through the same pattern | — |
 | OSS | Publish under `denismaciel` (MIT OR Apache-2.0) | Timing: open question |
 
 Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4

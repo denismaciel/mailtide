@@ -86,7 +86,7 @@ No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
 | `crates/mailtide-gmail` | Gmail wire layer (pure) |
 | `crates/mailtide-store` | Store trait; memory, SQLite, Postgres stores; conformance suite |
 | `crates/mailtide-io` | Async driver: HTTP, quota gate, blobs, runner |
-| `crates/mailtide-mime` | Optional MIME parsing |
+| `crates/mailtide-mime` | Optional MIME: parsing, and composing messages to send or save as drafts |
 | `python/mailtide` | Thin Python shell: re-exports and type stubs |
 | `scripts/zero_tests.py` | Tracks Zero's sync tests ported by name (see below) |
 

@@ -2,7 +2,7 @@ id = "compose-mime"
 title = "Compose: RFC 5322 messages from structured input"
 summary = "A pure `compose` in mailtide-mime that validates a flat, JMAP-shaped message (addresses, subject, text and HTML, inline images, attachments, threading ids, the private X-Mailtide-Id tracking id, custom headers) and writes deterministic RFC 5322 bytes through Stalwart's mail-builder, returning the bytes, the ids written and the recipients; a pure reader finds the tracking id in raw bytes; no Gmail call, no store change."
 roadmap = ["C1"]
-status = "in_progress"
+status = "done"
 design = "docs/features/compose-mime.md"
 # Nothing here depends on another feature. `drafts` and `send` take the bytes
 # and the Message-ID this returns; `identities` decides which From is allowed.
