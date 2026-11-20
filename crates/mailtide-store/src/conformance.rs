@@ -9,7 +9,7 @@ use std::future::Future;
 use mailtide::commit::{
     Commit, CommitOutcome, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
-use mailtide::gmail::{HeaderFacts, Label, LabelKind, MessageObservation};
+use mailtide::gmail::{HeaderFacts, Label, LabelKind, MessageFacts, MessageObservation};
 use mailtide::ids::{
     AccountId, BlobRef, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId,
     ThreadId, Timestamp,
@@ -134,6 +134,7 @@ where
     cases.extend(isolation_cases());
     cases.extend(consumer_cases());
     cases.extend(search_cases());
+    cases.extend(message_facts_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -242,6 +243,13 @@ fn search_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     ]
 }
 
+/// The cases of message facts (SPEC §4, §10.3).
+fn message_facts_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![("content written without facts reads back", |s| {
+        Box::pin(content_written_without_facts_reads_back(s))
+    })]
+}
+
 fn account() -> AccountId {
     AccountId("conformance@example.com".into())
 }
@@ -302,6 +310,16 @@ fn import_in(thread: &str, id: &str, labels: &[&str], checkpoint: u64, date: i64
             subject: Some(format!("Subject {id}")),
             ..HeaderFacts::default()
         }),
+        facts: Some(Box::new(facts_of(id))),
+    }
+}
+
+/// Facts an extractor could have found in `id`'s raw content.
+fn facts_of(id: &str) -> MessageFacts {
+    MessageFacts {
+        sender_email: Some(format!("{id}@example.com")),
+        list_id: Some("news.example.com".into()),
+        ..MessageFacts::empty()
     }
 }
 
@@ -2903,5 +2921,49 @@ async fn locate<S: Store>(store: &S) -> Result<(), String> {
     expect(
         matches!(apply(store, &later).await?, CommitOutcome::Applied { .. }),
         "the engine keeps its claim",
+    )
+}
+
+/// A row as a build from before message facts wrote it: an import that
+/// carries none serialises exactly as that build did.
+async fn content_written_without_facts_reads_back<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut old = import("a", &["INBOX"], 1);
+    if let MessageOp::MarkImported { facts, .. } = &mut old {
+        *facts = None;
+    }
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![old, import("b", &["INBOX"], 2)];
+    apply(store, &c).await?;
+    let content = |id: &str| {
+        let id = id.to_owned();
+        async move {
+            view(store, &id)
+                .await?
+                .content
+                .ok_or_else(|| format!("{id} is imported"))
+        }
+    };
+    let a = content("a").await?;
+    expect(a.facts.is_none(), "a row without facts reads as None")?;
+    expect(
+        a.headers.subject.as_deref() == Some("Subject a"),
+        "the rest of the record reads as written",
+    )?;
+    expect(
+        content("b").await?.facts == Some(facts_of("b")),
+        "a row with facts reads them back",
+    )?;
+    let page = store
+        .changes(&account(), StateSeq(0).into(), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        page.changes.iter().any(|entry| {
+            matches!(&entry.change, Change::MessageImported { id, .. } if id.0 == "a")
+                && entry.content.as_ref().is_some_and(|c| c.facts.is_none())
+        }),
+        "its import entry carries the content with no facts",
     )
 }

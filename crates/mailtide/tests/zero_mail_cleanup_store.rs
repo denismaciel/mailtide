@@ -119,6 +119,7 @@ mod common {
             size: 1,
             internal_date: Timestamp(0),
             headers: Box::new(HeaderFacts::default()),
+            facts: None,
         }
     }
 
@@ -561,6 +562,7 @@ fn durable_spam_cleanup_resumes_discovery_and_delivery_without_changing_the_enum
             size: 1,
             internal_date: Timestamp(0),
             headers: HeaderFacts::default(),
+            facts: None,
         }),
     });
     // Delivery resumes after a restart with exactly what is left.

@@ -173,6 +173,7 @@ mod tests {
                 size: 10,
                 internal_date: Timestamp(date),
                 headers,
+                facts: None,
             }),
             ..pending(id, labels)
         }

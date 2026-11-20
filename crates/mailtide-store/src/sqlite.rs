@@ -715,6 +715,92 @@ mod tests {
         );
     }
 
+    /// Migration 8 is version only: content records written by version 7
+    /// read back with no facts, and an older build sees the database as
+    /// ahead. The documented rollback (drop the refresh entries, forget the
+    /// version) leaves a database version 7 can run, and migrating again
+    /// restores it.
+    #[tokio::test]
+    async fn migration_8_is_version_only_and_revertible() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState, migrations};
+        let all = migrations();
+        assert_eq!(all[7].version, 8);
+        assert_eq!(
+            all[7].statements[1..],
+            ["INSERT INTO mailtide_schema (version) VALUES (8)".to_owned()]
+        );
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        let run = |statements: Vec<String>| {
+            let store = &store;
+            async move {
+                for statement in statements {
+                    store
+                        .inner
+                        .execute_for_tests(&statement)
+                        .await
+                        .expect("statement");
+                }
+            }
+        };
+        run(all[..7].iter().flat_map(|m| m.statements.clone()).collect()).await;
+        // An account and an imported message as version 7 stored them.
+        run(vec![
+            "INSERT INTO mailtide_accounts
+               (account, epoch, engine_version, cursor, sync, watch_expiration, last_activity,
+                cooldown, rng_seed, seq, log_floor, generation)
+             VALUES ('a@example.com', 1, 1, 7, '\"Live\"', NULL, NULL, NULL, 0, 1, 0, 1)"
+                .to_owned(),
+            r#"INSERT INTO mailtide_messages (account, id, thread_id, labels, checkpoint, unverified, content)
+               VALUES ('a@example.com', 'm1', 't1', '["INBOX"]', 7, NULL,
+                 '{"blob":"a/m1.eml","size":10,"internal_date":0,"headers":{"rfc822_message_id":null,"in_reply_to":null,"references":[],"from":"x@example.com","to":[],"cc":[],"subject":"hi","snippet":null}}')"#
+                .to_owned(),
+        ])
+        .await;
+        store.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        let views = store
+            .messages(&account, &[MessageId("m1".into())])
+            .await
+            .expect("messages");
+        let content = views[0].content.clone().expect("imported");
+        assert_eq!(content.headers.subject.as_deref(), Some("hi"));
+        assert_eq!(content.facts, None);
+        // The documented downgrade, after forgetting the later migrations.
+        run(vec![
+            r#"INSERT INTO mailtide_changes (account, seq, idx, change)
+               VALUES ('a@example.com', 1, 0, '{"FactsRefreshed":{"id":"m1","thread_id":"t1"}}')"#
+                .to_owned(),
+            "DELETE FROM mailtide_schema WHERE version > 8".to_owned(),
+            r#"DELETE FROM mailtide_changes WHERE change LIKE '{"FactsRefreshed"%'"#.to_owned(),
+            "DELETE FROM mailtide_schema WHERE version = 8".to_owned(),
+        ])
+        .await;
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests("SELECT CAST(COUNT(*) AS TEXT) FROM mailtide_changes")
+                .await
+                .expect("count"),
+            "0"
+        );
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: 7,
+                expected: SCHEMA_VERSION
+            }
+        );
+        store.migrate().await.expect("migrate again");
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Current {
+                version: SCHEMA_VERSION
+            }
+        );
+    }
+
     /// A stored number out of range is corrupt, never read as another value.
     #[tokio::test]
     async fn a_negative_stored_cursor_is_corrupt() {
@@ -802,6 +888,7 @@ mod tests {
                     from: Some(format!("{id}@example.com")),
                     ..HeaderFacts::default()
                 }),
+                facts: None,
             }
         };
         commit.messages = vec![

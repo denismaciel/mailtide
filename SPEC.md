@@ -845,6 +845,22 @@ DROP TABLE mailtide_consumers;
 DELETE FROM mailtide_schema WHERE version = 7;
 ```
 
+Migration 8 is version only: the message facts (§4) live in the existing
+content record, but a build from before them would drop them from every row
+it rewrites and cannot read a `FactsRefreshed` feed entry, so it must see the
+database as `ahead` and refuse to sync. `ENGINE_VERSION` is unchanged.
+Reverting it:
+
+```sql
+DELETE FROM mailtide_changes WHERE change LIKE '{"FactsRefreshed"%';
+DELETE FROM mailtide_schema WHERE version = 8;
+```
+
+The `facts` keys may stay (an older build ignores them). Lost: the facts of
+rows the older build rewrites, and the refresh entries; after the next
+upgrade, `refresh_facts` finds those rows and restores their facts from the
+blobs. Part references a host holds stay valid: they name bytes in a blob.
+
 Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach
 retries, cleanups and confirmations without sleeping.

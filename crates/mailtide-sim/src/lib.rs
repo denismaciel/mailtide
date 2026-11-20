@@ -28,7 +28,7 @@ use mailtide::engine::Engine;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{
     HeaderFacts, HistoryPage, HistoryRecord, ImportedMessage, Label, LabelKind, ListPage,
-    MessageObservation, MessageRef,
+    MessageFacts, MessageObservation, MessageRef,
 };
 use mailtide::ids::{
     AccountId, BlobRef, CommandId, ENGINE_VERSION, HistoryId, LabelId, MessageId, PageToken,
@@ -1437,6 +1437,7 @@ impl Sim {
                             size: 1_000,
                             internal_date: self.gmail.messages.get(id).map_or(self.now, |m| m.date),
                             headers: HeaderFacts::default(),
+                            facts: Some(Box::new(MessageFacts::empty())),
                             observation,
                         }),
                     }

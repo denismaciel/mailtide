@@ -1079,6 +1079,7 @@ impl Engine {
             size: message.size,
             internal_date: message.internal_date,
             headers: Box::new(message.headers),
+            facts: message.facts,
         }];
         let mut out = vec![self.finish_job(&job, JobOutcome::Done, ops, now)];
         out.extend(refresh);

@@ -9,7 +9,7 @@
 //! jobs in the same transaction (review #1), so every message's next step is
 //! durable (I6).
 
-use crate::gmail::{HeaderFacts, Label, MessageObservation};
+use crate::gmail::{HeaderFacts, Label, MessageFacts, MessageObservation};
 use crate::ids::{
     AccountId, BlobRef, CommitId, EngineVersion, Epoch, HistoryId, MessageId, Timestamp,
 };
@@ -165,6 +165,8 @@ pub enum MessageOp {
         internal_date: Timestamp,
         /// Header facts.
         headers: Box<HeaderFacts>,
+        /// The facts extracted from the stored bytes, if any.
+        facts: Option<Box<MessageFacts>>,
     },
     /// Delete the message and keep a tombstone; cancels its other jobs and
     /// intents and enqueues cleanup of any raw content. Applies even to

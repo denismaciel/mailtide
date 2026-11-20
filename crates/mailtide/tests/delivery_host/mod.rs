@@ -81,6 +81,7 @@ pub fn imported_mirror(ids: &[&str], labels: &[&str]) -> AccountMirror {
             size: 1,
             internal_date: Timestamp(0),
             headers: Box::new(HeaderFacts::default()),
+            facts: None,
         })
         .collect();
     assert!(matches!(mirror.apply(&c), CommitOutcome::Applied { .. }));

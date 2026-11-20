@@ -33,6 +33,26 @@ change = "modify"
 role = "Pass the facts from the import event into the commit"
 
 [[file]]
+path = "crates/mailtide/Cargo.toml"
+change = "modify"
+role = "serde_json as a dev-dependency, for the test that reads content records written before facts existed"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_history_store.rs"
+change = "modify"
+role = "Imports in the ported tests carry no facts (facts: None)"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_cleanup_store.rs"
+change = "modify"
+role = "Imports in the ported tests carry no facts (facts: None)"
+
+[[file]]
+path = "crates/mailtide/tests/label_refresh.rs"
+change = "modify"
+role = "Imports in the label refresh tests carry no facts (facts: None)"
+
+[[file]]
 path = "crates/mailtide/src/revision.rs"
 change = "modify"
 role = "Change::FactsRefreshed; ChangeEntry.content is filled for it as for imports"
@@ -94,7 +114,7 @@ role = "Delegate refresh_facts"
 [[file]]
 path = "crates/mailtide-store/src/sqlite.rs"
 change = "modify"
-role = "Delegate refresh_facts"
+role = "Delegate refresh_facts; the version-only migration's test: older content reads back, and the documented rollback runs"
 
 [[file]]
 path = "crates/mailtide-store/src/conformance.rs"
@@ -251,6 +271,11 @@ role = "Driver tests against a fake Gmail: facts at import, the refresh"
 path = "crates/mailtide-io/tests/parts.rs"
 change = "new"
 role = "Driver tests: ranged reads, streaming, refusals, a blob store without ranges"
+
+[[file]]
+path = "tests/test_migrations_clock.py"
+change = "modify"
+role = "SCHEMA_VERSION is 5: the version-only step"
 
 [[file]]
 path = "tests/test_message_facts.py"

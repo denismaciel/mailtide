@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::commit::{
     AccountOp, Commit, CommitOutcome, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
-use crate::gmail::{HeaderFacts, Label, MessageObservation};
+use crate::gmail::{HeaderFacts, Label, MessageFacts, MessageObservation};
 use crate::ids::{
     AccountId, BlobRef, EngineVersion, Epoch, HistoryId, MessageId, ThreadId, Timestamp,
     stable_hash,
@@ -72,6 +72,10 @@ pub struct StoredContent {
     pub internal_date: Timestamp,
     /// Header facts.
     pub headers: HeaderFacts,
+    /// The facts extracted from the raw content (SPEC §4); `None` in rows
+    /// written before they existed, or when the extractor gave up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<MessageFacts>,
 }
 
 /// A message as hosts read it: labels with pending actions applied.
@@ -1185,6 +1189,7 @@ impl AccountMirror {
                 size,
                 internal_date,
                 headers,
+                facts,
             } => mark_imported(
                 self.messages.get(&observation.id),
                 self.tombstones.get(&observation.id).copied(),
@@ -1194,6 +1199,7 @@ impl AccountMirror {
                     size: *size,
                     internal_date: *internal_date,
                     headers: (**headers).clone(),
+                    facts: facts.as_deref().cloned(),
                 },
                 plan,
             ),
@@ -1949,6 +1955,7 @@ mod tests {
             size: 1,
             internal_date: Timestamp(0),
             headers: Box::default(),
+            facts: None,
         }];
         let _ = mirror.apply(&imported);
         assert!(
@@ -2027,6 +2034,7 @@ mod tests {
             size: 1,
             internal_date: Timestamp(0),
             headers: HeaderFacts::default(),
+            facts: None,
         }));
         let mut c = commit(&mirror);
         c.messages = vec![MessageOp::Tombstone {
@@ -2449,6 +2457,7 @@ mod tests {
                 from: Some(format!("{id}@example.com")),
                 ..HeaderFacts::default()
             }),
+            facts: None,
         }
     }
 
@@ -2725,5 +2734,76 @@ mod tests {
             mirror.ack(&extra, at, Timestamp(1)),
             AckOutcome::Acked(_)
         ));
+    }
+
+    fn import_op(id: &str, checkpoint: u64, facts: Option<MessageFacts>) -> MessageOp {
+        MessageOp::MarkImported {
+            observation: observation(id, &["INBOX"], checkpoint),
+            blob: BlobRef(format!("{id}.eml")),
+            size: 120,
+            internal_date: Timestamp(0),
+            headers: Box::default(),
+            facts: facts.map(Box::new),
+        }
+    }
+
+    fn stored(mirror: &AccountMirror, id: &str) -> Option<StoredContent> {
+        mirror.view(&MessageId(id.into()))?.content
+    }
+
+    #[test]
+    fn content_stored_before_facts_existed_still_reads() {
+        let before = r#"{"blob":"a.eml","size":120,"internal_date":0,"headers":{"rfc822_message_id":null,"in_reply_to":null,"references":[],"from":"a@x.org","to":[],"cc":[],"subject":"hi","snippet":null}}"#;
+        let content: StoredContent = serde_json::from_str(before).expect("old content reads");
+        assert_eq!(content.facts, None);
+        assert_eq!(content.headers.subject.as_deref(), Some("hi"));
+        assert_eq!(
+            serde_json::to_string(&content).expect("serialises"),
+            before,
+            "written back as the previous build wrote it"
+        );
+        let newer = r#"{"blob":"a.eml","size":120,"internal_date":0,"headers":{"rfc822_message_id":null,"in_reply_to":null,"references":[],"from":null,"to":[],"cc":[],"subject":null,"snippet":null},"facts":{"version":9,"sender_email":"a@x.org","unknown":true},"later":1}"#;
+        let content: StoredContent = serde_json::from_str(newer).expect("unknown keys are skipped");
+        let facts = content.facts.expect("facts");
+        assert_eq!(facts.version, 9);
+        assert_eq!(facts.sender_email.as_deref(), Some("a@x.org"));
+        assert!(facts.parts.is_empty());
+    }
+
+    #[test]
+    fn an_import_stores_the_facts_it_was_given() {
+        let mut mirror = claimed();
+        let facts = MessageFacts {
+            sender_email: Some("a@x.org".into()),
+            attached: 1,
+            ..MessageFacts::empty()
+        };
+        let mut c = commit(&mirror);
+        c.messages = vec![import_op("a", 3, Some(facts.clone()))];
+        let _ = mirror.apply(&c);
+        assert_eq!(
+            stored(&mirror, "a").and_then(|content| content.facts),
+            Some(facts.clone())
+        );
+        let page = mirror.changes(StateSeq(0).into(), 10);
+        let imported = page
+            .changes
+            .iter()
+            .find(|entry| matches!(entry.change, Change::MessageImported { .. }))
+            .expect("import entry");
+        assert_eq!(
+            imported
+                .content
+                .as_ref()
+                .and_then(|content| content.facts.clone()),
+            Some(facts)
+        );
+        let mut c = commit(&mirror);
+        c.messages = vec![import_op("b", 3, None)];
+        let _ = mirror.apply(&c);
+        assert_eq!(
+            stored(&mirror, "b").map(|content| content.facts),
+            Some(None)
+        );
     }
 }

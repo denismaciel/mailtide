@@ -167,6 +167,32 @@ class MessageContent:
     cc: list[str]
     subject: str | None
     snippet: str | None
+    facts_version: int
+    bcc: list[str]
+    reply_to: list[str]
+    sent_at_ms: int | None
+    sent_at_offset_min: int | None
+    sender_name: str | None
+    sender_email: str | None
+    list_id: str | None
+    list_unsubscribe: list[str]
+    one_click_unsubscribe: bool
+    auto_submitted: str | None
+    precedence: str | None
+    attachments: list[AttachmentInfo] | None
+    attachment_count: int | None
+    inline_count: int | None
+    has_attachment: bool | None
+
+@final
+class AttachmentInfo:
+    part: str
+    filename: str | None
+    content_type: str
+    size: int
+    inline: bool
+    disposition: str | None
+    content_id: str | None
 
 @final
 class MessageView:
@@ -225,6 +251,7 @@ class Attachment:
     filename: str | None
     content_type: str
     content_id: str | None
+    part: str | None
     data: bytes
     def __init__(
         self,
@@ -637,3 +664,4 @@ def tracking_id(raw: bytes) -> str | None: ...
 def parse_addresses(value: str) -> list[Address]: ...
 def search_literal(text: str) -> str: ...
 def search_by_message_id(message_id: str) -> str: ...
+def decode_header(value: str) -> str: ...

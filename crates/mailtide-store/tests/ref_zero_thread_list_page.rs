@@ -38,6 +38,7 @@ fn import(thread: &str, id: &str, date: i64) -> MessageOp {
             subject: Some(format!("Subject {id}")),
             ..HeaderFacts::default()
         }),
+        facts: None,
     }
 }
 

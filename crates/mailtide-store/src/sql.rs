@@ -104,7 +104,13 @@ const MIGRATIONS: &[&[&str]] = &[&[
 // is a position inside a commit, which they can't read.
 &["CREATE TABLE IF NOT EXISTS mailtide_consumers (
     account TEXT NOT NULL, name TEXT NOT NULL, seq BIGINT NOT NULL, idx BIGINT,
-    seen_at BIGINT NOT NULL, PRIMARY KEY (account, name))"]];
+    seen_at BIGINT NOT NULL, PRIMARY KEY (account, name))"],
+
+// 8: message facts, inside the existing content record, and the
+// FactsRefreshed feed entry. Version only: nothing to migrate, but an older
+// build would drop the facts from every row it rewrites and cannot read the
+// entry, so it must see this database as ahead.
+&[]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below

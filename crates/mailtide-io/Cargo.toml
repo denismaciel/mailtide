@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 mailtide = { path = "../mailtide", version = "0.2.1" }
 mailtide-gmail = { path = "../mailtide-gmail", version = "0.2.1" }
+mailtide-mime = { path = "../mailtide-mime", version = "0.2.1" }
 mailtide-store = { path = "../mailtide-store", version = "0.2.1" }
 bytes = "1"
 futures-util = "0.3"

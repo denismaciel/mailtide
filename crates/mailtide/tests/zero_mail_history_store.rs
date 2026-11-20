@@ -142,6 +142,7 @@ mod common {
             size: 1,
             internal_date: Timestamp(0),
             headers: Box::new(HeaderFacts::default()),
+            facts: None,
         }
     }
 
@@ -662,6 +663,7 @@ fn durable_gmail_history_checkpoints_retains_a_notification_arriving_during_a_sy
             size: 1,
             internal_date: Timestamp(0),
             headers: HeaderFacts::default(),
+            facts: None,
         }),
     });
     assert!(host.mirror.jobs.is_empty());

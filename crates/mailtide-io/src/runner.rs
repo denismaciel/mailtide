@@ -12,7 +12,7 @@ use mailtide::command::{Command, CommandKind, GmailCall, GmailRequest};
 use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
 use mailtide::engine::Stopped;
 use mailtide::event::{Event, EventKind};
-use mailtide::gmail::{ImportedMessage, Label};
+use mailtide::gmail::{ImportedMessage, Label, MessageFacts};
 use mailtide::ids::{
     AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, ThreadId, Timestamp,
 };
@@ -151,6 +151,7 @@ pub struct Runner<S, B, T, Q, A> {
     tokens: A,
     config: RunnerConfig,
     clock: crate::Clock,
+    extract: fn(&[u8]) -> MessageFacts,
 }
 
 /// What one run did.
@@ -409,6 +410,7 @@ where
             tokens,
             config,
             clock: crate::Clock::system(),
+            extract: mailtide_mime::facts,
         }
     }
 
@@ -423,6 +425,14 @@ where
     #[must_use]
     pub fn with_clock(mut self, clock: crate::Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Extract the facts stored at import with `extract` instead of
+    /// [`mailtide_mime::facts`] (tests inject an extractor that fails).
+    #[must_use]
+    pub fn with_facts_extractor(mut self, extract: fn(&[u8]) -> MessageFacts) -> Self {
+        self.extract = extract;
         self
     }
 
@@ -1313,16 +1323,32 @@ where
             return Outcome::StoreFailed(error);
         }
         report.imported += 1;
+        let headers = headers::facts(&raw.rfc822, raw.snippet.as_deref());
+        let size = u64::try_from(raw.rfc822.len()).unwrap_or(u64::MAX);
+        let facts = self.extract_facts(raw.rfc822).await;
         Outcome::Event(EventKind::MessageImported {
             command,
             message: Box::new(ImportedMessage {
-                headers: headers::facts(&raw.rfc822, raw.snippet.as_deref()),
+                headers,
                 blob: key,
-                size: u64::try_from(raw.rfc822.len()).unwrap_or(u64::MAX),
+                size,
                 internal_date: raw.internal_date,
                 observation: raw.observation,
+                facts,
             }),
         })
+    }
+
+    /// The facts of the bytes just stored, parsed off the async workers. An
+    /// import never fails because of a message's shape: if the extractor
+    /// gives up, the message is imported without facts.
+    async fn extract_facts(&self, stored: Vec<u8>) -> Option<Box<MessageFacts>> {
+        let extract = self.extract;
+        let extracted = tokio::task::spawn_blocking(move || extract(&stored)).await;
+        if extracted.is_err() {
+            tracing::warn!("facts extraction failed; the message is imported without them");
+        }
+        extracted.ok().map(Box::new)
     }
 }
 

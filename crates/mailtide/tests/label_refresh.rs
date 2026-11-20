@@ -571,6 +571,7 @@ fn an_imported_message_with_an_unknown_label_asks_for_a_refresh() {
             size: 1,
             internal_date: Timestamp(0),
             headers: HeaderFacts::default(),
+            facts: None,
         }),
     });
     host.take_label_call();

@@ -430,6 +430,9 @@ pub struct ImportedMessage {
     pub internal_date: Timestamp,
     /// Header facts.
     pub headers: HeaderFacts,
+    /// What the driver extracted from the stored bytes; `None` when the
+    /// extractor gave up on the message, which is imported all the same.
+    pub facts: Option<Box<MessageFacts>>,
 }
 
 /// The kind of a Gmail label.

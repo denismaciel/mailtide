@@ -99,6 +99,7 @@ impl Mailbox {
             size: 100,
             internal_date: Timestamp(date),
             headers: Box::new(headers),
+            facts: None,
         }]);
     }
 

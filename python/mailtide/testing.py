@@ -46,9 +46,11 @@ class Mailbox:
         sender: str | None = None,
         to: list[str] | None = None,
         cc: list[str] | None = None,
+        raw: bytes | None = None,
     ) -> None:
         """A new message: in its own thread unless ``thread`` names one, from
-        ``sender-{mid}@example.com`` unless ``sender`` says otherwise."""
+        ``sender-{mid}@example.com`` unless ``sender`` says otherwise; ``raw``
+        is its RFC 822 content (generated from the rest when omitted)."""
         self.history_id += 1
         self.messages[mid] = {
             "labels": labels,
@@ -58,6 +60,7 @@ class Mailbox:
             "from": sender or f"sender-{mid}@example.com",
             "to": to or [],
             "cc": cc or [],
+            "raw": raw,
         }
         ref = {"id": mid, "threadId": self.messages[mid]["thread"], "labelIds": labels}
         self.history.append({"id": str(self.history_id), "messagesAdded": [{"message": ref}]})
@@ -199,9 +202,12 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                         if m[key]
                     )
                     raw = (
-                        f"Message-ID: <{mid}@example.com>\r\nFrom: {m['from']}\r\n{recipients}"
-                        f"Subject: Message {mid}\r\n\r\nBody of {mid}\r\n"
-                    ).encode()
+                        m["raw"]
+                        or (
+                            f"Message-ID: <{mid}@example.com>\r\nFrom: {m['from']}\r\n{recipients}"
+                            f"Subject: Message {mid}\r\n\r\nBody of {mid}\r\n"
+                        ).encode()
+                    )
                     body["raw"] = base64.urlsafe_b64encode(raw).decode().rstrip("=")
                 return self.reply(200, body)
             return self.reply(404, {"error": {"code": 404, "message": "not found"}})
@@ -262,8 +268,10 @@ class FakeGmail:
         sender: str | None = None,
         to: list[str] | None = None,
         cc: list[str] | None = None,
+        raw: bytes | None = None,
     ) -> None:
-        """A new message arrives with ``labels``, in ``thread`` if given."""
+        """A new message arrives with ``labels``, in ``thread`` if given; ``raw``
+        is its RFC 822 content (generated from the rest when omitted)."""
         with self.mailbox.lock:
             self.mailbox.add(
                 message_id,
@@ -273,6 +281,7 @@ class FakeGmail:
                 sender=sender,
                 to=to,
                 cc=cc,
+                raw=raw,
             )
 
     def script_search(self, query: str, message_ids: list[str]) -> None:

@@ -658,7 +658,8 @@ mod _core {
         })
     }
 
-    /// Raw content of an imported message: where it is and its header facts.
+    /// Raw content of an imported message: where it is, its header facts,
+    /// and the facts extracted from it (envelope and attachment summary).
     #[pyclass(frozen, get_all)]
     struct MessageContent {
         /// The blob key (`{account}/{id}.eml` under the blob URL's prefix).
@@ -673,6 +674,48 @@ mod _core {
         cc: Vec<String>,
         subject: Option<String>,
         snippet: Option<String>,
+        /// The extractor version that wrote the facts below; 0 when they
+        /// were not extracted (imported before they existed): then the
+        /// attachment fields are `None`, never "no attachments".
+        facts_version: u32,
+        bcc: Vec<String>,
+        reply_to: Vec<String>,
+        /// The `Date` header as an instant, and the sender's UTC offset.
+        sent_at_ms: Option<i64>,
+        sent_at_offset_min: Option<i32>,
+        /// The first `From` mailbox: decoded display name and address.
+        sender_name: Option<String>,
+        sender_email: Option<String>,
+        list_id: Option<String>,
+        list_unsubscribe: Vec<String>,
+        one_click_unsubscribe: bool,
+        auto_submitted: Option<String>,
+        precedence: Option<String>,
+        /// The first 32 listed parts, in document order.
+        attachments: Option<Vec<Py<AttachmentInfo>>>,
+        /// Attached parts, counted beyond the list.
+        attachment_count: Option<u32>,
+        /// Inline parts, counted beyond the list.
+        inline_count: Option<u32>,
+        /// Whether to show a paperclip.
+        has_attachment: Option<bool>,
+    }
+
+    /// One part of a message's attachment summary.
+    #[pyclass(frozen, get_all)]
+    struct AttachmentInfo {
+        /// The part reference: read it with `read_part` or `open_part`.
+        part: String,
+        /// The decoded filename, as the sender wrote it: untrusted.
+        filename: Option<String>,
+        content_type: String,
+        /// Bytes after transfer decoding: exactly what a read returns.
+        size: u64,
+        /// Shown inside the message rather than attached.
+        inline: bool,
+        /// The declared `Content-Disposition`, lowercased.
+        disposition: Option<String>,
+        content_id: Option<String>,
     }
 
     /// A message as the host should show it.
@@ -697,6 +740,32 @@ mod _core {
         py: Python<'_>,
         stored: mailtide::mirror::StoredContent,
     ) -> PyResult<Py<MessageContent>> {
+        let extracted = stored.facts.is_some();
+        let facts = stored.facts.unwrap_or_default();
+        let attachments = if extracted {
+            Some(
+                facts
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        Py::new(
+                            py,
+                            AttachmentInfo {
+                                part: part.part.to_string(),
+                                filename: part.filename.clone(),
+                                content_type: part.content_type.clone(),
+                                size: part.size,
+                                inline: part.is_inline(),
+                                disposition: part.disposition.clone(),
+                                content_id: part.content_id.clone(),
+                            },
+                        )
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
         Py::new(
             py,
             MessageContent {
@@ -711,6 +780,22 @@ mod _core {
                 cc: stored.headers.cc,
                 subject: stored.headers.subject,
                 snippet: stored.headers.snippet,
+                facts_version: facts.version,
+                attachments,
+                attachment_count: extracted.then_some(facts.attached),
+                inline_count: extracted.then_some(facts.inline),
+                has_attachment: extracted.then(|| facts.has_attachment()),
+                bcc: facts.bcc,
+                reply_to: facts.reply_to,
+                sent_at_ms: facts.sent_at.map(|sent| sent.at.0),
+                sent_at_offset_min: facts.sent_at.map(|sent| sent.offset_minutes),
+                sender_name: facts.sender_name,
+                sender_email: facts.sender_email,
+                list_id: facts.list_id,
+                list_unsubscribe: facts.list_unsubscribe,
+                one_click_unsubscribe: facts.one_click_unsubscribe,
+                auto_submitted: facts.auto_submitted,
+                precedence: facts.precedence,
             },
         )
     }
@@ -856,6 +941,10 @@ mod _core {
         filename: Option<String>,
         content_type: String,
         content_id: Option<String>,
+        /// Its part reference in the raw message (as the attachment summary
+        /// names it); `None` inside a transfer-encoded attached message, and
+        /// for a part to compose.
+        part: Option<String>,
         data: Py<PyBytes>,
     }
 
@@ -873,6 +962,7 @@ mod _core {
                 filename,
                 content_type,
                 content_id,
+                part: None,
                 data,
             }
         }
@@ -3087,13 +3177,15 @@ mod _core {
         let attachments = parsed
             .attachments
             .into_iter()
-            .map(|a| {
+            .zip(parsed.attachment_parts)
+            .map(|(a, part)| {
                 Py::new(
                     py,
                     Attachment {
                         filename: a.filename,
                         content_type: a.content_type,
                         content_id: a.content_id,
+                        part: part.map(|part| part.to_string()),
                         data: PyBytes::new(py, &a.bytes).unbind(),
                     },
                 )
@@ -3272,5 +3364,12 @@ mod _core {
             .into_iter()
             .map(Address::from)
             .collect()
+    }
+
+    /// An unstructured header value (a `subject`) with its RFC 2047 encoded
+    /// words decoded.
+    #[pyfunction]
+    fn decode_header(value: &str) -> String {
+        mailtide_mime::decode_header(value)
     }
 }
