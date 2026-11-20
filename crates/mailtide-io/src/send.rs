@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use mailtide::command::GmailRequest;
 use mailtide::event::EventKind;
-use mailtide::ids::{AccountId, LabelId, MessageId, ThreadId, Timestamp};
+use mailtide::ids::{AccountId, DraftId, LabelId, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::AttemptId;
 use mailtide::quota::Priority;
 use mailtide::submission::{
@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::TokenSource;
 use crate::blobs::{BlobError, BlobStore, outbox_key};
+use crate::drafts::{DraftError, SentDraft};
 use crate::quota_gate::QuotaGate;
-use crate::runner::{Access, CallError, RunError, Runner, SyncReport};
+use crate::runner::{Access, CallError, RunError, RunOutcome, Runner, SyncReport};
 use crate::transport::GmailTransport;
 
 const LOCAL_RETRY: Duration = Duration::from_secs(5);
@@ -32,6 +33,45 @@ pub struct SendOptions {
     pub thread_of: Option<MessageId>,
     /// The first eligible time. Omit to allow immediate delivery.
     pub send_at: Option<Timestamp>,
+}
+
+/// Which Gmail send path to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendSource {
+    /// Durable submission of RFC 5322 bytes.
+    Raw {
+        /// Optional host key, defaulting to the tracking token.
+        key: Option<SubmissionKey>,
+        /// The bytes to stage and send.
+        raw: Vec<u8>,
+        /// Scheduling and thread selection.
+        options: SendOptions,
+    },
+    /// Send the stored version through the existing draft lifecycle.
+    Draft {
+        /// Gmail's draft id.
+        draft_id: DraftId,
+        /// Refuse if this is no longer the draft's current message.
+        if_message_id: Option<MessageId>,
+    },
+}
+
+/// A queued raw submission and the run that attempted progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSendOutcome {
+    /// The persisted submission after the run.
+    pub submission: Submission,
+    /// What the run did.
+    pub run: RunOutcome,
+}
+
+/// A send's result according to its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The raw submission and run.
+    Raw(Box<RawSendOutcome>),
+    /// The existing draft receipt.
+    Draft(SentDraft),
 }
 
 /// Why a raw submission operation could not complete.
@@ -62,6 +102,8 @@ pub enum SendError {
     CannotUnsend(SubmissionState),
     /// The original has no readable stored content.
     OriginalUnavailable,
+    /// An error from the existing draft path.
+    Draft(DraftError),
     /// A store, blob or runner failure.
     Run(RunError),
 }
@@ -109,6 +151,37 @@ where
     Q: QuotaGate,
     A: TokenSource,
 {
+    /// Submit raw mail and run the queue, or send a stored draft.
+    pub async fn send(
+        &self,
+        account: &AccountId,
+        source: SendSource,
+        budget: Duration,
+    ) -> Result<SendOutcome, SendError> {
+        match source {
+            SendSource::Raw { key, raw, options } => {
+                let submitted = self.submit(account, key, raw, options).await?;
+                let run = self.run(account, budget).await.map_err(SendError::Run)?;
+                let submission = self
+                    .submission(account, &submitted.key)
+                    .await?
+                    .ok_or(SendError::UnknownSubmission)?;
+                Ok(SendOutcome::Raw(Box::new(RawSendOutcome {
+                    submission,
+                    run,
+                })))
+            }
+            SendSource::Draft {
+                draft_id,
+                if_message_id,
+            } => self
+                .send_draft(account, &draft_id, if_message_id, budget)
+                .await
+                .map(SendOutcome::Draft)
+                .map_err(SendError::Draft),
+        }
+    }
+
     /// Stage and admit raw bytes without calling Gmail.
     pub async fn submit(
         &self,

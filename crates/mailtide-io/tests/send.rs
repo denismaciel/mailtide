@@ -673,3 +673,117 @@ fn submission_job_due_time_includes_confirmation_and_cleanup() {
         assert!(row.blob.is_none() && row.due_at.is_none());
     });
 }
+
+async fn draft_source(r: &TestRunner) -> mailtide_io::send::SendSource {
+    let saved = r
+        .create_draft(&account(), bytes(2), None, BUDGET)
+        .await
+        .unwrap();
+    mailtide_io::send::SendSource::Draft {
+        draft_id: saved.id,
+        if_message_id: Some(saved.message),
+    }
+}
+
+#[test]
+fn sending_an_existing_draft_uses_only_the_drafts_path() {
+    use mailtide_io::send::SendOutcome;
+    block_on(async {
+        let (r, setup) = runner();
+        synced(&r).await;
+        let source = draft_source(&r).await;
+        let result = r.send(&account(), source, BUDGET).await.unwrap();
+        assert!(matches!(result, SendOutcome::Draft(_)));
+        assert!(
+            r.submissions(&account(), None, &[], 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), 1);
+        assert_eq!(sends(&setup), 0);
+    });
+}
+
+#[test]
+fn a_draft_unknown_uses_drafts_fences_and_confirmation() {
+    use mailtide_io::drafts::DraftError;
+    block_on(async {
+        let (r, setup) = runner();
+        synced(&r).await;
+        let source = draft_source(&r).await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Lost { applied: true });
+        assert!(matches!(
+            r.send(&account(), source.clone(), BUDGET).await,
+            Err(SendError::Draft(DraftError::OutcomeUnknown(_)))
+        ));
+        setup.clock.advance(Duration::from_mins(5));
+        assert_eq!(
+            r.send(&account(), source, BUDGET).await,
+            Err(SendError::Draft(DraftError::SendUnconfirmed))
+        );
+        sync(&r).await;
+        assert!(
+            fake_gmail::draft_feed(&r)
+                .await
+                .iter()
+                .any(|entry| entry.0 == "sent")
+        );
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), 1);
+        assert_eq!(sends(&setup), 0);
+    });
+}
+
+#[test]
+fn a_draft_http_refusal_preserves_drafts_retry_rules() {
+    use mailtide_io::drafts::DraftError;
+    use mailtide_io::send::SendOutcome;
+    block_on(async {
+        let (r, setup) = runner();
+        synced(&r).await;
+        let source = draft_source(&r).await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Status(400));
+        assert!(matches!(
+            r.send(&account(), source.clone(), BUDGET).await,
+            Err(SendError::Draft(DraftError::Refused(_)))
+        ));
+        assert!(matches!(
+            r.send(&account(), source, BUDGET).await,
+            Ok(SendOutcome::Draft(_))
+        ));
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), 2);
+        assert_eq!(setup.gmail.lock().labelled("SENT").len(), 1);
+    });
+}
+
+#[test]
+fn a_changed_or_gone_draft_uses_drafts_own_error() {
+    use mailtide_io::drafts::DraftError;
+    use mailtide_io::send::SendSource;
+    block_on(async {
+        let (r, setup) = runner();
+        synced(&r).await;
+        let source = draft_source(&r).await;
+        let SendSource::Draft { draft_id, .. } = &source else {
+            panic!("draft");
+        };
+        r.update_draft(&account(), draft_id, bytes(2), None, None, BUDGET)
+            .await
+            .unwrap();
+        assert!(matches!(
+            r.send(&account(), source.clone(), BUDGET).await,
+            Err(SendError::Draft(DraftError::Conflict { .. }))
+        ));
+        r.delete_draft(&account(), draft_id, BUDGET).await.unwrap();
+        assert_eq!(
+            r.send(&account(), source, BUDGET).await,
+            Err(SendError::Draft(DraftError::NotFound))
+        );
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), 0);
+        assert_eq!(sends(&setup), 0);
+    });
+}
