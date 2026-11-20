@@ -1,4 +1,4 @@
-//! Recipient guard from himalaya's src/email/submission.rs (MIT OR Apache-2.0,
+//! Recipient guard from himalaya's `src/email/submission.rs` (MIT OR Apache-2.0,
 //! commit a5623dcac615).
 
 pub mod fake_gmail;

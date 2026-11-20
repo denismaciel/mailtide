@@ -9,6 +9,7 @@
 //! checks both.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3355,7 +3356,7 @@ impl SqlStore {
                 .map(|n| format!("${n}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            sql.push_str(&format!(" AND state IN ({slots})"));
+            write!(sql, " AND state IN ({slots})").expect("writing to a string");
         }
         sql.push_str(" ORDER BY key LIMIT $3");
         let mut query = sqlx::query(AssertSqlSafe(sql))

@@ -36,6 +36,7 @@ mod _core {
     };
     use mailtide::search::{HitState, SearchPageToken, SearchQuery};
     use mailtide::state::SyncPhase;
+    use mailtide::submission::{SubmissionKey, SubmissionState};
     use mailtide_gmail::push::{self, Jwks, PushExpectations};
     use mailtide_io::auth::CachedTokens;
     use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
@@ -47,6 +48,7 @@ mod _core {
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
     use mailtide_io::search::{self as runner_search, SearchError};
+    use mailtide_io::send::{self as runner_send, SendError, SendOptions, SendSource};
     use mailtide_io::transport::ReqwestTransport;
     use mailtide_store::sql::{SchemaState, SqlStore};
     use mailtide_store::{Store, StoreError};
@@ -293,6 +295,43 @@ mod _core {
         "A purge names at most 1,000 messages (a thread at most 1,000 members): split the set. Nothing was sent."
     );
 
+    create_exception!(
+        _core,
+        CannotUnsend,
+        MailtideError,
+        "The send has already been claimed."
+    );
+    create_exception!(
+        _core,
+        SubmissionConflict,
+        MailtideError,
+        "The key already identifies a different send request."
+    );
+    create_exception!(
+        _core,
+        DuplicateTrackingId,
+        MailtideError,
+        "The tracking token already belongs to another send."
+    );
+    create_exception!(
+        _core,
+        SubmissionNotFound,
+        MailtideError,
+        "The submission does not exist."
+    );
+    create_exception!(
+        _core,
+        OriginalUnavailable,
+        MailtideError,
+        "The original message or a carried part is unavailable."
+    );
+    create_exception!(
+        _core,
+        SendTooLarge,
+        MailtideError,
+        "The raw message exceeds the configured size limit."
+    );
+
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         let py = m.py();
@@ -306,6 +345,12 @@ mod _core {
         m.add("QuotaGateError", py.get_type::<QuotaGateError>())?;
         m.add("QuotaDeferred", py.get_type::<QuotaDeferred>())?;
         m.add("WriteOutcomeUnknown", py.get_type::<WriteOutcomeUnknown>())?;
+        m.add("CannotUnsend", py.get_type::<CannotUnsend>())?;
+        m.add("SubmissionConflict", py.get_type::<SubmissionConflict>())?;
+        m.add("DuplicateTrackingId", py.get_type::<DuplicateTrackingId>())?;
+        m.add("SubmissionNotFound", py.get_type::<SubmissionNotFound>())?;
+        m.add("OriginalUnavailable", py.get_type::<OriginalUnavailable>())?;
+        m.add("SendTooLarge", py.get_type::<SendTooLarge>())?;
         m.add("DraftNotFound", py.get_type::<DraftNotFound>())?;
         m.add("DraftConflict", py.get_type::<DraftConflict>())?;
         m.add("DraftTooLarge", py.get_type::<DraftTooLarge>())?;
@@ -535,7 +580,7 @@ mod _core {
         }
     }
 
-    /// Refuse a keyword a label method does not take (its signature is in
+    /// Refuse a keyword a method does not take (its signature is in
     /// the stubs), as Python would.
     fn check_keywords(given: &Bound<'_, PyDict>, method: &str, takes: &[&str]) -> PyResult<()> {
         for key in given.keys() {
@@ -732,6 +777,127 @@ mod _core {
             ),
             DraftError::Run(error) => run_error(error),
         }
+    }
+
+    fn send_error(error: SendError) -> PyErr {
+        match error {
+            SendError::ReadOnly => {
+                ReadOnlyMode::new_err("raw sends are disabled in read-only mode")
+            }
+            SendError::InvalidTrackingId => {
+                PyValueError::new_err("supply exactly one valid X-Mailtide-Id")
+            }
+            SendError::NoRecipients => PyValueError::new_err("the message has no recipient"),
+            SendError::TooLarge { limit } => Python::attach(|py| {
+                with_attribute(
+                    SendTooLarge::new_err(format!("the message is above {limit} bytes")),
+                    "limit",
+                    limit,
+                    py,
+                )
+            }),
+            SendError::InvalidOptions => {
+                PyValueError::new_err("use a nonempty key and at most one thread selector")
+            }
+            SendError::UnknownOriginal | SendError::OriginalUnavailable => {
+                OriginalUnavailable::new_err("the original message or a part could not be read")
+            }
+            SendError::KeyConflict => {
+                SubmissionConflict::new_err("this key already has a different send request")
+            }
+            SendError::DuplicateTrackingId => {
+                DuplicateTrackingId::new_err("the token already belongs to another send")
+            }
+            SendError::CannotUnsend(state) => Python::attach(|py| {
+                with_attribute(
+                    CannotUnsend::new_err("the submission is already claimed"),
+                    "state",
+                    state.as_str(),
+                    py,
+                )
+            }),
+            SendError::UnknownSubmission => SubmissionNotFound::new_err("no such submission"),
+            SendError::Draft(error) => draft_error(error),
+            SendError::Run(error) => run_error(error),
+        }
+    }
+
+    fn send_options(given: &Bound<'_, PyDict>) -> PyResult<SendOptions> {
+        Ok(SendOptions {
+            thread_id: keyword(given, "thread_id")?.map(ThreadId),
+            thread_of: keyword(given, "thread_of")?.map(MessageId),
+            send_at: keyword(given, "send_at_ms")?.map(Timestamp),
+        })
+    }
+
+    fn submit_options(given: &Bound<'_, PyDict>) -> PyResult<(Option<SubmissionKey>, SendOptions)> {
+        check_keywords(
+            given,
+            "submit",
+            &["key", "thread_id", "thread_of", "send_at_ms"],
+        )?;
+        Ok((
+            keyword(given, "key")?.map(SubmissionKey),
+            send_options(given)?,
+        ))
+    }
+
+    fn send_source(raw: Option<&[u8]>, given: &Bound<'_, PyDict>) -> PyResult<SendSource> {
+        check_keywords(
+            given,
+            "send",
+            &[
+                "draft_id",
+                "if_message_id",
+                "key",
+                "thread_id",
+                "thread_of",
+                "send_at_ms",
+            ],
+        )?;
+        let draft_id = keyword(given, "draft_id")?;
+        let if_message_id: Option<String> = keyword(given, "if_message_id")?;
+        let key = keyword(given, "key")?;
+        let options = send_options(given)?;
+        match (raw, draft_id) {
+            (Some(raw), None) if if_message_id.is_none() => Ok(SendSource::Raw {
+                key: key.map(SubmissionKey),
+                raw: raw.to_vec(),
+                options,
+            }),
+            (None, Some(draft)) if key.is_none() && options == SendOptions::default() => {
+                Ok(SendSource::Draft {
+                    draft_id: DraftId(draft),
+                    if_message_id: if_message_id.map(MessageId),
+                })
+            }
+            _ => Err(PyValueError::new_err(
+                "supply raw bytes with raw options, or one draft id with its optional version",
+            )),
+        }
+    }
+
+    fn submission_states(states: Vec<String>) -> PyResult<Vec<SubmissionState>> {
+        states
+            .into_iter()
+            .map(|state| {
+                Ok(match state.as_str() {
+                    "pending" => SubmissionState::Pending,
+                    "claimed" => SubmissionState::Claimed,
+                    "sending" => SubmissionState::Sending,
+                    "confirming" => SubmissionState::Confirming,
+                    "sent" => SubmissionState::Sent,
+                    "unknown" => SubmissionState::Unknown,
+                    "refused" => SubmissionState::Refused,
+                    "canceled" => SubmissionState::Canceled,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown submission state {state:?}"
+                        )));
+                    }
+                })
+            })
+            .collect()
     }
 
     fn account_id(account: &str) -> PyResult<AccountId> {
@@ -1198,11 +1364,16 @@ mod _core {
                 },
             )?
             .into_any(),
-            Change::SubmissionChanged { .. } => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "raw submission delivery is unavailable",
-                ));
-            }
+            Change::SubmissionChanged { submission } => Py::new(
+                py,
+                SubmissionChanged {
+                    kind: "submission_changed",
+                    state,
+                    index,
+                    submission: Py::new(py, Submission::from(submission.clone()))?,
+                },
+            )?
+            .into_any(),
             Change::DraftSent {
                 draft_id,
                 message_id,
@@ -2901,6 +3072,180 @@ mod _core {
         }
     }
 
+    /// One durable raw submission.
+    #[pyclass(frozen, get_all)]
+    struct Submission {
+        key: String,
+        tracking_id: String,
+        state: &'static str,
+        send_at_ms: i64,
+        confirmation_deadline_ms: Option<i64>,
+        message_id: Option<String>,
+        thread_id: Option<String>,
+        refusal: Option<String>,
+        retry_at_ms: Option<i64>,
+    }
+
+    impl From<mailtide::submission::Submission> for Submission {
+        fn from(value: mailtide::submission::Submission) -> Self {
+            Self {
+                key: value.key.0,
+                tracking_id: value.tracking_id,
+                state: value.state.as_str(),
+                send_at_ms: value.send_at.0,
+                confirmation_deadline_ms: value.confirmation_deadline.map(|time| time.0),
+                message_id: value.message_id.map(|id| id.0),
+                thread_id: value.thread_id.map(|id| id.0),
+                refusal: value.refusal,
+                retry_at_ms: value.retry_at.map(|time| time.0),
+            }
+        }
+    }
+
+    /// What a raw send's run did and the persisted result so far.
+    #[pyclass(frozen, get_all)]
+    struct SendOutcome {
+        submission: Py<Submission>,
+        run: Py<RunOutcome>,
+    }
+
+    /// A raw submission changed state in the same commit as its feed entry.
+    #[pyclass(frozen, get_all)]
+    struct SubmissionChanged {
+        kind: &'static str,
+        state: String,
+        index: u32,
+        submission: Py<Submission>,
+    }
+
+    /// Inputs for composing a reply.
+    #[pyclass(frozen, get_all)]
+    struct ReplyPlan {
+        subject: String,
+        to: Vec<Address>,
+        cc: Vec<Address>,
+        in_reply_to: Option<String>,
+        references: Vec<String>,
+        quote_text: Option<String>,
+    }
+
+    impl From<mailtide_mime::ReplyPlan> for ReplyPlan {
+        fn from(plan: mailtide_mime::ReplyPlan) -> Self {
+            Self {
+                subject: plan.subject,
+                to: plan.to.into_iter().map(Address::from).collect(),
+                cc: plan.cc.into_iter().map(Address::from).collect(),
+                in_reply_to: plan.in_reply_to.map(|id| id.to_string()),
+                references: plan.references.iter().map(ToString::to_string).collect(),
+                quote_text: plan.quote_text,
+            }
+        }
+    }
+
+    /// Display headers for a forwarded message.
+    #[pyclass(frozen, get_all)]
+    struct ForwardHeaders {
+        #[pyo3(name = "from_")]
+        from: Vec<Address>,
+        date: Option<String>,
+        subject: Option<String>,
+        to: Vec<Address>,
+        cc: Vec<Address>,
+    }
+
+    /// A carried attachment or inline part.
+    #[pyclass(frozen, get_all)]
+    struct ForwardPart {
+        attachment: Py<Attachment>,
+        content_type_parameters: Vec<(String, String)>,
+        part: String,
+        inline: bool,
+    }
+
+    /// Inputs for composing a forward.
+    #[pyclass(frozen, get_all)]
+    struct ForwardPlan {
+        subject: String,
+        references: Vec<String>,
+        original: Py<ForwardHeaders>,
+        quote_text: Option<String>,
+        html: Option<String>,
+        parts: Vec<Py<ForwardPart>>,
+    }
+
+    fn forward_view(py: Python<'_>, plan: mailtide_mime::ForwardPlan) -> PyResult<ForwardPlan> {
+        Ok(ForwardPlan {
+            subject: plan.subject,
+            references: plan.references.iter().map(ToString::to_string).collect(),
+            original: Py::new(
+                py,
+                ForwardHeaders {
+                    from: plan.original.from.into_iter().map(Address::from).collect(),
+                    date: plan.original.date,
+                    subject: plan.original.subject,
+                    to: plan.original.to.into_iter().map(Address::from).collect(),
+                    cc: plan.original.cc.into_iter().map(Address::from).collect(),
+                },
+            )?,
+            quote_text: plan.quote_text,
+            html: plan.html,
+            parts: plan
+                .parts
+                .into_iter()
+                .map(|part| {
+                    let reference = part.part.to_string();
+                    Py::new(
+                        py,
+                        ForwardPart {
+                            attachment: Py::new(
+                                py,
+                                Attachment {
+                                    filename: part.attachment.filename,
+                                    content_type: part.attachment.content_type,
+                                    content_id: part.attachment.content_id,
+                                    part: Some(reference.clone()),
+                                    data: PyBytes::new(py, &part.attachment.bytes).unbind(),
+                                },
+                            )?,
+                            content_type_parameters: part.content_type_parameters,
+                            part: reference,
+                            inline: part.inline,
+                        },
+                    )
+                })
+                .collect::<PyResult<_>>()?,
+        })
+    }
+
+    /// Derive a reply plan directly from the original RFC 5322 bytes.
+    #[pyfunction]
+    #[pyo3(signature = (raw, own_addresses=None, *, all=false))]
+    fn reply_plan(
+        raw: &[u8],
+        own_addresses: Option<Vec<String>>,
+        all: bool,
+    ) -> PyResult<ReplyPlan> {
+        let own_addresses = own_addresses.unwrap_or_default();
+        let addresses: Vec<_> = own_addresses.iter().map(String::as_str).collect();
+        mailtide_mime::reply_plan(raw, &addresses, all)
+            .map(ReplyPlan::from)
+            .map_err(|error| OriginalUnavailable::new_err(error.0))
+    }
+
+    /// Derive a forward plan directly from the original RFC 5322 bytes.
+    #[pyfunction]
+    fn forward_plan(py: Python<'_>, raw: &[u8]) -> PyResult<ForwardPlan> {
+        let plan = mailtide_mime::forward_plan(raw)
+            .map_err(|error| OriginalUnavailable::new_err(error.0))?;
+        forward_view(py, plan)
+    }
+
+    /// Add a level of quoting to every plain-text line.
+    #[pyfunction]
+    fn quote_plain(text: &str) -> String {
+        mailtide_mime::quote_plain(text)
+    }
+
     /// A state string: a position in one generation of an account's feed,
     /// `mt2-<generation>.<seq>` for a whole commit or
     /// `mt2-<generation>.<seq>.<entry>` inside one.
@@ -3385,6 +3730,132 @@ mod _core {
                 Deleted::Deleted => "deleted",
                 Deleted::AlreadyGone => "already_gone",
             })
+        }
+
+        async fn submit(
+            self: Arc<Self>,
+            account: AccountId,
+            raw: Vec<u8>,
+            key: Option<SubmissionKey>,
+            options: SendOptions,
+        ) -> PyResult<Submission> {
+            self.inner
+                .submit(&account, key, raw, options)
+                .await
+                .map(Submission::from)
+                .map_err(send_error)
+        }
+
+        async fn send(
+            self: Arc<Self>,
+            account: AccountId,
+            source: SendSource,
+            budget: Duration,
+        ) -> PyResult<Py<PyAny>> {
+            let sent = self
+                .inner
+                .send(&account, source, budget)
+                .await
+                .map_err(send_error)?;
+            Python::attach(|py| {
+                Ok(match sent {
+                    runner_send::SendOutcome::Raw(outcome) => Py::new(
+                        py,
+                        SendOutcome {
+                            submission: Py::new(py, Submission::from(outcome.submission))?,
+                            run: Py::new(py, RunOutcome::from(outcome.run))?,
+                        },
+                    )?
+                    .into_any(),
+                    runner_send::SendOutcome::Draft(draft) => Py::new(
+                        py,
+                        SentDraft {
+                            message_id: draft.message_id.0,
+                            thread_id: draft.thread_id.0,
+                        },
+                    )?
+                    .into_any(),
+                })
+            })
+        }
+
+        async fn cancel_submission(
+            self: Arc<Self>,
+            account: AccountId,
+            key: SubmissionKey,
+        ) -> PyResult<Submission> {
+            self.inner
+                .cancel_submission(&account, &key)
+                .await
+                .map(Submission::from)
+                .map_err(send_error)
+        }
+
+        async fn submission(
+            self: Arc<Self>,
+            account: AccountId,
+            key: SubmissionKey,
+        ) -> PyResult<Option<Submission>> {
+            self.inner
+                .submission(&account, &key)
+                .await
+                .map(|row| row.map(Submission::from))
+                .map_err(send_error)
+        }
+
+        async fn submissions(
+            self: Arc<Self>,
+            account: AccountId,
+            after: Option<SubmissionKey>,
+            states: Vec<SubmissionState>,
+            limit: u32,
+        ) -> PyResult<Vec<Submission>> {
+            self.inner
+                .submissions(&account, after.as_ref(), &states, limit)
+                .await
+                .map(|rows| rows.into_iter().map(Submission::from).collect())
+                .map_err(send_error)
+        }
+
+        async fn submission_content(
+            self: Arc<Self>,
+            account: AccountId,
+            key: SubmissionKey,
+        ) -> PyResult<Option<Py<PyBytes>>> {
+            let raw = self
+                .inner
+                .submission_content(&account, &key)
+                .await
+                .map_err(send_error)?;
+            Ok(raw.map(|bytes| Python::attach(|py| PyBytes::new(py, &bytes).unbind())))
+        }
+
+        async fn reply_plan(
+            self: Arc<Self>,
+            account: AccountId,
+            message: MessageId,
+            own_addresses: Vec<String>,
+            all: bool,
+        ) -> PyResult<ReplyPlan> {
+            let addrs: Vec<_> = own_addresses.iter().map(String::as_str).collect();
+            self.inner
+                .reply_plan(&account, &message, &addrs, all)
+                .await
+                .map(ReplyPlan::from)
+                .map_err(send_error)
+        }
+
+        async fn forward_plan(
+            self: Arc<Self>,
+            account: AccountId,
+            message: MessageId,
+        ) -> PyResult<ForwardPlan> {
+            let plan = self
+                .inner
+                .forward_plan(&account, &message)
+                .await
+                .map_err(send_error)?;
+            Python::attach(|py| forward_view(py, plan))
         }
 
         async fn send_draft(
@@ -4134,6 +4605,153 @@ mod _core {
             )
         }
 
+        #[pyo3(signature = (account, raw, **options))]
+        fn submit<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            raw: &[u8],
+            options: Option<Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let (key, options) = submit_options(&options)?;
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .submit(account_id(account)?, raw.to_vec(), key, options),
+            )
+        }
+
+        #[pyo3(signature = (account, raw=None, *, budget_s=60.0, **options))]
+        fn send<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            raw: Option<&[u8]>,
+            budget_s: f64,
+            options: Option<Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let source = send_source(raw, &options)?;
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().send(
+                    account_id(account)?,
+                    source,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, key))]
+        fn cancel_submission<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            key: String,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .cancel_submission(account_id(account)?, SubmissionKey(key)),
+            )
+        }
+
+        #[pyo3(signature = (account, key))]
+        fn submission<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            key: String,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .submission(account_id(account)?, SubmissionKey(key)),
+            )
+        }
+
+        #[pyo3(signature = (account, *, after=None, states=Vec::new(), limit=100))]
+        fn submissions<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            after: Option<String>,
+            states: Vec<String>,
+            limit: u32,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().submissions(
+                    account_id(account)?,
+                    after.map(SubmissionKey),
+                    submission_states(states)?,
+                    limit,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, key))]
+        fn submission_content<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            key: String,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .submission_content(account_id(account)?, SubmissionKey(key)),
+            )
+        }
+
+        #[pyo3(signature = (account, message_id, *, own_addresses=Vec::new(), all=false))]
+        fn reply_plan<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_id: String,
+            own_addresses: Vec<String>,
+            all: bool,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().reply_plan(
+                    account_id(account)?,
+                    MessageId(message_id),
+                    own_addresses,
+                    all,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, message_id))]
+        fn forward_plan<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_id: String,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .forward_plan(account_id(account)?, MessageId(message_id)),
+            )
+        }
+
         #[pyo3(signature = (account, draft_id, *, if_message_id=None, budget_s=60.0))]
         fn send_draft<'py>(
             &self,
@@ -4871,6 +5489,153 @@ mod _core {
                     DraftId(draft_id),
                     seconds(budget_s, "budget_s")?,
                 ),
+            )
+        }
+
+        #[pyo3(signature = (account, raw, **options))]
+        fn submit(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            raw: &[u8],
+            options: Option<Bound<'_, PyDict>>,
+        ) -> PyResult<Submission> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let (key, options) = submit_options(&options)?;
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .submit(account_id(account)?, raw.to_vec(), key, options),
+            )
+        }
+
+        #[pyo3(signature = (account, raw=None, *, budget_s=60.0, **options))]
+        fn send(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            raw: Option<&[u8]>,
+            budget_s: f64,
+            options: Option<Bound<'_, PyDict>>,
+        ) -> PyResult<Py<PyAny>> {
+            let options = options.unwrap_or_else(|| PyDict::new(py));
+            let source = send_source(raw, &options)?;
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().send(
+                    account_id(account)?,
+                    source,
+                    seconds(budget_s, "budget_s")?,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, key))]
+        fn cancel_submission(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            key: String,
+        ) -> PyResult<Submission> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .cancel_submission(account_id(account)?, SubmissionKey(key)),
+            )
+        }
+
+        #[pyo3(signature = (account, key))]
+        fn submission(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            key: String,
+        ) -> PyResult<Option<Submission>> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .submission(account_id(account)?, SubmissionKey(key)),
+            )
+        }
+
+        #[pyo3(signature = (account, *, after=None, states=Vec::new(), limit=100))]
+        fn submissions(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            after: Option<String>,
+            states: Vec<String>,
+            limit: u32,
+        ) -> PyResult<Vec<Submission>> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().submissions(
+                    account_id(account)?,
+                    after.map(SubmissionKey),
+                    submission_states(states)?,
+                    limit,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, key))]
+        fn submission_content(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            key: String,
+        ) -> PyResult<Option<Py<PyBytes>>> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .submission_content(account_id(account)?, SubmissionKey(key)),
+            )
+        }
+
+        #[pyo3(signature = (account, message_id, *, own_addresses=Vec::new(), all=false))]
+        fn reply_plan(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_id: String,
+            own_addresses: Vec<String>,
+            all: bool,
+        ) -> PyResult<ReplyPlan> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().reply_plan(
+                    account_id(account)?,
+                    MessageId(message_id),
+                    own_addresses,
+                    all,
+                ),
+            )
+        }
+
+        #[pyo3(signature = (account, message_id))]
+        fn forward_plan(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_id: String,
+        ) -> PyResult<ForwardPlan> {
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .forward_plan(account_id(account)?, MessageId(message_id)),
             )
         }
 

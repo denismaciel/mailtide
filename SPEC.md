@@ -675,6 +675,37 @@ and the sync keep true.
    (`deleted`, `gone`, `send_unconfirmed`), `DraftSent{draft_id, message_id,
    thread_id}`. The messages themselves come as any message's entries.
 
+## 7b. Raw submissions
+
+`submit` stages RFC 5322 bytes and admits a row with one tracking token,
+an optional host key and a due time. The supplied `X-Mailtide-Id` must be
+unique within the account for the send. The key defaults to that token.
+Reusing the key with different bytes or options is a conflict. A request
+can name either a Gmail thread or an original live non-draft message from
+which the mirror resolves its thread. Gmail selects the sender-side thread
+by the request's `threadId`. Omitting it starts a thread.
+
+The account's Foreground `SendSubmissions` job serializes the first claim
+against cancellation. A worker checks the staged bytes and commits a
+dispatch marker under the job attempt and account incarnation before POST
+`messages.send`. Only definite non-dispatch can make the claimed row eligible
+again. Each submission makes at most one wire request, including after an
+HTTP refusal, timeout or lost answer. It uses JSON `raw` and the same
+`max_message_bytes` limit as drafts (34 MiB by default).
+
+A decoded receipt records provisional acceptance. Normal sync confirms a
+send only when its first import sees the token on a `SENT` message. The
+submission transition and `MessageImported` share a commit. After ten minutes
+without a sighting, the row reports `unknown`. A late import can still settle
+it. A bounce is a separate incoming message. Staged bytes expire seven days
+after the first terminal state. Token ownership and receipts survive until
+account offboarding, so a replay can return the original disposition.
+
+`send` accepts raw bytes or a stored draft. For a draft it delegates to §7a
+and uses Gmail's draft-id consumption fence and existing draft receipts.
+The same token namespace is reserved under the account lock by raw admission
+and draft `BeginSend`.
+
 ### 7a. Purge: permanent delete (a call, not an intent)
 
 Deleting mail for good (`Runner::purge`, `Runner::empty`) is the one
@@ -1150,6 +1181,12 @@ runner per process, after forking:
   `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
+- raw sends (§7b): `submit(account, raw, *, key, thread_id, thread_of,
+  send_at_ms)` admits for `run`. `send` accepts the same raw inputs and returns
+  the updated submission and run, or returns `SentDraft` for `draft_id`.
+  Read or cancel with `submission`, `submissions`, `submission_content`
+  and `cancel_submission`. The Python and Rust reply and forward helpers
+  derive compose inputs from an original without making Gmail requests.
 - drafts (§7a): `await create_draft(account, raw, *, thread_id=None)
   -> DraftRef`, `await update_draft(account, draft_id, raw, *,
   thread_id=None, if_message_id=None) -> DraftRef`, `await
@@ -1371,6 +1408,23 @@ ALTER TABLE mailtide_accounts DROP COLUMN audit_progress;
 ALTER TABLE mailtide_accounts DROP COLUMN audited_at;
 DELETE FROM mailtide_schema WHERE version = 11;
 ```
+
+Migration 12 adds raw submissions and account-scoped token ownership (§7b).
+The schema version covers the new `SubmissionChanged` entry and
+`SendSubmissions` job (kind 5). To roll back, stop accepting new raw work,
+cancel pending submissions, settle in-flight rows, then stop workers.
+Remove their staged objects and roll back the queue:
+
+```sql
+DELETE FROM mailtide_jobs WHERE kind = 5;
+DELETE FROM mailtide_changes WHERE change LIKE '{"SubmissionChanged"%';
+DROP TABLE mailtide_send_tokens;
+DROP TABLE mailtide_submissions;
+DELETE FROM mailtide_schema WHERE version = 12;
+```
+
+This removes raw receipts and idempotency history. Preserve previously
+used keys outside the rollback if a host will retry them.
 
 Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach

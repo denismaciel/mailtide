@@ -129,3 +129,29 @@ fn a_draft_read_without_its_raw_content_is_refused() {
         assert!(String::from_utf8_lossy(&content.raw).contains("Subject: a\r\n"));
     });
 }
+
+// Zero's forward fail-closed case. The mirror's blob is the original.
+#[test]
+fn a_forward_plan_whose_original_cannot_be_read_is_refused() {
+    use mailtide::ids::MessageId;
+    use mailtide_io::blobs::BlobStore as _;
+    use mailtide_io::send::SendError;
+    block_on(async {
+        let (r, setup) = runner();
+        let id = MessageId(setup.gmail.lock().add_message(
+            None,
+            &["INBOX"],
+            raw(&token(3), "Original"),
+        ));
+        synced(&r).await;
+        assert!(r.forward_plan(&account(), &id).await.is_ok());
+        r.blobs()
+            .delete(&mailtide_io::blobs::blob_key(&account(), &id))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.forward_plan(&account(), &id).await,
+            Err(SendError::OriginalUnavailable)
+        );
+    });
+}

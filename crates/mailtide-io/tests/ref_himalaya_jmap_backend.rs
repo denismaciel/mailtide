@@ -1,4 +1,4 @@
-//! Cases from himalaya's src/jmap/backend.rs (MIT OR Apache-2.0,
+//! Cases from himalaya's `src/jmap/backend.rs` (MIT OR Apache-2.0,
 //! commit a5623dcac615), exercising refusal on the two Gmail send routes.
 
 pub mod fake_gmail;

@@ -1,4 +1,4 @@
-//! Queue uncertainty from himalaya's src/pimdir/queue/show.rs
+//! Queue uncertainty from himalaya's `src/pimdir/queue/show.rs`
 //! (MIT OR Apache-2.0, commit a5623dcac615).
 
 pub mod fake_gmail;

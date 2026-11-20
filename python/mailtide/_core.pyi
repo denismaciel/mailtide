@@ -202,6 +202,75 @@ class DraftSent:
     message_id: str
     thread_id: str
 
+class Submission:
+    key: str
+    tracking_id: str
+    state: Literal[
+        "pending", "claimed", "sending", "confirming", "sent", "unknown", "refused", "canceled"
+    ]
+    send_at_ms: int
+    confirmation_deadline_ms: int | None
+    message_id: str | None
+    thread_id: str | None
+    refusal: str | None
+    retry_at_ms: int | None
+
+class SubmissionChanged:
+    kind: Literal["submission_changed"]
+    state: str
+    index: int
+    submission: Submission
+
+class SendOutcome:
+    submission: Submission
+    run: RunOutcome
+
+class ReplyPlan:
+    subject: str
+    to: list[Address]
+    cc: list[Address]
+    in_reply_to: str | None
+    references: list[str]
+    quote_text: str | None
+
+class ForwardHeaders:
+    from_: list[Address]
+    date: str | None
+    subject: str | None
+    to: list[Address]
+    cc: list[Address]
+
+class ForwardPart:
+    attachment: Attachment
+    content_type_parameters: list[tuple[str, str]]
+    part: str
+    inline: bool
+
+class ForwardPlan:
+    subject: str
+    references: list[str]
+    original: ForwardHeaders
+    quote_text: str | None
+    html: str | None
+    parts: list[ForwardPart]
+
+def reply_plan(
+    raw: bytes, own_addresses: Sequence[str] | None = None, *, all: bool = False
+) -> ReplyPlan: ...
+def forward_plan(raw: bytes) -> ForwardPlan: ...
+def quote_plain(text: str) -> str: ...
+
+class CannotUnsend(MailtideError):
+    state: str
+
+class SubmissionConflict(MailtideError): ...
+class DuplicateTrackingId(MailtideError): ...
+class SubmissionNotFound(MailtideError): ...
+class OriginalUnavailable(MailtideError): ...
+
+class SendTooLarge(MailtideError):
+    limit: int
+
 Change = (
     MessageDiscovered
     | MessageImported
@@ -213,6 +282,7 @@ Change = (
     | DraftSaved
     | DraftRemoved
     | DraftSent
+    | SubmissionChanged
 )
 
 @final
@@ -794,6 +864,44 @@ class Runner:
     def delete_draft(
         self, account: str, draft_id: str, *, budget_s: float = 60.0
     ) -> Awaitable[Literal["deleted", "already_gone"]]: ...
+    def submit(
+        self,
+        account: str,
+        raw: bytes,
+        *,
+        key: str | None = None,
+        thread_id: str | None = None,
+        thread_of: str | None = None,
+        send_at_ms: int | None = None,
+    ) -> Awaitable[Submission]: ...
+    def send(
+        self,
+        account: str,
+        raw: bytes | None = None,
+        *,
+        draft_id: str | None = None,
+        if_message_id: str | None = None,
+        key: str | None = None,
+        thread_id: str | None = None,
+        thread_of: str | None = None,
+        send_at_ms: int | None = None,
+        budget_s: float = 60.0,
+    ) -> Awaitable[SendOutcome | SentDraft]: ...
+    def cancel_submission(self, account: str, key: str) -> Awaitable[Submission]: ...
+    def submission(self, account: str, key: str) -> Awaitable[Submission | None]: ...
+    def submissions(
+        self,
+        account: str,
+        *,
+        after: str | None = None,
+        states: Sequence[str] = (),
+        limit: int = 100,
+    ) -> Awaitable[list[Submission]]: ...
+    def submission_content(self, account: str, key: str) -> Awaitable[bytes | None]: ...
+    def reply_plan(
+        self, account: str, message_id: str, *, own_addresses: Sequence[str] = (), all: bool = False
+    ) -> Awaitable[ReplyPlan]: ...
+    def forward_plan(self, account: str, message_id: str) -> Awaitable[ForwardPlan]: ...
     def send_draft(
         self,
         account: str,
@@ -981,6 +1089,44 @@ class BlockingRunner:
     def delete_draft(
         self, account: str, draft_id: str, *, budget_s: float = 60.0
     ) -> Literal["deleted", "already_gone"]: ...
+    def submit(
+        self,
+        account: str,
+        raw: bytes,
+        *,
+        key: str | None = None,
+        thread_id: str | None = None,
+        thread_of: str | None = None,
+        send_at_ms: int | None = None,
+    ) -> Submission: ...
+    def send(
+        self,
+        account: str,
+        raw: bytes | None = None,
+        *,
+        draft_id: str | None = None,
+        if_message_id: str | None = None,
+        key: str | None = None,
+        thread_id: str | None = None,
+        thread_of: str | None = None,
+        send_at_ms: int | None = None,
+        budget_s: float = 60.0,
+    ) -> SendOutcome | SentDraft: ...
+    def cancel_submission(self, account: str, key: str) -> Submission: ...
+    def submission(self, account: str, key: str) -> Submission | None: ...
+    def submissions(
+        self,
+        account: str,
+        *,
+        after: str | None = None,
+        states: Sequence[str] = (),
+        limit: int = 100,
+    ) -> list[Submission]: ...
+    def submission_content(self, account: str, key: str) -> bytes | None: ...
+    def reply_plan(
+        self, account: str, message_id: str, *, own_addresses: Sequence[str] = (), all: bool = False
+    ) -> ReplyPlan: ...
+    def forward_plan(self, account: str, message_id: str) -> ForwardPlan: ...
     def send_draft(
         self,
         account: str,

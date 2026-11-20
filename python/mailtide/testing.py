@@ -26,6 +26,9 @@ class Mailbox:
         self.history_id = 0
         self.history_floor = 0  # history requests from before it answer 404
         self.messages: dict[str, dict] = {}
+        self.send_calls = 0
+        self.drop_send_answer = False
+        self.send_refusal: tuple[int, str] | None = None
         self.drafts: dict[str, str] = {}  # draft id -> its current message id
         self.next_id = 0
         self.history: list[dict] = []
@@ -425,6 +428,22 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             parts = urlparse(self.path).path.removeprefix(PREFIX).split("/")
             if parts[0] == "drafts":
                 return self._drafts(parts, {}, body)
+            if parts == ["messages", "send"]:
+                mailbox.send_calls += 1
+                if mailbox.send_refusal:
+                    status, reason = mailbox.send_refusal
+                    return self.refuse(status, reason, "send refused")
+                thread = body.get("threadId")
+                if thread is not None and all(
+                    m["thread"] != thread for m in mailbox.messages.values()
+                ):
+                    return self.refuse(404, "notFound", "Requested entity was not found.")
+                mid = mailbox.stored(decode(body["raw"]), ["SENT"], thread)
+                if mailbox.drop_send_answer:
+                    mailbox.drop_send_answer = False
+                    self.close_connection = True
+                    return
+                return self.reply(200, {"id": mid, "threadId": mailbox.messages[mid]["thread"]})
             if len(parts) == 3 and parts[0] == "messages" and parts[2] == "modify":
                 add, remove = body.get("addLabelIds", []), body.get("removeLabelIds", [])
                 if not all(mailbox.defines(label) for label in add):

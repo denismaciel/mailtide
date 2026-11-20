@@ -1,4 +1,4 @@
-//! By behavior from himalaya's tests/send_outcome.rs (MIT OR Apache-2.0,
+//! By behavior from himalaya's `tests/send_outcome.rs` (MIT OR Apache-2.0,
 //! commit a5623dcac615). Exercise Gmail's refusal in the durable queue.
 
 pub mod fake_gmail;

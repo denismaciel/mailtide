@@ -2468,6 +2468,37 @@ impl Sim {
         });
     }
 
+    fn execute_commit(&mut self, commit: &Commit) {
+        let before = self.mirror.clone();
+        let outcome = self.mirror.apply(commit);
+        self.check_listing(&before, commit, &outcome);
+        for violation in invariants::check_commit(&before, &self.mirror, commit, &outcome) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+        self.check_tombstones();
+        self.check_draft_feed();
+        match &outcome {
+            CommitOutcome::Applied { .. } => self.stats.commits += 1,
+            CommitOutcome::Rejected(_) => self.stats.rejections += 1,
+        }
+        if self.rng.chance(self.faults.lost_commit_ack) {
+            // The host can't tell whether the commit applied: rebuild.
+            self.rebuild();
+            return;
+        }
+        let kind = match outcome {
+            CommitOutcome::Applied { .. } => EventKind::CommitApplied { commit: commit.id },
+            CommitOutcome::Rejected(reason) => EventKind::CommitRejected {
+                commit: commit.id,
+                reason,
+            },
+        };
+        self.deliver(kind);
+    }
+
     fn execute(&mut self, command: Command) {
         let id = command.id;
         match command.kind {
@@ -2495,37 +2526,7 @@ impl Sim {
                 };
                 self.deliver(kind);
             }
-            CommandKind::Commit(commit) => {
-                let before = self.mirror.clone();
-                let outcome = self.mirror.apply(&commit);
-                self.check_listing(&before, &commit, &outcome);
-                for violation in invariants::check_commit(&before, &self.mirror, &commit, &outcome)
-                {
-                    self.violations.push(ObservedViolation {
-                        step: self.step,
-                        violation,
-                    });
-                }
-                self.check_tombstones();
-                self.check_draft_feed();
-                match &outcome {
-                    CommitOutcome::Applied { .. } => self.stats.commits += 1,
-                    CommitOutcome::Rejected(_) => self.stats.rejections += 1,
-                }
-                if self.rng.chance(self.faults.lost_commit_ack) {
-                    // The host can't tell whether the commit applied: rebuild.
-                    self.rebuild();
-                    return;
-                }
-                let kind = match outcome {
-                    CommitOutcome::Applied { .. } => EventKind::CommitApplied { commit: commit.id },
-                    CommitOutcome::Rejected(reason) => EventKind::CommitRejected {
-                        commit: commit.id,
-                        reason,
-                    },
-                };
-                self.deliver(kind);
-            }
+            CommandKind::Commit(commit) => self.execute_commit(&commit),
             CommandKind::Schedule { timer, at } => {
                 self.timers.insert(timer, at);
             }
@@ -3841,7 +3842,9 @@ mod submission_tests {
             let mut mirror = AccountMirror::new(AccountId("sender@example.org".into()), 1);
             let now = Timestamp(100);
             let key = SubmissionKey("key".into());
-            let write = |mirror: &mut AccountMirror, op| mirror.write_submission(1, &op, now);
+            let write = |mirror: &mut AccountMirror, op: &SubmissionWrite| {
+                mirror.write_submission(1, op, now)
+            };
             let row = SubmissionRow {
                 view: Submission {
                     key: key.clone(),
@@ -3862,16 +3865,16 @@ mod submission_tests {
                 dispatch: None,
                 terminal_at: None,
             };
-            write(&mut mirror, SubmissionWrite::Admit(Box::new(row)));
+            write(&mut mirror, &SubmissionWrite::Admit(Box::new(row)));
             let first = AttemptId(1);
             mirror
                 .claim_jobs(mirror.record.epoch, 1, now, first)
                 .unwrap();
             if seed % 4 == 0 {
-                write(&mut mirror, SubmissionWrite::Cancel(key.clone()));
+                write(&mut mirror, &SubmissionWrite::Cancel(key.clone()));
             }
-            write(&mut mirror, SubmissionWrite::Take(first));
-            let dispatch = write(&mut mirror, SubmissionWrite::Begin(first, key.clone()));
+            write(&mut mirror, &SubmissionWrite::Take(first));
+            let dispatch = write(&mut mirror, &SubmissionWrite::Begin(first, key.clone()));
             let expected = match seed % 4 {
                 0 => {
                     assert_eq!(dispatch, SubmissionWritten::Stale);
@@ -3881,7 +3884,7 @@ mod submission_tests {
                     assert!(matches!(dispatch, SubmissionWritten::Row(_)));
                     write(
                         &mut mirror,
-                        SubmissionWrite::Complete(
+                        &SubmissionWrite::Complete(
                             first,
                             key.clone(),
                             Disposition::Refused {
@@ -3896,7 +3899,7 @@ mod submission_tests {
                     assert!(matches!(dispatch, SubmissionWritten::Row(_)));
                     write(
                         &mut mirror,
-                        SubmissionWrite::Complete(first, key.clone(), Disposition::Unanswered),
+                        &SubmissionWrite::Complete(first, key.clone(), Disposition::Unanswered),
                     );
                     SubmissionState::Unknown
                 }
@@ -3910,9 +3913,9 @@ mod submission_tests {
             mirror
                 .claim_jobs(mirror.record.epoch, 1, now, successor)
                 .unwrap();
-            write(&mut mirror, SubmissionWrite::Take(successor));
+            write(&mut mirror, &SubmissionWrite::Take(successor));
             assert_eq!(
-                write(&mut mirror, SubmissionWrite::Begin(successor, key.clone())),
+                write(&mut mirror, &SubmissionWrite::Begin(successor, key.clone())),
                 SubmissionWritten::Stale
             );
             mirror.write_submission(

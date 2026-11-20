@@ -82,13 +82,28 @@ draft = await runner.create_draft("alice@example.com", raw)  # Gmail's draft id 
 draft = await runner.update_draft("alice@example.com", draft.draft_id, raw)  # autosave
 sent = await runner.send_draft("alice@example.com", draft.draft_id)  # at most once
 drafts = await runner.drafts("alice@example.com")  # the index; DraftSaved/DraftSent in changes
+
+raw = mailtide.compose_message(message).raw
+scheduled = await runner.submit("alice@example.com", raw, send_at_ms=send_at_ms)
+# Until the delivery worker claims it:
+await runner.cancel_submission("alice@example.com", scheduled.key)
+# Or submit new bytes and run immediately:
+result = await runner.send("alice@example.com", another_raw_message)
 ```
 
 Drafts are saved from RFC 5322 bytes carrying exactly one `X-Mailtide-Id`
 (Gmail replaces the Message-ID on every save; that header survives) and
 read back from the mirror's draft index, which follows drafts changed in
-other clients. A send whose answer was lost is never sent again: the sync
-settles it (`DraftSent` once the sent message is imported). See SPEC §7a.
+other clients. Gmail consumes the draft id on send. A lost answer is reconciled by the
+draft index and sent-message import. See SPEC §7a.
+
+Raw mail is staged before admission and sent by the account's next eligible
+run. Use a stable host key, or replay the exact bytes with the same
+`X-Mailtide-Id`. An HTTP receipt can be provisional. A `SubmissionChanged`
+entry reports `sent` after import finds the token on a `SENT` message, or
+`unknown` after the confirmation deadline. Raw mail gets one wire request,
+including after an unknown outcome. The default RFC 5322 size cap is 34 MiB
+for both drafts and raw mail. See SPEC §7b.
 
 A thread view (`ThreadView`) is folded from the mirror on every read: its
 messages oldest first, the label union of its non-draft messages with pending

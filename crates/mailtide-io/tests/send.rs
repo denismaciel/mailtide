@@ -787,3 +787,20 @@ fn a_changed_or_gone_draft_uses_drafts_own_error() {
         assert_eq!(sends(&setup), 0);
     });
 }
+
+#[test]
+fn a_reply_plan_for_an_original_not_imported_is_refused() {
+    block_on(async {
+        let (r, _) = runner();
+        r.track(&account()).await.unwrap();
+        let id = MessageId("not-imported".into());
+        assert_eq!(
+            r.reply_plan(&account(), &id, &[], false).await,
+            Err(SendError::OriginalUnavailable)
+        );
+        assert_eq!(
+            r.forward_plan(&account(), &id).await,
+            Err(SendError::OriginalUnavailable)
+        );
+    });
+}

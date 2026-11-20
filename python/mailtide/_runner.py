@@ -24,6 +24,7 @@ from mailtide._core import (
     EmptyOutcome,
     FactsRefresh,
     ForgetResult,
+    ForwardPlan,
     Health,
     Label,
     LabelColor,
@@ -36,12 +37,15 @@ from mailtide._core import (
     PrioritiseResult,
     Progress,
     PurgeOutcome,
+    ReplyPlan,
     ResumeResult,
     RunOutcome,
     SchemaStatus,
     SearchPage,
+    SendOutcome,
     SentDraft,
     StateTooOld,
+    Submission,
     ThreadSearchPage,
     ThreadView,
     TrackResult,
@@ -514,6 +518,92 @@ class Runner:
         ``already_gone`` if Gmail had no such draft, so a retry is safe. A
         draft being sent is not deleted (``SendInProgress``)."""
         return await self._core.delete_draft(account, draft_id, budget_s=budget_s)
+
+    async def submit(
+        self,
+        account: str,
+        raw: bytes,
+        *,
+        key: str | None = None,
+        thread_id: str | None = None,
+        thread_of: str | None = None,
+        send_at_ms: int | None = None,
+    ) -> Submission:
+        """Admit raw bytes for durable delivery by a subsequent run."""
+        return await self._core.submit(
+            account,
+            raw,
+            key=key,
+            thread_id=thread_id,
+            thread_of=thread_of,
+            send_at_ms=send_at_ms,
+        )
+
+    async def send(
+        self,
+        account: str,
+        raw: bytes | None = None,
+        *,
+        draft_id: str | None = None,
+        if_message_id: str | None = None,
+        key: str | None = None,
+        thread_id: str | None = None,
+        thread_of: str | None = None,
+        send_at_ms: int | None = None,
+        budget_s: float = 60.0,
+    ) -> SendOutcome | SentDraft:
+        """Submit raw bytes and run, or send an existing draft."""
+        return await self._core.send(
+            account,
+            raw,
+            draft_id=draft_id,
+            if_message_id=if_message_id,
+            key=key,
+            thread_id=thread_id,
+            thread_of=thread_of,
+            send_at_ms=send_at_ms,
+            budget_s=budget_s,
+        )
+
+    async def cancel_submission(self, account: str, key: str) -> Submission:
+        """Cancel a raw submission before a worker claims it."""
+        return await self._core.cancel_submission(account, key)
+
+    async def submission(self, account: str, key: str) -> Submission | None:
+        """Read the latest state of a raw submission."""
+        return await self._core.submission(account, key)
+
+    async def submissions(
+        self,
+        account: str,
+        *,
+        after: str | None = None,
+        states: Sequence[str] = (),
+        limit: int = 100,
+    ) -> list[Submission]:
+        """List raw submissions in key order."""
+        return await self._core.submissions(account, after=after, states=list(states), limit=limit)
+
+    async def submission_content(self, account: str, key: str) -> bytes | None:
+        """Read staged bytes while retained."""
+        return await self._core.submission_content(account, key)
+
+    async def reply_plan(
+        self,
+        account: str,
+        message_id: str,
+        *,
+        own_addresses: Sequence[str] = (),
+        all: bool = False,
+    ) -> ReplyPlan:
+        """Derive reply headers and quote text from the mirrored original."""
+        return await self._core.reply_plan(
+            account, message_id, own_addresses=list(own_addresses), all=all
+        )
+
+    async def forward_plan(self, account: str, message_id: str) -> ForwardPlan:
+        """Derive forward headers, quote text and parts from the mirrored original."""
+        return await self._core.forward_plan(account, message_id)
 
     async def send_draft(
         self,

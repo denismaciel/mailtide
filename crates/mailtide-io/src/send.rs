@@ -345,6 +345,50 @@ where
         }
     }
 
+    /// Plan a reply from the mirror's immutable original bytes.
+    pub async fn reply_plan(
+        &self,
+        account: &AccountId,
+        message: &MessageId,
+        own_addresses: &[&str],
+        all: bool,
+    ) -> Result<mailtide_mime::ReplyPlan, SendError> {
+        let raw = self.original_content(account, message).await?;
+        mailtide_mime::reply_plan(&raw, own_addresses, all)
+            .map_err(|_| SendError::OriginalUnavailable)
+    }
+
+    /// Plan a forward from the mirror's immutable original bytes.
+    pub async fn forward_plan(
+        &self,
+        account: &AccountId,
+        message: &MessageId,
+    ) -> Result<mailtide_mime::ForwardPlan, SendError> {
+        let raw = self.original_content(account, message).await?;
+        mailtide_mime::forward_plan(&raw).map_err(|_| SendError::OriginalUnavailable)
+    }
+
+    async fn original_content(
+        &self,
+        account: &AccountId,
+        message: &MessageId,
+    ) -> Result<Vec<u8>, SendError> {
+        let content = self
+            .store()
+            .messages(account, std::slice::from_ref(message))
+            .await
+            .map_err(RunError::Store)
+            .map_err(SendError::Run)?
+            .into_iter()
+            .next()
+            .and_then(|message| message.content)
+            .ok_or(SendError::OriginalUnavailable)?;
+        self.blobs()
+            .get(&content.blob)
+            .await
+            .map_err(|_| SendError::OriginalUnavailable)
+    }
+
     async fn submission_generation(&self, account: &AccountId) -> Result<u64, SendError> {
         self.status(account)
             .await
@@ -476,7 +520,7 @@ where
                 return Ok((false, None));
             }
         };
-        let marker = self
+        let recorded = self
             .store()
             .write_submission(
                 account,
@@ -486,7 +530,7 @@ where
             )
             .await
             .map_err(RunError::Store)?;
-        let SubmissionWritten::Row(marked) = marker else {
+        let SubmissionWritten::Row(marked) = recorded else {
             return Ok((false, None));
         };
         let Some(confirm_by) = marked.view.confirmation_deadline else {

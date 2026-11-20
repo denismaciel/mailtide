@@ -1296,17 +1296,16 @@ where
             Err(StoreError::Rejected(_)) => return Ok(None),
             Err(error) => return Err(RunError::Store(error)),
         };
-        if matches!(snapshot.sync, mailtide::state::SyncState::Blocked { .. }) {
-            self.store
-                .write_submission(
-                    account,
-                    snapshot.account_generation,
-                    &mailtide::submission::SubmissionWrite::Expire,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(RunError::Store)?;
-        }
+        // Expiry is local work, even when an account cannot claim delivery jobs.
+        self.store
+            .write_submission(
+                account,
+                snapshot.account_generation,
+                &mailtide::submission::SubmissionWrite::Expire,
+                self.clock.now(),
+            )
+            .await
+            .map_err(RunError::Store)?;
         let snapshot = snapshot
             .validate()
             .map_err(|e| RunError::Corrupt(format!("{e:?}")))?;
@@ -1764,12 +1763,17 @@ where
         };
         // After a possible send, preserve the disposition even past the
         // budget. Otherwise an expired budget can abandon the unused lease.
-        let release_budget = if matches!(call.request, GmailRequest::MessagesSend { .. }) {
+        let raw_send = matches!(call.request, GmailRequest::MessagesSend { .. });
+        let release_budget = if raw_send {
             Some(Instant::now() + self.config.writes.request_timeout)
         } else {
             budget.filter(|_| matches!(&outcome, Outcome::DispatchExpired | Outcome::NotSent(_)))
         };
         let cleanup = held.release(bytes, self.clock.now(), release_budget).await;
+        let cleanup = cleanup.or_else(|| {
+            (raw_send && held.lease.is_some())
+                .then(|| RunError::Quota("send lease release exceeded the request timeout".into()))
+        });
         Ok(Attempt::Done { outcome, cleanup })
     }
 
@@ -1802,9 +1806,9 @@ where
                 return Outcome::DispatchExpired;
             }
             report.gmail_requests += 1;
-            let send = self.transport.send(http, &token);
-            let sent = if matches!(gmail_request, GmailRequest::MessagesSend { .. }) {
-                tokio::time::timeout(self.config.writes.request_timeout, send)
+            let transport = self.transport.send(http, &token);
+            let reply = if matches!(gmail_request, GmailRequest::MessagesSend { .. }) {
+                tokio::time::timeout(self.config.writes.request_timeout, transport)
                     .await
                     .unwrap_or_else(|_| {
                         Err(TransportError::OutcomeUnknown(
@@ -1812,9 +1816,9 @@ where
                         ))
                     })
             } else {
-                send.await
+                transport.await
             };
-            let response = match sent {
+            let response = match reply {
                 Ok(response) => response,
                 Err(TransportError::NotSent(detail)) if last.is_none() => {
                     return Outcome::NotSent(transient(detail));
@@ -1907,15 +1911,7 @@ where
                     .map(|label| EventKind::LabelSaved { command, label })
             }
             GmailRequest::DeleteLabel { .. } => Ok(EventKind::LabelDeleted { command }),
-            GmailRequest::MessagesSend { .. } => {
-                mailtide_gmail::send::receipt(body).map(|(message_id, thread_id)| {
-                    EventKind::MessageSent {
-                        command,
-                        message_id,
-                        thread_id,
-                    }
-                })
-            }
+            GmailRequest::MessagesSend { .. } => return decode_send(command, body),
             GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
                 Ok(EventKind::MessagesDeleted {
                     command,
@@ -1934,9 +1930,6 @@ where
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
-            Err(_) if matches!(gmail_request, GmailRequest::MessagesSend { .. }) => {
-                Outcome::Unanswered("messages.send answered without a usable receipt".into())
-            }
             Err(_) if matches!(gmail_request, GmailRequest::AuditMessages { .. }) => {
                 Outcome::Event(EventKind::AuditPageMalformed { command })
             }
@@ -1998,6 +1991,17 @@ where
             tracing::warn!("facts extraction failed; the message is imported without them");
         }
         extracted.ok().map(Box::new)
+    }
+}
+
+fn decode_send(command: CommandId, body: &[u8]) -> Outcome {
+    match mailtide_gmail::send::receipt(body) {
+        Ok((message_id, thread_id)) => Outcome::Event(EventKind::MessageSent {
+            command,
+            message_id,
+            thread_id,
+        }),
+        Err(_) => Outcome::Unanswered("messages.send answered without a usable receipt".into()),
     }
 }
 

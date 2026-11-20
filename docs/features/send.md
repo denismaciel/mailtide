@@ -1,6 +1,6 @@
 # Send: new, reply and forward, at most once, undo and schedule
 
-Plan `features/send.toml` (roadmap C3, C5), in progress. Requires `drafts` for
+Plan `features/send.toml` (roadmap C3, C5), done. Requires `drafts` for
 saved-draft delivery, `compose-mime` for tracking tokens and reply/forward
 types, and `message-facts` for the token on imported mail.
 
@@ -64,7 +64,7 @@ Rust methods on `mailtide_io::Runner`:
 | Method | Result |
 |---|---|
 | `submit(account, key, raw, options)` | Admit a raw submission without calling Gmail and return its `Submission`. |
-| `send(account, source, budget)` | For `Raw { key, raw, options }`, submit then run within budget and return `SendOutcome::Raw { submission, run }`. For `Draft { draft_id, if_message_id }`, return `SendOutcome::Draft(SentDraft)` or the draft error. |
+| `send(account, source, budget)` | For `Raw { key, raw, options }`, submit then run within budget and return `SendOutcome::Raw` with the submission and run. For `Draft { draft_id, if_message_id }`, return `SendOutcome::Draft(SentDraft)` or the draft error. |
 | `cancel_submission(account, key)` | Cancel while `pending`. Repeated cancellation returns the same canceled row. After claim, return `CannotUnsend` with the known disposition. |
 | `submission(account, key)`, `submissions(account, states, after, limit)` | Read raw submissions from the schema-checked store. |
 | `submission_content(account, key)` | Read staged bytes while retained. |

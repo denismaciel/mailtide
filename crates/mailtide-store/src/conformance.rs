@@ -4426,18 +4426,18 @@ async fn submissions<S: Store>(store: &S) -> Result<(), String> {
     use mailtide::drafts::{DraftRecorded, DraftWrite};
     use mailtide::ids::DraftId;
     use mailtide::submission::{
-        Submission, SubmissionKey, SubmissionRow, SubmissionState, SubmissionWrite,
-        SubmissionWritten,
+        SubmissionKey, SubmissionState, SubmissionWrite, SubmissionWritten,
     };
-    fn debug(error: StoreError) -> String {
-        format!("{error:?}")
-    }
-    fn exact<T: PartialEq + std::fmt::Debug>(actual: T, expected: T) -> Result<(), String> {
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(format!("expected {expected:?}, got {actual:?}"))
-        }
+    let debug = |error| format!("{error:?}");
+    macro_rules! exact {
+        ($actual:expr, $expected:expr $(,)?) => {{
+            let (actual, expected) = ($actual, $expected);
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(format!("expected {expected:?}, got {actual:?}"))
+            }
+        }};
     }
     let snapshot = claim(store).await?;
     let account = account();
@@ -4450,7 +4450,75 @@ async fn submissions<S: Store>(store: &S) -> Result<(), String> {
     let now = Timestamp(100);
     let key = SubmissionKey("raw".into());
     let token = "tracking-token-100001";
-    let candidate = SubmissionRow {
+    let candidate = submission_candidate(&key, token, now);
+    let admit = SubmissionWrite::Admit(Box::new(candidate));
+    exact!(
+        store
+            .write_submission(&account, generation + 1, &admit, now)
+            .await
+            .map_err(debug)?,
+        SubmissionWritten::Stale,
+    )?;
+    let admitted = store
+        .write_submission(&account, generation, &admit, now)
+        .await
+        .map_err(debug)?;
+    exact!(
+        store
+            .write_submission(&account, generation, &admit, now)
+            .await
+            .map_err(debug)?,
+        admitted,
+    )?;
+    let save = DraftWrite::Saved {
+        draft: listed("draft-token", "draft-message"),
+        tracking_id: token.into(),
+        created: true,
+    };
+    store
+        .record_draft(&account, &save, now)
+        .await
+        .map_err(debug)?;
+    let attempt = claim_raw_submission(store, &snapshot, &key, generation, now).await?;
+    let begin = DraftWrite::BeginSend {
+        draft: DraftId("draft-token".into()),
+        retry_at: Timestamp(500),
+    };
+    exact!(
+        store
+            .record_draft(&account, &begin, now)
+            .await
+            .map_err(debug)?,
+        DraftRecorded::TokenConflict,
+    )?;
+    store
+        .write_submission(
+            &account,
+            generation,
+            &SubmissionWrite::Begin(attempt, key.clone()),
+            now,
+        )
+        .await
+        .map_err(debug)?;
+    import_sent_submission(store, &snapshot, token).await?;
+    let row = store
+        .submission(&account, &key)
+        .await
+        .map_err(debug)?
+        .ok_or("submission lost")?;
+    exact!(row.view.state, SubmissionState::Sent)?;
+    exact!(row.view.message_id, Some(MessageId("gmail-sent".into())))?;
+    store.forget(&account).await.map_err(debug)?;
+    exact!(store.submission(&account, &key).await.map_err(debug)?, None)
+}
+
+fn submission_candidate(
+    key: &mailtide::submission::SubmissionKey,
+    token: &str,
+    now: Timestamp,
+) -> mailtide::submission::SubmissionRow {
+    use mailtide::submission::{Submission, SubmissionRow, SubmissionState};
+    SubmissionRow {
         view: Submission {
             key: key.clone(),
             tracking_id: token.into(),
@@ -4469,39 +4537,48 @@ async fn submissions<S: Store>(store: &S) -> Result<(), String> {
         due_at: Some(now),
         dispatch: None,
         terminal_at: None,
-    };
-    let admit = SubmissionWrite::Admit(Box::new(candidate));
-    exact(
-        store
-            .write_submission(&account, generation + 1, &admit, now)
-            .await
-            .map_err(debug)?,
-        SubmissionWritten::Stale,
-    )?;
-    let admitted = store
-        .write_submission(&account, generation, &admit, now)
+    }
+}
+
+async fn import_sent_submission<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    token: &str,
+) -> Result<(), String> {
+    let mut imported = import("gmail-sent", &["SENT"], 1);
+    if let MessageOp::MarkImported {
+        facts: Some(facts), ..
+    } = &mut imported
+    {
+        facts.tracking_id = Some(token.into());
+    }
+    let mut commit = commit(snapshot, 2);
+    commit.messages.push(imported);
+    let applied = store
+        .apply(&commit)
         .await
-        .map_err(debug)?;
-    exact(
-        store
-            .write_submission(&account, generation, &admit, now)
-            .await
-            .map_err(debug)?,
-        admitted,
-    )?;
-    let save = DraftWrite::Saved {
-        draft: listed("draft-token", "draft-message"),
-        tracking_id: token.into(),
-        created: true,
-    };
-    store
-        .record_draft(&account, &save, now)
-        .await
-        .map_err(debug)?;
+        .map_err(|error| format!("{error:?}"))?;
+    if matches!(applied, CommitOutcome::Applied { .. }) {
+        Ok(())
+    } else {
+        Err(format!("import: {applied:?}"))
+    }
+}
+
+async fn claim_raw_submission<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    key: &mailtide::submission::SubmissionKey,
+    generation: u64,
+    now: Timestamp,
+) -> Result<AttemptId, String> {
+    use mailtide::submission::{SubmissionState, SubmissionWrite, SubmissionWritten};
+    let debug = |error| format!("{error:?}");
+    let account = &snapshot.account;
     let attempt = AttemptId(44);
     let claimed = store
         .claim_jobs(
-            &account,
+            account,
             (snapshot.epoch, generation),
             1,
             now,
@@ -4510,66 +4587,26 @@ async fn submissions<S: Store>(store: &S) -> Result<(), String> {
         )
         .await
         .map_err(debug)?;
-    if !matches!(claimed, mailtide::jobs::ClaimOutcome::Claimed { jobs, .. } if jobs.len() == 1 && jobs[0].kind() == JobKind::SendSubmissions)
+    if !matches!(claimed, mailtide::jobs::ClaimOutcome::Claimed { jobs, .. }
+        if jobs.len() == 1 && jobs[0].kind() == JobKind::SendSubmissions)
     {
         return Err("raw submission job was not claimed".into());
     }
     store
-        .write_submission(&account, generation, &SubmissionWrite::Take(attempt), now)
+        .write_submission(account, generation, &SubmissionWrite::Take(attempt), now)
         .await
         .map_err(debug)?;
-    exact(
-        store
-            .write_submission(
-                &account,
-                generation,
-                &SubmissionWrite::Cancel(key.clone()),
-                now,
-            )
-            .await
-            .map_err(debug)?,
-        SubmissionWritten::CannotUnsend(SubmissionState::Claimed),
-    )?;
-    let begin = DraftWrite::BeginSend {
-        draft: DraftId("draft-token".into()),
-        retry_at: Timestamp(500),
-    };
-    exact(
-        store
-            .record_draft(&account, &begin, now)
-            .await
-            .map_err(debug)?,
-        DraftRecorded::TokenConflict,
-    )?;
-    store
+    let canceled = store
         .write_submission(
-            &account,
+            account,
             generation,
-            &SubmissionWrite::Begin(attempt, key.clone()),
+            &SubmissionWrite::Cancel(key.clone()),
             now,
         )
         .await
         .map_err(debug)?;
-    let mut imported = import("gmail-sent", &["SENT"], 1);
-    if let MessageOp::MarkImported {
-        facts: Some(facts), ..
-    } = &mut imported
-    {
-        facts.tracking_id = Some(token.into());
+    if canceled != SubmissionWritten::CannotUnsend(SubmissionState::Claimed) {
+        return Err(format!("claim lost its cancellation fence: {canceled:?}"));
     }
-    let mut commit = commit(&snapshot, 2);
-    commit.messages.push(imported);
-    let applied = store.apply(&commit).await.map_err(debug)?;
-    if !matches!(applied, CommitOutcome::Applied { .. }) {
-        return Err(format!("import: {applied:?}"));
-    }
-    let row = store
-        .submission(&account, &key)
-        .await
-        .map_err(debug)?
-        .ok_or("submission lost")?;
-    exact(row.view.state, SubmissionState::Sent)?;
-    exact(row.view.message_id, Some(MessageId("gmail-sent".into())))?;
-    store.forget(&account).await.map_err(debug)?;
-    exact(store.submission(&account, &key).await.map_err(debug)?, None)
+    Ok(attempt)
 }

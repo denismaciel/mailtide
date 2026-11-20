@@ -539,14 +539,14 @@ mod tests {
         let row = candidate("key");
         let key = row.view.key.clone();
         assert!(matches!(
-            write(&mut mirror, SubmissionWrite::Admit(Box::new(row))),
+            write(&mut mirror, &SubmissionWrite::Admit(Box::new(row))),
             SubmissionWritten::Row(_)
         ));
         (mirror, key)
     }
 
-    fn write(mirror: &mut AccountMirror, op: SubmissionWrite) -> SubmissionWritten {
-        mirror.write_submission(GENERATION, &op, NOW)
+    fn write(mirror: &mut AccountMirror, op: &SubmissionWrite) -> SubmissionWritten {
+        mirror.write_submission(GENERATION, op, NOW)
     }
 
     fn claim(mirror: &mut AccountMirror, attempt: AttemptId) {
@@ -559,9 +559,9 @@ mod tests {
     fn begun() -> (AccountMirror, SubmissionKey) {
         let (mut mirror, key) = admitted();
         claim(&mut mirror, ATTEMPT);
-        write(&mut mirror, SubmissionWrite::Take(ATTEMPT));
+        write(&mut mirror, &SubmissionWrite::Take(ATTEMPT));
         assert!(matches!(
-            write(&mut mirror, SubmissionWrite::Begin(ATTEMPT, key.clone())),
+            write(&mut mirror, &SubmissionWrite::Begin(ATTEMPT, key.clone())),
             SubmissionWritten::Row(_)
         ));
         (mirror, key)
@@ -573,7 +573,7 @@ mod tests {
         let mut replay = candidate("key");
         replay.blob = Some(BlobRef("loser.eml".into()));
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Admit(Box::new(replay))),
+            write(&mut mirror, &SubmissionWrite::Admit(Box::new(replay))),
             SubmissionWritten::Row(Box::new(mirror.submissions[&key].clone()))
         );
         assert_eq!(mirror.log.len(), 1);
@@ -585,7 +585,7 @@ mod tests {
         let mut replay = candidate("key");
         replay.fingerprint = "different".into();
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Admit(Box::new(replay))),
+            write(&mut mirror, &SubmissionWrite::Admit(Box::new(replay))),
             SubmissionWritten::KeyConflict
         );
     }
@@ -595,7 +595,7 @@ mod tests {
         let (mut mirror, _) = admitted();
         let row = candidate("different key");
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Admit(Box::new(row))),
+            write(&mut mirror, &SubmissionWrite::Admit(Box::new(row))),
             SubmissionWritten::DuplicateTrackingId
         );
     }
@@ -604,9 +604,9 @@ mod tests {
     fn a_claim_closes_cancellation_for_a_due_submission() {
         let (mut mirror, key) = admitted();
         claim(&mut mirror, ATTEMPT);
-        write(&mut mirror, SubmissionWrite::Take(ATTEMPT));
+        write(&mut mirror, &SubmissionWrite::Take(ATTEMPT));
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Cancel(key)),
+            write(&mut mirror, &SubmissionWrite::Cancel(key)),
             SubmissionWritten::CannotUnsend(SubmissionState::Claimed)
         );
     }
@@ -614,14 +614,14 @@ mod tests {
     #[test]
     fn cancel_wins_only_while_pending() {
         let (mut mirror, key) = admitted();
-        let canceled = write(&mut mirror, SubmissionWrite::Cancel(key.clone()));
+        let canceled = write(&mut mirror, &SubmissionWrite::Cancel(key.clone()));
         assert_eq!(
             canceled,
-            write(&mut mirror, SubmissionWrite::Cancel(key.clone()))
+            write(&mut mirror, &SubmissionWrite::Cancel(key.clone()))
         );
         claim(&mut mirror, ATTEMPT);
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Begin(ATTEMPT, key)),
+            write(&mut mirror, &SubmissionWrite::Begin(ATTEMPT, key)),
             SubmissionWritten::Stale
         );
     }
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(
             write(
                 &mut mirror,
-                SubmissionWrite::Complete(AttemptId(2), key, Disposition::Unanswered)
+                &SubmissionWrite::Complete(AttemptId(2), key, Disposition::Unanswered)
             ),
             SubmissionWritten::Stale
         );
@@ -645,13 +645,13 @@ mod tests {
         mirror.claim(crate::ids::ENGINE_VERSION).unwrap();
         let successor = AttemptId(2);
         claim(&mut mirror, successor);
-        write(&mut mirror, SubmissionWrite::Take(successor));
+        write(&mut mirror, &SubmissionWrite::Take(successor));
         assert_eq!(
             mirror.submissions[&key].view.state,
             SubmissionState::Confirming
         );
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Begin(successor, key)),
+            write(&mut mirror, &SubmissionWrite::Begin(successor, key)),
             SubmissionWritten::Stale
         );
     }
@@ -661,11 +661,11 @@ mod tests {
         let (mut mirror, key) = begun();
         write(
             &mut mirror,
-            SubmissionWrite::Complete(ATTEMPT, key.clone(), Disposition::NotSent(Timestamp(200))),
+            &SubmissionWrite::Complete(ATTEMPT, key.clone(), Disposition::NotSent(Timestamp(200))),
         );
         assert_eq!(mirror.submissions[&key].due_at, Some(Timestamp(200)));
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Cancel(key)),
+            write(&mut mirror, &SubmissionWrite::Cancel(key)),
             SubmissionWritten::CannotUnsend(SubmissionState::Claimed)
         );
     }
@@ -675,7 +675,7 @@ mod tests {
         let (mut mirror, key) = begun();
         write(
             &mut mirror,
-            SubmissionWrite::Complete(
+            &SubmissionWrite::Complete(
                 ATTEMPT,
                 key.clone(),
                 Disposition::Accepted(MessageId("gmail".into()), ThreadId("actual".into())),
@@ -696,7 +696,7 @@ mod tests {
             SubmissionState::Unknown
         );
         assert_eq!(
-            write(&mut mirror, SubmissionWrite::Begin(ATTEMPT, key)),
+            write(&mut mirror, &SubmissionWrite::Begin(ATTEMPT, key)),
             SubmissionWritten::Stale
         );
     }
@@ -706,7 +706,7 @@ mod tests {
         let (mut mirror, key) = begun();
         write(
             &mut mirror,
-            SubmissionWrite::Complete(
+            &SubmissionWrite::Complete(
                 ATTEMPT,
                 key.clone(),
                 Disposition::Refused {
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn blob_retention_preserves_the_terminal_receipt_and_token() {
         let (mut mirror, key) = admitted();
-        write(&mut mirror, SubmissionWrite::Cancel(key.clone()));
+        write(&mut mirror, &SubmissionWrite::Cancel(key.clone()));
         claim(&mut mirror, ATTEMPT);
         let at = mirror.submissions[&key].due_at.unwrap();
         mirror.write_submission(
@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(
             write(
                 &mut mirror,
-                SubmissionWrite::Complete(ATTEMPT, key.clone(), Disposition::Unanswered)
+                &SubmissionWrite::Complete(ATTEMPT, key.clone(), Disposition::Unanswered)
             ),
             SubmissionWritten::Stale
         );

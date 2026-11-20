@@ -2,7 +2,7 @@ id = "send"
 title = "Send: new, reply and forward, at most once, undo and schedule"
 summary = "Raw bytes go through one durable JSON messages.send submission, cancellable until claim and confirmed by an imported X-Mailtide-Id. A saved draft uses drafts' own fenced send."
 roadmap = ["C3", "C5"]
-status = "in_progress"
+status = "done"
 design = "docs/features/send.md"
 # drafts supplies the existing draft send, its account-level job shape and the
 # import confirmation hook. compose-mime and message-facts supply the token
@@ -205,6 +205,11 @@ role = "Re-export the send types, reply_plan, forward_plan and the exceptions"
 path = "python/mailtide/testing.py"
 change = "modify"
 role = "FakeGmail JSON raw send that preserves the tracking token and can refuse or lose a send answer"
+
+[[file]]
+path = "README.md"
+change = "modify"
+role = "Host raw submission and cancellation examples"
 
 [[file]]
 path = "SPEC.md"
@@ -789,7 +794,7 @@ target = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
 [[suite.test]]
 name = "an_html_only_body_is_quoted_as_text"
 test = "an_html_only_original_offers_plain_text_to_quote"
-note = "Use mail-parser's plain text conversion. The test checks readable lines and decoded entities, independent of blank-line layout."
+note = "Use mail-parser's plain text conversion. The test checks readable lines and decoded entities."
 
 [[suite.test]]
 name = "a_flowed_text_is_unwrapped_whatever_its_charset"
