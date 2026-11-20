@@ -825,10 +825,15 @@ created, renamed and deleted in Gmail, and checks invariants after every
 commit and every open (also that no job's class goes down outside a claim's
 finish) and convergence after healing (message sets, labels, thread ids and
 thread views), label definitions within the refresh
-interval; a feed reader takes one page of a random limit (1 to 8) between
-steps and must end with the whole change log, entry for entry
-(`FeedPagesDiverged` otherwise) (CI: 500 seeds × 1,000 steps; locally 3,000
-seeds). Zero's suites
+interval; two named feed readers take one page of a random limit (1 to 8)
+between steps and acknowledge it while the log is compacted at random
+steps (§4, consumer cursors): the steady one must never be cut off
+(`ConsumerCutOff`), no compaction may keep a commit every live reader had
+passed (`AcknowledgedEntriesKept`), and it must end with the whole change
+log, compacted entries included, entry for entry (`FeedPagesDiverged`
+otherwise); the other stalls, and the host's housekeeping after a quiet
+spell past the idle limit cuts it off (CI: 500 seeds × 1,000 steps; locally
+3,000 seeds). Zero's suites
 are ported by name and tracked by `scripts/zero_tests.py`. Python tests drive
 the real `Runner` against a fake Gmail over HTTP.
 

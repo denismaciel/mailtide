@@ -88,7 +88,7 @@ role = "Python cases with the ManualClock"
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
-role = "Two named readers (one steady, one that stalls) that acknowledge, and compaction at random steps under the simulated clock"
+role = "Two named readers (one steady, one that stalls) that acknowledge, and compaction at random steps under the simulated clock, plus one housekeeping compaction after a quiet spell past the idle limit (a busy run's clock barely moves)"
 
 [[file]]
 path = "SPEC.md"
@@ -287,4 +287,4 @@ covers = "On every seed: a reader that reads, acks and is compacted around at ra
 [[test]]
 target = "crates/mailtide-sim/src/lib.rs"
 name = "a_stalled_consumer_is_cut_off_and_the_log_shrinks"
-covers = "A second reader stops acking; once the simulated clock passes max_idle the next compaction removes what it held, its read is TooOld, and the steady reader is unaffected"
+covers = "A second reader stops acking; once the simulated clock passes max_idle the next compaction removes what it held, its read is TooOld, and the steady reader is unaffected. The clock of a busy run hardly moves, so each run ends with the host's housekeeping after a quiet spell past max_idle"

@@ -10,6 +10,7 @@ use crate::ids::{HistoryId, MessageId};
 use crate::jobs::{JobKind, JobOp, JobState};
 use crate::mirror::{AccountMirror, Content};
 use crate::quota::Priority;
+use crate::revision::{FeedCursor, Retention, StateSeq};
 
 /// An invariant that doesn't hold, with its evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,24 @@ pub enum Violation {
         read: u64,
         /// What differs.
         difference: String,
+    },
+    /// A compaction cut off a consumer that was live: it removed entries
+    /// the consumer had not acknowledged.
+    ConsumerCutOff {
+        /// The consumer.
+        consumer: String,
+        /// Its position.
+        at: FeedCursor,
+        /// The floor after the compaction.
+        floor: StateSeq,
+    },
+    /// After a compaction, the log still holds a commit every live
+    /// consumer (and the explicit bound, if any) had passed.
+    AcknowledgedEntriesKept {
+        /// The last commit every live consumer had passed.
+        acknowledged: StateSeq,
+        /// A commit at or before it still in the log.
+        kept: StateSeq,
     },
     /// A rejected commit changed something.
     RejectedCommitChangedState,
@@ -147,6 +166,46 @@ pub fn check_commit(
 pub fn check_prioritise(before: &AccountMirror, after: &AccountMirror) -> Vec<Violation> {
     let mut violations = lowered(before, after, &[]);
     violations.extend(check_state(after));
+    violations
+}
+
+/// Check a compaction under `retention` ([`AccountMirror::compact`]): no
+/// consumer live before it is cut off, and no commit every live consumer
+/// (and the bound, if given) had passed is left in the log. Liveness is
+/// judged after the compaction saw the cursors at the head, against the
+/// floor before it.
+#[must_use]
+pub fn check_compaction(
+    before: &AccountMirror,
+    after: &AccountMirror,
+    retention: &Retention,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut acknowledged = retention.through;
+    let mut any_live = false;
+    for cursor in after.consumers.values() {
+        if !cursor.is_live(before.record.log_floor, retention) {
+            continue;
+        }
+        any_live = true;
+        if cursor.is_lost(after.record.log_floor) {
+            violations.push(Violation::ConsumerCutOff {
+                consumer: cursor.name.as_str().to_owned(),
+                at: cursor.at,
+                floor: after.record.log_floor,
+            });
+        }
+        let passed = cursor.at.compactable();
+        acknowledged = Some(acknowledged.map_or(passed, |a| a.min(passed)));
+    }
+    if let (true, Some(acknowledged)) = (any_live, acknowledged)
+        && let Some((kept, _)) = after.log.iter().find(|(seq, _)| *seq <= acknowledged)
+    {
+        violations.push(Violation::AcknowledgedEntriesKept {
+            acknowledged,
+            kept: *kept,
+        });
+    }
     violations
 }
 

@@ -8,10 +8,13 @@
 //! expiry, dropped and duplicated pushes, lost commit acknowledgements and
 //! crashes (the engine is rebuilt from the store; results meant for the dead
 //! engine still arrive). Label definitions are created, renamed and deleted
-//! while the account is live. Invariants are checked after every commit. A
-//! feed reader takes one page of a random limit between steps and must end
-//! with the whole change log. Then all faults heal and the mirror must
-//! converge to Gmail, its label definitions within the refresh interval.
+//! while the account is live. Invariants are checked after every commit. Two
+//! named feed readers take one page of a random limit between steps and
+//! acknowledge it, while the log is compacted at random steps: the steady
+//! one must never be cut off and must end with the whole change log; the
+//! other stalls, and once the simulated clock passes the idle limit it is
+//! cut off. Then all faults heal and the mirror must converge to Gmail, its
+//! label definitions within the refresh interval.
 //!
 //! Zero counterpart, by role: `lib/imap/testing/memory-server.ts`.
 
@@ -41,7 +44,9 @@ use mailtide::outbox::{
 };
 use mailtide::reconcile::ListScope;
 use mailtide::retry::{Failure, Retryable, RetryableFailure};
-use mailtide::revision::{Change, FeedCursor, StateSeq};
+use mailtide::revision::{
+    AckOutcome, Change, ChangeFeed, ConsumerName, FeedCursor, FeedPosition, Retention, StateSeq,
+};
 use mailtide::schedule::TimerKind;
 
 // ------------------------------------------------------------ randomness
@@ -274,6 +279,12 @@ pub struct Stats {
     /// Feed pages the reader took that ended inside a commit (one larger
     /// than the page's limit).
     pub feed_pages_split: u64,
+    /// Compactions of the change log.
+    pub compactions: u64,
+    /// Log entries they removed.
+    pub compacted: u64,
+    /// Readers cut off for staying silent past the idle limit.
+    pub consumers_cut_off: u64,
 }
 
 /// The outcome of one run.
@@ -696,33 +707,82 @@ impl Gmail {
     }
 }
 
-// ------------------------------------------------------------ the feed reader
+// ------------------------------------------------------------ the feed readers
 
-/// A consumer of the change feed: between steps it takes one page of a
-/// random limit from where it stopped, as a host's pipeline would, and at
-/// the end its entries must be the log's, entry for entry. It draws from its
-/// own generator, so runs take the same steps as without it.
+/// How long a reader may stay silent behind the head and still hold the log
+/// (the simulated clock moves by timers: minutes to hours per run).
+const MAX_IDLE: Duration = Duration::from_mins(30);
+
+/// The chance that the log is compacted after a step.
+const COMPACTION: f64 = 0.1;
+
+/// A named consumer of the change feed: between steps it takes one page of
+/// a random limit from where it stopped and acknowledges it, as a host's
+/// pipeline would. The steady reader never stops, so compaction must never
+/// cut it off, and at the end its entries must be the log's (the compacted
+/// part included), entry for entry. The stalled reader stops after a random
+/// step; at the end it is either cut off (its read is too old) or reads on
+/// to the same log. Each draws from its own generator, so runs take the same
+/// steps as without them.
 struct FeedReader {
+    name: ConsumerName,
     rng: Rng,
     at: FeedCursor,
     read: Vec<(StateSeq, u32, Change)>,
+    /// The step after which it neither reads nor acknowledges.
+    stalls_after: Option<u64>,
 }
 
 impl FeedReader {
-    fn new(rng: &Rng) -> Self {
+    fn steady(rng: &Rng) -> Self {
+        Self::new(
+            "steady",
+            Rng(splitmix64(rng.0 ^ 0x0fee_d0fe_ed00_f00d)),
+            None,
+        )
+    }
+
+    fn stalled(rng: &Rng) -> Self {
+        let mut own = Rng(splitmix64(rng.0 ^ 0x5741_11ed_0000_0001));
+        let stalls_after = u64::try_from(own.below(200)).unwrap_or(0) + 1;
+        Self::new("stalled", own, Some(stalls_after))
+    }
+
+    fn new(name: &str, rng: Rng, stalls_after: Option<u64>) -> Self {
         Self {
-            rng: Rng(splitmix64(rng.0 ^ 0x0fee_d0fe_ed00_f00d)),
+            name: ConsumerName::parse(name).expect("a valid consumer name"),
+            rng,
             at: StateSeq(0).into(),
             read: Vec::new(),
+            stalls_after,
         }
     }
 
-    /// Take one page: whether more are waiting. A page above its limit, or
-    /// one that ends inside a commit it does not fill alone, is a
-    /// divergence.
-    fn take_page(&mut self, mirror: &AccountMirror, stats: &mut Stats) -> Result<bool, Violation> {
+    /// Whether it has stopped by `step`.
+    fn is_stalled(&self, step: u64) -> bool {
+        self.stalls_after.is_some_and(|last| step > last)
+    }
+
+    /// Take one page and acknowledge it at `now`: whether more are waiting.
+    /// A read that is too old is a cut-off; a page above its limit, or one
+    /// that ends inside a commit it does not fill alone, is a divergence.
+    fn take_page(
+        &mut self,
+        mirror: &mut AccountMirror,
+        now: Timestamp,
+        stats: &mut Stats,
+    ) -> Result<bool, Violation> {
         let limit = u32::try_from(self.rng.below(8) + 1).unwrap_or(1);
-        let page = mirror.changes(self.at, limit);
+        let page = match mirror.feed(self.at, limit) {
+            ChangeFeed::Page(page) => page,
+            ChangeFeed::TooOld { oldest, .. } => {
+                return Err(Violation::ConsumerCutOff {
+                    consumer: self.name.as_str().to_owned(),
+                    at: self.at,
+                    floor: oldest,
+                });
+            }
+        };
         if page.changes.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
             return Err(self.diverged(format!(
                 "a page of {} entries above its limit {limit}",
@@ -752,22 +812,50 @@ impl FeedReader {
                 .map(|entry| (entry.state, entry.index, entry.change)),
         );
         self.at = page.next;
-        Ok(page.has_more)
+        let position = FeedPosition {
+            generation: page.generation,
+            at: page.next,
+        };
+        match mirror.ack(&self.name, position, now) {
+            AckOutcome::Acked(_) => Ok(page.has_more),
+            refused => Err(self.diverged(format!(
+                "the ack of {:?} after reading it was refused: {refused:?}",
+                page.next
+            ))),
+        }
     }
 
-    /// Read to the end, then compare with the log, entries numbered within
-    /// their commit.
-    fn finish(&mut self, mirror: &AccountMirror, stats: &mut Stats) -> Option<Violation> {
+    /// At the end of a run: a reader the compactions cut off must find its
+    /// read too old; any other reads to the end, and its entries must be
+    /// `compacted` then the log, numbered within their commit.
+    fn finish(
+        &mut self,
+        mirror: &mut AccountMirror,
+        compacted: &[(StateSeq, Change)],
+        now: Timestamp,
+        stats: &mut Stats,
+    ) -> Option<Violation> {
+        let lost = mirror
+            .consumers
+            .get(&self.name)
+            .is_some_and(|cursor| cursor.is_lost(mirror.record.log_floor));
+        if lost {
+            if !matches!(mirror.feed(self.at, 1), ChangeFeed::TooOld { .. }) {
+                return Some(self.diverged("a lost reader read on".to_owned()));
+            }
+            stats.consumers_cut_off += 1;
+            return None;
+        }
         loop {
-            match self.take_page(mirror, stats) {
+            match self.take_page(mirror, now, stats) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(violation) => return Some(violation),
             }
         }
-        let mut logged = Vec::with_capacity(mirror.log.len());
+        let mut logged = Vec::with_capacity(compacted.len() + mirror.log.len());
         let mut position: Option<(StateSeq, u32)> = None;
-        for (seq, change) in &mirror.log {
+        for (seq, change) in compacted.iter().chain(&mirror.log) {
             let index = match position {
                 Some((current, index)) if current == *seq => index + 1,
                 Some(_) | None => 0,
@@ -789,7 +877,8 @@ impl FeedReader {
             .position(|(a, b)| a != b)
             .unwrap_or(read.len().min(logged.len()));
         Some(self.diverged(format!(
-            "read {} entries, the log holds {}; first difference at {at}: {:?} != {:?}",
+            "{} read {} entries, the log holds {}; first difference at {at}: {:?} != {:?}",
+            self.name.as_str(),
             read.len(),
             logged.len(),
             read.get(at),
@@ -823,6 +912,11 @@ struct Sim {
     violations: Vec<ObservedViolation>,
     stats: Stats,
     reader: FeedReader,
+    stalled: FeedReader,
+    /// Decides when the log is compacted, from its own generator.
+    compactor: Rng,
+    /// The entries compaction removed, in log order.
+    compacted: Vec<(StateSeq, Change)>,
     step: u64,
     trace: std::collections::VecDeque<String>,
     /// Debugging: every line containing this text is kept in `matched`.
@@ -855,7 +949,9 @@ impl Sim {
                 thread: (n % 2 == 0).then_some(0),
             });
         }
-        let reader = FeedReader::new(&rng);
+        let reader = FeedReader::steady(&rng);
+        let stalled = FeedReader::stalled(&rng);
+        let compactor = Rng(splitmix64(rng.0 ^ 0xc0_4ac7_0000_0002));
         Self {
             rng,
             faults,
@@ -872,6 +968,9 @@ impl Sim {
             violations: Vec::new(),
             stats: Stats::default(),
             reader,
+            stalled,
+            compactor,
+            compacted: Vec::new(),
             step: 0,
             trace: std::collections::VecDeque::new(),
             grep: None,
@@ -893,11 +992,16 @@ impl Sim {
         let fault_steps = self.step;
         let faults = std::mem::replace(&mut self.faults, Faults::none());
         let convergence = self.heal();
-        if let Some(violation) = self.reader.finish(&self.mirror, &mut self.stats) {
-            self.violations.push(ObservedViolation {
-                step: self.step,
-                violation,
-            });
+        self.housekeeping();
+        for reader in [&mut self.reader, &mut self.stalled] {
+            if let Some(violation) =
+                reader.finish(&mut self.mirror, &self.compacted, self.now, &mut self.stats)
+            {
+                self.violations.push(ObservedViolation {
+                    step: self.step,
+                    violation,
+                });
+            }
         }
         self.stats.messages = u64::try_from(self.gmail.messages.len()).unwrap_or(u64::MAX);
         self.stats.threads = u64::try_from(self.gmail.threads().len()).unwrap_or(u64::MAX);
@@ -927,11 +1031,64 @@ impl Sim {
         }
         self.advance();
         self.read_feed();
+        self.compact();
     }
 
-    /// The feed reader takes its page for this step.
+    /// The feed readers that have not stalled take their page for this step.
     fn read_feed(&mut self) {
-        if let Err(violation) = self.reader.take_page(&self.mirror, &mut self.stats) {
+        for reader in [&mut self.reader, &mut self.stalled] {
+            if reader.is_stalled(self.step) {
+                continue;
+            }
+            if let Err(violation) = reader.take_page(&mut self.mirror, self.now, &mut self.stats) {
+                self.violations.push(ObservedViolation {
+                    step: self.step,
+                    violation,
+                });
+            }
+        }
+    }
+
+    /// Now and then, compact the log as the host would: usually as far as
+    /// the readers allow, sometimes with an explicit bound too.
+    fn compact(&mut self) {
+        if !self
+            .compactor
+            .chance(Probability::new(COMPACTION).unwrap_or(Probability::NEVER))
+        {
+            return;
+        }
+        let mut retention = Retention::new(self.now);
+        retention.max_idle = MAX_IDLE;
+        if self.compactor.below(3) == 0 {
+            let head = usize::try_from(self.mirror.seq.0).unwrap_or(usize::MAX);
+            let through = u64::try_from(self.compactor.below(head.saturating_add(1))).unwrap_or(0);
+            retention = retention.through(StateSeq(through));
+        }
+        self.compact_with(retention);
+    }
+
+    /// The host's housekeeping after a quiet spell longer than the idle
+    /// limit (a busy run's clock barely moves): the readers that still read
+    /// take a page, then the log is compacted as far as they allow.
+    fn housekeeping(&mut self) {
+        self.now = self.now.plus(MAX_IDLE).plus(Duration::from_mins(1));
+        self.read_feed();
+        let mut retention = Retention::new(self.now);
+        retention.max_idle = MAX_IDLE;
+        self.compact_with(retention);
+    }
+
+    fn compact_with(&mut self, retention: Retention) {
+        let before = self.mirror.clone();
+        let removed = self.mirror.compact(&retention);
+        let removed_entries = usize::try_from(removed).unwrap_or(usize::MAX);
+        self.compacted
+            .extend(before.log.iter().take(removed_entries).cloned());
+        self.stats.compactions += 1;
+        self.stats.compacted += removed;
+        self.note(&format!("compact {retention:?}: {removed} removed"));
+        for violation in invariants::check_compaction(&before, &self.mirror, &retention) {
             self.violations.push(ObservedViolation {
                 step: self.step,
                 violation,
@@ -1351,6 +1508,7 @@ impl Sim {
             }
             self.advance();
             self.read_feed();
+            self.compact();
         }
         Convergence::NotReached {
             difference,
@@ -1646,6 +1804,61 @@ mod tests {
             .collect();
         let result = replay(3, &script);
         assert!(result.passed(), "{result:#?}");
+    }
+
+    /// Violations of the consumer rules: a live reader cut off, or a
+    /// compaction that kept what every live reader had passed.
+    fn consumer_violations(results: &[RunResult]) -> Vec<&ObservedViolation> {
+        results
+            .iter()
+            .flat_map(|result| &result.violations)
+            .filter(|v| {
+                matches!(
+                    v.violation,
+                    Violation::ConsumerCutOff { .. }
+                        | Violation::AcknowledgedEntriesKept { .. }
+                        | Violation::FeedPagesDiverged { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_steady_consumer_is_never_cut_off() {
+        let results: Vec<RunResult> = (400..500).map(|seed| run(seed, 400)).collect();
+        let violations = consumer_violations(&results);
+        assert!(violations.is_empty(), "{violations:#?}");
+        let compacting = results.iter().filter(|r| r.stats.compacted > 0).count();
+        assert!(
+            compacting == results.len(),
+            "every run compacts around its readers ({compacting} did)"
+        );
+    }
+
+    #[test]
+    fn a_stalled_consumer_is_cut_off_and_the_log_shrinks() {
+        let results: Vec<RunResult> = (500..600).map(|seed| run(seed, 400)).collect();
+        let violations = consumer_violations(&results);
+        assert!(violations.is_empty(), "{violations:#?}");
+        // The stalled reader stops by step 200 and falls behind; the
+        // housekeeping after a quiet spell past the idle limit cuts it off,
+        // and its read is then too old (checked as each run finishes).
+        let cut_off = results
+            .iter()
+            .filter(|r| r.stats.consumers_cut_off == 1)
+            .count();
+        assert!(
+            cut_off > results.len() * 9 / 10,
+            "most runs cut the stalled reader off ({cut_off} did)"
+        );
+        assert!(results.iter().all(|r| r.stats.consumers_cut_off <= 1));
+        assert!(
+            results
+                .iter()
+                .filter(|r| r.stats.consumers_cut_off == 1)
+                .all(|r| r.stats.compacted > 0),
+            "what it held was removed"
+        );
     }
 
     #[test]

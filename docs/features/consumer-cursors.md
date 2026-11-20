@@ -287,7 +287,13 @@ Own tests (28):
 - **Simulator** (2): on every seed a steady reader that acks, with
   compaction at random steps, is never cut off and the log never keeps a
   commit every live cursor has passed; a stalled reader is cut off once the
-  simulated clock passes `max_idle`, and only it.
+  simulated clock passes `max_idle`, and only it. The simulated clock moves
+  only when the engine is idle, so in most runs it stands still through the
+  fault phase; each run therefore ends with the host's housekeeping: the
+  clock moves past `max_idle`, the readers that still read take a page,
+  and the log is compacted. The existing reader of `feed-pages` became the
+  steady one: it now reads with the too-old check and compares its entries
+  with the compacted ones followed by the log.
 
 ## 6. Slices
 
