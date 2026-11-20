@@ -108,6 +108,8 @@ cargo deny check
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` (rustup).
+With Nix, `nix develop` gives that toolchain plus `uv` and `cargo-deny`
+(Linux and Apple Silicon macOS); everything above applies unchanged inside it.
 
 ## Parity with Zero's tests
 
