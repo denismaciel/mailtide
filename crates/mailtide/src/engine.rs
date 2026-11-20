@@ -355,11 +355,11 @@ impl Engine {
             EventKind::RequestDeferred { command, until } => self.on_deferred(command, until),
             EventKind::ActionRequested { action } => self.on_action(action, now),
             EventKind::LabelsModified { command } => self.on_modified(command, now),
-            // A search and its label check are the driver's direct calls: no
-            // engine command waits for them.
-            EventKind::Searched { .. } | EventKind::LabelFetched { .. } => Vec::new(),
-            // Answers to the driver's label writes: the engine sends none.
-            EventKind::LabelSaved { .. }
+            // A search, its label check and the label writes are the
+            // driver's direct calls: no engine command waits for them.
+            EventKind::Searched { .. }
+            | EventKind::LabelFetched { .. }
+            | EventKind::LabelSaved { .. }
             | EventKind::LabelNameTaken { .. }
             | EventKind::LabelDeleted { .. } => Vec::new(),
         }

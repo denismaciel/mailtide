@@ -1267,27 +1267,7 @@ where
                 self.tokens.invalidate(account);
             }
             if !response.is_success() {
-                return match (errors::classify(&response), gmail_request) {
-                    (Failure::NotFound, GmailRequest::ListHistory { .. }) => {
-                        Outcome::Event(EventKind::HistoryExpired { command })
-                    }
-                    (
-                        Failure::NotFound,
-                        GmailRequest::GetMessage { id } | GmailRequest::ImportMessage { id },
-                    ) => Outcome::Event(EventKind::MessageNotFound {
-                        command,
-                        message_id: id.clone(),
-                    }),
-                    // `Label name exists or conflicts`: the caller's to
-                    // resolve, with the label that holds the name.
-                    (
-                        Failure::Blocking(_),
-                        GmailRequest::CreateLabel(_) | GmailRequest::PatchLabel { .. },
-                    ) if response.status == 409 => {
-                        Outcome::Event(EventKind::LabelNameTaken { command })
-                    }
-                    (failure, _) => Outcome::Failed(failure),
-                };
+                return refused(&response, gmail_request, command);
             }
             last = Some(response);
         }
@@ -1412,6 +1392,36 @@ impl<Q: QuotaGate> Drop for LeaseGuard<'_, Q> {
         if let Some(lease) = self.lease.take() {
             self.gate.abandon(lease);
         }
+    }
+}
+
+/// What Gmail's refusal of `request` means: an event for the answers that
+/// are facts (an expired cursor, a missing message, a taken label name),
+/// otherwise the classified failure.
+fn refused(
+    response: &mailtide_gmail::http::HttpResponse,
+    request: &GmailRequest,
+    command: CommandId,
+) -> Outcome {
+    match (errors::classify(response), request) {
+        (Failure::NotFound, GmailRequest::ListHistory { .. }) => {
+            Outcome::Event(EventKind::HistoryExpired { command })
+        }
+        (
+            Failure::NotFound,
+            GmailRequest::GetMessage { id } | GmailRequest::ImportMessage { id },
+        ) => Outcome::Event(EventKind::MessageNotFound {
+            command,
+            message_id: id.clone(),
+        }),
+        // `Label name exists or conflicts`: the caller's to resolve, with
+        // the label that holds the name.
+        (Failure::Blocking(_), GmailRequest::CreateLabel(_) | GmailRequest::PatchLabel { .. })
+            if response.status == 409 =>
+        {
+            Outcome::Event(EventKind::LabelNameTaken { command })
+        }
+        (failure, _) => Outcome::Failed(failure),
     }
 }
 

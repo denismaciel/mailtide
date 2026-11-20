@@ -417,11 +417,11 @@ mod tests {
 
     #[test]
     fn label_ids_the_mirror_does_not_hold_are_named() {
-        let known = [Label {
-            id: LabelId("INBOX".into()),
-            name: "INBOX".into(),
-            kind: LabelKind::System,
-        }];
+        let known = [Label::plain(
+            LabelId("INBOX".into()),
+            "INBOX",
+            LabelKind::System,
+        )];
         let asked = labels(&["Label_9", "INBOX", "Label_9", "Label_2"]);
         assert_eq!(
             missing_labels(&asked, &known),
