@@ -638,6 +638,8 @@ question = "With a token that has gmail.modify but not https://mail.google.com/,
 assumed = "HTTP 403 with reason insufficientPermissions (status PERMISSION_DENIED, ACCESS_TOKEN_SCOPE_INSUFFICIENT), and nothing is deleted."
 if_wrong = "Safe: any 4xx to a delete call is the caller's error, never an account block and never a tombstone. If the reason differs the error is the generic Refused with Gmail's message instead of ScopeRequired."
 test = "Mint a token with only https://www.googleapis.com/auth/gmail.modify. 1) Insert a message M in TRASH with a full-scope token. 2) With the modify token call messages.delete M: record status, error.status, error.errors[].reason and error.details. 3) Same for messages.batchDelete {ids: [M]}. 4) messages.get M with either token: expect it to exist. 5) Repeat with a gmail.readonly token."
+status = "confirmed"
+result = "2026-11-20: messages.delete on an inserted message in TRASH with a token holding only gmail.modify: HTTP 403, error.status PERMISSION_DENIED, errors[].reason insufficientPermissions, message \"Request had insufficient authentication scopes.\", details[0] = google.rpc.ErrorInfo {reason: ACCESS_TOKEN_SCOPE_INSUFFICIENT, domain: googleapis.com, metadata.method: caribou.api.proto.MailboxService.DeleteMessage, metadata.service: gmail.googleapis.com}; no WWW-Authenticate header. 3 of 3 identical; a gmail.readonly token got the same answer. messages.get afterwards: 200, still in TRASH. messages.batchDelete was not probed (this run was allowed the messages.delete probe only)."
 
 [[unknown]]
 id = "purge-delete-missing"

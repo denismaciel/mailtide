@@ -980,6 +980,8 @@ question = "Does Gmail send the Date header the client wrote, in particular for 
 assumed = "It sends the Date as written and adds one only when it is missing."
 if_wrong = "Harmless in both directions: if Gmail restamps Date at send time the advice to save a draft once more before sending it becomes unnecessary; compose keeps writing Date because RFC 5322 requires it."
 test = "Build raw with `Date:` 72 hours in the past. POST users.drafts.create, then users.drafts.send; GET the SENT copy format=raw and the recipient's copy: compare Date with the one written and with internalDate. Repeat with users.messages.send. Repeat both with no Date header at all and record the Date Gmail writes, if any. Run together with drafts-message-id-kept and send-message-id-kept: the same sends, with the Date set back."
+status = "refuted"
+result = "2026-11-20: Gmail rewrites Date on every path. A Date 72 h in the past (and one 10 min in the past written in +0100) was replaced by the time of the call, written in -0800, in the SENT message of messages.send (metadata URI x4, resumable x1) and of drafts.send (x4); internalDate equals that time. Sends whose Date was current had it rewritten into -0800 as well. drafts.create and drafts.update also rewrite the stored draft's Date to the time of the save, so a draft never keeps the composer's Date either. With no Date header Gmail adds one (appended after the last client header) with the send time (3 of 3). Only messages.insert keeps Date as written. The recipient's copy was read only for mail to the account itself (the same stored message). So Date as written is never sent; the advice to save a draft again before sending is unnecessary."
 
 [[unknown]]
 id = "compose-mime-rfc2231-filename"

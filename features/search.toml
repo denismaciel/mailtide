@@ -887,6 +887,8 @@ question = "How do messages.list and threads.list answer a labelIds value that d
 assumed = "With HTTP 400 naming the label, not with 200 and no results."
 if_wrong = "A filter on a deleted label would look like an empty result. mailtide would then check label_ids against the mirror's label definitions and refuse an id it does not hold (UnknownLabel) before calling Gmail."
 test = "GET users/me/messages?labelIds=Label_doesnotexist&q=in:anywhere; then labels.create a label, labels.delete it and list with its id. Repeat on users/me/threads. Record status and error body. Run together with label-edit-modify-deleted-label (one deleted label id, used in a listing and in a modify)."
+status = "refuted"
+result = "2026-11-20: a labelIds value that does not exist is not an error. messages.list and threads.list answered 200 with no messages/threads and resultSizeEstimate 0 for a never-created id (Label_doesnotexist, Label_999999999) and for the ids of 3 labels deleted seconds before, with and without q. Nothing distinguishes it from an empty result. if_wrong applies: check label_ids against the mirror's label definitions before calling Gmail."
 
 [[unknown]]
 id = "search-spam-trash-default"

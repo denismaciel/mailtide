@@ -720,6 +720,8 @@ question = "Does a message keep its threadId for life, or can Gmail move an exis
 assumed = "A message's threadId never changes after the message is created."
 if_wrong = "History has no record for such a move, so the mirror would show the message in its old thread until the next full observation of it (a verification fetch or a reconciliation), which rewrites the row's thread id and moves it in the views. The feed would carry no entry for the move, so a host's own list would keep the old grouping until it rebuilds: we would then add a ThreadChanged feed entry to the commit that rewrites a thread id."
 test = "With messages.insert create message A (new thread, note threadId TA) and message B with an unrelated Subject (threadId TB). Insert C with `References: <A's Message-ID> <B's Message-ID>`, the Subject of A and threadId TA. Then messages.get(format=minimal) A and B, and history.list from the historyId read before inserting C. Expect A in TA and B in TB, unchanged, and no history record naming B. Repeat by sending C through messages.send instead of insert."
+status = "confirmed"
+result = "2026-11-20, 3 rounds: A and B inserted in separate threads TA and TB; C inserted with threadId TA, A's Subject and `References: <A> <B>` (In-Reply-To B) landed in TA; a second C sent with messages.send and threadId TA also landed in TA. After each, messages.get(format=minimal) showed A still in TA and B still in TB, and history.list from the historyId read before held only messagesAdded for the new messages, no record naming A or B. Unchanged again when re-read more than 60 s later. (A third message sent with the same References and no threadId started a new thread; it moved neither A nor B.)"
 
 [[unknown]]
 id = "threads-internal-date-is-gmails-order"
