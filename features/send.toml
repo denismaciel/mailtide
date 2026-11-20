@@ -47,6 +47,11 @@ change = "modify"
 role = "100-unit cost for MessagesSend"
 
 [[file]]
+path = "crates/mailtide/src/purge.rs"
+change = "modify"
+role = "Exclude MessagesSend from the existing delete-request id extractor"
+
+[[file]]
 path = "crates/mailtide/src/commit.rs"
 change = "modify"
 role = "Fenced submission state operations including BeginSubmissionSend and jobs planning"
@@ -232,6 +237,11 @@ role = "Update the schema version expectation to the next free migration"
 path = "crates/mailtide-io/tests/send.rs"
 change = "new"
 role = "Driver coverage of raw submission admission, one-wire delivery, token imports, undo and schedule, plus draft routing"
+
+[[file]]
+path = "crates/mailtide-io/tests/direct_calls.rs"
+change = "modify"
+role = "Include messages.send in the public direct-call write guard test"
 
 [[file]]
 path = "crates/mailtide-io/tests/ref_zero_draft_providers.rs"
@@ -1185,9 +1195,14 @@ covers = "Seeded submits, cancels and schedules with quota deferrals, refusals, 
 # crates/mailtide-io/tests/send.rs
 
 [[test]]
-target = "crates/mailtide-io/tests/send.rs"
-name = "public_call_gmail_refuses_messages_send"
+target = "crates/mailtide-io/tests/direct_calls.rs"
+name = "the_public_call_refuses_every_write_before_any_token_or_quota"
 covers = "An attempt to bypass admission through the read-only direct API spends no credentials, quota or wire request"
+
+[[test]]
+target = "crates/mailtide-io/src/runner.rs"
+name = "raw_send_keeps_its_disposition_when_quota_cleanup_fails"
+covers = "The bounded detailed direct call retains the raw receipt, definitive refusal or unknown outcome even when releasing a lease or installing cooldown fails"
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"

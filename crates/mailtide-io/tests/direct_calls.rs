@@ -310,6 +310,10 @@ async fn the_public_call_refuses_every_write_before_any_token_or_quota() {
             },
         },
         GmailRequest::DeleteLabel { id: label },
+        GmailRequest::MessagesSend {
+            raw: Vec::new(),
+            thread_id: None,
+        },
         GmailRequest::DeleteMessage {
             id: MessageId("m1".into()),
         },

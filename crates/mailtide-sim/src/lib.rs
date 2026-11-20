@@ -2722,7 +2722,8 @@ impl Sim {
             | GmailRequest::CreateDraft { .. }
             | GmailRequest::UpdateDraft { .. }
             | GmailRequest::DeleteDraft { .. }
-            | GmailRequest::SendDraft { .. } => direct_only(command),
+            | GmailRequest::SendDraft { .. }
+            | GmailRequest::MessagesSend { .. } => direct_only(command),
             GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
                 self.deleted(command, request)
             }

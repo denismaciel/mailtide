@@ -171,6 +171,7 @@ fn request_kind(request: &GmailRequest) -> &'static str {
         GmailRequest::CreateLabel(_) => "create_label",
         GmailRequest::PatchLabel { .. } => "patch_label",
         GmailRequest::DeleteLabel { .. } => "delete_label",
+        GmailRequest::MessagesSend { .. } => "messages_send",
         GmailRequest::DeleteMessage { .. } => "delete_message",
         GmailRequest::BatchDeleteMessages { .. } => "batch_delete_messages",
         GmailRequest::ListDrafts { .. } => "list_drafts",
@@ -481,7 +482,7 @@ mod direct_call_tests {
         AccountId("alice@example.com".into())
     }
 
-    struct Answer(Result<HttpResponse, TransportError>);
+    struct Answer(std::sync::Mutex<Option<Result<HttpResponse, TransportError>>>);
 
     impl GmailTransport for Answer {
         async fn send(
@@ -489,7 +490,7 @@ mod direct_call_tests {
             _request: HttpRequest,
             _token: &AccessToken,
         ) -> Result<HttpResponse, TransportError> {
-            self.0.clone()
+            self.0.lock().expect("lock").take().expect("one call")
         }
     }
 
@@ -521,10 +522,10 @@ mod direct_call_tests {
         }
     }
 
-    async fn call_with_cleanup(
+    fn direct_runner(
         answer: Result<HttpResponse, TransportError>,
         fail_release: bool,
-    ) -> DirectCallResponse {
+    ) -> Runner<MemoryStore, ObjectBlobs, Answer, FailingCleanup, StaticTokens> {
         let tokens = StaticTokens(BTreeMap::from([(
             account(),
             AccessToken {
@@ -535,7 +536,7 @@ mod direct_call_tests {
         Runner::new(
             MemoryStore::tracking(&[account()]),
             ObjectBlobs::memory(),
-            Answer(answer),
+            Answer(std::sync::Mutex::new(Some(answer))),
             FailingCleanup {
                 inner: LocalGate::new(Budget::GMAIL_DEFAULT),
                 release: fail_release,
@@ -549,14 +550,21 @@ mod direct_call_tests {
                 writes: crate::runner::WriteSettings::default(),
             },
         )
-        .direct_call_with_cleanup(
-            &account(),
-            GmailRequest::GetProfile,
-            Priority::Foreground,
-            Instant::now(),
-        )
-        .await
-        .expect("an attempted call")
+    }
+
+    async fn call_with_cleanup(
+        answer: Result<HttpResponse, TransportError>,
+        fail_release: bool,
+    ) -> DirectCallResponse {
+        direct_runner(answer, fail_release)
+            .direct_call_with_cleanup(
+                &account(),
+                GmailRequest::GetProfile,
+                Priority::Foreground,
+                Instant::now(),
+            )
+            .await
+            .expect("an attempted call")
     }
 
     #[tokio::test]
@@ -613,6 +621,67 @@ mod direct_call_tests {
             answer.cleanup,
             Some(RunError::Quota("cooldown failed".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn raw_send_keeps_its_disposition_when_quota_cleanup_fails() {
+        for (status, body, release_error) in [
+            (200, r#"{"id":"m","threadId":"t"}"#, true),
+            (200, r#"{"id":"m"}"#, true),
+            (400, r#"{"error":{"message":"Message refused"}}"#, true),
+            (429, "", false),
+            (503, "", true),
+        ] {
+            let runner = direct_runner(
+                Ok(HttpResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: body.as_bytes().to_vec(),
+                }),
+                release_error,
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let response = runner
+                .direct_call_before(
+                    &account(),
+                    GmailRequest::MessagesSend {
+                        raw: b"To: a@example.com\r\n\r\nhello\r\n".to_vec(),
+                        thread_id: None,
+                    },
+                    Priority::Foreground,
+                    deadline,
+                    deadline,
+                )
+                .await
+                .expect("a direct call")
+                .expect("issued before the deadline");
+            assert!(!response.not_sent);
+            let error = if release_error {
+                "release failed"
+            } else {
+                "cooldown failed"
+            };
+            assert_eq!(response.cleanup, Some(RunError::Quota(error.into())));
+            match status {
+                200 if body.contains("threadId") => assert!(matches!(
+                    response.outcome,
+                    Ok(EventKind::MessageSent { message_id, thread_id, .. })
+                        if message_id.0 == "m" && thread_id.0 == "t"
+                )),
+                400 => assert!(matches!(
+                    response.outcome,
+                    Err(CallError::Refused(failure)) if failure.detail.contains("Message refused")
+                )),
+                429 => assert!(matches!(
+                    response.outcome,
+                    Err(CallError::Retryable(failure)) if failure.class == Retryable::AccountRateLimited
+                )),
+                _ => assert!(matches!(
+                    response.outcome,
+                    Err(CallError::OutcomeUnknown(_))
+                )),
+            }
+        }
     }
 }
 
@@ -1495,6 +1564,11 @@ where
         call: GmailCall,
         report: &mut SyncReport,
     ) -> Result<EventKind, RunError> {
+        if matches!(call.request, GmailRequest::MessagesSend { .. }) {
+            return Err(RunError::Invariant(
+                "messages.send requires a fenced direct call",
+            ));
+        }
         if changes_mailbox(&call.request) && self.config.access == Access::ReadOnly {
             // Never sent: the intents block (shown as blocked), the job ends.
             return Ok(EventKind::RequestFailed {
@@ -1785,6 +1859,15 @@ where
                     .map(|label| EventKind::LabelSaved { command, label })
             }
             GmailRequest::DeleteLabel { .. } => Ok(EventKind::LabelDeleted { command }),
+            GmailRequest::MessagesSend { .. } => {
+                mailtide_gmail::send::receipt(body).map(|(message_id, thread_id)| {
+                    EventKind::MessageSent {
+                        command,
+                        message_id,
+                        thread_id,
+                    }
+                })
+            }
             GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
                 Ok(EventKind::MessagesDeleted {
                     command,
@@ -1803,6 +1886,9 @@ where
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
+            Err(_) if matches!(gmail_request, GmailRequest::MessagesSend { .. }) => {
+                Outcome::Unanswered("messages.send answered without a usable receipt".into())
+            }
             Err(_) if matches!(gmail_request, GmailRequest::AuditMessages { .. }) => {
                 Outcome::Event(EventKind::AuditPageMalformed { command })
             }
@@ -1962,6 +2048,12 @@ fn refused(
     request: &GmailRequest,
     command: CommandId,
 ) -> Outcome {
+    if matches!(request, GmailRequest::MessagesSend { .. }) {
+        return match errors::classify_send(response) {
+            Some(failure) => Outcome::Failed(failure),
+            None => Outcome::Unanswered(format!("messages.send returned HTTP {}", response.status)),
+        };
+    }
     match (errors::classify(response), request) {
         (Failure::NotFound, GmailRequest::ListHistory { .. }) => {
             Outcome::Event(EventKind::HistoryExpired { command })
@@ -2052,6 +2144,7 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::CreateLabel(_)
         | GmailRequest::PatchLabel { .. }
         | GmailRequest::DeleteLabel { .. }
+        | GmailRequest::MessagesSend { .. }
         | GmailRequest::DeleteMessage { .. }
         | GmailRequest::BatchDeleteMessages { .. }
         | GmailRequest::CreateDraft { .. }

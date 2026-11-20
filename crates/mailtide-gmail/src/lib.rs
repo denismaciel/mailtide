@@ -19,3 +19,4 @@ pub mod purge;
 pub mod push;
 pub mod request;
 pub mod search;
+pub mod send;

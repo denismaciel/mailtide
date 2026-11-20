@@ -406,7 +406,8 @@ pub fn request_ids(request: &GmailRequest) -> Vec<MessageId> {
         | GmailRequest::CreateDraft { .. }
         | GmailRequest::UpdateDraft { .. }
         | GmailRequest::DeleteDraft { .. }
-        | GmailRequest::SendDraft { .. } => Vec::new(),
+        | GmailRequest::SendDraft { .. }
+        | GmailRequest::MessagesSend { .. } => Vec::new(),
     }
 }
 

@@ -151,6 +151,14 @@ pub enum GmailRequest {
         /// The label.
         id: LabelId,
     },
+    /// `messages.send` as a single JSON request. Only the driver's fenced
+    /// send path may issue it.
+    MessagesSend {
+        /// RFC 5322 bytes as supplied by the host.
+        raw: Vec<u8>,
+        /// Gmail thread to join, or a new thread when omitted.
+        thread_id: Option<crate::ids::ThreadId>,
+    },
     /// `messages.delete`: removes one message for good. Issued by the
     /// driver's purge ([`crate::purge`]), never by the engine.
     DeleteMessage {

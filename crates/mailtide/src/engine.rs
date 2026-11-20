@@ -477,7 +477,8 @@ impl Engine {
             | EventKind::DraftSaved { .. }
             | EventKind::DraftDeleted { .. }
             | EventKind::DraftSent { .. }
-            | EventKind::DraftNotFound { .. } => Vec::new(),
+            | EventKind::DraftNotFound { .. }
+            | EventKind::MessageSent { .. } => Vec::new(),
         }
     }
 

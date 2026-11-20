@@ -41,6 +41,19 @@ struct WireReason {
 /// Classify a failed Gmail response.
 #[must_use]
 pub fn classify(response: &HttpResponse) -> Failure {
+    classify_response(response, false)
+}
+
+/// Classify a failed `messages.send` response. `None` means the response
+/// does not prove refusal. A retry class still governs the shared quota
+/// gate, but any positive refusal here has already consumed the request.
+#[must_use]
+pub fn classify_send(response: &HttpResponse) -> Option<Failure> {
+    matches!(response.status, 400 | 401 | 403 | 404 | 413 | 429)
+        .then(|| classify_response(response, true))
+}
+
+fn classify_response(response: &HttpResponse, keep_not_found_detail: bool) -> Failure {
     let body: WireErrorBody = serde_json::from_slice(&response.body).unwrap_or_default();
     let reasons: Vec<&str> = body
         .error
@@ -96,7 +109,7 @@ pub fn classify(response: &HttpResponse) -> Failure {
     };
     let has = |reason: &str| reasons.contains(&reason);
     match response.status {
-        404 => Failure::NotFound,
+        404 if !keep_not_found_detail => Failure::NotFound,
         // 401: the token expired between minting and use; retrying mints a new one.
         401 | 408 | 500..=599 => retryable(Retryable::Transient),
         429 if message.contains("concurrent") => retryable(Retryable::AccountConcurrency),
@@ -148,6 +161,21 @@ pub fn classify_token_error(error: &str, description: Option<&str>) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_definitive_send_refusals_count_as_refused() {
+        for status in [400, 401, 403, 404, 413, 429] {
+            let refusal = response(status, "test", "message refused");
+            assert!(classify_send(&refusal).is_some(), "{status}");
+        }
+        for status in [204, 308, 408, 500, 503] {
+            assert_eq!(classify_send(&response(status, "", "")), None, "{status}");
+        }
+        assert!(matches!(
+            classify_send(&response(404, "notFound", "thread is gone")),
+            Some(Failure::Blocking(failure)) if failure.detail == "404 notFound thread is gone"
+        ));
+    }
 
     fn response(status: u16, reason: &str, message: &str) -> HttpResponse {
         HttpResponse {

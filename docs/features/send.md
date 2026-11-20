@@ -294,7 +294,9 @@ after its answer is lost.
 
 1. **Single JSON call.** Build the typed wire request and receipt, quota
    cost and detailed direct-call disposition. Exercise the request,
-   decoder and public write guard without enabling delivery.
+   decoder and public write guard without enabling delivery. On the
+   detailed response, an explicit refusal with `not_sent = false`
+   consumes the request even if the error class calls for cooldown.
 2. **Raw admission and store.** Add key and token reservations, migration
    and its schema assertion, reads, due time, atomic claim/cancel and feed.
    Integrate the draft token reservation with `BeginSend` after drafts

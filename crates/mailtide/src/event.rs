@@ -221,6 +221,16 @@ pub enum EventKind {
         /// The command it answers.
         command: CommandId,
     },
+    /// `messages.send` acknowledged the request. Ordinary sync imports the
+    /// sent message separately.
+    MessageSent {
+        /// The direct call it answers.
+        command: CommandId,
+        /// Gmail's new message id.
+        message_id: MessageId,
+        /// The thread Gmail used.
+        thread_id: ThreadId,
+    },
     /// `messages.delete` or `messages.batchDelete` answered 2xx. Gmail's
     /// answer names no id and proves nothing: only a history record is
     /// evidence of the deletion ([`crate::purge`]). Answers the driver's

@@ -47,7 +47,7 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
         | GmailRequest::DeleteLabel { .. } => 5,
         GmailRequest::GetMessage { .. } => 20,
         GmailRequest::ImportMessage { .. } => 60,
-        GmailRequest::Watch | GmailRequest::SendDraft { .. } => 100,
+        GmailRequest::Watch | GmailRequest::SendDraft { .. } | GmailRequest::MessagesSend { .. } => 100,
         GmailRequest::Modify(group) => match u32::try_from(group.messages.len()) {
             Ok(n) if n < BATCH_MODIFY_THRESHOLD => 5 * n,
             _ => 50,
@@ -74,6 +74,18 @@ pub const BATCH_MODIFY_THRESHOLD: u32 = 10;
 /// A purge of at least this many ids uses `messages.batchDelete` (50
 /// units); fewer use one `messages.delete` each (10 units, at most 40).
 pub const PURGE_BATCH_THRESHOLD: u32 = 5;
+
+#[cfg(test)]
+#[test]
+fn send_costs_follow_gmails_quota_table() {
+    assert_eq!(
+        cost(&GmailRequest::MessagesSend {
+            raw: Vec::new(),
+            thread_id: None,
+        }),
+        QuotaUnits(100),
+    );
+}
 
 /// Budgets the ledger enforces.
 #[derive(Debug, Clone, PartialEq, Eq)]
