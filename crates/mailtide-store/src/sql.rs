@@ -9,6 +9,8 @@
 //! checks both.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mailtide::commit::{Commit, CommitOutcome, MessageOp, Rejection};
 use mailtide::gmail::{Label, LabelKind};
@@ -156,6 +158,8 @@ pub enum SchemaState {
 pub struct SqlStore {
     pool: AnyPool,
     dialect: Dialect,
+    /// Set once the schema was seen current; shared by clones.
+    schema_current: Arc<AtomicBool>,
 }
 
 fn unavailable(error: &sqlx::Error) -> StoreError {
@@ -275,7 +279,11 @@ impl SqlStore {
             Connect::Eager => options.connect(url.as_str()).await,
         }
         .map_err(|e| unavailable(&e))?;
-        Ok(Self { pool, dialect })
+        Ok(Self {
+            pool,
+            dialect,
+            schema_current: Arc::default(),
+        })
     }
 
     /// Where this database's schema stands (read-only; works on an empty
@@ -315,6 +323,29 @@ impl SqlStore {
                 expected: SCHEMA_VERSION,
             },
         })
+    }
+
+    /// Refuse to read or write a database whose schema this build doesn't
+    /// match: one that is behind would fail mid-operation with a SQL error,
+    /// and one a newer mailtide migrated may hold rows this build would
+    /// misread or drop. Every [`crate::Store`] method checks it first (in
+    /// the inherent method, for those the wrappers call directly). The
+    /// answer is cached once current, shared by clones: one query per
+    /// store, not one per call.
+    async fn ensure_schema(&self) -> Result<(), StoreError> {
+        if self.schema_current.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match self.schema().await? {
+            SchemaState::Current { .. } => {
+                self.schema_current.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            SchemaState::Behind { applied, expected }
+            | SchemaState::Ahead { applied, expected } => {
+                Err(StoreError::SchemaOutOfDate { applied, expected })
+            }
+        }
     }
 
     /// Whether the database answers within the pool's acquire timeout.
@@ -835,6 +866,7 @@ impl SqlStore {
         account: &AccountId,
         generation: u64,
     ) -> Result<TrackOutcome, StoreError> {
+        self.ensure_schema().await?;
         let initial = AccountRecord::new(account, generation);
         let inserted = sqlx::query(
             "INSERT INTO mailtide_accounts
@@ -864,6 +896,7 @@ impl SqlStore {
         account: &AccountId,
         version: EngineVersion,
     ) -> Result<StoreSnapshot, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         // The row exists (track created it) and is locked, so two claims
         // racing get different epochs.
@@ -909,6 +942,7 @@ impl SqlStore {
     }
 
     pub(crate) async fn apply(&self, commit: &Commit) -> Result<CommitOutcome, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let Some((record, seq)) = self.load_account(&mut tx, &commit.account).await? else {
             return Ok(CommitOutcome::Rejected(Rejection::StaleEpoch));
@@ -941,6 +975,7 @@ impl SqlStore {
         attempt: AttemptId,
         floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let current = self
             .load_account(&mut tx, account)
@@ -1017,6 +1052,7 @@ impl SqlStore {
         since: StateSeq,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
+        self.ensure_schema().await?;
         let row = sqlx::query(
             "SELECT log_floor, generation, seq FROM mailtide_accounts WHERE account = $1",
         )
@@ -1453,6 +1489,7 @@ impl crate::Store for SqlStore {
     }
 
     async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let Some((mut record, seq)) = self.load_account(&mut tx, account).await? else {
             return Ok(0);
@@ -1479,6 +1516,7 @@ impl crate::Store for SqlStore {
         after: Option<&MessageId>,
         limit: u32,
     ) -> Result<Vec<MessageId>, StoreError> {
+        self.ensure_schema().await?;
         let rows = sqlx::query(
             "SELECT id FROM mailtide_messages WHERE account = $1 AND id > $2 ORDER BY id LIMIT $3",
         )
@@ -1494,6 +1532,7 @@ impl crate::Store for SqlStore {
     }
 
     async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let Some((record, seq)) = self.load_account_unlocked(&mut tx, account).await? else {
             return Ok(None);
@@ -1560,6 +1599,7 @@ impl crate::Store for SqlStore {
     }
 
     async fn accounts(&self) -> Result<Vec<AccountId>, StoreError> {
+        self.ensure_schema().await?;
         let rows = sqlx::query("SELECT account FROM mailtide_accounts ORDER BY account")
             .fetch_all(&self.pool)
             .await
@@ -1577,6 +1617,7 @@ impl crate::Store for SqlStore {
         account: &AccountId,
         now: Timestamp,
     ) -> Result<ResumeOutcome, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
             return Ok(ResumeOutcome::Unknown);
@@ -1605,6 +1646,7 @@ impl crate::Store for SqlStore {
     }
 
     async fn forget(&self, account: &AccountId) -> Result<ForgetOutcome, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         if self.load_account(&mut tx, account).await?.is_none() {
             return Ok(ForgetOutcome::Unknown);
@@ -1647,6 +1689,7 @@ impl crate::Store for SqlStore {
         request: &ActionRequest,
         now: Timestamp,
     ) -> Result<u32, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
             // Nothing synced yet: no message can be a target.
@@ -1697,6 +1740,7 @@ impl crate::Store for SqlStore {
         ids: &[MessageId],
         now: Timestamp,
     ) -> Result<Prioritised, StoreError> {
+        self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         // The account row lock serializes this with commits and claims.
         let Some((record, seq)) = self.load_account(&mut tx, account).await? else {
@@ -1738,6 +1782,7 @@ impl crate::Store for SqlStore {
         account: &AccountId,
         ids: &[MessageId],
     ) -> Result<Vec<MessageView>, StoreError> {
+        self.ensure_schema().await?;
         // A view needs only the rows and their intents: two set-based
         // queries per chunk, not a handful per message.
         let mut records: BTreeMap<MessageId, MessageRecord> = BTreeMap::new();
@@ -1797,6 +1842,7 @@ impl crate::Store for SqlStore {
     }
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
+        self.ensure_schema().await?;
         load_labels(&self.pool, account).await
     }
 }

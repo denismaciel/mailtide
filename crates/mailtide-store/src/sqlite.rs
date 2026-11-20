@@ -198,6 +198,139 @@ mod tests {
         );
     }
 
+    /// Every [`Store`] method of `store`, each expected to refuse with
+    /// `SchemaOutOfDate { applied, .. }` before reading or writing.
+    async fn assert_every_call_refused(store: &SqliteStore, commit: &Commit, applied: u32) {
+        use crate::sql::SCHEMA_VERSION;
+        use mailtide::outbox::Action;
+        let account = &commit.account;
+        let ids = [MessageId("m".into())];
+        let action = ActionRequest::Messages {
+            ids: ids.to_vec(),
+            action: Action::Archive,
+        };
+        let refused = |what: &str, error: Option<StoreError>| {
+            assert_eq!(
+                error,
+                Some(StoreError::SchemaOutOfDate {
+                    applied,
+                    expected: SCHEMA_VERSION
+                }),
+                "{what}"
+            );
+        };
+        let now = Timestamp(0);
+        let floor = mailtide::quota::Priority::Backfill;
+        refused("track", store.track(account, 1).await.err());
+        refused(
+            "claim",
+            store
+                .claim(account, mailtide::ids::ENGINE_VERSION)
+                .await
+                .err(),
+        );
+        refused("apply", store.apply(commit).await.err());
+        let jobs = store
+            .claim_jobs(account, commit.epoch, 1, now, AttemptId(1), floor)
+            .await;
+        refused("claim_jobs", jobs.err());
+        refused(
+            "changes",
+            store.changes(account, StateSeq(0), 10).await.err(),
+        );
+        refused("compact", store.compact(account, StateSeq(1)).await.err());
+        refused(
+            "message_ids",
+            store.message_ids(account, None, 10).await.err(),
+        );
+        refused("admit", store.admit(account, &action, now).await.err());
+        refused(
+            "prioritise",
+            store.prioritise(account, &ids, now).await.err(),
+        );
+        refused("status", store.status(account).await.err());
+        refused("accounts", store.accounts().await.err());
+        refused("resume", store.resume(account, now).await.err());
+        refused("forget", store.forget(account).await.err());
+        refused("messages", store.messages(account, &ids).await.err());
+        refused("labels", store.labels(account).await.err());
+    }
+
+    /// Reads refuse a schema this build doesn't match as writes do: one
+    /// that is behind would fail mid-call, one that is ahead may hold rows
+    /// this build would misread. Nothing is created on the way.
+    #[tokio::test]
+    async fn every_read_and_write_refuses_a_schema_out_of_date() {
+        use crate::sql::SCHEMA_VERSION;
+        use mailtide::state::SyncState;
+        let current = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        current.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        current.track(&account, 1).await.expect("track");
+        let snapshot = current
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        let commit = lifecycle_commit(&snapshot, 0, SyncState::Live, None, 0);
+
+        let behind = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        assert_every_call_refused(&behind, &commit, 0).await;
+        assert_eq!(
+            behind
+                .inner
+                .text_for_tests(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM sqlite_master WHERE type = 'table'"
+                )
+                .await
+                .expect("tables"),
+            "0",
+            "no table was created"
+        );
+
+        let ahead = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        ahead.migrate().await.expect("migrate");
+        ahead
+            .inner
+            .execute_for_tests(&format!(
+                "INSERT INTO mailtide_schema (version) VALUES ({})",
+                SCHEMA_VERSION + 1
+            ))
+            .await
+            .expect("a newer build's migration");
+        assert_every_call_refused(&ahead, &commit, SCHEMA_VERSION + 1).await;
+    }
+
+    /// The check costs one query per store, not one per call: once the
+    /// schema was seen current, a clone of the store does not ask again.
+    #[tokio::test]
+    async fn a_current_schema_is_checked_once() {
+        use crate::sql::SCHEMA_VERSION;
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        assert_eq!(store.accounts().await, Ok(Vec::new()));
+        store
+            .inner
+            .execute_for_tests(&format!(
+                "INSERT INTO mailtide_schema (version) VALUES ({})",
+                SCHEMA_VERSION + 1
+            ))
+            .await
+            .expect("a newer build's migration");
+        assert_eq!(store.clone().accounts().await, Ok(Vec::new()), "cached");
+        let fresh = SqliteStore {
+            inner: crate::sql::SqlStore::clone(&store.inner),
+        };
+        assert_eq!(fresh.accounts().await, Ok(Vec::new()), "shared by clones");
+    }
+
     /// A commit moving `snapshot`'s account to `sync`, recording a label
     /// listing at `listed`.
     fn lifecycle_commit(

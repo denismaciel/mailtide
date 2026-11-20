@@ -239,6 +239,7 @@ impl RunError {
             Self::Store(StoreError::Misconfigured(_)) => "misconfigured",
             Self::Store(StoreError::Rejected(_)) => "superseded",
             Self::Store(StoreError::NotTracked) => "not_tracked",
+            Self::Store(StoreError::SchemaOutOfDate { .. }) => "schema_out_of_date",
             Self::Quota(_) => "quota_gate",
             Self::Blobs(_) => "blobs",
             Self::Invariant(_) => "invariant",

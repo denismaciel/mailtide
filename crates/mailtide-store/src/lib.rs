@@ -44,6 +44,16 @@ pub enum StoreError {
     Misconfigured(String),
     /// The account isn't tracked: mirroring starts only with `track`.
     NotTracked,
+    /// The database's schema doesn't match this build: `applied` below
+    /// `expected` needs migrations; above it, a newer mailtide migrated the
+    /// database and this build must neither read nor write it. Nothing was
+    /// read or written.
+    SchemaOutOfDate {
+        /// The newest migration applied (0: none).
+        applied: u32,
+        /// The newest this build knows.
+        expected: u32,
+    },
 }
 
 /// The store contract.

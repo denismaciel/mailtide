@@ -1,6 +1,7 @@
 """Migrations a host's tool can run, the schema check, and the test kit."""
 
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import mailtide
@@ -38,6 +39,71 @@ def test_an_unmigrated_database_refuses_to_sync() -> None:
     runner.migrate()
     runner.track("alice@example.com")
     assert runner.schema().state == "current"
+
+
+def every_database_call(
+    runner: mailtide.BlockingRunner, state: str
+) -> dict[str, Callable[[], object]]:
+    """Every runner method that reads or writes the database."""
+    return {
+        "track": lambda: runner.track(ACCOUNT),
+        "run": lambda: runner.run(ACCOUNT),
+        "act": lambda: runner.act(ACCOUNT, "archive", message_ids=["m1"]),
+        "admit": lambda: runner.admit(ACCOUNT, "archive", message_ids=["m1"]),
+        "prioritise": lambda: runner.prioritise(ACCOUNT, ["m1"]),
+        "drift": lambda: runner.drift(ACCOUNT, ["m1"]),
+        "notify": lambda: runner.notify(ACCOUNT, 7),
+        "status": lambda: runner.status(ACCOUNT),
+        "accounts": runner.accounts,
+        "resume": lambda: runner.resume(ACCOUNT),
+        "forget": lambda: runner.forget(ACCOUNT),
+        "labels": lambda: runner.labels(ACCOUNT),
+        "messages": lambda: runner.messages(ACCOUNT, ["m1"]),
+        "changes": lambda: runner.changes(ACCOUNT),
+        "compact": lambda: runner.compact(ACCOUNT, state),
+        "message_ids": lambda: runner.message_ids(ACCOUNT),
+    }
+
+
+def a_state_string() -> str:
+    runner = mailtide.BlockingRunner(make_config(), tokens)
+    runner.migrate()
+    runner.track(ACCOUNT)
+    page = runner.changes(ACCOUNT)
+    assert isinstance(page, mailtide.ChangePage)
+    return page.next
+
+
+def test_reads_refuse_an_unmigrated_database_as_writes_do() -> None:
+    runner = mailtide.BlockingRunner(make_config(), tokens)
+    for name, call in every_database_call(runner, a_state_string()).items():
+        with pytest.raises(mailtide.SchemaOutOfDate, match="migrate"):
+            call()
+            pytest.fail(name)
+    assert runner.schema().state == "behind"
+
+
+def test_reads_refuse_a_database_a_newer_build_migrated(tmp_path: Path) -> None:
+    """A build that is too old refuses instead of misreading rows it does not
+    know; only the schema status, health and blob reads still answer."""
+    path = tmp_path / "mail.db"
+    config = Config(Database(f"sqlite:{path}?mode=rwc"), Blobs("memory:///"))
+    newer = mailtide.BlockingRunner(config, tokens)
+    newer.migrate()
+    newer.track(ACCOUNT)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO mailtide_schema (version) VALUES (?)", (mailtide.SCHEMA_VERSION + 1,)
+        )
+    older = mailtide.BlockingRunner(config, tokens)
+    for name, call in every_database_call(older, a_state_string()).items():
+        with pytest.raises(mailtide.SchemaOutOfDate, match="upgrade"):
+            call()
+            pytest.fail(name)
+    assert older.schema().state == "ahead"
+    assert older.health().database == "ok"
+    with pytest.raises(mailtide.BlobNotFound):
+        older.read_blob(ACCOUNT, "m1")
 
 
 def test_a_manual_clock_reaches_confirmation_without_sleeping() -> None:

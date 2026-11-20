@@ -86,8 +86,10 @@ class Runner:
         return await self._core.track(account)
 
     async def schema(self) -> SchemaStatus:
-        """Where the database's schema stands against this build. Syncing
-        refuses with ``SchemaOutOfDate`` unless it is ``current``."""
+        """Where the database's schema stands against this build. Every call
+        that reads or writes the database (all but ``schema``, ``migrate``,
+        ``health`` and ``read_blob``) refuses with ``SchemaOutOfDate`` unless
+        it is ``current``."""
         return await self._core.schema()
 
     async def run(

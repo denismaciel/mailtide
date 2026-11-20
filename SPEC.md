@@ -518,6 +518,11 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `messages(account, ids)`: `MessageView`s for hosts.
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
   last synced, in id order; empty before the first label sync.
+- The SQL store refuses every one of these with
+  `StoreError::SchemaOutOfDate { applied, expected }`, before reading or
+  writing, while the database's schema is behind this build (migrations
+  missing) or ahead of it (a newer mailtide migrated it). It asks once: after
+  it has seen the schema current, it and its clones do not ask again.
 
 The conformance suite (`mailtide_store::conformance`, 35 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
@@ -590,8 +595,14 @@ safe because every commit is atomic and fenced. The token source may be sync
 Schema: `await migrate()` applies mailtide's versioned migrations under an
 advisory lock; hosts that run migrations with their own tool execute
 `mailtide.migrations()` (ordered SQL with its bookkeeping) instead.
-`schema()` reports `current`, `behind` or `ahead`, and `run`/`act`/`admit`/
-`prioritise` refuse with `SchemaOutOfDate` unless it is current.
+`schema()` reports `current`, `behind` or `ahead`. Every call that reads or
+writes the database refuses with `SchemaOutOfDate` unless it is current:
+`run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, and the
+reads too (`changes`, `messages`, `labels`, `message_ids`, `compact`,
+`status`, `accounts`, `resume`, `forget`), so a build that is too old
+refuses instead of misreading. Only `schema`, `migrate`, `health` and
+`read_blob` (blob storage only) answer whatever the schema. The SQL store
+makes the check (§10.3), so Rust hosts get it too.
 
 Migrations are additive. Migration 4 adds the nullable
 `mailtide_accounts.labels_refreshed_at` (§6.6); a build from before it sees

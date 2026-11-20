@@ -163,6 +163,14 @@ mod _core {
             StoreError::NotTracked => AccountNotTracked::new_err(
                 "the account isn't tracked: call track(account) to start mirroring it",
             ),
+            StoreError::SchemaOutOfDate { applied, expected } if applied < expected => {
+                SchemaOutOfDate::new_err(format!(
+                    "mailtide schema is at version {applied}, this build needs {expected}: run migrate() (or mailtide.migrations()) first"
+                ))
+            }
+            StoreError::SchemaOutOfDate { applied, expected } => SchemaOutOfDate::new_err(format!(
+                "mailtide schema is at version {applied}, newer than this build ({expected}): upgrade mailtide"
+            )),
         }
     }
 
@@ -897,8 +905,6 @@ mod _core {
         inner: Inner,
         /// This runner's log bridge; every future it runs carries it.
         dispatch: tracing::Dispatch,
-        /// Set once the schema was seen current (checked before syncing).
-        schema_current: std::sync::atomic::AtomicBool,
     }
 
     /// Parse and validate the configuration, then build the runner. Nothing
@@ -950,11 +956,7 @@ mod _core {
                 })
             })),
         };
-        Ok(Arc::new(Shared {
-            inner,
-            dispatch,
-            schema_current: std::sync::atomic::AtomicBool::new(false),
-        }))
+        Ok(Arc::new(Shared { inner, dispatch }))
     }
 
     // ------------------------------------------------------------ results
@@ -1283,30 +1285,6 @@ mod _core {
 
     // The operations, as futures both runners drive.
     impl Shared {
-        /// Refuse to sync against a schema this build doesn't match: a
-        /// forgotten migration surfaces as one clear error, not a SQL error
-        /// mid-run.
-        async fn ensure_schema(&self) -> PyResult<()> {
-            use std::sync::atomic::Ordering;
-            if self.schema_current.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            match self.inner.store().schema().await.map_err(store_error)? {
-                SchemaState::Current { .. } => {
-                    self.schema_current.store(true, Ordering::Relaxed);
-                    Ok(())
-                }
-                SchemaState::Behind { applied, expected } => {
-                    Err(SchemaOutOfDate::new_err(format!(
-                        "mailtide schema is at version {applied}, this build needs {expected}: run migrate() (or mailtide.migrations()) first"
-                    )))
-                }
-                SchemaState::Ahead { applied, expected } => Err(SchemaOutOfDate::new_err(format!(
-                    "mailtide schema is at version {applied}, newer than this build ({expected}): upgrade mailtide"
-                ))),
-            }
-        }
-
         async fn schema(self: Arc<Self>) -> PyResult<SchemaStatus> {
             Ok(
                 match self.inner.store().schema().await.map_err(store_error)? {
@@ -1339,7 +1317,6 @@ mod _core {
             budget: Duration,
             on_progress: Option<Py<PyAny>>,
         ) -> PyResult<RunOutcome> {
-            self.ensure_schema().await?;
             let report = |p: &runner::Progress| {
                 if let Some(callback) = &on_progress {
                     Python::attach(|py| {
@@ -1371,7 +1348,6 @@ mod _core {
             request: ActionRequest,
             budget: Duration,
         ) -> PyResult<RunOutcome> {
-            self.ensure_schema().await?;
             self.inner
                 .act(&account, request, budget)
                 .await
@@ -1384,7 +1360,6 @@ mod _core {
             account: AccountId,
             request: ActionRequest,
         ) -> PyResult<u32> {
-            self.ensure_schema().await?;
             self.inner
                 .admit(&account, &request)
                 .await
@@ -1396,7 +1371,6 @@ mod _core {
             account: AccountId,
             ids: Vec<MessageId>,
         ) -> PyResult<PrioritiseResult> {
-            self.ensure_schema().await?;
             self.inner
                 .prioritise(&account, &ids)
                 .await
@@ -1427,7 +1401,6 @@ mod _core {
             ids: Vec<MessageId>,
             budget: Duration,
         ) -> PyResult<Vec<DriftResult>> {
-            self.ensure_schema().await?;
             let checked = self
                 .inner
                 .drift(&account, &ids, budget)
@@ -1445,7 +1418,6 @@ mod _core {
             history_id: u64,
             budget: Duration,
         ) -> PyResult<NotifyResult> {
-            self.ensure_schema().await?;
             let notified = self
                 .inner
                 .notify(&account, mailtide::ids::HistoryId(history_id), budget)
@@ -1572,7 +1544,6 @@ mod _core {
 
         async fn track(self: Arc<Self>, account: AccountId) -> PyResult<TrackResult> {
             use mailtide::status::TrackOutcome;
-            self.ensure_schema().await?;
             Ok(match self.inner.track(&account).await.map_err(run_error)? {
                 TrackOutcome::Tracked { generation } => TrackResult {
                     outcome: "tracked",
