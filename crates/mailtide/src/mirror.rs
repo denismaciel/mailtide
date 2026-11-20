@@ -722,6 +722,28 @@ impl AccountMirror {
         Some(self.messages.get(id)?.view(&self.intents_of(id)))
     }
 
+    /// The rows of thread `id`, drafts included, in id order. The empty id
+    /// is never a thread: rows a record without a thread id created are not
+    /// grouped together (SPEC §4).
+    pub fn thread_members<'a>(
+        &'a self,
+        id: &'a ThreadId,
+    ) -> impl Iterator<Item = &'a MessageRecord> + 'a {
+        self.messages
+            .values()
+            .filter(move |record| !id.0.is_empty() && &record.thread_id == id)
+    }
+
+    /// How hosts see a thread; `None` if the mirror has no message in it.
+    #[must_use]
+    pub fn thread(&self, id: &ThreadId) -> Option<crate::thread::ThreadView> {
+        let members = self
+            .thread_members(id)
+            .map(|record| record.view(&self.intents_of(&record.id)))
+            .collect();
+        crate::thread::view(id, members)
+    }
+
     /// The label definitions as last synced, in id order.
     #[must_use]
     pub fn label_definitions(&self) -> Vec<Label> {
@@ -1016,11 +1038,8 @@ impl AccountMirror {
                 let (targets, action): (Vec<MessageId>, _) = match request {
                     ActionRequest::Messages { ids, action } => (ids.clone(), action),
                     ActionRequest::Thread { id, action } => (
-                        self.messages
-                            .values()
-                            .filter(|record| {
-                                &record.thread_id == id && !labels::is_draft(&record.labels)
-                            })
+                        self.thread_members(id)
+                            .filter(|record| !labels::is_draft(&record.labels))
                             .map(|record| record.id.clone())
                             .collect(),
                         action,
@@ -2309,5 +2328,166 @@ mod tests {
         let rest = mirror.changes(most.next, u32::MAX);
         assert_eq!(rest.changes.len(), 1);
         assert!(!rest.has_more);
+    }
+
+    fn in_thread(thread: &str, id: &str, labels: &[&str], checkpoint: u64) -> MessageObservation {
+        MessageObservation {
+            thread_id: ThreadId(thread.into()),
+            ..observation(id, labels, checkpoint)
+        }
+    }
+
+    fn import_in(thread: &str, id: &str, labels: &[&str], checkpoint: u64, date: i64) -> MessageOp {
+        MessageOp::MarkImported {
+            observation: in_thread(thread, id, labels, checkpoint),
+            blob: BlobRef(format!("{id}.eml")),
+            size: 10,
+            internal_date: Timestamp(date),
+            headers: Box::new(HeaderFacts {
+                from: Some(format!("{id}@example.com")),
+                ..HeaderFacts::default()
+            }),
+        }
+    }
+
+    fn applied(mirror: &mut AccountMirror, ops: Vec<MessageOp>) {
+        let mut c = commit(mirror);
+        c.messages = ops;
+        assert!(matches!(mirror.apply(&c), CommitOutcome::Applied { .. }));
+    }
+
+    fn members(view: &crate::thread::ThreadView) -> Vec<&str> {
+        view.messages.iter().map(|m| m.id.0.as_str()).collect()
+    }
+
+    #[test]
+    fn a_thread_action_reaches_exactly_the_views_non_draft_messages() {
+        let mut mirror = claimed();
+        applied(
+            &mut mirror,
+            vec![
+                import_in("t1", "a", &["INBOX", "UNREAD"], 10, 1),
+                MessageOp::Observe(in_thread("t1", "b", &["INBOX", "UNREAD"], 11)),
+                import_in("t1", "d", &["DRAFT", "UNREAD"], 12, 3),
+                import_in("t2", "c", &["INBOX", "UNREAD"], 13, 4),
+            ],
+        );
+        let t1 = ThreadId("t1".into());
+        let before = mirror.thread(&t1).expect("t1");
+        let admitted = mirror.admit_action(
+            &ActionRequest::Thread {
+                id: t1.clone(),
+                action: outbox::Action::SetRead(outbox::ReadState::Read),
+            },
+            Timestamp(0),
+        );
+        assert_eq!(admitted, before.message_count);
+        let targets: BTreeSet<&str> = mirror
+            .intents
+            .keys()
+            .map(|(message, _)| message.0.as_str())
+            .collect();
+        let non_draft: BTreeSet<&str> = before
+            .messages
+            .iter()
+            .filter(|m| !labels::is_draft(&m.labels))
+            .map(|m| m.id.0.as_str())
+            .collect();
+        assert_eq!(targets, non_draft);
+        assert_eq!(targets, BTreeSet::from(["a", "b"]));
+        let after = mirror.thread(&t1).expect("t1");
+        assert!(!after.unread);
+        assert!(mirror.thread(&ThreadId("t2".into())).expect("t2").unread);
+    }
+
+    #[test]
+    fn a_reply_found_by_history_joins_its_thread_before_it_is_imported() {
+        let mut mirror = claimed();
+        applied(&mut mirror, vec![import_in("t", "a", &["INBOX"], 10, 100)]);
+        let t = ThreadId("t".into());
+        let first = mirror.thread(&t).expect("t");
+        assert!(!first.unread);
+        assert_eq!(first.latest, Some(MessageId("a".into())));
+        // History discovers the reply: its labels count at once.
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(in_thread(
+                "t",
+                "b",
+                &["INBOX", "UNREAD"],
+                20,
+            ))],
+        );
+        let discovered = mirror.thread(&t).expect("t");
+        assert_eq!(members(&discovered), ["a", "b"]);
+        assert!(discovered.unread);
+        assert_eq!(discovered.latest, Some(MessageId("a".into())));
+        assert_eq!(discovered.awaiting_import, 1);
+        // Its import makes it latest.
+        applied(
+            &mut mirror,
+            vec![import_in("t", "b", &["INBOX", "UNREAD"], 21, 200)],
+        );
+        let imported = mirror.thread(&t).expect("t");
+        assert_eq!(imported.latest, Some(MessageId("b".into())));
+        assert_eq!(imported.awaiting_import, 0);
+        assert_eq!(imported.participants, ["a@example.com", "b@example.com"]);
+    }
+
+    #[test]
+    fn a_full_observation_in_another_thread_moves_the_message() {
+        let mut mirror = claimed();
+        applied(
+            &mut mirror,
+            vec![
+                import_in("t1", "a", &["INBOX"], 10, 1),
+                import_in("t1", "b", &["INBOX", "UNREAD"], 11, 2),
+            ],
+        );
+        // A verification fetch sees b in another thread.
+        applied(
+            &mut mirror,
+            vec![MessageOp::Observe(in_thread(
+                "t2",
+                "b",
+                &["INBOX", "UNREAD"],
+                30,
+            ))],
+        );
+        let t1 = mirror.thread(&ThreadId("t1".into())).expect("t1");
+        assert_eq!(members(&t1), ["a"]);
+        assert!(!t1.unread);
+        let t2 = mirror.thread(&ThreadId("t2".into())).expect("t2");
+        assert_eq!(members(&t2), ["b"]);
+        assert!(t2.unread);
+    }
+
+    #[test]
+    fn an_empty_thread_id_is_never_a_thread() {
+        let mut mirror = claimed();
+        applied(
+            &mut mirror,
+            vec![
+                MessageOp::Observe(in_thread("", "a", &["INBOX"], 10)),
+                MessageOp::Observe(in_thread("", "b", &["INBOX"], 11)),
+            ],
+        );
+        let empty = ThreadId(String::new());
+        assert_eq!(mirror.thread_members(&empty).count(), 0);
+        assert_eq!(mirror.thread(&empty), None);
+        let admitted = mirror.admit_action(
+            &ActionRequest::Thread {
+                id: empty.clone(),
+                action: outbox::Action::Archive,
+            },
+            Timestamp(0),
+        );
+        assert_eq!(admitted, 0);
+        assert!(mirror.intents.is_empty());
+        // The import carries the real thread id and the message joins it.
+        applied(&mut mirror, vec![import_in("t", "a", &["INBOX"], 12, 1)]);
+        let t = mirror.thread(&ThreadId("t".into())).expect("t");
+        assert_eq!(members(&t), ["a"]);
+        assert_eq!(mirror.thread(&empty), None);
     }
 }

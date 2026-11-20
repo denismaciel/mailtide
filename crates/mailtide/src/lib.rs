@@ -29,6 +29,7 @@ pub mod revision;
 pub mod schedule;
 pub mod state;
 pub mod status;
+pub mod thread;
 
 pub use command::Command;
 pub use engine::{Engine, EngineConfig};

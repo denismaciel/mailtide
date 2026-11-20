@@ -2,7 +2,7 @@ id = "threads"
 title = "Thread views read from the mirror"
 summary = "A pure thread rule (messages in order, label union of non-draft messages with pending actions applied, unread, latest, counts, participants) read for a batch of thread ids through one new index; listing threads by label stays in the host's read model, fed by the change feed."
 roadmap = ["R7"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/threads.md"
 # No hard dependency. `message-facts` may change how header facts hold addresses;
 # participants read whatever the facts hold. Migration numbers are taken in merge
