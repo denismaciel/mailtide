@@ -1,0 +1,293 @@
+id = "consumer-cursors"
+title = "Consumer cursors: compaction that waits for feed consumers"
+summary = "Named consumers record how far they have processed the feed (`ack`); `compact(account)` drops only what every live consumer has acknowledged, and a consumer that has neither acknowledged nor been seen caught up for `max_idle` (7 days) stops holding the log."
+roadmap = ["S5"]
+status = "approved"
+design = "docs/features/consumer-cursors.md"
+# The cursor a consumer acknowledges is feed-pages' FeedCursor (it may point
+# inside a commit).
+depends_on = ["feed-pages"]
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/revision.rs"
+change = "modify"
+role = "ConsumerName (validated), ConsumerCursor, Retention, AckOutcome, and the pure rule `compaction_target`"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "AccountMirror.consumers; ack, drop_consumer and compact by Retention over the shared rule"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Violations for the simulator: a live consumer cut off; entries every live consumer acknowledged still present after compaction"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::ack, ::consumers, ::drop_consumer; Store::compact takes a Retention (an explicit `through` becomes optional)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "The consumer methods over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "The next migration: table mailtide_consumers; ack, list, drop and compaction under the account row lock; forget deletes the account's cursors"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance cases for cursors, the compaction rule, the idle cap and forget"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Runner::ack, ::consumers, ::drop_consumer and ::compact, which supply the runner's clock"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the consumer types"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "ack, consumers, drop_consumer on both runners; compact(account, through=None, max_idle_s=...); ConsumerCursor"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the new methods and ConsumerCursor"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Export ConsumerCursor"
+
+[[file]]
+path = "tests/test_feed.py"
+change = "modify"
+role = "Python cases with the ManualClock"
+
+# ------------------------------------------------------------- simulator, docs
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Two named readers (one steady, one that stalls) that acknowledge, and compaction at random steps under the simulated clock"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 (consumer cursors in the data model), §10.3 and §11"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "stalwart"
+path = "crates/common/src/storage/transaction.rs"
+symbols = ["delete_changes", "max_entries", "max_duration", "truncate_change_log"]
+note = "Names only (AGPL). A JMAP server trims each account's change log by a count or an age, without knowing its clients. That is mailtide today: retention by the host's call, and a consumer behind it rebuilds."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/changes/get.rs"
+symbols = ["CannotCalculateChanges"]
+note = "Names only (AGPL). What a client behind the trimmed log is told. mailtide's StateTooOld is the same answer and does not change."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/core/error.rs"
+symbols = ["CannotCalculateChanges"]
+note = "The client side of the same error: the only recovery JMAP offers a slow consumer is to refetch everything."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/push_subscription/set.rs"
+symbols = ["expires", "verification_code"]
+note = "The nearest JMAP has to a registered consumer: a push subscription that lapses unless the client extends `expires`. A registration kept alive by the consumer and dropped when it goes quiet is the liveness rule used here; it is not about log retention."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-history-store.ts"
+symbols = ["acknowledgeNotification", "notifications"]
+note = "Zero delivers changes to browsers as one versioned row per thread, removed when acknowledged at that version. There is no log and no cursor, so nothing to compact and nothing to take beyond 'acknowledge by position, never by time'."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8620.html#section-5.2"
+note = "cannotCalculateChanges: 'The server cannot calculate the changes from the state string given by the client... The client MUST invalidate its Foo cache.' Read 2026-11-20."
+
+[[source]]
+url = "https://www.postgresql.org/docs/current/runtime-config-replication.html"
+note = "Replication slots are the model: a slot holds the log for its consumer; max_slot_wal_keep_size and idle_replication_slot_timeout ('Invalidate replication slots that have remained inactive ... for longer than this duration') stop a dead one holding it forever. Read 2026-11-20."
+
+# ------------------------------------------------------------------------ tests
+# No reference test covers this: neither JMAP implementation registers
+# consumers with the change log, and Zero has no log.
+
+# Core rule.
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "consumer_names_are_short_and_plain"
+covers = "1 to 64 characters of letters, digits, dot, dash and underscore; empty, longer or other characters are refused"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "compaction_stops_at_the_slowest_live_consumer"
+covers = "Cursors at commits 10 and 40, head 50, no explicit bound: the target is 10"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "an_explicit_bound_is_capped_by_live_consumers"
+covers = "through = 30 with a live cursor at 10 gives 10; through = 5 gives 5; with no cursors it is the bound itself (today's behaviour)"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "a_cursor_inside_a_commit_holds_that_commit"
+covers = "A cursor through entry 3 of commit 20 gives target 19: the commit it is reading stays whole"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "an_idle_consumer_stops_holding_the_log"
+covers = "seen_at older than now - max_idle: the cursor is ignored; exactly at the limit it still holds"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "with_only_idle_consumers_everything_goes"
+covers = "Cursors exist but none is live and no bound is given: the target is the head. With no cursor at all and no bound: nothing is compacted"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "a_lost_cursor_never_holds_the_log"
+covers = "A cursor already behind the floor is not counted, so it cannot pin compaction at the floor for ever"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "ack_sets_the_position_and_the_time"
+covers = "A first ack registers the consumer; a later ack moves it, also backwards if the position is still held; seen_at is the time given"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "an_ack_behind_the_floor_is_too_old_and_stores_nothing"
+covers = "Position before the floor, or inside the floor commit: AckOutcome::TooOld with the oldest position; the cursor is unchanged or absent"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_consumer_at_the_head_is_seen_by_compaction"
+covers = "A caught-up consumer that never acks again in a quiet mailbox has seen_at refreshed by each compaction, so its idle clock starts when it first falls behind"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "the_number_of_consumers_per_account_is_bounded"
+covers = "The 17th distinct name is refused with TooManyConsumers; acking an existing name still works; dropping one frees a place"
+
+# Store conformance (memory, SQLite, Postgres).
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "compaction_waits_for_the_slowest_consumer"
+covers = "Three commits, consumers acked at the first and the third: compact() with no bound removes the first commit only; the slow one reads on without TooOld; after it acks the head the rest goes"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "compaction_without_consumers_is_unchanged"
+covers = "The existing `compaction` case's behaviour: an explicit bound with no cursors removes exactly through it; no bound and no cursors removes nothing"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "an_explicit_bound_cannot_pass_a_live_consumer"
+covers = "compact(through = head) with a consumer acked at commit 1 removes commit 1 only and the consumer continues"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "an_idle_consumer_is_cut_off_after_max_idle"
+covers = "A consumer acked at t0 and behind: compact at t0 + max_idle - 1 keeps its entries, at t0 + max_idle + 1 removes them; its next read is TooOld, its cursor is listed as lost, and an ack at its old position is TooOld"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_caught_up_consumer_survives_a_quiet_period"
+covers = "Consumer at the head, compactions over 3 x max_idle with no acks, then new commits and a compaction: nothing after its position is removed"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_lost_consumer_can_start_again"
+covers = "After being cut off, an ack at the current head registers it again and it holds the log from there"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_dropped_consumer_stops_holding_the_log"
+covers = "drop_consumer returns true once, false afterwards; the next compact() no longer waits for it"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "acks_are_unfenced_and_never_touch_the_mirror"
+covers = "An ack succeeds across an epoch bump, leaves seq, messages, jobs and the feed as they were, and an engine's commit before and after applies"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "forget_removes_cursors_and_a_new_generation_starts_clean"
+covers = "After forget and track, consumers() is empty and compact() with no bound removes nothing"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_consumer_inside_a_commit_keeps_it"
+covers = "Ack through entry 1 of a 3-entry commit, compact(): the commit stays and changes(since) returns entries 2 and 3"
+
+# SQL store.
+
+[[test]]
+target = "crates/mailtide-store/src/sqlite.rs"
+name = "the_consumers_migration_applies_to_an_existing_database"
+covers = "A database at the previous schema version with feed entries migrates, keeps its log and floor, and has no cursors"
+
+# Bindings.
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_compaction_waits_for_a_registered_consumer"
+covers = "Two consumers ack different positions; compact(account) returns the count up to the slower one; consumers() lists both with their state strings; changes() for the slower one is a ChangePage"
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_a_silent_consumer_is_cut_off_after_max_idle"
+covers = "ManualClock advanced past max_idle_s: compact() removes the silent consumer's entries, its read is StateTooOld, consumers() shows lost=True, ack() returns StateTooOld"
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_compact_with_a_position_still_works_without_consumers"
+covers = "The existing call compact(account, page.next) on an account with no cursors behaves as before"
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_ack_rejects_a_position_from_another_generation"
+covers = "After forget and track, an ack with a state string of the old generation returns StateTooOld and registers nothing"
+
+# Simulator.
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_steady_consumer_is_never_cut_off"
+covers = "On every seed: a reader that reads, acks and is compacted around at random steps never sees TooOld, and after each compaction no commit at or before every live cursor remains"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_stalled_consumer_is_cut_off_and_the_log_shrinks"
+covers = "A second reader stops acking; once the simulated clock passes max_idle the next compaction removes what it held, its read is TooOld, and the steady reader is unaffected"

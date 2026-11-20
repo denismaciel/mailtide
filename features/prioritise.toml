@@ -1,0 +1,252 @@
+id = "prioritise"
+title = "Prioritise: fetch a message a user opened ahead of the backlog"
+summary = "`Runner.prioritise(account, message_ids)` raises the queued body imports of those messages to the Foreground class in one unfenced store write, bounded per call and per account; the import still runs as the same durable job and the feed's `MessageImported` entry says when the body is there."
+roadmap = ["S1"]
+status = "approved"
+design = "docs/features/prioritise.md"
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/jobs.rs"
+change = "modify"
+role = "The pure rule `prioritise(job, now)`, the `Prioritised` outcome, PRIORITISE_MAX_IDS and FOREGROUND_IMPORT_CAP"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "AccountMirror::prioritise: sort each id into queued, imported, unknown, blocked or over_limit and raise the jobs it may"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Violation::PriorityLowered: outside a claim's finish, a job's class never goes down"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::prioritise (unfenced, like admit)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "Delegate to the mirror under the store lock"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "Under the account row lock: read the ids' rows and import jobs, count Foreground imports, update the raised jobs. No schema change"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance cases for the rule, the caps, the missing fence and claim order afterwards"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Runner::prioritise: validate the id count, call the store with the runner's clock; allowed in read-only mode"
+
+[[file]]
+path = "crates/mailtide-io/tests/end_to_end.rs"
+change = "modify"
+role = "A backlog behind a tight quota: the opened message is fetched in the Foreground class before the rest"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Runner and BlockingRunner `prioritise`, PrioritiseResult"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for prioritise and PrioritiseResult"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "The coroutine wrapper"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Export PrioritiseResult"
+
+[[file]]
+path = "tests/test_operations.py"
+change = "modify"
+role = "Python cases against the fake Gmail"
+
+# ------------------------------------------------------------- simulator, docs
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "UserOp::HostOpen: a user opens a mirrored message at a random step"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§6.4 (who raises a job to foreground), §10.3 and §11"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-history-store.ts"
+symbols = ["ensureImport", "jobPriority", "backfillPausedUntil"]
+note = "Opening a thread upserts its import job and lifts a backfill job into the live class; due time, attempts and version are left alone, so a failed import's cooldown survives. Jobs are picked class by class, and a paused backfill skips only its own class."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/agent/index.ts"
+symbols = ["ensureCachedThreadImport", "scheduleHistorySoon", "getThreadFromDB"]
+note = "The caller: a read that misses the cache returns an empty thread at once, promotes the import, wakes the sync loop, and the browser is told to refetch when the import lands. Nothing waits on Gmail in the request."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-priority.ts"
+symbols = ["gmailPriority", "withGmailPriority"]
+note = "The quota class is ambient per call; a promoted import runs as `sync` (live), not `foreground`. mailtide's job row carries the class instead."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+note = "'Live imports and opened threads have priority over historical backfill'; 'Cold thread misses deduplicate queued imports'; foreground 100%, live 90%, backfill 70% as admission reserves."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "messages.get costs 60 units when format is raw (20 otherwise); 6,000 units per user per minute, of which mailtide budgets 4,800. The import a prioritised job runs is that one call, unchanged. Read 2026-11-20."
+
+# ------------------------------------------------------------------------ tests
+# The two Zero tests of this behaviour live in mail-history-store.test.ts, a
+# suite scripts/zero_tests.py owns: they are already ported to
+# crates/mailtide/tests/zero_mail_history_store.rs against JobOp::Enqueue and
+# are not declared here. No other reference test covers it.
+
+# Core rule.
+
+[[test]]
+target = "crates/mailtide/src/jobs.rs"
+name = "prioritising_raises_the_class_and_keeps_attempts"
+covers = "A ready Backfill or Live import becomes Foreground; failed_attempts and the job's identity are unchanged"
+
+[[test]]
+target = "crates/mailtide/src/jobs.rs"
+name = "prioritising_makes_a_delayed_job_due_unless_it_is_backing_off"
+covers = "due_at in the future with no failed attempt (quota deferral, draft settle delay) becomes now; with a failed attempt the backoff stands"
+
+[[test]]
+target = "crates/mailtide/src/jobs.rs"
+name = "prioritising_a_running_or_foreground_job_changes_only_what_is_lower"
+covers = "A running job keeps its claim and state and gets the class for its next attempt; a Foreground job is returned unchanged"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "each_id_is_reported_in_exactly_one_group"
+covers = "queued (job raised or already Foreground), imported (content stored), unknown (no row, or tombstoned), blocked (job parked), over_limit; duplicates in the request collapse"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "the_foreground_import_cap_counts_jobs_already_raised"
+covers = "With FOREGROUND_IMPORT_CAP - 1 Foreground imports queued, two new ids yield one queued and one over_limit, in request order; once one finishes the other can be raised"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "prioritising_writes_no_feed_entry_and_keeps_the_state"
+covers = "The change log, the account's seq and every message row are untouched: state strings do not move"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_prioritised_import_is_claimed_before_live_and_backfill_work"
+covers = "With Backfill, Live and one raised import ready, a claim of 1 returns the raised import; a claim with floor Foreground returns it too"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_prioritised_import_is_requested_in_the_foreground_class"
+covers = "The engine's next claim after the store write issues ImportMessage with Priority::Foreground and cost 60, while Backfill is held back by a deferral"
+
+# Store conformance (memory, SQLite, Postgres).
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_raises_queued_imports"
+covers = "Three pending messages at Backfill; prioritise one: the next claim returns it first with Priority::Foreground, the others keep their class"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_is_unfenced"
+covers = "Engine 1 claims, engine 2 claims (epoch bumped), prioritise succeeds without an epoch, and engine 2's next claim gets the job; engine 1's claim is still refused"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_reports_what_it_could_not_raise"
+covers = "An imported message, an unknown id, a tombstoned id and a blocked import come back as imported, unknown, unknown and blocked; no job is created for any of them"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_keeps_a_failed_imports_backoff"
+covers = "After a Retry outcome due at T, prioritise raises the class but the job is not claimable before T and carries failed_attempts 1"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_survives_a_running_claim"
+covers = "Prioritise a job that is running: the claim's finish (Done) still applies; a finish with Retry leaves the job ready at Foreground"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_respects_the_foreground_cap"
+covers = "FOREGROUND_IMPORT_CAP + 5 ids: the first CAP are queued, five are over_limit and stay in their class; an untracked account answers every id as unknown"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "prioritise_leaves_the_feed_alone"
+covers = "status().state and changes() are identical before and after"
+
+# Driver.
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "an_opened_message_jumps_the_backlog"
+covers = "50 pending messages behind a quota that admits Backfill slowly: after prioritise + run with a short budget the opened message is imported, the request log shows it in the Foreground class, and at most JOB_CONCURRENCY backlog imports preceded it"
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "prioritise_refuses_more_than_the_call_limit"
+covers = "PRIORITISE_MAX_IDS + 1 ids is an error before any store write"
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "prioritise_works_in_read_only_mode"
+covers = "Access::ReadOnly: prioritise is allowed (an import changes nothing in Gmail) while act still raises ReadOnly"
+
+# Bindings.
+
+[[test]]
+target = "tests/test_operations.py"
+name = "test_prioritise_then_the_feed_reports_the_import"
+covers = "Discover without importing (a budget too short for the backlog), prioritise one id, run: PrioritiseResult.queued == [id], a MessageImported entry for it appears, messages() shows content"
+
+[[test]]
+target = "tests/test_operations.py"
+name = "test_prioritise_reports_imported_and_unknown_ids"
+covers = "An already imported id is in `imported`, a made-up id in `unknown`; more than 100 ids raises ValueError"
+
+# Simulator.
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "opening_messages_never_breaks_the_invariants"
+covers = "UserOp::HostOpen in the random op mix (also during bootstrap, reconciliation, crashes and quota denial): I5 and I6 hold, no job's class is lowered (PriorityLowered), and every seed still converges"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "an_opened_message_is_imported_within_a_bounded_number_of_imports"
+covers = "Scripted: 200 messages pending at Backfill, open the oldest; it is imported before more than JOB_CONCURRENCY other imports complete"

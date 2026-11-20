@@ -1,0 +1,996 @@
+id = "compose-mime"
+title = "Compose: RFC 5322 messages from structured input"
+summary = "A pure `compose` in mailtide-mime that validates a flat, JMAP-shaped message (addresses, subject, text and HTML, inline images, attachments, threading ids, custom headers) and writes deterministic RFC 5322 bytes through Stalwart's mail-builder, returning the bytes, the Message-ID and the recipients; no Gmail call, no store change."
+roadmap = ["C1"]
+status = "approved"
+design = "docs/features/compose-mime.md"
+# Nothing here depends on another feature. `drafts` and `send` take the bytes
+# and the Message-ID this returns; `identities` decides which From is allowed.
+depends_on = []
+
+# ------------------------------------------------------------------ the crate
+
+[[file]]
+path = "crates/mailtide-mime/Cargo.toml"
+change = "modify"
+role = "Depend on mail-builder 2 without default features (no hostname lookup); dev-depend on mailtide-gmail for the header-facts test; description covers composition"
+
+[[file]]
+path = "crates/mailtide-mime/src/lib.rs"
+change = "modify"
+role = "Crate docs; export compose, address and message_id; `Attachment` (unchanged) is shared by parse and compose"
+
+[[file]]
+path = "crates/mailtide-mime/src/compose.rs"
+change = "new"
+role = "OutgoingMessage, ComposeOptions, Purpose, Composed, ComposeError; validation, the fixed part tree, deterministic boundaries, the size check, the call into mail-builder"
+
+[[file]]
+path = "crates/mailtide-mime/src/address.rs"
+change = "new"
+role = "Address { name, email }, its syntax rules, and Address::parse_list (a header value from the mirror -> addresses, through mail-parser)"
+
+[[file]]
+path = "crates/mailtide-mime/src/message_id.rs"
+change = "new"
+role = "MessageId: strict for our own, lenient for ids we echo; from_entropy on the sender's domain; parse_list"
+
+[[file]]
+path = "Cargo.lock"
+change = "modify"
+role = "mail-builder (its one dependency, encodify, is already locked through mail-parser)"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/Cargo.toml"
+change = "modify"
+role = "getrandom, for the Message-ID entropy the pure crate does not draw itself"
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "compose_message, new_message_id, parse_addresses; Address, OutgoingMessage, ComposedMessage; a constructor for Attachment; ComposeError"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the compose API"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export the compose functions, types and ComposeError"
+
+# ------------------------------------------------------------------------ docs
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§5.5 becomes parsing and composition (pure, optional); §11 lists the compose functions; §14 phase 7 names the crate"
+
+[[file]]
+path = "ARCHITECTURE.md"
+change = "modify"
+role = "mailtide-mime: parsing and composition"
+
+[[file]]
+path = "README.md"
+change = "modify"
+role = "Crate table line for mailtide-mime"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_zero_outgoing_mime.rs"
+change = "new"
+role = "Tests ported from Zero's outgoing MIME suite"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_message_builder.rs"
+change = "new"
+role = "The composition tests of himalaya's message builder"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_pimalaya_core_message_compiler.rs"
+change = "new"
+role = "Header tests of pimalaya core's MML compiler, by behaviour"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_pimalaya_core_body_compiler_mod.rs"
+change = "new"
+role = "Exact-bytes tests of pimalaya core's MML body compiler, by behaviour"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_lib.rs"
+change = "new"
+role = "mail-builder's whole-message tests, through compose"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_mime.rs"
+change = "new"
+role = "mail-builder's multipart tests that compose can reach"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_encode.rs"
+change = "new"
+role = "mail-builder's body transfer-encoding test, through compose"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_address.rs"
+change = "new"
+role = "mail-builder's address header tests; where it strips, compose refuses"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_content_type.rs"
+change = "new"
+role = "mail-builder's parameter tests, as attachment file names"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_roundtrip.rs"
+change = "new"
+role = "mail-builder's seeded build-then-parse tests, through compose and mailtide_mime::parse"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_builder_text.rs"
+change = "new"
+role = "mail-builder's subject encoding tests, through compose"
+
+[[file]]
+path = "crates/mailtide-mime/tests/mirror_facts.rs"
+change = "new"
+role = "The mirror's header parse (mailtide-gmail) reads back the ids compose wrote"
+
+[[file]]
+path = "tests/test_compose.py"
+change = "new"
+role = "Python tests of compose_message, new_message_id and parse_addresses"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/outgoing-mime.ts"
+symbols = ["buildOutgoingMime", "buildDraftMime", "toMessageIdList", "addressOf", "literalSender", "BuiltMime"]
+note = "One function per purpose over the `mimetext` library: HTML only, inline images then attachments, References normalised to `<a> <b>`, an optional fixed Message-ID, and the deduplicated envelope returned beside the bytes. Take: bytes plus recipients as the result, a caller-fixed Message-ID, ids accepted with or without brackets, drafts without recipients. Leave: caller headers written unchecked (a header named Bcc adds a recipient), the empty From Gmail is left to fill, silent removal of duplicate recipients from the headers."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/sanitize-tip-tap-html.ts"
+symbols = ["sanitizeTipTapHtml", "inlineImages"]
+note = "Sanitises editor HTML and turns `data:` images into cid parts before composing. This is what stays host-side: compose takes finished HTML and the inline parts as data."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/imap.ts"
+symbols = ["messageIdFor", "threadingHeaders", "stripBccHeader"]
+note = "Message-ID is `<uuid@sender-domain>`, minted before sending and reused when a draft is saved again: the rule we adopt. Bcc is stripped because SMTP has an envelope; Gmail's API has none, so we keep the header."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["parseOutgoing", "createMimeMessage", "createDraft"]
+note = "The Gmail driver builds draft MIME a second time, inline, splitting recipients on `, `; a display name with a comma breaks it. One builder for drafts and sends avoids the drift."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/package.json"
+symbols = ["mimetext"]
+note = "Zero depends on a MIME library rather than writing one."
+
+[[reference]]
+impl = "mail-builder"
+path = "src/lib.rs"
+symbols = ["MessageBuilder", "serialize", "local_hostname", "generate_message_id_header", "write_body_parts"]
+note = "The library we wrap. `serialize` fills in Message-ID (hostname and clock), Date (clock) and boundaries when they are missing, and its default layout puts inline parts in multipart/mixed: compose always gives all three and builds the tree itself with `body`."
+
+[[reference]]
+impl = "mail-builder"
+path = "src/mime.rs"
+symbols = ["MimePart", "write_multipart_headers", "make_boundary", "transfer_encoding", "cid"]
+note = "A multipart whose Content-Type already has a `boundary` attribute keeps it, which is how compose stays deterministic. `transfer_encoding` writes a part's bytes as given, used for an attached message."
+
+[[reference]]
+impl = "mail-builder"
+path = "src/headers/address.rs"
+symbols = ["EmailAddress", "addr_spec", "write_mailbox"]
+note = "Display names are quoted or RFC 2047 encoded; control characters in an address are dropped silently. compose refuses them first, so the address written is the one given."
+
+[[reference]]
+impl = "mail-builder"
+path = "src/headers/content_type.rs"
+symbols = ["ContentType", "attribute", "is_attachment"]
+note = "Parameters (file names) are written per RFC 2231 when non-ASCII or long."
+
+[[reference]]
+impl = "mail-builder"
+path = "src/encoders/encode.rs"
+symbols = ["BodyEncoding", "for_text"]
+note = "7bit when the text needs nothing, else the shorter of quoted-printable and base64; bare LF becomes CRLF."
+
+[[reference]]
+impl = "mail-builder"
+path = "CHANGELOG.md"
+symbols = ["EmailAddress::email", "RFC 2231", "gethostname"]
+note = "Maintenance evidence: 2.0.1 on 2026-11-02; header-injection fixes in 1.0.0 and 2.0.0; `gethostname` optional."
+
+[[reference]]
+impl = "mail-builder"
+path = "Cargo.toml"
+symbols = ["encodify", "gethostname"]
+note = "Apache-2.0 OR MIT; one required dependency (encodify, already in our lock file through mail-parser)."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "mml/src/message/compiler.rs"
+symbols = ["MmlCompilerBuilder", "MessageBuilder"]
+note = "MML is a text template language compiled to MIME with mail-builder 0.3. Take: the precedent for wrapping mail-builder and its header cases. Leave: the template language; our input is structured."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "mml/src/message/body/compiler/mod.rs"
+symbols = ["MmlBodyCompiler", "MimePart"]
+note = "Parts, attachments read from file paths, optional PGP. Its tests pin exact bytes by fixing Message-ID and Date, as ours do."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/email/message/template/new/mod.rs"
+symbols = ["NewTemplateBuilder", "with_body"]
+note = "New, reply and forward templates with signatures: text for an editor, not MIME bytes. Host-side for us."
+
+[[reference]]
+impl = "himalaya"
+path = "src/shared/message/builder.rs"
+symbols = ["BuilderArgs", "InlineAttachment", "new_message_id", "unique_id", "parse_mailboxes", "compute_references"]
+note = "One assembler for compose, reply and forward over a strict builder that writes only what it is given. Take: Message-ID on the sender's domain (a hostname leaks the machine), name and address kept apart, an attached message never base64. Leave: reading the clock and the hostname inside the builder; signature placement (host-side); reply derivation and plain-text quoting (`send`)."
+
+[[reference]]
+impl = "himalaya"
+path = "Cargo.toml"
+symbols = ["mime-rs"]
+note = "himalaya moved from mail-builder to its own `mime-rs` 0.2 for parsing and building. Young and tied to that project; not a candidate while mail-parser is already our parser."
+
+[[reference]]
+impl = "himalaya"
+path = "src/shared/crlf.rs"
+symbols = ["normalize"]
+note = "Bare LF to CRLF on every raw input; compose does the same for an attached message written unencoded."
+
+[[reference]]
+impl = "himalaya"
+path = "src/email/submission.rs"
+symbols = ["SubmissionEnvelope"]
+note = "Envelope derived from raw headers for SMTP. Gmail derives it itself; compose returns the recipients it wrote instead of re-parsing."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/set.rs"
+symbols = ["text_body", "html_body", "attachment", "content_id", "in_reply_to", "references", "sent_at", "reply_to"]
+note = "The JMAP Email creation properties, whose names and shape OutgoingMessage follows."
+
+[[reference]]
+impl = "mail-send"
+path = "src/smtp/message.rs"
+symbols = ["IntoMessage", "MissingRcptTo"]
+note = "A message without recipients is refused before sending; compose does the same for purpose Send."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/fields/address.rs"
+symbols = ["parse_address"]
+note = "The address parser behind Address::parse_list and behind every build-then-parse check."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/email/set.rs"
+symbols = ["email_set", "MessageBuilder", "multipart/related"]
+note = "Names only (AGPL). The server builds a message from a JMAP Email with mail-builder 2 and wraps the HTML body and its inline parts in multipart/related."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/common/src/config/network.rs"
+symbols = ["message_id", "make_boundary"]
+note = "Names only (AGPL). Where the server mints a Message-ID on its own name when the client gave none."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send"
+note = "Read 2026-11-20: 'Sends the specified message to the recipients in the To, Cc, and Bcc headers.' No envelope parameter exists, so Bcc must be a header. No size limit is stated."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages"
+note = "Read 2026-11-20: `raw` is the whole RFC 2822 message, base64url; a reply joins a thread only with `threadId` on the request, RFC-compliant References and In-Reply-To, and a matching Subject. Says nothing about Message-ID, Date or Bcc being kept or rewritten."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/sending"
+note = "Read 2026-11-20: messages are 'MIME email messages compliant with RFC 2822 and encoded as base64URL strings'; attachments are MIME parts of that message."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc5322"
+note = "Header syntax; Date and From are the only required fields (3.6); Message-ID, In-Reply-To and References (3.6.4); line length 998 and 78 (2.1.1)."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2046"
+note = "multipart/mixed and multipart/alternative (plainest first); boundaries; message/rfc822 takes no transfer encoding but 7bit, 8bit or binary (5.2.1)."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2387"
+note = "multipart/related with a `type` parameter; with RFC 2392 (`cid:` URLs and Content-ID) the layout for inline images."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2047"
+note = "Encoded words for non-ASCII display names and subjects; RFC 2231 covers parameters (file names), RFC 2183 Content-Disposition."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621#section-4.6"
+note = "JMAP Email creation: the property names and the rule that a server builds the MIME structure from textBody, htmlBody and attachments."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/driver/outgoing-mime.test.ts"
+target = "crates/mailtide-mime/tests/ref_zero_outgoing_mime.rs"
+
+[[suite.test]]
+name = "outgoing MIME > collects envelope recipients and honours a fixed Message-ID"
+test = "recipients_are_collected_once_and_a_given_message_id_is_written"
+note = "Zero also removes the duplicate from the To header; we keep headers as given and deduplicate only `recipients`."
+
+[[suite.test]]
+name = "outgoing MIME > builds drafts without recipients"
+test = "a_draft_is_composed_without_recipients"
+
+[[suite.test]]
+name = "outgoing MIME > normalizes message id lists"
+test = "a_message_id_list_is_parsed_with_or_without_angle_brackets"
+
+# Zero's smtp/client.test.ts is declared by `send`, which lists its five tests.
+# Its Bcc-stripping helper is the opposite of our rule: bcc_is_written_as_a_header.
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/message/builder.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_message_builder.rs"
+# Reply and forward derivation, quoting and signature layout are deferred to
+# `send`, which plans the plain-text quoting helper as a pure function in this
+# crate; signature placement and HTML quoting are host-side in both plans.
+
+[[suite.test]]
+name = "compose_populates_headers_and_body"
+test = "a_new_message_has_its_headers_and_body_and_no_in_reply_to"
+
+[[suite.test]]
+name = "compose_names_the_from_address"
+test = "a_from_name_with_a_comma_is_quoted"
+
+[[suite.test]]
+name = "message_id_sits_on_the_sender_domain"
+test = "a_minted_message_id_sits_on_the_senders_domain_and_is_written_once"
+
+[[suite.test]]
+name = "message_id_needs_a_plain_domain"
+test = "a_message_id_domain_must_be_a_plain_dot_atom"
+
+[[suite.test]]
+name = "parse_mailboxes_splits_name_and_address"
+test = "parse_list_splits_names_and_addresses"
+
+[[suite.test]]
+name = "compose_from_keeps_a_spelled_out_display_name_apart"
+test = "a_from_parsed_from_text_is_written_as_name_and_address"
+note = "himalaya takes `Name <addr>` strings; we take Address values, parse_list is the bridge, and the whole string given as an email is refused."
+
+[[suite.test]]
+name = "compose_to_keeps_a_spelled_out_display_name_apart"
+test = "a_to_parsed_from_text_is_written_as_name_and_address"
+
+[[suite.test]]
+name = "compose_to_keeps_every_mailbox_of_every_value"
+test = "every_address_of_every_parsed_value_is_written"
+
+[[suite.test]]
+name = "a_single_part_message_ends_with_a_line_break"
+
+[[suite.test]]
+name = "an_attached_message_is_not_base64"
+test = "a_7_bit_attached_message_is_written_unencoded_with_crlf"
+note = "First half. himalaya re-encodes an 8-bit inner message; we cannot without rewriting it, so that case is our own an_8_bit_attached_message_becomes_a_base64_file."
+
+[[suite.defer]]
+name = "reply_sets_subject_recipients_and_threading"
+to = "send"
+
+[[suite.defer]]
+name = "reply_keeps_existing_re_prefix"
+to = "send"
+
+[[suite.defer]]
+name = "reply_prefixes_subject_that_merely_starts_with_re_letters"
+to = "send"
+
+[[suite.defer]]
+name = "reply_explicit_to_overrides_source_from"
+to = "send"
+
+[[suite.defer]]
+name = "reply_without_all_leaves_cc_empty"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_copies_the_other_recipients_once"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_keeps_the_display_names"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_leaves_out_who_is_already_in_to"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_with_explicit_to_dedupes_against_it"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_explicit_cc_wins"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_without_own_email_keeps_every_recipient"
+to = "send"
+
+[[suite.defer]]
+name = "reply_all_leaves_out_the_reply_s_from_and_the_logins"
+to = "send"
+
+[[suite.defer]]
+name = "forward_prefixes_subject_and_omits_in_reply_to"
+to = "send"
+
+[[suite.defer]]
+name = "has_prefix_requires_the_colon_case_insensitively"
+to = "send"
+
+[[suite.defer]]
+name = "compute_references_appends_source_id"
+to = "send"
+
+[[suite.defer]]
+name = "forward_carries_the_attachments_with_their_parameters_unencoded"
+to = "send"
+
+[[suite.defer]]
+name = "compose_body_honours_posting_style_and_signature"
+to = "send"
+
+[[suite.defer]]
+name = "compose_body_writes_the_signature_delimiter_verbatim"
+to = "send"
+
+[[suite.defer]]
+name = "compose_body_quotes_an_empty_line_without_a_trailing_blank"
+to = "send"
+
+[[suite]]
+impl = "pimalaya-core"
+path = "mml/src/message/compiler.rs"
+target = "crates/mailtide-mime/tests/ref_pimalaya_core_message_compiler.rs"
+
+[[suite.test]]
+name = "non_ascii_headers"
+test = "non_ascii_from_to_and_subject_parse_back_unchanged"
+
+[[suite.test]]
+name = "message_id_with_angles"
+test = "a_message_id_given_in_angle_brackets_is_written_bracketed_once"
+
+[[suite.test]]
+name = "message_id_without_angles"
+test = "a_message_id_given_bare_gains_angle_brackets"
+
+[[suite.test]]
+name = "mml_markup_unescaped"
+na = "MML template markup. compose takes structured input, there is no markup to escape"
+
+[[suite]]
+impl = "pimalaya-core"
+path = "mml/src/message/body/compiler/mod.rs"
+target = "crates/mailtide-mime/tests/ref_pimalaya_core_body_compiler_mod.rs"
+
+[[suite.test]]
+name = "plain"
+test = "a_plain_text_message_is_exactly_these_bytes"
+
+[[suite.test]]
+name = "html"
+test = "an_html_message_is_exactly_these_bytes"
+
+[[suite.test]]
+name = "attachment"
+na = "Reads the file from a path and labels the part with an encoding the MML asked for. compose takes bytes and chooses the encoding; our own attachments_wrap_the_body_in_mixed covers the layout"
+
+[[suite]]
+impl = "mail-builder"
+path = "src/lib.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_lib.rs"
+
+[[suite.test]]
+name = "build_nested_message"
+test = "the_fullest_layout_parses_back_part_for_part"
+note = "The reference nests parts freely; compose has one layout (mixed > alternative > related), so that is the tree checked."
+
+[[suite.test]]
+name = "build_message"
+test = "non_ascii_names_bodies_and_file_names_parse_back"
+note = "Without the address groups, which are not an input."
+
+[[suite]]
+impl = "mail-builder"
+path = "src/mime.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_mime.rs"
+
+[[suite.test]]
+name = "raw_content_type_with_boundary_is_written_and_reused"
+test = "the_boundary_compose_chose_is_written_and_delimits_the_parts"
+
+[[suite.test]]
+name = "no_empty_preamble_before_first_boundary"
+test = "multipart_headers_are_followed_by_exactly_one_empty_line"
+
+[[suite.test]]
+name = "unexpected_multipart_content_type_values_do_not_panic"
+na = "compose always gives a multipart a typed Content-Type; the untyped paths are not reachable through it"
+
+[[suite.test]]
+name = "hex_digits_match_the_formatter"
+na = "The library's random boundary generator, which compose never uses: it passes every boundary"
+
+[[suite.test]]
+name = "boundary_keeps_its_shape"
+na = "The library's random boundary generator, which compose never uses: it passes every boundary"
+
+[[suite.test]]
+name = "boundaries_are_unique_within_a_thread"
+na = "The library's random boundary generator; our own every_multipart_of_one_message_has_its_own_boundary covers the boundaries compose derives"
+
+[[suite.test]]
+name = "boundaries_are_unique_across_threads"
+na = "The library's random boundary generator; compose's boundaries depend on the message, not on the thread"
+
+[[suite.test]]
+name = "message_id_boundaries_are_unique_across_threads"
+na = "The library's Message-ID generator, which compose never uses: the id is always an input"
+
+[[suite.test]]
+name = "estimates_cover_the_output"
+na = "The library's capacity estimate; not a behaviour of the bytes"
+
+[[suite]]
+impl = "mail-builder"
+path = "src/encoders/encode.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_encode.rs"
+
+[[suite.test]]
+name = "test_write_encoded_body"
+test = "text_is_7bit_when_clean_quoted_printable_past_78_columns_and_always_crlf"
+
+[[suite.test]]
+name = "every_sink_receives_the_same_body"
+na = "The library's output sinks; compose writes to one buffer"
+
+[[suite.test]]
+name = "quoted_printable_length_is_exact"
+na = "The library's length prediction for its encoder; not a behaviour of the bytes"
+
+[[suite.test]]
+name = "non_space_control_scan_matches_a_naive_scan"
+na = "The library's word-at-a-time scan against a naive one; internal"
+
+[[suite]]
+impl = "mail-builder"
+path = "src/headers/address.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_address.rs"
+
+[[suite.test]]
+name = "lines_with_encoded_words_stay_within_76_characters"
+test = "an_encoded_display_name_keeps_its_lines_within_76_characters"
+
+[[suite.test]]
+name = "control_characters_in_addresses_cannot_inject_headers"
+test = "a_line_break_in_an_address_is_refused_and_injects_nothing"
+note = "The library drops the control characters and writes the rest; compose refuses the message."
+
+[[suite.test]]
+name = "control_characters_in_names_are_encoded"
+test = "a_control_character_in_a_display_name_is_refused"
+note = "The library encodes them; compose refuses the message."
+
+[[suite.test]]
+name = "encoded_display_name_is_not_wrapped_in_quotes"
+test = "a_non_ascii_display_name_is_an_unquoted_encoded_word"
+
+[[suite.test]]
+name = "base64_display_name_is_not_wrapped_in_quotes"
+test = "a_base64_encoded_display_name_is_not_quoted"
+
+[[suite.test]]
+name = "display_name_containing_quotes_and_comma_round_trips"
+
+[[suite.test]]
+name = "comma_in_encoded_display_name_does_not_split_list"
+
+[[suite.test]]
+name = "phrase_encoded_word_escapes_specials"
+
+[[suite.test]]
+name = "ascii_display_name_with_comma_uses_quoted_string"
+
+[[suite.test]]
+name = "ascii_display_name_with_quotes_is_escaped"
+
+[[suite.test]]
+name = "nameless_groups_are_written_as_their_mailboxes"
+na = "Address groups are not an input: Address::parse_list flattens them"
+
+[[suite.test]]
+name = "group_with_empty_nested_group_last_is_terminated"
+na = "Address groups are not an input: Address::parse_list flattens them"
+
+[[suite.test]]
+name = "group_name_with_specials_round_trips"
+na = "Address groups are not an input: Address::parse_list flattens them"
+
+[[suite.test]]
+name = "control_scan_matches_a_naive_scan"
+na = "The library's word-at-a-time scan against a naive one; internal"
+
+[[suite]]
+impl = "mail-builder"
+path = "src/headers/content_type.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_content_type.rs"
+
+[[suite.test]]
+name = "non_ascii_parameter_value_uses_rfc_2231"
+test = "a_non_ascii_file_name_is_an_rfc_2231_parameter"
+
+[[suite.test]]
+name = "long_rfc_2231_value_is_split_into_sections"
+test = "a_long_non_ascii_file_name_is_split_into_sections"
+
+[[suite.test]]
+name = "long_ascii_value_uses_quoted_continuations"
+test = "a_long_ascii_file_name_uses_quoted_continuations"
+
+[[suite.test]]
+name = "control_characters_in_parameter_values_are_percent_encoded"
+test = "a_control_character_in_a_file_name_is_refused"
+note = "The library percent-encodes them; compose refuses the message."
+
+[[suite.test]]
+name = "plain_parameter_value_is_quoted_and_escaped"
+test = "a_file_name_with_quotes_is_quoted_and_escaped"
+
+[[suite]]
+impl = "mail-builder"
+path = "src/headers/roundtrip.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_roundtrip.rs"
+
+[[suite.test]]
+name = "text_round_trips"
+test = "seeded_subjects_round_trip"
+
+[[suite.test]]
+name = "addresses_round_trip"
+test = "seeded_address_lists_round_trip"
+
+[[suite.test]]
+name = "content_type_round_trips"
+test = "seeded_attachment_types_and_file_names_round_trip"
+
+[[suite.test]]
+name = "message_ids_round_trip"
+test = "seeded_reference_lists_round_trip"
+
+[[suite.test]]
+name = "single_address_and_grouped_headers_validate"
+test = "seeded_from_headers_keep_the_folding_rules"
+note = "The single-address half; groups are not an input."
+
+[[suite.test]]
+name = "headers_fold_from_any_starting_column"
+test = "seeded_custom_headers_fold_within_78_columns_under_any_name_length"
+
+[[suite.test]]
+name = "date_matches_a_civil_calendar_reference"
+test = "the_date_header_matches_a_civil_calendar_reference"
+
+[[suite.test]]
+name = "control_characters_never_reach_the_output"
+test = "seeded_input_with_control_characters_is_refused"
+note = "The library keeps them out by encoding or dropping; compose by refusing."
+
+[[suite.test]]
+name = "raw_stays_valid"
+na = "compose writes no raw header: custom values go through the encoding text writer"
+
+[[suite.test]]
+name = "groups_round_trip"
+na = "Address groups are not an input: Address::parse_list flattens them"
+
+[[suite.test]]
+name = "nested_lists_do_not_panic"
+na = "Address lists are flat in OutgoingMessage"
+
+[[suite.test]]
+name = "urls_round_trip"
+na = "No URL-typed header: List-* headers, if a host wants them, are custom text headers"
+
+[[suite.test]]
+name = "date_header_matches_to_rfc822"
+na = "Two formatters of the library agreeing with each other; internal"
+
+[[suite]]
+impl = "mail-builder"
+path = "src/headers/text.rs"
+target = "crates/mailtide-mime/tests/ref_mail_builder_text.rs"
+
+[[suite.test]]
+name = "test_utf8_q_encoding_boundaries"
+test = "a_long_q_encoded_subject_never_splits_a_character"
+
+[[suite.test]]
+name = "test_utf8_b_encoding_boundaries"
+test = "a_long_base64_encoded_subject_never_splits_a_character"
+
+[[suite.test]]
+name = "control_characters_are_encoded"
+test = "a_control_character_in_a_subject_is_refused"
+note = "The library encodes them; compose refuses the message."
+
+[[suite.test]]
+name = "test_utf8_b_encoding_large_bytes_written"
+na = "A value written from column 500; compose starts every value right after a header name that validation keeps short"
+
+[[suite]]
+impl = "himalaya"
+path = "src/account/context.rs"
+# `identities` declares this suite and left these two tests to this plan.
+
+[[suite.test]]
+name = "resolve_signature_stands_down_for_either_flag"
+na = "Which signature applies (a flag, a file, the configuration) is the host's choice. compose takes finished text and HTML and adds no signature"
+
+[[suite.test]]
+name = "signature_delim_defaults_to_the_rfc_separator"
+na = "compose places no signature, so it has no delimiter; a host that appends one to its plain text writes the `-- ` line itself"
+
+# ------------------------------------------------------------ our own tests
+
+# Layout
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "text_only_is_one_text_plain_part"
+covers = "No multipart when there is one part: Content-Type text/plain; charset utf-8 on the message itself"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "text_and_html_are_one_alternative_with_text_first"
+covers = "multipart/alternative, plainest first (RFC 2046 5.1.4)"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "inline_images_sit_in_a_related_part_under_the_html"
+covers = "alternative > [text, related(type=text/html) > [html, image with Content-ID and Content-Disposition: inline]]"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "attachments_wrap_the_body_in_mixed"
+covers = "multipart/mixed > [body, attachment...] in the order given; an attachment without a file name is written without one"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_message_with_no_body_gets_an_empty_text_part"
+covers = "Neither text nor html: an empty text/plain part stands in, alone or as the first child of mixed"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "an_inline_part_without_html_is_refused"
+covers = "Inline parts belong to the HTML body; with no html the input is refused, not silently turned into attachments"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "an_inline_part_needs_a_unique_content_id"
+covers = "Missing, duplicate or malformed content ids are refused; angle brackets around a given id are accepted and written once"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_multipart_attachment_type_is_refused"
+covers = "content_type must be type/subtype tokens and not multipart/*"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "an_8_bit_attached_message_becomes_a_base64_file"
+covers = "A message/rfc822 attachment with 8-bit bytes or a line over 998 bytes is written as application/octet-stream in base64 with its file name, bytes exact"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "compose_then_parse_returns_the_input"
+covers = "mailtide_mime::parse of the output gives back the text, the html, and every inline part and attachment with its type, name, content id and exact bytes (all 256 byte values)"
+
+# Headers
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "headers_are_written_in_a_fixed_order"
+covers = "From, Sender, Reply-To, To, Cc, Bcc, Subject, Date, Message-ID, In-Reply-To, References, custom headers in the order given, MIME-Version; absent ones are skipped, a missing subject writes no Subject"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "bcc_is_written_as_a_header"
+covers = "Gmail reads recipients from the Bcc header; compose never strips it, for drafts or sends"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_send_needs_a_recipient_and_a_draft_does_not"
+covers = "Purpose::Send refuses a message with no To, Cc or Bcc; Purpose::Draft accepts it; both need From"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_reserved_header_name_is_refused"
+covers = "A custom header may not be one compose writes (From, To, Cc, Bcc, Sender, Reply-To, Subject, Date, Message-ID, In-Reply-To, References, MIME-Version) nor start with Content-, in any letter case"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_custom_header_name_must_be_printable_ascii_without_a_colon"
+covers = "RFC 5322 field names only, at most 76 bytes; a space, a colon, a line break or non-ASCII in the name is refused"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_line_break_in_a_custom_header_value_is_refused"
+covers = "Header injection through a value: any control character is refused; a non-ASCII value is written as encoded words"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "threading_ids_from_the_mirror_are_written_in_order"
+covers = "in_reply_to and references accept the mirror's `<a@x>` form and the bare form, and are written once-bracketed, space separated, in the order given"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "errors_name_the_field_and_position_never_the_value"
+covers = "ComposeError carries field, index and reason; its Display holds no address, subject or body text, so a host can log it"
+
+# Determinism and size
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "composing_twice_gives_identical_bytes"
+covers = "compose is a function of its input: same message, same date, same Message-ID give byte-identical output on any thread"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "every_multipart_of_one_message_has_its_own_boundary"
+covers = "The three levels of the fullest layout get three distinct boundaries derived from the Message-ID"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_boundary_found_in_a_body_is_replaced"
+covers = "A text, html or attached-message body containing a derived boundary makes compose pick the next candidate, so content cannot close a part early"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_message_over_the_limit_is_refused_before_encoding"
+covers = "max_bytes: refused from the sum of the part sizes when that alone exceeds it, without encoding anything"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "the_limit_applies_to_the_encoded_size"
+covers = "A message whose parts fit but whose base64 output does not is refused with TooLarge { size, limit }"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "seeded_messages_have_only_crlf_and_no_line_over_998_bytes"
+covers = "Seeded inputs (long lines, bare LF, bare CR, binary): every line of the output ends in CRLF and is at most 998 bytes"
+
+# Addresses and ids
+
+[[test]]
+target = "crates/mailtide-mime/src/address.rs"
+name = "an_address_needs_a_local_part_and_a_domain"
+covers = "Empty, no @, empty local part or domain, a space, a quoted local part, a domain literal: each refused with its reason"
+
+[[test]]
+target = "crates/mailtide-mime/src/address.rs"
+name = "a_name_and_address_in_one_string_is_refused_as_an_email"
+covers = "`Alice <a@x.org>` given as `email` is refused (it would be written as <Alice <a@x.org>>); parse_list is the way in"
+
+[[test]]
+target = "crates/mailtide-mime/src/address.rs"
+name = "a_non_ascii_address_is_refused"
+covers = "Non-ASCII local part or domain is refused; an IDN domain in its A-label form is accepted"
+
+[[test]]
+target = "crates/mailtide-mime/src/address.rs"
+name = "an_over_long_address_is_refused"
+covers = "Local part over 64 bytes, domain over 255, address over 254 (RFC 5321 4.5.3.1)"
+
+[[test]]
+target = "crates/mailtide-mime/src/address.rs"
+name = "parse_list_flattens_groups_and_decodes_names"
+covers = "A header value as the mirror stores it (`\"Doe, Jane\" <jane@x>`, encoded words, a group) becomes addresses compose accepts; entries without an address are dropped"
+
+[[test]]
+target = "crates/mailtide-mime/src/message_id.rs"
+name = "the_same_entropy_and_sender_give_the_same_id"
+covers = "from_entropy is pure: <32 lowercase hex digits@sender domain>, 128 bits, no clock, no hostname"
+
+[[test]]
+target = "crates/mailtide-mime/src/message_id.rs"
+name = "our_own_id_is_strict_and_an_echoed_id_is_lenient"
+covers = "The Message-ID to write needs left@right in dot-atom form; in_reply_to and references accept any token without spaces, control characters or angle brackets, since other senders' ids are often malformed"
+
+[[test]]
+target = "crates/mailtide-mime/tests/mirror_facts.rs"
+name = "the_mirror_reads_back_the_ids_compose_wrote"
+covers = "mailtide_gmail::headers::facts over composed bytes: rfc822_message_id equals Composed.message_id, in_reply_to and references equal the input, also when References folds over several lines"
+
+# Python
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_compose_then_parse_round_trips"
+covers = "compose_message then parse_message: text, html, an inline image and an attachment come back"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_compose_mints_a_message_id_on_the_senders_domain"
+covers = "message_id=None: ComposedMessage.message_id is new on each call, bracketed, on the From domain, and is the header in raw"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_a_fixed_message_id_and_date_give_identical_bytes"
+covers = "new_message_id once, sent_at_ms fixed: two calls return the same bytes (a draft saved twice, a send retried)"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_invalid_input_raises_compose_error_naming_the_field"
+covers = "ComposeError is a ValueError with field, index and reason; the message does not contain the offending value"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_a_draft_needs_no_recipient"
+covers = "purpose='draft' composes without recipients; the default purpose='send' raises"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_parsed_attachments_can_be_composed_again"
+covers = "Attachment objects from parse_message are accepted by OutgoingMessage, and Attachment can be constructed from Python"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_parse_addresses_bridges_mirror_headers"
+covers = "parse_addresses on the strings MessageContent.sender, to and cc hold gives Address values compose accepts"
+
+# ------------------------------------------- Gmail behaviour assumed, not proven
+
+[[unknown]]
+id = "compose-mime-date-kept"
+question = "Does Gmail send the Date header the client wrote, in particular for a draft sent long after it was composed, and what does it do when there is none?"
+assumed = "It sends the Date as written and adds one only when it is missing."
+if_wrong = "Harmless in both directions: if Gmail restamps Date at send time the advice to save a draft once more before sending it becomes unnecessary; compose keeps writing Date because RFC 5322 requires it."
+test = "Build raw with `Date:` 72 hours in the past. POST users.drafts.create, then users.drafts.send; GET the SENT copy format=raw and the recipient's copy: compare Date with the one written and with internalDate. Repeat with users.messages.send. Repeat both with no Date header at all and record the Date Gmail writes, if any. Run together with drafts-message-id-kept and send-message-id-kept: the same sends, with the Date set back."
+
+[[unknown]]
+id = "compose-mime-rfc2231-filename"
+question = "Does Gmail read an attachment file name given only as RFC 2231 parameters (`filename*=UTF-8''...`, `filename*0*=`/`filename*1*=`, and quoted `filename*0=`/`filename*1=` continuations)?"
+assumed = "Yes: users.messages.get reports the decoded name in payload.parts[].filename and Gmail's web UI shows it."
+if_wrong = "Non-ASCII or long file names would arrive garbled or unnamed. compose then also writes the name the way Gmail itself does, as an RFC 2047 encoded word in the Content-Type `name` parameter, next to the RFC 2231 form."
+test = "Compose a message to self with three attachments: one named `résumé.pdf` (written `filename*=UTF-8''r%C3%A9sum%C3%A9.pdf`), one with a 120-character non-ASCII name (split into `*0*`, `*1*` sections), one with a 120-character ASCII name (quoted `*0`, `*1` continuations). POST users.messages.send; GET users.messages.get format=full on the SENT copy: payload.parts[1..3].filename must equal the three names exactly. Open it in Gmail's web UI and check the three attachment names. Repeat through users.drafts.create and users.drafts.get format=full."
+
+[[unknown]]
+id = "compose-mime-inline-related"
+question = "Does Gmail show an image inline, and not as an attachment, when it sits in multipart/related under the HTML alternative (alternative > [text, related > [html, image]]) and is referenced by `cid:`?"
+assumed = "Yes: this is the layout RFC 2387 describes and other clients send; Gmail's own composer nests the other way round (related > [alternative, image]) and is assumed to read both."
+if_wrong = "Inline images would show as attachments or not at all. compose switches to Gmail's own nesting, a change confined to the function that builds the tree; the input type and every other test stay."
+test = "Compose to self: text, html containing `<img src=\"cid:probe1\">`, one inline PNG with content id `probe1`, one PDF attachment. POST users.messages.send; GET users.messages.get format=full on the SENT copy and record the payload tree (mimeType of each node, the image's Content-ID and Content-Disposition headers). In Gmail's web UI and one mobile client: the image renders in the body and only the PDF is listed as an attachment. Repeat through users.drafts.create and open the draft in Gmail's web composer: the image is in the editor."

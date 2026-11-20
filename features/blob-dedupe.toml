@@ -1,0 +1,148 @@
+id = "blob-dedupe"
+title = "Blob dedupe across accounts: decided against"
+summary = "Keep one blob per (account, message). Two mailboxes' copies of a message are expected to differ in their delivery headers, so hashing whole messages would share almost nothing, and sharing blobs would cost per-account deletion, `forget` by prefix and crash-safe cleanup. The plan records the decision, the two Gmail facts it rests on as unknowns to test, and tests that pin the isolation being kept."
+roadmap = ["A3"]
+status = "approved"
+design = "docs/features/blob-dedupe.md"
+depends_on = []
+
+# No source file changes behaviour. The files below are the decision record and
+# tests of properties the decision relies on.
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§3 and §15: blobs are keyed per account and message on purpose; cross-account dedupe is decided against, with the condition that would reopen it"
+
+[[file]]
+path = "crates/mailtide-io/src/blobs.rs"
+change = "modify"
+role = "Tests only: per-account keys and delete_account by prefix"
+
+[[file]]
+path = "crates/mailtide-io/tests/end_to_end.rs"
+change = "modify"
+role = "Test only: two accounts holding the same bytes are independent through cleanup and forget"
+
+[[file]]
+path = "tests/test_operations.py"
+change = "modify"
+role = "Test only: forget of one account leaves another account's content readable"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Test only: one conformance case with two accounts, pinning that a store keeps accounts apart"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/agent/index.ts"
+symbols = ["getThreadKey", "THREADS_BUCKET"]
+note = "Thread bodies are stored under `<mailbox agent>/<threadId>.json`: one object per mailbox and thread, deleted by that mailbox's own cleanup job. No sharing across mailboxes."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-asset-cache.ts"
+symbols = ["MailAssetCache", "mailbox"]
+note = "Attachment bytes are cached under a SHA-256 key, but the hash is of (mailbox, kind, message id, attachment id), not of the content: a hashed name, not content addressing. The same attachment in two mailboxes is stored twice."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+note = "'Keys include the authenticated user/mailbox, data kind, message ID, and attachment ID'; R2 cleanup is a durable per-mailbox job."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/types/src/blob_hash.rs"
+symbols = ["BlobHash", "generate"]
+note = "Names only (AGPL). A mail server that does content-address: the blob key is a hash of the bytes. It can, because it writes one set of bytes for every local recipient of a delivery."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/store/src/write/blob.rs"
+symbols = ["BlobLinkValue", "blob_exists", "purge_blobs"]
+note = "Names only (AGPL). What content addressing costs: a link record per holder of a blob, temporary links while a write is in flight, and a purge pass that deletes blobs no link names. This is the machinery mailtide would have to add."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/common/src/storage/blob.rs"
+symbols = ["hold_blob", "put_blob"]
+note = "Names only (AGPL). The write path reserves the hash before uploading, so a concurrent purge cannot delete a blob between its upload and its link."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/blob/copy.rs"
+symbols = ["CopyBlobRequest", "from_account_id"]
+note = "In JMAP a blob id belongs to an account; using content in another account is an explicit Blob/copy. The protocol mailtide's API follows keeps blobs per account even where a server shares storage underneath."
+
+[[reference]]
+impl = "mail-parser"
+path = "resources/eml/thirdparty/011.eml"
+symbols = ["Delivered-To", "Return-Path", "Received"]
+note = "A stored message as a receiving system keeps it: Return-Path, Delivered-To and Received are prepended on delivery and name the recipient and the hop. A sample of the header block that differs per mailbox; not a Gmail capture."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/Format"
+note = "format=raw 'Returns the full email message data with body content in the raw field as a base64url encoded string'. The docs do not say whether two mailboxes' copies of one message are byte-identical. Read 2026-11-20."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc5321.html#section-4.4"
+note = "'When an SMTP server receives a message for delivery or further processing, it MUST insert trace (\"time stamp\" or \"Received\") information at the beginning of the message content'; final delivery 'inserts a return-path line'. Why a received copy differs from the sent one. Read 2026-11-20."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc9228.html"
+note = "Delivered-To (experimental, 2022): added at delivery, 'records information about a single address, for one recipient'. Why two recipients' copies differ from each other where it is used. Read 2026-11-20."
+
+# --------------------------------------------------------------------- unknowns
+
+[[unknown]]
+id = "blob-dedupe-raw-differs-per-mailbox"
+question = "Are the raw bytes Gmail returns for one message different in the sender's mailbox and in each recipient's mailbox?"
+assumed = "Yes. Each recipient's copy starts with delivery headers naming that recipient (Delivered-To, Received ... for <recipient>, per-hop ids and times), and the sender's Sent copy has none of them, so the three SHA-256 digests differ."
+if_wrong = "Nothing breaks: per-account keys are correct whatever the bytes are, so the decision fails safe and only storage is spent. If copies are byte-identical, whole-message content addressing would save their duplicates and the 'if it is ever built' design in the note is the starting point; reopen the decision with the measured share of duplicate bytes."
+test = "With three test mailboxes A, B, C in one Workspace domain: (1) as A, users.messages.send a message To: B, Cc: C with a unique Message-ID and a 1 MB attachment. (2) In each of A, B, C: users.messages.list?q=rfc822msgid:<that id>&includeSpamTrash=true, then users.messages.get?format=raw on the id returned; base64url-decode `raw`; record its length and SHA-256. (3) Expect three different digests. (4) List the header field names before the first empty line of each copy and record which appear only in B and C and which carry the recipient's own address. (5) Repeat with A sending from an external domain to B and C, and with B and C as members of one Google Group the message is sent to. (6) Fetch one copy twice and expect the same digest both times. Run together with send-bcc-stripped (the same sends, the same copies read back raw)."
+
+[[unknown]]
+id = "blob-dedupe-body-identical"
+question = "Below the header block, are the copies of one message byte-identical across mailboxes?"
+assumed = "Yes for mail inside one domain: everything after the first empty line (the MIME body, with its attachments) is the same bytes in the sender's and every recipient's copy."
+if_wrong = "Then not even dedupe below the message level (hashing the body or each attachment apart from the headers) would share anything, and the alternative is closed for good. If right, it stays what the note says: possible, but a different storage format, not this feature."
+test = "On the three copies from blob-dedupe-raw-differs-per-mailbox: split each at the first CRLF CRLF (or LF LF), take SHA-256 of the part after it, and expect one digest for A, B and C. Record the body's share of the total bytes. Repeat for the external-sender and Google Group cases, and once with a domain footer rule enabled if the test domain has one, noting where the digests diverge. Run together with send-bcc-stripped, on the same copies."
+
+# ------------------------------------------------------------------------ tests
+# Nothing is built, so these pin what the decision keeps: an account's content
+# is its own, and deleting it cannot touch another account's. The one reference
+# test near the subject (Zero's IMAP store deduplicating one Message-ID across
+# folders) is declared and marked not applicable by `message-facts`.
+
+[[test]]
+target = "crates/mailtide-io/src/blobs.rs"
+name = "the_same_message_id_in_two_accounts_has_two_keys"
+covers = "blob_key is `<account>/<message>.eml`: equal message ids, or equal bytes, in two accounts never share a key"
+
+[[test]]
+target = "crates/mailtide-io/src/blobs.rs"
+name = "identical_bytes_in_two_accounts_are_two_objects"
+covers = "Put the same bytes under two accounts' keys, delete one: the other still reads back, on the memory and the local-disk backends"
+
+[[test]]
+target = "crates/mailtide-io/src/blobs.rs"
+name = "deleting_an_account_spares_an_account_whose_name_extends_it"
+covers = "delete_account(`a@x.co`) leaves `a@x.com/...` and `a@x.co.uk/...` in place and reports only its own count: the prefix is a path segment, not a string prefix"
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "one_accounts_cleanup_and_forget_leave_anothers_copy"
+covers = "Two accounts import a message with the same raw bytes. Deleting it in the first and passing the 24 h grace removes only the first account's blob; forget of the first then reports its own blobs and the second account's read_blob and views are unchanged"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "accounts_are_kept_apart"
+covers = "Two tracked accounts hold a message with the same id; tombstoning it in one queues a cleanup only there, and forget of that account leaves the other's row, content reference, jobs and feed as they were"
+
+[[test]]
+target = "tests/test_operations.py"
+name = "test_forget_leaves_other_accounts_content"
+covers = "Two accounts mirrored from fake mailboxes with one identical message: after forget(first), read_blob(second, id) returns the bytes and messages(second) still has content"

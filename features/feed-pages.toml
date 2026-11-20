@@ -1,0 +1,227 @@
+id = "feed-pages"
+title = "Feed pages bounded by `limit`, also inside a commit"
+summary = "A feed position can name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`), so `changes(account, since, limit)` never returns more than `limit` entries; state strings already persisted keep their meaning, and no schema changes."
+roadmap = ["R6"]
+status = "approved"
+design = "docs/features/feed-pages.md"
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/revision.rs"
+change = "modify"
+role = "FeedCursor (a commit, or an entry inside one) and its order; FeedPosition carries it and encodes the third field; ChangePage.next becomes a FeedCursor; MAX_FEED_PAGE"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "AccountMirror::changes and ::feed page by cursor and stop at `limit`; an entry's index is counted from its commit's first entry, not from the page; TooOld also for a cursor inside the floor commit"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Violation::FeedPagesDiverged for the simulator's paging check"
+
+[[file]]
+path = "crates/mailtide/tests/zero_mail_history_store.rs"
+change = "modify"
+role = "Compile fix only: the ported tests pass `page.next` back to `changes`"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::changes takes a FeedCursor; its contract says at most `limit` entries (clamped to MAX_FEED_PAGE)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "Pass the cursor through to the mirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "One keyset query on (seq, idx) for limit + 1 rows replaces the three whole-commit queries; content hydration is bounded by the page. The next migration is a version-only step (no statement of its own): it keeps a build that cannot decode a three-field state string away from the database"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Replace the two whole-commit cases with the split-page cases; add compaction and legacy-position cases"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Encode and decode the three-field state string; `compact` maps a position inside a commit to the commit before it; docstrings"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "ChangePage and changes() docstrings: `limit` is a bound, `next` may point inside a commit"
+
+# ------------------------------------------------------------- simulator, docs
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "A feed reader that pages with random limits between steps and is compared with the mirror's log"
+
+[[file]]
+path = "tests/test_feed.py"
+change = "modify"
+role = "Python cases: bounded pages over a large commit, old state strings, compaction from a mid-commit position"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 (state string), §10.3 (changes: bounded pages) and §11 (Python)"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "jmap-client"
+path = "src/core/changes.rs"
+symbols = ["max_changes", "has_more_changes", "new_state"]
+note = "The JMAP /changes shape mailtide's feed follows: a client bound on the page, a flag for more, and a new state to ask from next. The client only carries the strings; how an intermediate state is formed is the server's business."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap-proto/src/types/state.rs"
+symbols = ["JMAPIntermediateState", "items_sent", "new_intermediate"]
+note = "Names only (AGPL). A JMAP server's state type has an exact form and an intermediate form that records how far into a range of changes the client got: the same idea as a position inside a commit."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/changes/get.rs"
+symbols = ["changes_max_results", "has_more_changes", "CannotCalculateChanges"]
+note = "Names only (AGPL). The server clamps the client's maxChanges to its own maximum and answers cannotCalculateChanges for a state it can no longer serve: the model for MAX_FEED_PAGE and for StateTooOld staying as it is."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-data-revision.ts"
+symbols = ["MailDataRevision", "memo"]
+note = "Zero has no change feed to page: one revision counter, bumped by triggers, invalidates cached aggregates, and clients refetch. Nothing to take for paging."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8620.html#section-5.2"
+note = "JMAP /changes: maxChanges, hasMoreChanges, 'the server SHOULD generate an update to take the client to an intermediate state', cannotCalculateChanges. Read 2026-11-20."
+
+# ------------------------------------------------------------------------ tests
+# No reference test covers this: jmap-client has no /changes tests, the pinned
+# Stalwart tree ships no test files for its changes code, and Zero has no feed.
+
+# Core rules.
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "positions_inside_a_commit_round_trip"
+covers = "mt2-7.beef.2a decodes to (generation 7, commit 0xbeef, through entry 0x2a) and encodes back to the same string"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "two_field_state_strings_still_mean_the_whole_commit"
+covers = "Backward compatibility: mt2-7.beef decodes to the commit form and a position at a commit boundary encodes to exactly the old string"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "malformed_three_field_strings_are_rejected"
+covers = "mt2-1.2. , mt2-1.2.zz, mt2-1.2.3.4 and an index beyond u32 are InvalidState, not a guess"
+
+[[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "cursors_order_by_commit_then_entry_with_the_whole_commit_last"
+covers = "(S, entry i) < (S, entry i+1) < (S, whole) < (S+1, entry 0): the order every store's comparison must match"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_page_never_exceeds_its_limit"
+covers = "A commit of 7 entries read with limit 3 arrives as 3 + 3 + 1; has_more is true until the last page"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "pages_of_every_limit_concatenate_to_the_log"
+covers = "Exhaustive over small logs (commit sizes 0 to 4, up to 4 commits) and limits 1 to 6: reading to the end yields every entry once, in order, with the identities a single unbounded read gives"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_page_that_ends_a_commit_returns_the_commit_position"
+covers = "When the last entry of a page is the last of its commit, `next` is the two-field form, so it can be compacted through and an older build can read it"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "entry_identities_do_not_depend_on_where_pages_split"
+covers = "(state, index) of each entry is the same for limit 1, limit 3 and one whole read: consumers that deduplicate by identity keep working"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "commits_appended_between_pages_are_not_skipped"
+covers = "Read half a commit, apply two more commits, continue: the rest of the first commit comes first, then the new ones"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_position_inside_a_compacted_commit_is_too_old"
+covers = "Cursor (S, entry 2) with the floor at S: TooOld (the rest of S is gone); cursor (S, whole) with the floor at S: a page"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_limit_of_zero_or_above_the_maximum_is_clamped"
+covers = "limit 0 behaves as 1 and limit u32::MAX as MAX_FEED_PAGE; has_more tells the caller to continue"
+
+# Store conformance (memory, SQLite, Postgres).
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "pages_split_inside_a_commit"
+covers = "Replaces whole_commit_pages: commits of 3 and 1 entries read with limit 2 arrive as 2 + 2, every change exactly once, identities equal to an unbounded read"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_large_commit_arrives_in_bounded_pages"
+covers = "Replaces large_import_commits: one commit of 1,200 imports read with limit 500 arrives as 500 + 500 + 200, each entry hydrated with its own envelope, no page above the limit"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_page_hydrates_only_its_own_imports"
+covers = "An import whose message was deleted before the page was read has content None while its neighbours in the same page keep theirs; entries of other kinds stay None"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "commit_positions_read_as_before"
+covers = "A consumer that only ever passes commit positions (the old state strings) and a limit above every commit's size sees the pages it saw before the change"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "compaction_keeps_a_commit_a_reader_is_inside"
+covers = "Compacting through the commit before a mid-commit cursor removes only earlier commits and the reader continues; compacting through the cursor's commit makes it TooOld with `oldest` at that commit"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_split_read_survives_writes_between_pages"
+covers = "apply and admit between two pages of one commit: no entry skipped or repeated, and head moves while next does not jump"
+
+# Bindings.
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_a_large_commit_pages_within_the_limit"
+covers = "FakeGmail mailbox of 40 messages bootstrapped, changes(limit=7) to the end: no page above 7, ids discovered equal the mailbox, `next` strings parse back"
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_a_state_string_from_before_split_pages_still_resumes"
+covers = "A two-field string built by hand (as an older build wrote it) resumes at the same entry a new build's commit position does"
+
+[[test]]
+target = "tests/test_feed.py"
+name = "test_compacting_through_a_mid_commit_position_keeps_the_rest"
+covers = "compact(account, next) with `next` inside a commit removes only whole commits before it; changes(since=next) still returns the remainder"
+
+# Simulator.
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "a_feed_reader_with_random_limits_sees_the_whole_log"
+covers = "During every seeded run a reader takes one page of a random limit (1 to 8) between steps, across crashes, rebuilds and admissions; at the end its entries equal the mirror's log entry for entry (FeedPagesDiverged otherwise)"

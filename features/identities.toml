@@ -1,0 +1,999 @@
+id = "identities"
+title = "Identities and the settings mirror: send-as aliases, signatures, vacation responder, filters, forwarding"
+summary = "Mirror four small account settings (send-as identities with their signatures, the vacation responder, filters, forwarding) into the store with a slow refresh job, an on-demand refresh and a feed entry when one changes; then make identity fields, the vacation responder and filters writable as synchronous calls. Reads need no scope beyond what a sync already holds."
+roadmap = ["C4", "A1"]
+status = "approved"
+design = "docs/features/identities.md"
+# No hard dependency. Shared groundwork, added by whichever plan lands first:
+#   an account-level job kind (also `drafts`: RefreshDrafts), the PUT, PATCH
+#   and DELETE methods (also drafts, label-edit, purge, send), the unfenced
+#   driver-call pattern and the QuotaDeferred exception (also drafts,
+#   label-edit, purge, search). The refresh schedule follows the label refresh
+#   `main` has (SPEC §6.6). A host calls `check_sender` before it
+#   saves or sends, and places `Identity.html_signature` in the body itself
+#   (`compose-mime` adds no signature).
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/identities.rs"
+change = "new"
+role = "Identity, Verification, IdentityPatch and the pure rules: who may send, sender lookup, which identity answers a message"
+
+[[file]]
+path = "crates/mailtide/src/settings.rs"
+change = "new"
+role = "SettingKind, SettingValue (identities, VacationResponse, filters, Forwarding), SettingRecord, VacationPatch and the pure rules: apply a reading behind the generation fence, record a local write, diff into created/updated/destroyed ids"
+
+[[file]]
+path = "crates/mailtide/src/lib.rs"
+change = "modify"
+role = "Export the identities and settings modules"
+
+[[file]]
+path = "crates/mailtide/src/ids.rs"
+change = "modify"
+role = "IdentityId (the send-as address as Gmail spells it) and FilterId"
+
+[[file]]
+path = "crates/mailtide/src/command.rs"
+change = "modify"
+role = "GmailRequest::ReadSetting (five reads, from the engine and the driver) and the write variants the driver issues (patch send-as, update vacation, create and delete a filter)"
+
+[[file]]
+path = "crates/mailtide/src/event.rs"
+change = "modify"
+role = "SettingFetched (one decoded reading) and SettingRefused (a read Gmail refused for good)"
+
+[[file]]
+path = "crates/mailtide/src/quota.rs"
+change = "modify"
+role = "Costs of the settings calls"
+
+[[file]]
+path = "crates/mailtide/src/commit.rs"
+change = "modify"
+role = "Commit.settings (SettingsOp::Observe, conditional on the generation read at the claim); AccountOp::SetSettingsRefreshedAt, beside SetLabelsRefreshedAt"
+
+[[file]]
+path = "crates/mailtide/src/jobs.rs"
+change = "modify"
+role = "Account-level RefreshSettings job; its claim carries each kind's generation. Shared groundwork: the account-level job kind (a mailtide_jobs row with an empty message key) is added by whichever of drafts, identities lands first"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "Settings rows in AccountMirror; apply SettingsOp with the shared rules; the account record keeps settings_refreshed_at; record_setting enqueues RefreshSettings after a lost answer"
+
+[[file]]
+path = "crates/mailtide/src/revision.rs"
+change = "modify"
+role = "Feed entry SettingsChanged { kind, created, updated, destroyed, origin }"
+
+[[file]]
+path = "crates/mailtide/src/schedule.rs"
+change = "modify"
+role = "TimerKind::Settings and settings_refresh_due, beside TimerKind::Labels and label_refresh_due and by the same rule: an interval after the last refresh, or now if never refreshed"
+
+[[file]]
+path = "crates/mailtide/src/state.rs"
+change = "modify"
+role = "StoreSnapshot carries when the settings were last refreshed, as it carries labels_refreshed_at"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "Run RefreshSettings: five reads, one commit; the periodic schedule, in the shape of the label refresh this file already has (LabelRefresh, pump_labels): due from the persisted settings_refreshed_at, enqueued at once on start when that is settings_refresh old or unset, else on the Settings timer; a refused read never blocks the account"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Settings invariants: one row per kind, generations never decrease, a quiet mirror's settings equal Gmail's"
+
+# ------------------------------------------------------------------ wire layer
+
+[[file]]
+path = "crates/mailtide-gmail/src/settings.rs"
+change = "new"
+role = "Gmail settings requests (sendAs list and patch, vacation get and update, filters list, create and delete, forwarding addresses, auto-forwarding) and their decoders"
+
+[[file]]
+path = "crates/mailtide-gmail/src/request.rs"
+change = "modify"
+role = "Build the settings variants of GmailRequest"
+
+[[file]]
+path = "crates/mailtide-gmail/src/http.rs"
+change = "modify"
+role = "PATCH, PUT and DELETE methods. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-gmail/src/lib.rs"
+change = "modify"
+role = "Export the settings module"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::settings (read one kind) and Store::record_setting (a local write or a foreground reading; not fenced by an epoch, like admit)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "Settings methods over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "The next migration: table mailtide_settings (account, kind, value, generation, fetched_at, problem) and the column mailtide_accounts.settings_refreshed_at (nothing is added to the sync column); load and write the rows a commit touches; forget deletes them"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance case for settings rows, the generation fence and the feed entry"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/settings.rs"
+change = "new"
+role = "Runner settings methods: identities, vacation, filters, forwarding, settings_status, refresh_settings, check_sender, update_identity, set_vacation, create_filter, delete_filter; SettingsError and SenderError"
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Perform and decode settings requests; refuse settings writes in read-only mode. Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "crates/mailtide-io/src/transport.rs"
+change = "modify"
+role = "Send PATCH, PUT and DELETE. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the settings types"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Settings in the fake Gmail (changed here and elsewhere, refused reads) and the settings invariants"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Runner and BlockingRunner settings methods; Identity, VacationResponse, Filter, Forwarding, SettingStatus; the SettingsChanged feed entry; exceptions. Shared groundwork: the QuotaDeferred exception is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "crates/mailtide-py/src/settings.rs"
+change = "modify"
+role = "engine.settings_refresh_s"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers for the settings methods"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the settings API"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export the settings types and exceptions; reply_identity and sendable helpers"
+
+[[file]]
+path = "python/mailtide/config.py"
+change = "modify"
+role = "Engine.settings_refresh_s"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail settings endpoints, helpers to change a setting as another client, and a switch that refuses settings calls with 403"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 settings rows, §5 settings leave no history, §6 settings refresh, §7 settings writes are calls, §8 costs, §10-11 interfaces, §12a scopes"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide/tests/ref_zero_draft_providers.rs"
+change = "new"
+role = "Zero's sending-alias test, as the pure rule for who may send"
+
+[[file]]
+path = "crates/mailtide/tests/ref_zero_assistant.rs"
+change = "new"
+role = "Zero's reply-sender tests, as the pure rules reply_identity and find_sender"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_assistant.rs"
+change = "new"
+role = "Zero's alias recheck, as a fresh sender check against the fake Gmail"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_account_context.rs"
+change = "new"
+role = "himalaya's From resolution test, as Identity::mailbox"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_shared_vacation_set.rs"
+change = "new"
+role = "himalaya's vacation patch test, as VacationPatch"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_settings_sendas_get.rs"
+change = "new"
+role = "Test ported from himalaya: one send-as alias on the wire"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_settings_filters_list.rs"
+change = "new"
+role = "Test ported from himalaya: the settings listings and their empty answers"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_settings_pop_get.rs"
+change = "new"
+role = "himalaya's singleton get and set tests, ported onto the vacation responder"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_email_vacation.rs"
+change = "new"
+role = "Test ported from himalaya: Gmail's epoch-millisecond vacation window"
+
+[[file]]
+path = "crates/mailtide-io/tests/settings.rs"
+change = "new"
+role = "Driver tests against a fake Gmail: refresh, feed, sender checks, writes, refusals, timeouts"
+
+[[file]]
+path = "tests/test_identities.py"
+change = "new"
+role = "Python tests of the settings API against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["getEmailAliases", "verificationStatus", "isPrimary", "getScope"]
+note = "Pass-through: getProfile plus settings.sendAs.list on every call; keeps the primary and aliases whose status is `accepted`. getScope shows no settings scope is requested: the read works with gmail.modify."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/types.ts"
+symbols = ["getEmailAliases"]
+note = "The driver contract: { email, name?, primary? }. No signature, reply-to or default flag."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-senders.ts"
+symbols = ["sendingAddresses", "verifySender", "sender_not_authorized", "sending_addresses_unavailable"]
+note = "The From check above the driver: case-insensitive match against the verified addresses, and fail closed when they cannot be read. The shape of our check_sender."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-drafts.ts"
+symbols = ["sentAs", "receivedAs", "sender_ambiguous", "listSendingAddresses"]
+note = "Which identity answers a message: the one it was sent as, else the only one addressed in To, else the only one in Cc; two at one level is ambiguous. Ported as the pure reply_identity."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["gmailQuotaCost", "settings"]
+note = "Every settings read is 1 unit; writes fall back to 100. We declare Google's per-method costs instead."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/settings.rs"
+symbols = ["GmailSettingsCommand", "raw_put"]
+note = "One thin command per users.settings sub-resource (send-as, vacation, filters, forwarding addresses, auto-forwarding, plus delegates, IMAP, POP and language, which we leave out)."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/settings/sendas/list.rs"
+symbols = ["GmailSettingsSendAsListCommand", "raw_list_at"]
+note = "sendAs.list is one unpaged answer under the `sendAs` key; a missing key is an empty list."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/settings/sendas/update.rs"
+symbols = ["GmailSendAsPatch", "GmailSendAsUpdate", "treat_as_alias"]
+note = "Update (PUT) clears every field left out, patch does not. We only patch."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/settings/convert.rs"
+symbols = ["verification_status_wire", "disposition_wire"]
+note = "The enum spellings on the wire, including statuses Google's reference page does not list (`rejected`, `expired`)."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/settings/filters/create.rs"
+symbols = ["GmailSettingsFilterCreateCommand", "GmailFilterCriteria", "GmailFilterAction"]
+note = "A filter is criteria plus action; there is no update, an edit is create and delete."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["get_vacation", "set_vacation"]
+note = "Vacation write is read, change the named fields, put the whole object back, so Gmail-only fields survive the replace. Taken as is."
+
+[[reference]]
+impl = "himalaya"
+path = "src/email/vacation.rs"
+symbols = ["Vacation", "VacationPatch", "date_from_millis"]
+note = "The shape JMAP and Gmail agree on, and the tri-state patch (keep, set, clear). Gmail's window is epoch milliseconds in a string."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/commands.md"
+symbols = ["The auto-reply is in the unified API", "the settings read first so the Gmail-only ones survive"]
+note = "Their written requirement for the vacation responder across JMAP and Gmail."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/testing/gmail-specific.md"
+symbols = ["settings writes need the settings scopes", "empty lists parse"]
+note = "Their live run: every settings read passed with a delegated token scoped to https://mail.google.com/ only; writes were not attempted. Our evidence, with Google's scope lists, that reads need no settings scope."
+
+[[reference]]
+impl = "himalaya"
+path = "src/jmap/backend.rs"
+symbols = ["resolve_identity_id"]
+note = "A JMAP send needs an identity id: the configured one, else the first Identity/get returns. Gmail needs none; the From header picks the alias."
+
+[[reference]]
+impl = "himalaya"
+path = "src/account/context.rs"
+symbols = ["resolve_from", "resolve_signature", "signature_delim"]
+note = "Their identity is local configuration: address, display name, signature text. A From spelled out by the caller never gets the configured name grafted on. Signature placement is composition, not ours."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/account/config/mod.rs"
+symbols = ["find_full_signature", "DEFAULT_SIGNATURE_DELIM"]
+note = "Signature as local config joined to a delimiter. Nothing to take: Gmail holds the signature, as HTML, per alias."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/identity/mod.rs"
+symbols = ["Identity", "replyTo", "textSignature", "htmlSignature", "mayDelete"]
+note = "RFC 8621 Identity. Our Identity keeps its names where Gmail has the field (name, email, reply_to, html_signature) and adds Gmail's flags."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/identity/helpers.rs"
+symbols = ["identity_changes", "identity_get"]
+note = "Identity/changes answers created, updated and destroyed ids since a state: the shape of our SettingsChanged entry."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/vacation_response/mod.rs"
+symbols = ["VacationResponse", "isEnabled", "fromDate", "toDate", "textBody", "htmlBody"]
+note = "RFC 8621 VacationResponse, a singleton. Our VacationResponse uses these names and adds Gmail's two audience restrictions."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/identity/get.rs"
+symbols = ["IdentityGet", "identity_get_or_create"]
+note = "Names only (AGPL). Identity/get; a server derives default identities from the account's addresses, as Gmail always lists the primary."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/identity/set.rs"
+symbols = ["IdentitySet", "validate_identity_value"]
+note = "Names only (AGPL). Where an identity's email is checked against the addresses the account may send from."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/submission/set.rs"
+symbols = ["identity_mail_from"]
+note = "Names only (AGPL). A submission takes its envelope sender from the identity: the server, not the client, is the authority on the From address."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/vacation/set.rs"
+symbols = ["VacationResponseSet", "build_script"]
+note = "Names only (AGPL). VacationResponse/set compiles to a Sieve script; Gmail keeps the responder as plain settings, so nothing carries over."
+
+# ------------------------------------------------------------ Google and RFCs
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.sendAs"
+note = "SendAs resource and methods, read 2026-11-20: isPrimary and verificationStatus are read-only; isDefault can only be set to true; smtpMsa username and password are write-only; signature is HTML shown in Gmail's web UI."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.sendAs/list"
+note = "Scopes, read 2026-11-20: any of gmail.settings.basic, mail.google.com, gmail.modify, gmail.readonly. The list includes the primary address. The same four scopes are listed for getVacation, filters.list, forwardingAddresses.list and getAutoForwarding."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.sendAs/patch"
+note = "Scopes, read 2026-11-20: gmail.settings.basic or gmail.settings.sharing. The update page adds: Gmail sanitizes the signature HTML before saving, and addresses other than the primary can only be updated by service accounts with domain-wide authority."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.sendAs/create"
+note = "Scope, read 2026-11-20: gmail.settings.sharing only, service accounts with domain-wide authority only. The same holds for sendAs.delete, forwardingAddresses.create and updateAutoForwarding: the writes this plan leaves out."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/updateVacation"
+note = "PUT of a whole VacationSettings, answered with the stored one; scope gmail.settings.basic only. Read 2026-11-20."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/VacationSettings"
+note = "Fields, read 2026-11-20: startTime and endTime are epoch milliseconds; the HTML body wins over the plain one and is sanitized; a subject or a body is required to auto-reply; restrictToDomain applies to Workspace only."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters"
+note = "Filter, Criteria and Action; methods are create, delete, get and list only (no update), list is unpaged, at most 1,000 filters; create and delete need gmail.settings.basic. Read 2026-11-20."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/AutoForwarding"
+note = "enabled, emailAddress, disposition (leaveInInbox, archive, trash, markRead). Read 2026-11-20."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Costs, read 2026-11-20: every settings get and list is 1 unit; sendAs update 100 (patch is not listed), create 100, verify 100, delete 5; updateVacation 5; filters create 5, delete 5; forwardingAddresses create 100; updateAutoForwarding 5."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/auth/scopes"
+note = "gmail.settings.basic and gmail.settings.sharing are restricted scopes; sharing is for Workspace service accounts with domain-wide delegation. Read 2026-11-20."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list"
+note = "History records are messagesAdded, messagesDeleted, labelsAdded and labelsRemoved: nothing for settings. Read 2026-11-20."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621#section-6"
+note = "JMAP Identity (section 6) and VacationResponse (section 8): the object shapes our views follow."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/driver/draft-providers.test.ts"
+target = "crates/mailtide/tests/ref_zero_draft_providers.rs"
+# Declared by `drafts`, which deferred this one test here.
+
+[[suite.test]]
+name = "provider draft safety > offers only the primary Gmail sender and accepted sending aliases"
+test = "only_the_primary_and_accepted_identities_may_send"
+note = "Ported as the pure rule over mirrored identities: the primary (which may carry no status) and an accepted alias may send, a pending one may not, and the primary is listed once."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/assistant.test.ts"
+target = "crates/mailtide/tests/ref_zero_assistant.rs"
+rest_na = "A host's approval workflow for an assistant (tool calls, owner approvals, conversation principals) over a mocked driver; mailtide has no such layer. `drafts` restated its stale-update and stale-send cases as its own tests."
+
+[[suite.test]]
+name = "reply recipients and real forwards > prefers the unique To identity over an alias copied on Cc"
+test = "a_reply_is_sent_as_the_identity_addressed_in_to_before_one_in_cc"
+note = "The sender choice only; the reply's recipients are `send`'s."
+
+[[suite.test]]
+name = "reply recipients and real forwards > requires a sender choice when multiple verified aliases are direct recipients"
+test = "two_identities_addressed_in_to_make_the_reply_sender_ambiguous"
+note = "reply_identity answers Ambiguous with both; naming one of them explicitly passes find_sender."
+
+[[suite.test]]
+name = "reply recipients and real forwards > selects a verified receiving alias as From, persists it, and refuses unverified From overrides"
+test = "the_addressed_identity_answers_and_an_address_that_is_no_identity_is_refused"
+note = "First and last thirds: the one identity addressed is chosen with its display name; an address outside the identities is refused. Saving and sending the draft with that From is `drafts`."
+
+[[suite.test]]
+name = "reply recipients and real forwards > rechecks alias availability before executing an approved save"
+target = "crates/mailtide-io/tests/ref_zero_assistant.rs"
+test = "a_fresh_sender_check_refuses_an_alias_removed_in_gmail"
+note = "Their recheck at approval time is our check_sender(fresh=true): one sendAs.list, then the answer."
+
+[[suite.test]]
+name = "reply recipients and real forwards > changes a saved draft’s From alias in place and can recover from a revoked old alias"
+na = "Changing From is a draft update with new bytes (`drafts`); the revoked-alias half is the recheck test above"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/settings/sendas/get.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_settings_sendas_get.rs"
+
+[[suite.test]]
+name = "an_alias_prints_as_gmail_sent_it"
+test = "an_alias_decodes_with_gmails_status_and_tolerates_unknown_fields"
+note = "We decode into Identity instead of printing Gmail's JSON: the status keeps Gmail's spelling and a property we do not model is ignored, not an error. Their request check (GET settings/sendAs/{email}) applies to the list request."
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/settings/filters/list.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_settings_filters_list.rs"
+
+[[suite.test]]
+name = "the_settings_lists_print_as_gmail_sent_them"
+test = "settings_listings_read_gmails_key_and_an_answer_without_it_is_empty"
+note = "Three of their four listings: sendAs, forwardingAddresses and filter (singular key). Delegates are not mirrored."
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/settings/pop/get.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_settings_pop_get.rs"
+# POP settings are not mirrored. These are the only reference unit tests of a
+# singleton setting's GET and PUT, so both are ported onto the vacation responder.
+
+[[suite.test]]
+name = "the_settings_print_as_gmail_sent_them"
+test = "the_vacation_get_reads_gmails_singleton_and_tolerates_unknown_fields"
+note = "Ported onto GET settings/vacation: same shape, a singleton with an unknown property."
+
+[[suite.test]]
+name = "a_set_prints_what_gmail_answered"
+test = "the_vacation_update_puts_the_object_and_returns_gmails_answer"
+note = "Ported onto PUT settings/vacation: the value returned is the one Gmail answered, not the one sent."
+
+[[suite]]
+impl = "himalaya"
+path = "src/email/vacation.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_email_vacation.rs"
+
+[[suite.test]]
+name = "gmail_milliseconds_read_as_utc"
+test = "the_vacation_window_is_read_from_epoch_milliseconds"
+note = "Second half differs: they pass an unparseable value through as text; we refuse the reading, so a window is never guessed."
+
+[[suite.test]]
+name = "a_date_is_rfc_3339_or_a_bare_day_in_utc"
+na = "Command-line date parsing. Our API takes timestamps (Rust) and aware datetimes (Python)"
+
+[[suite.test]]
+name = "the_window_prints_as_start_and_end"
+na = "Their output naming (start, end). We keep JMAP's from_date and to_date"
+
+[[suite.test]]
+name = "a_jmap_date_is_brought_to_utc"
+na = "JMAP backend only; Gmail sends epoch milliseconds"
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/vacation/set.rs"
+target = "crates/mailtide/tests/ref_himalaya_shared_vacation_set.rs"
+
+[[suite.test]]
+name = "a_no_flag_clears_its_field"
+test = "a_vacation_patch_sets_clears_or_keeps_each_field"
+
+[[suite.test]]
+name = "a_setter_and_its_no_flag_conflict"
+na = "Command-line flag conflicts. A VacationPatch field is one tri-state value, so it cannot be set and cleared at once"
+
+[[suite]]
+impl = "himalaya"
+path = "src/jmap/vacation/get.rs"
+
+[[suite.test]]
+name = "the_vacation_response_prints_as_sent"
+na = "Prints a JMAP server's object verbatim, unknown properties included. Our VacationResponse is a typed view of Gmail's settings; its decoding is covered by the vacation tests above"
+
+[[suite]]
+impl = "himalaya"
+path = "src/account/context.rs"
+target = "crates/mailtide/tests/ref_himalaya_account_context.rs"
+# The suite is shared with `compose-mime`, so every test is listed: no rest_na.
+
+[[suite.test]]
+name = "resolve_from_takes_the_global_name_and_the_account_address"
+test = "an_identity_gives_its_address_with_its_display_name_and_a_bare_address_gets_none"
+note = "Identity::mailbox() is (email, name); check_sender on a matching address returns the identity, and its name is used only when the caller asks for the identity's own From."
+
+[[suite.defer]]
+name = "resolve_signature_stands_down_for_either_flag"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "signature_delim_defaults_to_the_rfc_separator"
+to = "compose-mime"
+
+[[suite.test]]
+name = "role_aliases_override_the_backend_roles"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "a_role_alias_names_a_mailbox_by_its_unique_name_too"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "a_maildir_role_alias_spelled_with_a_slash_marks_the_role"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "resolve_mailbox_returns_alias_target"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "resolve_mailbox_lookup_is_case_insensitive"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "resolve_mailbox_normalizes_keys_stored_with_any_case"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "resolve_mailbox_preserves_id_case"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "resolve_mailbox_falls_back_to_input_when_no_alias"
+na = "himalaya's local mailbox role aliases (a config file naming which mailbox is Sent, Trash...); mailtide resolves no names or roles and has no configuration file"
+
+[[suite.test]]
+name = "resolve_save_falls_back_on_the_copy_only_when_sending"
+na = "A local save-a-copy-on-send setting; Gmail files the SENT copy itself"
+
+[[suite.test]]
+name = "save_copy_reads_a_v1_boolean"
+na = "Parsing of an older himalaya configuration format"
+
+[[suite.test]]
+name = "resolve_posting_style_lets_the_flag_win_over_the_config"
+na = "Top or bottom posting is reply layout: the host's (`send` and `compose-mime` build no body)"
+
+[[suite.test]]
+name = "merge_lets_account_override_global_alias"
+na = "Merging of himalaya's global and per-account configuration; identities come from Gmail"
+
+# ------------------------------------------------------------ our own tests
+
+# Wire layer
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "the_five_settings_reads_are_plain_gets"
+covers = "GET settings/sendAs, settings/vacation, settings/filters, settings/forwardingAddresses and settings/autoForwarding, with no query parameters and no paging"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "an_alias_without_an_address_is_refused"
+covers = "Decoding: a sendAs entry without sendAsEmail, or a filter without id, is a malformed payload, never a row with an empty id"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "relay_credentials_are_never_decoded"
+covers = "smtpMsa keeps host, port and security mode; username and password are dropped even if Gmail were to send them"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "an_empty_vacation_answer_is_a_disabled_responder"
+covers = "getVacation with only enableAutoReply=false (or nothing) decodes as disabled with every other field unset"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "addresses_and_auto_forwarding_decode_into_one_forwarding_value"
+covers = "forwardingAddresses.list and getAutoForwarding merge into Forwarding { enabled, address, disposition, addresses }; dispositionUnspecified and unknown spellings are kept as given"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "filters_decode_their_criteria_and_actions"
+covers = "from, to, subject, query, negatedQuery, hasAttachment, excludeChats, size with sizeComparison; addLabelIds, removeLabelIds, forward"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "an_identity_patch_sends_only_the_named_fields"
+covers = "PATCH settings/sendAs/{email} with the address percent-encoded in the path (a+b@x.org); fields the patch does not name are absent from the body, a cleared reply-to is an empty string"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "a_vacation_update_sends_back_fields_mailtide_does_not_model"
+covers = "The update is built from Gmail's own object: a key getVacation returned that we do not model is in the PUT body unchanged"
+
+[[test]]
+target = "crates/mailtide-gmail/src/settings.rs"
+name = "filter_create_and_delete_requests"
+covers = "POST settings/filters with criteria and action; DELETE settings/filters/{id} with the id percent-encoded"
+
+[[test]]
+target = "crates/mailtide/src/quota.rs"
+name = "settings_costs_follow_gmails_quota_table"
+covers = "Each settings read 1; send-as patch 100; vacation update 5; filter create 5 and delete 5"
+
+# Pure rules
+
+[[test]]
+target = "crates/mailtide/src/identities.rs"
+name = "a_status_mailtide_does_not_know_may_not_send"
+covers = "Fail closed: pending, rejected, expired, unspecified or any new spelling on a non-primary identity is not sendable"
+
+[[test]]
+target = "crates/mailtide/src/identities.rs"
+name = "sender_lookup_ignores_case_and_takes_a_bare_address"
+covers = "find_sender matches ASCII case-insensitively on the whole address and applies no other normalisation (dots and plus tags are different addresses)"
+
+[[test]]
+target = "crates/mailtide/src/identities.rs"
+name = "a_reply_to_our_own_message_is_sent_as_the_identity_that_sent_it"
+covers = "reply_identity: the original's From is one of ours, so it wins over anything in To or Cc (Zero: sentAs)"
+
+[[test]]
+target = "crates/mailtide/src/identities.rs"
+name = "a_reply_with_no_identity_addressed_uses_the_default_identity"
+covers = "reply_identity falls back to the identity Gmail marks isDefault, else the primary"
+
+[[test]]
+target = "crates/mailtide/src/identities.rs"
+name = "a_pending_identity_addressed_in_to_does_not_answer"
+covers = "Only sendable identities are candidates; a pending alias in To is skipped and does not make the choice ambiguous"
+
+[[test]]
+target = "crates/mailtide/src/identities.rs"
+name = "making_an_identity_default_clears_the_previous_default"
+covers = "Recording a patch answer with isDefault=true updates the stored list as Gmail does: one default at a time"
+
+[[test]]
+target = "crates/mailtide/src/settings.rs"
+name = "an_unchanged_reading_appends_no_feed_entry"
+covers = "A refresh that reads what the mirror holds updates fetched_at only: no SettingsChanged, no new state"
+
+[[test]]
+target = "crates/mailtide/src/settings.rs"
+name = "a_changed_reading_names_created_updated_and_destroyed_ids"
+covers = "Identities and filters diff by id; vacation and forwarding report updated = [singleton]"
+
+[[test]]
+target = "crates/mailtide/src/settings.rs"
+name = "a_reading_claimed_before_a_local_write_is_not_applied"
+covers = "Generation fence: an observation carrying an older generation is skipped, so a refresh in flight never undoes a write made through mailtide"
+
+[[test]]
+target = "crates/mailtide/src/settings.rs"
+name = "a_refused_reading_keeps_the_last_value_and_records_why"
+covers = "SettingsOp::Observe with Unavailable leaves value and generation alone, sets problem, and appends no feed entry"
+
+[[test]]
+target = "crates/mailtide/src/settings.rs"
+name = "an_invalid_vacation_is_refused_before_any_call"
+covers = "Enabled with neither subject nor body, or from_date not before to_date: Invalid naming the field"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_starting_engine_refreshes_settings_never_read_or_an_interval_old"
+covers = "A new account and an account tracked before this feature (settings_refreshed_at unset), or one last refreshed settings_refresh ago, get one RefreshSettings job at start; one refreshed more recently gets the Settings timer for when it will be due; an existing job is left as it is"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_settings_refresh_reads_five_settings_and_commits_once"
+covers = "The claimed job issues the five reads at live priority and one commit carrying four observations with the generations from the claim"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_finished_settings_refresh_is_due_again_after_the_interval"
+covers = "The finishing commit records settings_refreshed_at and the Settings timer is set for now + settings_refresh; the schedule survives a restart because the time is persisted, and a host that starts a run every few seconds refreshes once per interval"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_transient_failure_retries_the_refresh_and_applies_nothing"
+covers = "A 5xx or 429 on any of the five reads finishes the job as Retry with backoff; no observation is committed"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_refused_settings_read_never_blocks_the_account"
+covers = "403 or 400 on one read: that kind is observed as Unavailable, the other kinds apply, the refresh time is recorded so the next one is an interval away, and the sync state stays Live"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_fenced_observation_refreshes_again_soon"
+covers = "When the store skipped an observation because a local write moved the generation, the next refresh is due after one minute, not the full interval"
+
+[[test]]
+target = "crates/mailtide/src/invariants.rs"
+name = "settings_generations_never_decrease"
+covers = "Invariant: one row per (account, kind) and a generation that only grows"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "settings_rows"
+covers = "Every store: a value survives a restart, a local write bumps the generation and fences an older observation, the feed entry is written in the same transaction, an untracked account reads nothing, forget deletes the rows"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "settings_changed_here_and_elsewhere_converge_under_faults"
+covers = "Seeded campaign: settings edited through the driver and by another client, refused and failing reads, crashes between a Gmail write and its record; the invariants hold and after healing and one refresh the mirror equals Gmail"
+
+# Driver
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "settings_are_readable_after_the_first_run"
+covers = "A newly tracked account has identities, vacation, filters and forwarding in the store after its first run, at 5 quota units, with one SettingsChanged per kind"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "settings_are_none_before_the_first_read"
+covers = "Before any refresh each read returns None (not an empty list), and settings_status shows no fetched_at"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_signature_changed_in_gmail_reaches_the_feed_after_the_interval"
+covers = "Another client edits a signature; nothing happens until settings_refresh has passed, then the feed gets SettingsChanged { identities, updated: [id], origin: remote }"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_foreground_refresh_updates_the_mirror_without_claiming_the_account"
+covers = "refresh_settings reads at foreground priority and records the readings; the account's epoch is unchanged, so a sync running elsewhere is not superseded"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_refresh_of_some_kinds_reads_only_those"
+covers = "refresh_settings(kinds=[identities]) makes one request; forwarding makes two"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_deferred_settings_refresh_reads_nothing"
+covers = "The quota gate defers past the caller's budget: Deferred { until }, no request, no record"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "settings_are_mirrored_in_read_only_mode_and_writes_are_refused"
+covers = "Shadow mode: the refresh job runs (reads work with gmail.readonly); update_identity, set_vacation, create_filter and delete_filter raise ReadOnlyMode before any Gmail call"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_sender_check_before_the_first_read_fails_closed"
+covers = "No identities mirrored and no fresh read asked for: SenderError::Unknown, never a guess that the account address is allowed"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_fresh_sender_check_that_cannot_reach_gmail_fails_closed"
+covers = "check_sender(fresh=true) when sendAs.list fails or is deferred: Unknown, even if the stale mirror would have accepted the address (Zero: sending_addresses_unavailable)"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "an_identity_update_records_what_gmail_stored"
+covers = "update_identity returns and mirrors Gmail's answer (a sanitized signature, a display name an admin did not let change), bumps the generation and appends SettingsChanged { origin: local }"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_refused_settings_write_does_not_block_the_account"
+covers = "403 from sendAs.patch (no gmail.settings.basic, or a non-primary alias without domain-wide delegation) is Forbidden for the caller; nothing is recorded and sync keeps running"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "updating_an_unknown_identity_reports_not_found"
+covers = "404 from sendAs.patch is NotFound and schedules a refresh, since the mirror listed an identity Gmail no longer has"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_settings_write_that_times_out_refreshes_that_kind"
+covers = "OutcomeUnknown: nothing is recorded, the generation is bumped so older readings are fenced, and RefreshSettings is made due now; the next reading shows what Gmail holds"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_vacation_update_changes_only_the_named_fields"
+covers = "set_vacation reads the responder (1 unit), applies the patch, puts it back (5 units) and mirrors the answer; unnamed fields keep Gmail's values"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_filter_create_repeated_after_a_timeout_leaves_one_filter"
+covers = "create_filter first refreshes filters when the last create ended in OutcomeUnknown and returns the existing filter with the same criteria and action instead of creating a second"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "deleting_a_missing_filter_reports_already_gone"
+covers = "Delete is idempotent: a 404 removes the filter from the mirror and reports AlreadyGone"
+
+[[test]]
+target = "crates/mailtide-io/tests/settings.rs"
+name = "a_filter_edit_is_a_new_filter_then_a_delete"
+covers = "Gmail has no filter update: a host creates the new filter, then deletes the old one; the feed shows created = [new], then destroyed = [old]"
+
+# Python
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_settings_are_read_from_the_mirror"
+covers = "identities, vacation, filters, forwarding and settings_status through the async Runner against FakeGmail, with no Gmail request per read"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_a_setting_changed_elsewhere_reaches_the_feed"
+covers = "FakeGmail edits a signature as another client; refresh_settings then changes() yields SettingsChanged with the identity id"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_check_sender_refuses_a_pending_alias"
+covers = "SenderNotAllowed carries the reason (not_an_identity, not_verified, unknown)"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_reply_identity_helper"
+covers = "mailtide.reply_identity(identities, from_, to, cc) returns the identity, or raises AmbiguousSender listing the candidates"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_update_identity_signature"
+covers = "update_identity(html_signature=...) returns the Identity as Gmail stored it"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_set_vacation_window"
+covers = "set_vacation takes aware datetimes, mailtide.UNSET keeps a field and None clears it"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_settings_write_without_the_scope_raises_setting_forbidden"
+covers = "FakeGmail refuses settings writes with 403; SettingForbidden names gmail.settings.basic and run() still syncs"
+
+[[test]]
+target = "tests/test_identities.py"
+name = "test_blocking_runner_has_the_settings_methods"
+covers = "BlockingRunner mirrors the async settings API"
+
+# ------------------------------------- Gmail behaviour assumed, not proven
+
+[[unknown]]
+id = "identities-settings-leave-no-history"
+question = "Does changing a setting (a signature, the vacation responder, a filter) add a history record, advance the mailbox historyId, or publish a push notification?"
+assumed = "No. history.list documents only message and label records, so mailtide cannot learn of a settings change from the sync it already runs and must poll (RefreshSettings every settings_refresh, default 6 h) or be asked (refresh_settings)."
+if_wrong = "Safe as designed: polling stays correct, only slower than it could be. If the historyId does move, add a store rule that makes RefreshSettings due when a history pass advances the cursor with no records, and shorten nothing else."
+test = "On a test mailbox with users.watch active on a Pub/Sub topic: 1) users.getProfile, note historyId H. 2) settings.sendAs.patch the primary address with a new signature. 3) settings.updateVacation toggling enableAutoReply. 4) settings.filters.create then delete a filter. After each step wait 60 s, then call users.getProfile and users.history.list?startHistoryId=H and pull the subscription. Expect: historyId still H (or advanced only with zero records returned), no history records, no notification."
+
+[[unknown]]
+id = "identities-patch-quota-cost"
+question = "What does settings.sendAs.patch cost? Google's quota table lists sendAs update (100) but not patch."
+assumed = "100 units, the same as update."
+if_wrong = "If it is cheaper we over-reserve and stay inside the budget: safe. If it were dearer the quota gate would under-count; correct the constant in quota.rs."
+test = "In a Cloud project used for nothing else, as one user: call settings.sendAs.patch on the primary address 10 times within a minute (alternating two signatures). Read the Gmail API metric 'Quota units per minute per user' (Cloud console, APIs & Services, Gmail API, Quotas) for that minute. Expect about 1,000 units."
+
+[[unknown]]
+id = "identities-patch-answer-is-stored-state"
+question = "Is the body sendAs.patch (and updateVacation) answers with the state Gmail stored (sanitized HTML, a display name an admin setting silently refused to change), or an echo of the request?"
+assumed = "The stored state. update_identity and set_vacation record the answer in the mirror and return it."
+if_wrong = "The mirror would hold HTML Gmail did not store until the next refresh. Change the two writes to follow with settings.sendAs.get or getVacation (1 unit each) and record that reading instead."
+test = "1) settings.sendAs.patch the primary address with signature '<p onclick=\"x()\">Hi<script>alert(1)</script></p>'; keep the response body. 2) settings.sendAs.get the same address. Expect the two signature strings to be identical and to contain neither onclick nor script. 3) On a Workspace account whose admin has disabled name changes, patch displayName; compare the response's displayName with a following get. 4) settings.updateVacation with responseBodyHtml containing a script tag; compare the response with getVacation."
+
+[[unknown]]
+id = "identities-read-after-write"
+question = "Does a settings read made right after a settings write always return the written state?"
+assumed = "Yes. The generation fence only stops a reading claimed before a local write; a reading claimed after it is trusted."
+if_wrong = "A refresh just after a write could put the old value back until the next refresh. Add a hold-off: readings of a kind are skipped for 60 s after a local write of it (compare fetched time with the write time in the pure rule)."
+test = "Loop 50 times, alternating two signatures: settings.sendAs.patch the primary address, then at once settings.sendAs.get and settings.sendAs.list. Every get and list must show the signature just written. Repeat with updateVacation/getVacation and filters.create/filters.list. Run together with drafts-list-consistent and label-edit-list-consistency (the same loop: write, then read at once; a different endpoint each, so a separate answer each)."
+
+[[unknown]]
+id = "identities-from-outside-the-identities"
+question = "What does Gmail do with a message sent through the API (messages.send, drafts.send) whose From is not an accepted send-as address of the account?"
+assumed = "It sends the message with From replaced by the account's primary address; it neither refuses the call nor sends the header as given. So mailtide need not enforce From for safety (no spoofing is possible), and check_sender exists to stop a surprise, not an abuse."
+if_wrong = "If Gmail sends the header as given, a stale or skipped check lets a host send as an address it does not own: make `send` and `drafts` call check_sender(fresh=true) themselves before drafts.send and messages.send and refuse on failure. If Gmail refuses with 400, nothing changes but the error a host sees."
+test = "As a normal user token with gmail.send: 1) settings.sendAs.list to record the identities. 2) messages.send a raw message to the same account with 'From: Not Mine <someone@example.net>'. Record the status code. 3) If 200, messages.get?format=metadata&metadataHeaders=From on the returned id and on the received copy; record From, and look for X-Google-Original-From. 4) Repeat with a From that is a pending (unverified) alias. 5) Repeat steps 2 to 4 through drafts.create plus drafts.send."
+
+[[unknown]]
+id = "identities-signature-not-added-by-the-api"
+question = "Does Gmail append the alias's signature to a message sent through messages.send or drafts.send?"
+assumed = "No: the signature setting only feeds Gmail's own composers. The host (or compose-mime) places Identity.html_signature in the body it builds."
+if_wrong = "Messages would carry the signature twice. Then the signature must not be placed by the composer for API sends, and Identity.html_signature becomes display-only."
+test = "1) settings.sendAs.patch the primary address with signature '<div>SIG-MARKER-123</div>'. 2) messages.send a text/plain message and a multipart/alternative message without that marker. 3) drafts.create plus drafts.send a third. 4) messages.get?format=raw each sent message. Expect SIG-MARKER-123 in none of them."
+
+[[unknown]]
+id = "identities-status-of-primary-and-domain-aliases"
+question = "Which sendAs entries come without verificationStatus, and do addresses that need no verification (the primary, a Workspace alias the admin assigned, a domain alias) come as `accepted`?"
+assumed = "The primary may come without a status and is always sendable; every other entry that Gmail lets the user send from carries `accepted`. Any other or missing status on a non-primary entry is not sendable."
+if_wrong = "Fails closed: a usable alias without a status would be refused by check_sender, never a pending one accepted. Fix by treating a missing status as accepted when treatAsAlias is true or the address is in the account's domain, once the real shape is known."
+test = "On a Workspace test user with (a) an admin-assigned email alias, (b) a domain alias, (c) an external address verified by mail, (d) an external address still pending: settings.sendAs.list and record, per entry, isPrimary, isDefault, treatAsAlias and verificationStatus (present or absent, and its value). Do the same on a consumer gmail.com account with one verified external alias."
+
+[[unknown]]
+id = "identities-non-primary-update-refusal"
+question = "How does Gmail answer sendAs.patch on a non-primary alias from an ordinary user token (the docs say only service accounts with domain-wide authority may), and a settings write without gmail.settings.basic?"
+assumed = "HTTP 403 in both cases (reason forbidden or insufficientPermissions), mapped to SettingsError::Forbidden."
+if_wrong = "Only the error class changes: a 400 becomes Invalid. Either way it is the caller's error, nothing is recorded and the account is not blocked, because settings calls never block."
+test = "1) With a user OAuth token holding gmail.settings.basic: settings.sendAs.patch a verified non-primary alias with a new signature; record status, error.status and error.errors[].reason. 2) With a token holding only gmail.modify: settings.sendAs.patch the primary address, settings.updateVacation and settings.filters.create; record the same fields. 3) With a domain-wide-delegation token holding gmail.settings.basic: repeat step 1 and expect 200."
+
+[[unknown]]
+id = "identities-duplicate-filter"
+question = "What does filters.create answer when a filter with the same criteria and action already exists?"
+assumed = "400 ('Filter already exists'); no second filter is created."
+if_wrong = "Safe as designed: create_filter looks for an equal filter in a fresh listing before retrying after an unknown outcome, so mailtide never creates the duplicate itself. If Gmail does create duplicates, a host calling create twice on purpose gets two filters, both visible and deletable."
+test = "1) settings.filters.create { criteria: { from: 'dup-test@example.com' }, action: { addLabelIds: ['STARRED'] } }; note the id. 2) Send the identical request again; record status and error message. 3) settings.filters.list and count the filters with that criteria. 4) Delete what was created."

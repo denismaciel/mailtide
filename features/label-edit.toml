@@ -1,0 +1,803 @@
+id = "label-edit"
+title = "Label editing: create, rename, delete, colour, visibility and nesting"
+summary = "Label definitions gain visibility and colour in the mirror; create, rename, restyle and delete are quota-gated calls to Gmail's labels API whose answers are recorded at once; a deleted label, deleted here or elsewhere, leaves every mirrored message and cannot come back from a stale observation."
+roadmap = ["W2"]
+status = "approved"
+design = "docs/features/label-edit.md"
+# No dependency on another plan. It builds on what `main` has: Store::labels /
+# Runner.labels() and the label refresh of SPEC §6.6 (EngineConfig::label_refresh,
+# TimerKind::Labels, mailtide_accounts.labels_refreshed_at).
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/gmail.rs"
+change = "modify"
+role = "Label gains list_visibility, message_visibility and color (LabelListVisibility, MessageListVisibility, LabelColor); all optional, as Gmail omits them on system labels"
+
+[[file]]
+path = "crates/mailtide/src/label_names.rs"
+change = "new"
+role = "Pure naming rules: validate a name, parent and leaf of a `/` path, child path, the sublabel renames a rename implies, the parent label of each definition"
+
+[[file]]
+path = "crates/mailtide/src/lib.rs"
+change = "modify"
+role = "Export label_names"
+
+[[file]]
+path = "crates/mailtide/src/commit.rs"
+change = "modify"
+role = "LabelOp::Upsert and LabelOp::Remove; LabelOp::ReplaceAll (today a plain list, applied only when it differs from the stored definitions) also carries the label generation its listing was sent under"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "Label rules: a removed definition strips its id from every message row, drops its intents and is remembered as deleted; remembered ids are filtered from every later observation; a listing from an older generation is skipped; record_label for local writes"
+
+[[file]]
+path = "crates/mailtide/src/command.rs"
+change = "modify"
+role = "GmailRequest::CreateLabel, PatchLabel and DeleteLabel (issued by the driver, not the engine)"
+
+[[file]]
+path = "crates/mailtide/src/event.rs"
+change = "modify"
+role = "LabelsListed carries the generation read before the request; LabelSaved and LabelDeleted results"
+
+[[file]]
+path = "crates/mailtide/src/quota.rs"
+change = "modify"
+role = "Costs of labels.create, labels.patch and labels.delete"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "Pass the listing's generation into ReplaceAll, for reconciliation's listing and for the §6.6 refresh alike (on_labels, on_label_refresh); a 404 answering a delivery is verified with a get before the message is tombstoned"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Label invariants: definition ids are unique; no message row and no intent names a label remembered as deleted"
+
+# ------------------------------------------------------------------ wire layer
+
+[[file]]
+path = "crates/mailtide-gmail/src/labels.rs"
+change = "new"
+role = "labels.create, labels.patch and labels.delete requests, Label decoding with visibility and colour, Google's colour palette"
+
+[[file]]
+path = "crates/mailtide-gmail/src/decode.rs"
+change = "modify"
+role = "labels_list keeps labelListVisibility, messageListVisibility and color"
+
+[[file]]
+path = "crates/mailtide-gmail/src/request.rs"
+change = "modify"
+role = "Build the label variants of GmailRequest"
+
+[[file]]
+path = "crates/mailtide-gmail/src/http.rs"
+change = "modify"
+role = "PATCH and DELETE methods. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-gmail/src/lib.rs"
+change = "modify"
+role = "Export the labels module"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::record_label (unfenced, like admit) and Store::label_generation"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "Label methods over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "The next migration: mailtide_labels.attrs (visibility and colour as JSON) and, on mailtide_accounts, label_generation and deleted_labels (the deleted-label memory as JSON), each a column of its own: nothing is added to the sync column. Strip a removed label from the rows that carry it"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance cases for label attributes, record_label, the generation fence and label removal"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/labels.rs"
+change = "new"
+role = "Runner::create_label, update_label and delete_label; LabelError; sublabel renames and deletes in a resumable order"
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Perform and decode label requests; read the label generation before labels.list; refuse label writes in read-only mode. Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "crates/mailtide-io/src/transport.rs"
+change = "modify"
+role = "Send PATCH and DELETE. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the label types"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Labels in the fake Gmail: created, renamed and deleted here and elsewhere, with and without history records for a deletion; definitions compared at convergence"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Runner and BlockingRunner label methods; Label gains list_visibility, message_visibility, color and parent_id; exceptions. Shared groundwork: the QuotaDeferred exception is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers for create_label, update_label and delete_label"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the label API"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export LabelColor and the label exceptions"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail labels endpoints (create, patch, delete, 409 on a taken name) and helpers to rename or delete a label as another client"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§1 non-goals, §4 label row, §6.6 label removal and the deleted-label memory, §7 a delivery's 404 is verified, §8 costs, §10-11 interfaces"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_labels_update.rs"
+change = "new"
+role = "Test ported from himalaya: a rename patches the name alone"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_labels_get.rs"
+change = "new"
+role = "Test ported from himalaya, as a decoding test"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_labels_list.rs"
+change = "new"
+role = "Test ported from himalaya, as a decoding test"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_gmail_backend.rs"
+change = "new"
+role = "The pure sublabel-rename test of himalaya's Gmail backend suite"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_email_mailbox.rs"
+change = "new"
+role = "Name and path rules ported from himalaya"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_gmail_backend.rs"
+change = "new"
+role = "The duplicate-create test of himalaya's Gmail backend suite"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_gmail_client.rs"
+change = "new"
+role = "A label Gmail does not know is LabelNotFound"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_tests_mailbox.rs"
+change = "new"
+role = "The create, rename under the parent, delete lifecycle, against the fake Gmail"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_imap_sync.rs"
+change = "new"
+role = "Zero's folder-disappears test, as a label deleted elsewhere"
+
+[[file]]
+path = "crates/mailtide-io/tests/label_edit.rs"
+change = "new"
+role = "Driver tests against a fake Gmail: writes, lost answers, labels changed elsewhere, sublabels, read-only mode"
+
+[[file]]
+path = "tests/test_labels.py"
+change = "modify"
+role = "The read side, beside the existing labels() tests: Label carries colour, visibility and parent_id"
+
+[[file]]
+path = "tests/test_label_edit.py"
+change = "new"
+role = "Python tests of the label API against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["createLabel", "updateLabel", "deleteLabel", "getUserLabels", "getLabel", "resolveLabelId"]
+note = "Pass-through calls that return nothing: the caller lists labels again to learn a new id (resolveLabelId creates, then lists and matches by lower-cased name). createLabel always sends labelShow and show; updateLabel uses labels.update (PUT) with name and colour only, which drops the visibility the label had. We take the explicit visibility on create and avoid the PUT."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google-label-color-map.ts"
+symbols = ["GOOGLE_LABEL_COLOR_MAP", "mapGoogleLabelColor", "mapToGoogleLabelColor"]
+note = "Maps six Gmail colour pairs to the app's dark theme and back. Presentation only: mailtide stores Gmail's own pair and leaves theming to the host. Cited for the fact that colours travel as a text and background pair."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/types.ts"
+symbols = ["createLabel", "updateLabel", "deleteLabel", "getUserLabels"]
+note = "The driver contract: create, update and delete return void."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/agent/index.ts"
+symbols = ["deleteLabel", "forgetAppLabel", "saveCatalogue", "invalidateSearches"]
+note = "What a label write does locally: invalidate the cached catalogue and counts, and forget the label's app state on delete. Message labels are left to history. We record the answer instead of invalidating a cache."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-count-store.ts"
+symbols = ["saveCatalogue", "invalidate"]
+note = "The persisted label-id to name catalogue: a rename shows under the same id, a label missing from the next catalogue disappears, a failed refresh keeps the previous names."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["labels.create", "labels.update", "labels.delete", "labels.list", "labels.get"]
+note = "Declared costs, equal to Google's table: 5, 5, 5, 1, 1. Neither lists labels.patch."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+symbols = ["Gmail custom labels route durably by their", "label creation/deletion retain"]
+note = "Label changes on messages go through the durable outbox by provider id; label creation and deletion stay direct provider calls. The same split as this plan."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["create_mailbox", "rename_mailbox", "delete_mailbox", "sublabel_renames", "names_existing_label"]
+note = "Create under a parent as `<parent>/<name>`; rename with labels.patch and rename every sublabel by prefix, because Gmail nests by name alone; a 409 on create is a duplicate. We take all three and change the order of a rename (sublabels first) so that a retry finishes it."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/labels/update.rs"
+symbols = ["GmailLabelUpdateCommand", "label_patch"]
+note = "A rename sends the name alone through labels.patch, so colour and visibility survive; labels.update naming neither would clear them."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/labels/create.rs"
+symbols = ["GmailLabelCreateCommand", "label_create"]
+note = "Create reports the id Gmail assigned."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/labels/delete.rs"
+symbols = ["GmailLabelDeleteCommand", "label_delete"]
+note = "Delete is one call on the id; the messages stay under their other labels."
+
+[[reference]]
+impl = "himalaya"
+path = "src/email/mailbox.rs"
+symbols = ["validate_name", "validate_level", "child_path", "renamed_path"]
+note = "Name rules shared by every backend: not blank, no control character, one level holds no delimiter, a renamed path keeps its parent."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/backends.md"
+symbols = ["A Gmail label rename keeps the label", "Gmail treats labels as mailboxes"]
+note = "Their written requirement that a rename goes through labels.patch with the name alone."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/testing/gmail-specific.md"
+symbols = ["labels create/get/update/delete", "labelListVisibility"]
+note = "Their run against real Gmail: the label lifecycle works, and a rename through patch kept the colour and labelListVisibility. This is the tested behaviour our patch-only update rests on."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/mailbox/helpers.rs"
+symbols = ["mailbox_create", "mailbox_rename", "mailbox_move", "mailbox_destroy"]
+note = "JMAP's shape: create returns the server id, rename and move are updates of one object, destroy takes on_destroy_remove_emails. Our three calls follow it; a Gmail label has no parent id, so a move is a rename."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/core/set.rs"
+symbols = ["MailboxHasChild", "MailboxHasEmail", "not_destroyed"]
+note = "A JMAP destroy is refused while the mailbox has children (and, unless asked, while it has emails). We keep the first refusal (LabelHasSublabels) and not the second: deleting a Gmail label never deletes mail."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/mailbox/set.rs"
+symbols = ["on_destroy_remove_emails", "MailboxHasChild", "MailboxHasEmail", "will_destroy"]
+note = "Names only (AGPL). Where a server refuses to destroy a mailbox with children or emails."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/email/src/mailbox/destroy.rs"
+symbols = ["mailbox_destroy"]
+note = "Names only (AGPL). The server-side destroy of one mailbox."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/folder/delete/mod.rs"
+symbols = ["DeleteFolder"]
+note = "Folder add and delete traits for IMAP, Maildir and Notmuch only; no Gmail API backend. Nothing to take."
+
+# ------------------------------------------------------------- other sources
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.labels"
+note = "The Label resource, read 2026-11-20: the id is immutable; labelListVisibility is labelShow, labelShowIfUnread or labelHide; messageListVisibility is show or hide; color is a textColor and backgroundColor pair, both required, each from a fixed palette, user labels only; a mailbox holds at most 10,000 labels."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.labels/delete"
+note = "Read 2026-11-20: `Immediately and permanently deletes the specified label and removes it from any messages and threads that it's applied to.` Scopes: mail.google.com, gmail.modify or gmail.labels."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.labels/patch"
+note = "Read 2026-11-20: PATCH with a partial Label, answers the whole Label; no update mask. Same three scopes. labels.create documents the same scopes and says nothing about duplicate names."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/labels"
+note = "Read 2026-11-20: a user label cannot take a system label's name (HTTP 400, Invalid label name); labels cannot be applied to drafts; the gmail.labels scope is enough to manage labels. Silent on nesting, on duplicates and on history."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Read 2026-11-20: labels.create 5, labels.update 5, labels.delete 5, labels.get 1, labels.list 1. labels.patch is not in the table."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621#section-2.5"
+note = "Mailbox/set: parentId and name, destroy refused with mailboxHasChild or mailboxHasEmail unless onDestroyRemoveEmails. The shape our API borrows."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/labels/update.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_labels_update.rs"
+
+[[suite.test]]
+name = "a_rename_patches_the_name_alone"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/labels/get.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_labels_get.rs"
+
+[[suite.test]]
+name = "a_label_prints_as_gmail_sent_it"
+test = "a_label_answer_decodes_with_unknown_fields_and_without_colour_or_visibility"
+note = "himalaya prints Gmail's payload whole; we decode it. The same body: id, name, type and a field we do not model."
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/labels/list.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_labels_list.rs"
+
+[[suite.test]]
+name = "the_labels_print_as_gmail_sent_them"
+test = "a_label_listing_keeps_visibility_and_colour_of_each_label"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_gmail_backend.rs"
+# search, send and message-facts declare this suite too and account for its other tests;
+# search deferred these two here.
+
+[[suite.test]]
+name = "a_rename_moves_the_sublabels_and_only_them"
+target = "crates/mailtide/tests/ref_himalaya_gmail_backend.rs"
+
+[[suite.test]]
+name = "a_create_of_an_existing_label_is_a_duplicate"
+test = "a_create_of_an_existing_label_is_name_taken_and_another_refusal_keeps_its_own_code"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/client.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_gmail_client.rs"
+
+[[suite.test]]
+name = "a_missing_label_is_coded"
+test = "a_label_gmail_does_not_know_is_label_not_found"
+note = "himalaya answers from its name index without a request; mailtide addresses labels by id and asks Gmail, whose 404 is LabelNotFound."
+
+[[suite.test]]
+name = "a_whole_refusal_is_coded"
+na = "Generic error classification of any Gmail call: mailtide-gmail's existing errors.rs, not label editing"
+
+[[suite.test]]
+name = "a_daily_limit_is_rate_limited"
+na = "Generic rate-limit classification: mailtide-gmail's existing errors.rs, not label editing"
+
+[[suite]]
+impl = "himalaya"
+path = "src/email/mailbox.rs"
+target = "crates/mailtide/tests/ref_himalaya_email_mailbox.rs"
+
+[[suite.test]]
+name = "a_name_is_not_blank_and_holds_no_control_character"
+test = "a_label_name_is_not_blank_and_holds_no_control_character"
+
+[[suite.test]]
+name = "a_level_holds_no_delimiter"
+test = "a_child_name_holds_no_slash"
+
+[[suite.test]]
+name = "a_renamed_path_keeps_its_parent"
+test = "a_renamed_leaf_keeps_its_parent_path"
+
+[[suite.test]]
+name = "index_resolves_ids_then_names_then_roles"
+na = "mailtide addresses a label by its id only; resolving names and roles is the host's"
+
+[[suite.test]]
+name = "index_rejects_a_role_several_mailboxes_carry"
+na = "Gmail's roles are fixed system label ids; there is no role lookup to be ambiguous"
+
+[[suite.test]]
+name = "role_serializes_as_its_wire_spelling"
+na = "mailtide has no mailbox role type: system labels keep Gmail's ids"
+
+[[suite]]
+impl = "himalaya"
+path = "tests/mailbox.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_tests_mailbox.rs"
+
+[[suite.test]]
+name = "a_mailbox_is_created_renamed_under_its_parent_and_deleted"
+test = "a_label_is_created_under_a_parent_renamed_there_and_deleted"
+note = "The reference runs its binary against a Maildir; ours runs the same lifecycle through the Runner against the fake Gmail and checks the definitions and the feed."
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/mailbox/create.rs"
+
+[[suite.test]]
+name = "a_queued_creation_has_a_null_id_and_says_queued"
+na = "A queued write has no id to report. mailtide's create is a synchronous call that returns Gmail's id, which is why label writes are not intents"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/imap/sync.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_imap_sync.rs"
+rest_na = "IMAP sync engine (UIDs, UIDVALIDITY, folders as locations, AI workflow queueing): mailtide is Gmail only. One test states a provider-neutral rule and is ported by behaviour."
+
+[[suite.test]]
+name = "ImapSyncEngine > forgets folders that disappear from LIST"
+test = "a_label_missing_from_a_later_listing_leaves_the_definitions_and_every_message"
+
+# The two label-catalogue tests of Zero's count store. The count cache around
+# them has no counterpart; what they say about label names is behaviour `main`
+# already has and tests, so both map onto existing tests.
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/mail-count-store.test.ts"
+target = "crates/mailtide/tests/label_refresh.rs"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > uses updated label names and removes deleted labels from cached provider totals"
+target = "crates/mailtide-store/src/conformance.rs"
+test = "label_definitions"
+note = "The conformance case `label definitions read back as last synced`: a later listing renames a label under its id and a label the listing lacks is gone from labels(). The cached provider totals have no counterpart: mailtide fetches no counts."
+
+[[suite.test]]
+name = "storage-backed mailbox counts > refreshes label names after invalidation and backs off failed catalogue refreshes"
+test = "a_failed_refresh_neither_blocks_sync_nor_moves_the_cursor"
+note = "The second half: a failed labels.list keeps the stored names and retries on the Labels timer with the engine's backoff. The first half (new names after a refresh) is test_a_live_account_refreshes_renamed_labels_after_the_interval in tests/test_labels.py."
+
+# ------------------------------------------------------------ our own tests
+
+# Wire layer
+
+[[test]]
+target = "crates/mailtide-gmail/src/labels.rs"
+name = "create_posts_the_name_with_explicit_visibility"
+covers = "POST /labels with name, labelListVisibility and messageListVisibility always present, color only when given"
+
+[[test]]
+target = "crates/mailtide-gmail/src/labels.rs"
+name = "patch_sends_only_the_fields_that_change"
+covers = "PATCH /labels/{id}: a restyle sends no name, a rename no colour; the id is percent-encoded into the path"
+
+[[test]]
+target = "crates/mailtide-gmail/src/labels.rs"
+name = "delete_sends_delete_to_the_label_id"
+covers = "DELETE /labels/{id}, no body"
+
+[[test]]
+target = "crates/mailtide-gmail/src/labels.rs"
+name = "a_colour_outside_the_palette_is_refused_before_any_request"
+covers = "LabelColor::new accepts only Google's palette values, lower-cased, text and background both required"
+
+[[test]]
+target = "crates/mailtide-gmail/src/labels.rs"
+name = "a_label_answer_without_an_id_is_refused"
+covers = "Decoding: a Label without id or name is a permanent failure, never a row with an empty id"
+
+[[test]]
+target = "crates/mailtide/src/quota.rs"
+name = "label_write_costs_follow_gmails_quota_table"
+covers = "create 5, patch 5 (declared as labels.update), delete 5"
+
+# Pure rules
+
+[[test]]
+target = "crates/mailtide/src/label_names.rs"
+name = "a_parent_is_the_longest_existing_label_at_a_slash_boundary"
+covers = "A/B/C nests under A/B if it exists, else under A, else at the top; A/Subway is not under A/Sub"
+
+[[test]]
+target = "crates/mailtide/src/label_names.rs"
+name = "sublabel_renames_never_collide_with_an_existing_name"
+covers = "The planned names of a rename are checked against every other definition before anything is sent"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_removed_label_leaves_every_message_and_logs_each_change"
+covers = "LabelOp::Remove strips the id from every row that carries it, trusted or unverified, without moving a checkpoint, and logs LabelsChanged per message and one LabelDefinitionsChanged"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_removed_label_drops_its_intents"
+covers = "Pending, delivered and blocked intents on the label go, with OverlayChanged; their delivery job finds nothing to send"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "an_observation_naming_a_deleted_label_is_stored_without_it"
+covers = "The failure to avoid: a fetch or a replayed labelsAdded from before the deletion cannot put the id back on a row"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_listing_that_names_a_deleted_label_restores_it"
+covers = "Gmail's listing wins: the id leaves the deleted memory and the definition returns"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "the_deleted_memory_is_pruned_after_thirty_days"
+covers = "Entries older than DELETED_LABEL_MEMORY go at the next applied listing; Gmail keeps no history that old"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_listing_sent_before_a_local_label_write_is_not_applied"
+covers = "The generation fence: a stale labels.list cannot remove a label just created here nor restore one just deleted"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_rename_changes_no_message_row"
+covers = "LabelOp::Upsert with a new name logs LabelDefinitionsChanged and nothing else: rows hold ids"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "an_upsert_equal_to_the_stored_label_logs_nothing"
+covers = "Recording an answer the mirror already shows bumps the generation but adds no feed entry"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_delivery_answered_404_is_verified_before_the_message_is_tombstoned"
+covers = "A 404 to messages.modify enqueues a Verify instead of a tombstone, so a 404 about a label could never delete a live message from the mirror"
+
+[[test]]
+target = "crates/mailtide/src/invariants.rs"
+name = "no_row_or_intent_names_a_deleted_label"
+covers = "Invariant checked after every commit in the simulator"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "label_attributes_and_writes"
+covers = "Every store: visibility and colour round-trip, rows from before the migration read as unknown, record_label upserts and removes in one transaction with its feed entries, the generation fences an older listing, forget deletes it all"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "removing_a_label_finds_exactly_the_rows_that_carry_it"
+covers = "Label_1 is stripped and Label_10 and LabelX1 are not: the SQL candidate match is confirmed in Rust"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "labels_edited_here_and_elsewhere_converge_under_faults"
+covers = "Seeded campaign with label creates, renames and deletes from the driver and from another client, crashes between the Gmail call and its record, stale listings, and deletions that leave no history records: invariants hold and definitions and label sets equal Gmail's after healing"
+
+# Driver
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_created_label_is_in_the_definitions_before_any_sync"
+covers = "create_label returns Gmail's id; labels() and the feed show it without a run"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_new_label_can_be_applied_to_a_message_at_once"
+covers = "The id from create_label is accepted by act(ChangeLabels) and delivered"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_restyle_keeps_the_name_and_a_rename_keeps_the_style"
+covers = "Colour and both visibilities survive a rename; the name survives a colour change"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_create_that_times_out_then_finds_the_name_taken_reports_the_existing_label"
+covers = "OutcomeUnknown first; the retry's 409 lists labels once and returns NameTaken with the label holding the name, so the host can adopt it"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_rename_renames_sublabels_first_and_a_retry_finishes_it"
+covers = "Sublabels move before the parent; after a failure mid-way the same call finds the rest under the old prefix and completes"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_rename_onto_a_taken_name_changes_nothing"
+covers = "NameTaken before the first write when the target or a sublabel target is held by another label"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_rename_can_leave_sublabels_alone"
+covers = "sublabels = leave patches one label"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "deleting_a_label_with_sublabels_is_refused_unless_asked"
+covers = "LabelHasSublabels by default; sublabels = delete removes the deepest first and the label last"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_deleted_label_leaves_every_message_at_once"
+covers = "delete_label's answer strips the id from the mirror and the feed gets LabelsChanged for each message, before any history is read"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "deleting_a_missing_label_reports_already_gone"
+covers = "A 404 is proof too: the definition and its uses go, and a retry after a timeout is safe"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_label_deleted_elsewhere_without_history_records_still_leaves_every_message"
+covers = "The other answer to label-edit-delete-history: the next listing removes the label from every row"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "history_from_before_a_deletion_cannot_bring_the_label_back"
+covers = "A cursor behind the deletion replays labelsAdded for the dead id; rows stay without it"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_pending_action_on_a_label_deleted_elsewhere_is_dropped_not_blocked"
+covers = "The intent goes with the label; nothing is sent to Gmail for it"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_label_renamed_elsewhere_shows_under_the_same_id"
+covers = "A listing with a new name for a stored id updates the definition and logs LabelDefinitionsChanged; no message row changes"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_failed_listing_keeps_the_definitions"
+covers = "A labels.list that fails or does not decode changes nothing: the previous names stay"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_system_label_cannot_be_renamed_or_deleted"
+covers = "Refused from the definitions before any call; an id the mirror does not know is left to Gmail"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "label_writes_are_refused_in_read_only_mode"
+covers = "ReadOnly before any Gmail call; definitions are still mirrored with their colour and visibility"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_refused_label_write_does_not_block_the_account"
+covers = "A 403 for a missing scope or a 400 for a bad name is the caller's error (Refused); sync keeps running"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "a_deferred_label_write_sends_nothing"
+covers = "The quota gate defers past the caller's budget: Deferred, no request, no record"
+
+[[test]]
+target = "crates/mailtide-io/tests/label_edit.rs"
+name = "the_first_refresh_after_the_migration_fills_colour_and_visibility"
+covers = "Rows written before the migration have no attributes; one listing fills them and logs one LabelDefinitionsChanged"
+
+# Python
+
+[[test]]
+target = "tests/test_label_edit.py"
+name = "test_label_lifecycle"
+covers = "create_label, update_label, labels and delete_label through the async Runner against FakeGmail"
+
+[[test]]
+target = "tests/test_labels.py"
+name = "test_labels_carry_colour_visibility_and_parent"
+covers = "Label.color, list_visibility, message_visibility and parent_id"
+
+[[test]]
+target = "tests/test_label_edit.py"
+name = "test_a_taken_name_raises_label_name_taken"
+covers = "LabelNameTaken carries the existing label"
+
+[[test]]
+target = "tests/test_label_edit.py"
+name = "test_a_label_deleted_elsewhere_reaches_the_feed"
+covers = "FakeGmail deletes a label as another client; run() then changes() yields LabelDefinitionsChanged and LabelsChanged for its messages"
+
+[[test]]
+target = "tests/test_label_edit.py"
+name = "test_blocking_runner_has_the_label_methods"
+covers = "BlockingRunner mirrors the async label API"
+
+# ------------------------------------------- Gmail behaviour assumed, to test
+
+[[unknown]]
+id = "label-edit-delete-history"
+question = "When a user label is deleted, does history.list emit a labelsRemoved record for every message that carried it, or do those messages just stop listing the id with no history record?"
+assumed = "History emits one labelsRemoved record per message, as the simulator models. The design does not depend on it: the label is removed from every mirrored row on proof of the deletion (our own delete's answer, or a labels.list without the id), and the id is remembered as deleted for 30 days so no later observation can put it back."
+if_wrong = "Nothing changes in the mirror's result: rows are already stripped by the definition rule, and a replayed labelsAdded or an in-flight fetch from before the deletion is filtered by the deleted-label memory, so no mirrored message keeps the id. What changes is timing for a deletion made elsewhere: messages lose the label at the next label refresh (at most 15 minutes) instead of with the history page. If that is too slow, a labelsRemoved-free deletion can be noticed sooner by refreshing labels whenever a fetched message lacks a label its row has."
+test = "With a full-scope token: 1) labels.create {name: 'mt-probe-<random>'} and keep its id L. 2) messages.insert two small messages and messages.modify each with addLabelIds [L]. 3) getProfile and note historyId H. 4) labels.delete L. 5) history.list startHistoryId=H, following every page: record whether labelsRemoved records naming L appear for both messages, and their ids. 6) messages.get format=minimal on both: expect labelIds without L, and note whether each message's historyId is now greater than H. 7) Repeat steps 3 to 6 after 60 seconds to catch records that arrive late. 8) messages.delete both messages."
+
+[[unknown]]
+id = "label-edit-list-consistency"
+question = "Does labels.list always reflect label creates and deletes that completed before the request, and never omit a label that exists?"
+assumed = "Yes: one unpaginated answer that includes every existing label and no deleted one. A listing without a stored id is treated as proof that the label was deleted."
+if_wrong = "A listing that wrongly omits a live label would strip it from mirrored rows and nothing would put it back until those messages are fetched again (drift reports them as differs). The safe variant is local to one pure rule: remove a label only when two listings a refresh apart both lack it (a `missing` flag on the stored definition, no engine change), at the cost of up to one more refresh interval."
+test = "1) labels.create a probe label, then labels.list at once: expect the new id. Repeat 20 times with fresh names and count misses. 2) labels.delete each probe, then labels.list at once: expect the id gone; count the listings that still show it. 3) While creating 20 labels from one client in a loop, call labels.list from a second client 50 times: every listing must contain every label created before that request was sent and no label deleted before it. Run together with drafts-list-consistent and identities-read-after-write (the same loop: write, then list at once; a different endpoint each, so a separate answer each)."
+
+[[unknown]]
+id = "label-edit-duplicate-name"
+question = "What does labels.create answer for a name another label already holds, is the comparison case-sensitive, and does labels.patch answer the same way when a rename hits a taken name?"
+assumed = "HTTP 409 with the message `Label name exists or conflicts`, for create and for patch; names that differ only in case conflict."
+if_wrong = "Any other 4xx is reported as Refused with Gmail's message and nothing is recorded, so the mirror stays right. Only the error type is less precise (no NameTaken with the existing label), and a host retrying a create after a timeout must list labels itself."
+test = "1) labels.create {name: 'mt-dup'}; 2) labels.create {name: 'mt-dup'} again: record status and error body. 3) labels.create {name: 'MT-DUP'}: record whether it is refused. 4) labels.create {name: 'mt-dup2'} then labels.patch it with {name: 'mt-dup'}: record status and body. 5) labels.create {name: 'INBOX'} and {name: 'inbox'}: record status and body. 6) Delete the probes."
+
+[[unknown]]
+id = "label-edit-rename-parent"
+question = "Does renaming a label through labels.patch rename its sublabels (labels whose name starts with `<old>/`) on Gmail's side?"
+assumed = "No: the API changes one label; Gmail's web interface renames sublabels itself. mailtide renames each sublabel, sublabels first."
+if_wrong = "Harmless: the sublabels are renamed first, so by the time the parent is patched nothing is left under the old prefix for Gmail to rename, and a patch to a name a label already has changes nothing."
+test = "1) labels.create 'mt-p', 'mt-p/a' and 'mt-p/a/b'. 2) labels.patch the first with {name: 'mt-q'}. 3) labels.list: record the names of the other two (unchanged, or 'mt-q/a' and 'mt-q/a/b'). 4) Open Gmail's web interface and note how the two sublabels are shown. 5) Delete the probes."
+
+[[unknown]]
+id = "label-edit-delete-parent"
+question = "Does labels.delete on a label delete its sublabels too?"
+assumed = "No: only the named label goes; sublabels keep their names. mailtide refuses to delete a label that has sublabels unless asked to delete them, and then deletes each, deepest first."
+if_wrong = "Safe: with sublabels = delete they are already gone when the parent is deleted. With the default the call is refused while the mirror shows sublabels; a sublabel created elsewhere seconds ago could then be deleted by Gmail along with its parent, and the next listing removes it from the mirror like any label deleted elsewhere."
+test = "1) labels.create 'mt-d' and 'mt-d/child'; apply 'mt-d/child' to one inserted message. 2) labels.delete 'mt-d'. 3) labels.list: record whether 'mt-d/child' still exists. 4) messages.get the message: record whether it still carries the child's id. 5) Delete the probes."
+
+[[unknown]]
+id = "label-edit-color-rules"
+question = "Does Gmail accept any textColor and backgroundColor pair taken from the documented palette, and does labels.patch with `color: null` clear a label's colour?"
+assumed = "Any pair from the palette is accepted; a patch with a null color removes the colour and leaves name and visibility alone."
+if_wrong = "A refused pair is a 400 that mailtide reports as Refused, recording nothing. If null does not clear, clearing a colour is refused the same way until it is implemented as labels.get plus labels.update with every other field copied; no other call uses the PUT."
+test = "1) labels.create a probe with color {textColor: '#ffffff', backgroundColor: '#16a766'}: expect 200. 2) labels.patch it with a pair that Gmail's own picker does not offer together, e.g. {textColor: '#fb4c2f', backgroundColor: '#16a766'}: record status. 3) labels.patch with {textColor: '#123456', backgroundColor: '#16a766'}: expect 400. 4) labels.patch with {color: null}, then labels.get: record whether color is absent and whether name, labelListVisibility and messageListVisibility are unchanged. 5) Delete the probe."
+
+[[unknown]]
+id = "label-edit-modify-deleted-label"
+question = "What does messages.modify answer when addLabelIds or removeLabelIds names a label id that was deleted?"
+assumed = "HTTP 400 (invalid label), which the engine already treats as a permanent refusal of that change."
+if_wrong = "If Gmail answers 404, today's engine would read it as `the message is gone` and tombstone a live message. This plan removes that risk whatever the answer: a 404 to a delivery enqueues a verification fetch, and only that fetch's own 404 tombstones the message."
+test = "1) labels.create a probe and keep its id L; insert one message M. 2) labels.delete L. 3) messages.modify M with addLabelIds [L]: record status and error body. 4) messages.modify M with removeLabelIds [L]: record status and body. 5) messages.batchModify {ids: [M], addLabelIds: [L]}: record status and body. 6) messages.get M: expect it to exist. 7) messages.delete M. Run together with search-unknown-label-id (one deleted label id, used in a modify and in a listing)."

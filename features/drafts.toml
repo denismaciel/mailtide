@@ -1,0 +1,941 @@
+id = "drafts"
+title = "Drafts: create, update, delete, list, read and send"
+summary = "Draft writes as quota-gated calls to Gmail's drafts API that return Gmail's draft id at once, plus a mirrored draft index (draft id -> current message id) that follows drafts changed elsewhere and confirms a send whose answer was lost."
+roadmap = ["C2"]
+status = "approved"
+design = "docs/features/drafts.md"
+# No hard dependency: the API takes RFC 5322 bytes.
+#   compose-mime (C1) builds those bytes; send (C3) reuses `send_draft` and owns
+#   large uploads; identities (C4) decides which From addresses are allowed.
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/drafts.rs"
+change = "new"
+role = "DraftId-keyed rows, DraftOp, DraftView and the pure rules: local save, listing reconcile behind a generation fence, send settle"
+
+[[file]]
+path = "crates/mailtide/src/lib.rs"
+change = "modify"
+role = "Export the drafts module"
+
+[[file]]
+path = "crates/mailtide/src/ids.rs"
+change = "modify"
+role = "DraftId"
+
+[[file]]
+path = "crates/mailtide/src/command.rs"
+change = "modify"
+role = "GmailRequest draft variants (ListDrafts from the engine; get, create, update, delete, send from the driver)"
+
+[[file]]
+path = "crates/mailtide/src/event.rs"
+change = "modify"
+role = "Draft results: DraftsListed, DraftFetched, DraftSaved, DraftDeleted, DraftSent, DraftNotFound"
+
+[[file]]
+path = "crates/mailtide/src/quota.rs"
+change = "modify"
+role = "Costs of the drafts calls"
+
+[[file]]
+path = "crates/mailtide/src/commit.rs"
+change = "modify"
+role = "Commit.drafts (DraftOp), JobPlan.draft_refresh_due_at, AccountOp recording when the index was last refreshed"
+
+[[file]]
+path = "crates/mailtide/src/jobs.rs"
+change = "modify"
+role = "Account-level RefreshDrafts job; its claim carries the draft generation. Shared groundwork: the account-level job kind (a mailtide_jobs row with an empty message key) is added by whichever of drafts, identities lands first"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "Draft rows in AccountMirror; message ops that schedule a refresh; import of a SENT message settles a sending draft"
+
+[[file]]
+path = "crates/mailtide/src/revision.rs"
+change = "modify"
+role = "Feed entries DraftSaved, DraftRemoved, DraftSent"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "Run RefreshDrafts: page drafts.list, commit one reconcile; the periodic refresh, in the shape of the label refresh this file already has (LabelRefresh, pump_labels): due from the persisted drafts_refreshed_at, at once on start when that is 15 minutes old or unset, else on the Drafts timer; draft_refresh_delay and draft_send_grace tunables"
+
+[[file]]
+path = "crates/mailtide/src/schedule.rs"
+change = "modify"
+role = "TimerKind::Drafts and draft_refresh_due, beside TimerKind::Labels and label_refresh_due and by the same rule: an interval after the last listing, or now if never listed"
+
+[[file]]
+path = "crates/mailtide/src/state.rs"
+change = "modify"
+role = "StoreSnapshot carries when the draft index was last refreshed"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Draft invariants: one row per draft, one draft per message, a quiet mirror's index equals Gmail's"
+
+# ------------------------------------------------------------------ wire layer
+
+[[file]]
+path = "crates/mailtide-gmail/src/drafts.rs"
+change = "new"
+role = "Gmail drafts requests (create, update, get, list, delete, send) and Draft/Message response decoding"
+
+[[file]]
+path = "crates/mailtide-gmail/src/request.rs"
+change = "modify"
+role = "Build the draft variants of GmailRequest"
+
+[[file]]
+path = "crates/mailtide-gmail/src/http.rs"
+change = "modify"
+role = "PUT and DELETE methods. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-gmail/src/lib.rs"
+change = "modify"
+role = "Export the drafts module"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::record_draft (unfenced, like admit; saved -> sending is an atomic compare-and-set), Store::drafts, Store::draft"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "Draft methods over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "The next migration: table mailtide_drafts and, on mailtide_accounts, the columns drafts_generation and drafts_refreshed_at (nothing is added to the sync column); load and write draft rows a commit touches"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance cases for draft rows, the generation fence and the feed entries"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/drafts.rs"
+change = "new"
+role = "Runner draft methods: create, update, delete, send, drafts, draft, read_draft; DraftError"
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Perform and decode draft requests; refuse draft writes in read-only mode. Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "crates/mailtide-io/src/transport.rs"
+change = "modify"
+role = "Send PUT and DELETE. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the draft types"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Drafts in the fake Gmail (saved, replaced, deleted, sent, here and elsewhere) and the draft invariants"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Runner and BlockingRunner draft methods, DraftRef, DraftView, DraftContent, SentDraft, feed entries, exceptions. Shared groundwork: the QuotaDeferred exception is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "crates/mailtide-py/src/settings.rs"
+change = "modify"
+role = "draft_refresh_delay_s, draft_refresh_every_s, draft_send_grace_s, draft_inline_limit"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers for the draft methods"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the draft API"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export the draft types and exceptions"
+
+[[file]]
+path = "python/mailtide/config.py"
+change = "modify"
+role = "The four draft tunables"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail drafts endpoints and helpers to edit, delete or send a draft as another client"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 draft rows; §7 replace the last sentence (\"Sending and drafts reuse the same command and confirm-by-Gmail pattern later\"): draft writes are synchronous calls, only a lost send is confirmed by Gmail; §8 costs; §10-11 interfaces; §14 phase 7"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_drafts_get.rs"
+change = "new"
+role = "Test ported from himalaya"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_draft_providers.rs"
+change = "new"
+role = "Tests ported from Zero's provider draft suite"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_mail_draft_store.rs"
+change = "new"
+role = "Tests ported from Zero's draft read cache, as index rules"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_driver_imap.rs"
+change = "new"
+role = "The two provider-neutral draft tests of Zero's IMAP driver suite"
+
+[[file]]
+path = "crates/mailtide-io/tests/drafts.rs"
+change = "new"
+role = "Driver tests against a fake Gmail: lifecycle, conflicts, timeouts, drafts changed elsewhere"
+
+[[file]]
+path = "tests/test_drafts.py"
+change = "new"
+role = "Python tests of the Runner draft API against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["createDraft", "sendDraft", "getDraft", "listDrafts", "listThreadDrafts", "deleteDraft", "parseDraft"]
+note = "Pass-through calls; the client keeps Gmail's draft id. Create and update are one method keyed on `data.id`; send re-sends the MIME with the thread id; reading parses format=full and fetches attachments one by one."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/types.ts"
+symbols = ["ParsedDraft", "listThreadDrafts"]
+note = "The driver contract; listThreadDrafts is the draft id <-> message id mapping, found by scanning drafts.list."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-draft-store.ts"
+symbols = ["MailDraftStore", "mail_draft_revision", "invalidate"]
+note = "A 5 s / 10 s read cache fenced by a revision bumped on every local write. We keep the fence (a local write beats an older listing) and drop the cache."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/agent/index.ts"
+symbols = ["invalidateDrafts", "draftHistoryStamp"]
+note = "Where the cache is invalidated: after each local write, and by the history position for changes made elsewhere."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+symbols = ["Draft and attachment caching", "replace Gmail's underlying message ID"]
+note = "The stated rules: updates replace the message id; a draft deleted during enumeration is skipped on 404; transient failures never become a partial list."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["drafts.create", "drafts.update", "drafts.delete", "drafts.send", "drafts.get", "drafts.list"]
+note = "Declared costs; they match Google's table (drafts.get is 60 for raw/full, which Zero does not distinguish)."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-drafts.ts"
+symbols = ["checkedDraft", "version"]
+note = "Optimistic concurrency above the driver: read the draft, hash it, refuse the update or send if it changed. We use Gmail's message id as the version instead of a hash."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/outgoing-mime.ts"
+symbols = ["buildDraftMime"]
+note = "Draft MIME may have no recipients. Composition itself is compose-mime's; cited only for that fact."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/drafts.rs"
+symbols = ["GmailDraftsCommand", "GmailDraftWriteOutput"]
+note = "One thin command per users.drafts method; a write reports the immutable draft id with the current message id and thread id, which is the shape of our DraftRef."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/drafts/update.rs"
+symbols = ["GmailDraftUpdate", "encode_raw", "thread_id"]
+note = "Update replaces the whole message from raw bytes and passes the thread id again."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/drafts/send.rs"
+symbols = ["GmailDraftSend", "IdReceipt"]
+note = "Sends the stored draft as is: the request carries only the draft id, the answer is the new message id."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/drafts/list.rs"
+symbols = ["GmailDraftsListParams", "include_spam_trash"]
+note = "drafts.list parameters; each entry carries only the draft id and the message's id and thread id."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/testing/gmail-specific.md"
+symbols = ["refusal 404 after delete"]
+note = "Their live check of the draft lifecycle: a get after delete is a 404."
+
+[[reference]]
+impl = "himalaya"
+path = "src/jmap/backend.rs"
+symbols = ["$draft", "resolve_send_mailbox_ids"]
+note = "JMAP send stages the message as a $draft, submits it, and a refused submission destroys the staged draft; an uncertain one keeps it. The same draft-then-submit shape as Gmail's drafts.send."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/backends.md"
+symbols = ["onSuccessUpdateEmail", "Gmail and Graph declare no answered or draft flag"]
+note = "Their written requirements: DRAFT is never set by a client as a flag; a JMAP send moves the draft to sent on success."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email_submission/set.rs"
+symbols = ["on_success_update_email"]
+note = "JMAP's send-a-draft: an EmailSubmission whose success updates the Email (drops $draft). Gmail does this implicitly and gives the sent message a new id."
+
+[[reference]]
+impl = "jmap-client"
+path = "examples/messages.rs"
+symbols = ["$draft", "email_import"]
+note = "A draft in JMAP is an Email with the $draft keyword; emails are immutable, so an edit is create plus destroy, as in Gmail."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/types/src/keyword.rs"
+symbols = ["$draft"]
+note = "Names only (AGPL). The $draft keyword."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/submission/set.rs"
+symbols = ["on_success_update_email", "on_success_destroy_email"]
+note = "Names only (AGPL). Where a submission's success updates or destroys the draft it sent."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/email/src/message/ingest/checks.rs"
+symbols = ["has_duplicate_in", "DRAFT_BIT"]
+note = "Names only (AGPL). Duplicate detection by Message-ID leaves drafts out: a draft and the message it becomes share one."
+
+# ---------------------------------------------------- sources outside the refs
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/drafts"
+note = "Read 2026-11-20. A draft is a container with a stable id; its message is destroyed and replaced on update; a draft message has no label but DRAFT; on send the draft is deleted and a new message with a new id and SENT is created and returned."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Read 2026-11-20. drafts.create 10, drafts.update 15, drafts.delete 10, drafts.send 100, drafts.list 5, drafts.get 20 (60 for full or raw); 6,000 units per minute per user."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/list"
+note = "Read 2026-11-20. maxResults defaults to 100, at most 500; each entry's message has only id and threadId; includeSpamTrash; accepted with the gmail.readonly scope."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/get"
+note = "Read 2026-11-20. Takes a format; accepted with the gmail.readonly scope."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/send"
+note = "Read 2026-11-20. The request body is a Draft, the answer a Message; needs gmail.compose, gmail.modify or full access. States no size limit."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/update"
+note = "Read 2026-11-20. PUT replaces a draft's content; metadata and upload URIs; states no size limit and no precondition."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/delete"
+note = "Read 2026-11-20. Immediately and permanently deletes the draft; it is not moved to trash."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/uploads"
+note = "Read 2026-11-20. Draft create and update accept media uploads (simple, multipart, resumable); 5 MB is given only as an example of a small transfer; size limits are left to each method's page, which states none."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/driver/draft-providers.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_draft_providers.rs"
+
+[[suite.test]]
+name = "provider draft safety > writes the selected Gmail From address into the real saved MIME"
+
+[[suite.test]]
+name = "provider draft safety > does not replace or delete an Outlook draft when patch fails"
+na = "Outlook only (Graph patch, then post and delete). Gmail's update is one replace call; our own a_failed_update_leaves_the_draft_and_index_unchanged covers it"
+
+[[suite.test]]
+name = "provider draft safety > does not treat a sent Outlook message as a draft"
+na = "Outlook only (isDraft on a Graph message). Gmail draft ids are not message ids; our own reading_a_sent_draft_reports_not_found covers it"
+
+[[suite.test]]
+name = "provider draft safety > follows only a scoped Outlook drafts pagination cursor"
+na = "Outlook only: Graph cursors are URLs. Gmail page tokens are opaque values sent as a query parameter to a fixed origin"
+
+[[suite.test]]
+name = "provider draft safety > reads nested Gmail MIME content and retains threading and quoted recipients"
+
+[[suite.test]]
+name = "provider draft safety > converts plain-text Gmail drafts without losing newlines or interpreting HTML"
+na = "Zero turns text/plain into HTML for its editor. mailtide returns the draft's raw MIME; presentation is the host's"
+
+[[suite.test]]
+name = "provider draft safety > rejects a partial Gmail draft when an attachment cannot be read"
+test = "a_draft_read_without_its_raw_content_is_refused"
+
+[[suite.defer]]
+name = "provider draft safety > offers only the primary Gmail sender and accepted sending aliases"
+to = "identities"
+
+[[suite.defer]]
+name = "provider draft safety > fails closed when a fresh original Gmail attachment cannot be retrieved"
+to = "send"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/mail-draft-store.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_mail_draft_store.rs"
+
+[[suite.test]]
+name = "short-lived durable draft reads > coalesces detail reads, persists them across restart, and expires them after five seconds"
+na = "No TTL cache: reads come from the durable draft index and the immutable blob of the draft's current message, so there is nothing to coalesce or expire"
+
+[[suite.test]]
+name = "short-lived durable draft reads > preserves draft-list dates and page tokens while isolating query, size and page"
+na = "No cached Gmail list pages: `drafts` pages the index by draft id and takes no Gmail query"
+
+[[suite.test]]
+name = "short-lived durable draft reads > fences detail/list caches on edits, sends or deletes, including older in-flight reads"
+test = "a_listing_claimed_before_a_local_draft_write_never_overwrites_it"
+
+[[suite.test]]
+name = "short-lived durable draft reads > invalidates external history changes and never caches failed draft reads"
+test = "history_touching_a_draft_schedules_a_refresh_and_a_failed_refresh_keeps_the_index"
+
+[[suite.test]]
+name = "short-lived durable draft reads > keeps oversized UTF-8 drafts readable without storing oversized SQLite rows"
+na = "Index rows hold ids only; content is in blob storage, so no row grows with the draft"
+
+[[suite.test]]
+name = "short-lived durable draft reads > isolates mailbox storage and caps the number of cached draft entries"
+test = "draft_rows_are_isolated_per_account"
+note = "Only the first half applies (one account never reads another's rows); the 128-entry cache cap has no counterpart"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/driver/imap.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_driver_imap.rs"
+# The suite is shared with `send`, so every test is listed: no rest_na.
+
+[[suite.test]]
+name = "ImapMailManager > creates, updates, reads and deletes drafts with a stable id"
+test = "creates_updates_reads_and_deletes_drafts_with_a_stable_id"
+
+[[suite.test]]
+name = "ImapMailManager > does not expose an inbox message as an editable draft"
+test = "does_not_expose_an_inbox_message_as_an_editable_draft"
+
+[[suite.defer]]
+name = "ImapMailManager > sends via SMTP without Bcc, files a Sent copy and threads the reply"
+to = "send"
+
+[[suite.test]]
+name = "ImapMailManager > syncs, threads and parses messages with folder/flag labels"
+na = "IMAP sync: folders and flags read as labels, threads built from headers. mailtide syncs Gmail's own labels and threadId"
+
+[[suite.test]]
+name = "ImapMailManager > maps label mutations onto flags and folder moves"
+na = "IMAP flags and folder moves; Gmail label changes are mailtide's existing actions (SPEC §7)"
+
+[[suite.test]]
+name = "ImapMailManager > searches with Gmail-style queries"
+na = "Translation of a Gmail query into IMAP SEARCH; `search` forwards the query to Gmail untouched"
+
+[[suite.test]]
+name = "ImapMailManager > answers label-only queries like All Mail from the local index"
+na = "A local index answering label-only queries for an IMAP account; label views are a host query over the mirror"
+
+[[suite.test]]
+name = "ImapMailManager > stores tag labels as keywords without moving mail or creating folders"
+na = "IMAP keywords standing in for labels; Gmail has labels"
+
+[[suite.test]]
+name = "ImapMailManager > reports tag labels the server cannot store, and never moves for folder labels"
+na = "IMAP servers without keyword support; Gmail has labels"
+
+[[suite.test]]
+name = "ImapMailManager > surfaces keywords set by other clients as labels"
+na = "IMAP keywords read back as labels; Gmail reports label ids in history"
+
+[[suite.test]]
+name = "ImapMailManager > serves Gmail-style category tabs from header rules and AI overrides"
+na = "Category tabs computed by the host for an IMAP account; Gmail's CATEGORY_* labels are synced as labels"
+
+[[suite.test]]
+name = "ImapMailManager > pushes inbox changes over IDLE on a dedicated connection"
+na = "IMAP IDLE; mailtide is notified through Gmail's watch and Pub/Sub"
+
+[[suite.test]]
+name = "ImapMailManager > reports IDLE as unsupported when the server lacks it"
+na = "IMAP IDLE capability; no counterpart in the Gmail API"
+
+[[suite.test]]
+name = "ImapMailManager > maps auth failures to a reconnect error"
+na = "IMAP login failures; credential failures reach mailtide through the token source and block the account (existing)"
+
+[[suite.test]]
+name = "ImapMailManager > testImapSmtpSettings reports both sides"
+na = "A connection check of IMAP and SMTP settings; mailtide has neither"
+
+[[suite.test]]
+name = "ImapMailManager > refreshes XOAUTH2 tokens and persists rotated refresh tokens"
+na = "Token refresh for IMAP XOAUTH2; mailtide's tokens come from the host's token source"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/drafts/get.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_drafts_get.rs"
+
+[[suite.test]]
+name = "a_draft_prints_as_gmail_sent_it"
+test = "a_draft_get_asks_for_the_draft_by_id_and_tolerates_unknown_fields"
+
+# ------------------------------------------------------------ our own tests
+
+# Wire layer
+
+[[test]]
+target = "crates/mailtide-gmail/src/drafts.rs"
+name = "create_posts_base64url_raw_with_the_thread_id"
+covers = "POST /drafts with {message: {raw, threadId}}; raw is unpadded base64url of exactly the bytes given"
+
+[[test]]
+target = "crates/mailtide-gmail/src/drafts.rs"
+name = "update_puts_to_the_draft_id"
+covers = "PUT /drafts/{id}; the id is percent-encoded into the path"
+
+[[test]]
+target = "crates/mailtide-gmail/src/drafts.rs"
+name = "send_posts_only_the_draft_id"
+covers = "POST /drafts/send with {id}: the stored draft is sent as is"
+
+[[test]]
+target = "crates/mailtide-gmail/src/drafts.rs"
+name = "list_asks_for_full_pages_including_spam_and_trash"
+covers = "GET /drafts?maxResults=500&includeSpamTrash=true, following pageToken"
+
+[[test]]
+target = "crates/mailtide-gmail/src/drafts.rs"
+name = "a_draft_answer_without_a_message_id_is_refused"
+covers = "Decoding: a Draft without id or message.id is a permanent failure, never a row with an empty id"
+
+[[test]]
+target = "crates/mailtide/src/quota.rs"
+name = "draft_costs_follow_gmails_quota_table"
+covers = "create 10, update 15, delete 10, send 100, list 5, get 20 (minimal) and 60 (raw)"
+
+# Pure rules
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_local_save_points_the_draft_at_its_new_message"
+covers = "record_draft after create or update: the row holds the new message id and the feed gets DraftSaved"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_draft_message_no_row_points_at_schedules_a_refresh"
+covers = "A DRAFT-labelled message discovered by history or a listing that no draft row explains enqueues RefreshDrafts"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_tombstone_under_a_draft_marks_it_stale_and_schedules_a_refresh"
+covers = "The draft was replaced, deleted or sent elsewhere; the row is kept, marked stale, until Gmail's list says which"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "our_own_write_seen_again_in_history_schedules_nothing"
+covers = "The added message is the one the row already points at and the deleted one is no longer referenced: no drafts.list"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_listing_naming_a_tombstoned_message_is_not_applied"
+covers = "drafts.list is not a snapshot: a row pointing at a message the mirror knows is deleted proves the listing stale, so the refresh retries"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_draft_missing_from_a_listing_is_removed"
+covers = "Deleted or sent elsewhere: the row goes and the feed gets DraftRemoved with its last message id"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_sending_draft_missing_from_a_listing_waits_for_confirmation"
+covers = "A row marked sending is not removed by a listing; it is send_unconfirmed until a SENT import or the grace period settles it"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_sent_import_with_the_drafts_message_id_settles_the_send"
+covers = "Confirmation by Gmail: importing a SENT message whose Message-ID is the sending draft's emits DraftSent and drops the row"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "an_unconfirmed_send_ends_as_removed_after_the_grace_period"
+covers = "No draft row lives forever: DraftRemoved{send_unconfirmed} once the draft is gone, the cursor is past the attempt and draft_send_grace has passed"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_still_listed_sending_draft_returns_to_saved"
+covers = "The send never reached Gmail: a listing claimed after the attempt still shows the draft, so it can be sent again"
+
+[[test]]
+target = "crates/mailtide/src/invariants.rs"
+name = "one_message_belongs_to_at_most_one_draft"
+covers = "Invariant: draft ids are unique per account and no two rows share a message id"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "draft_rows"
+covers = "Every store: rows survive a restart, a local write bumps the generation and fences an older reconcile, feed entries are written in the same transaction, forget deletes them"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "drafts_changed_here_and_elsewhere_converge_under_faults"
+covers = "Seeded campaign with draft saves, deletes and sends from the driver and from another client, crashes between the Gmail call and its record: the draft invariants hold and the index equals Gmail's list after healing"
+
+# Driver
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_draft_update_keeps_its_draft_id"
+covers = "Gmail replaces the message id on update; the draft id is stable and the index follows the new message"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_created_draft_is_in_the_index_before_history_arrives"
+covers = "The create's answer is recorded at once: `drafts` and the feed show it without waiting for a sync or for draft_settle"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_draft_without_recipients_is_saved"
+covers = "A draft needs no To header (Zero: outgoing MIME > builds drafts without recipients); mailtide does not validate recipients on save"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_update_keeps_the_draft_in_its_thread"
+covers = "update_draft always sends a thread id: the caller's, else the index's"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_update_with_a_stale_message_id_is_refused"
+covers = "if_message_id: refused from the index when it already shows a newer message, otherwise checked with drafts.get before writing (Zero assistant: refuses stale updates)"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_with_a_stale_message_id_is_refused"
+covers = "The draft changed after the user reviewed it: DraftConflict and nothing is sent (Zero assistant: refuses to send a draft changed after approval)"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_failed_update_leaves_the_draft_and_index_unchanged"
+covers = "A refused or failed update records nothing; the row still points at the old message"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_update_retried_after_a_timeout_leaves_one_draft"
+covers = "Update is a replace, so a retry is safe: one draft, the retried content, the index at the last answer"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_create_that_times_out_returns_no_id_and_refreshes_the_index"
+covers = "WriteOutcomeUnknown: no DraftRef is invented; a refresh is scheduled so a draft Gmail did create appears in the index"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "deleting_a_missing_draft_reports_already_gone"
+covers = "Delete is idempotent: a 404 removes the row and reports AlreadyGone, so a retry after a timeout is safe"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "sending_returns_the_new_message_and_drops_the_draft"
+covers = "drafts.send: the answer's message id and thread id are returned, the row goes, the feed gets DraftSent tying the draft id to the new message"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_that_times_out_then_finds_the_draft_gone_is_unconfirmed_and_never_resent"
+covers = "A retry on a sending row reads the draft first; its 404 reports SendUnconfirmed (sent at most once), not DraftNotFound, and drafts.send is not called again"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_retried_after_a_request_that_never_arrived_sends_once"
+covers = "The draft is still there, so the retry sends it; exactly one message leaves"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_whose_answer_was_lost_is_confirmed_by_the_sync"
+covers = "Crash after Gmail sent but before the record: the row stays sending, the SENT message is imported, the feed gets DraftSent"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "reading_a_sent_draft_reports_not_found"
+covers = "Gmail analogue of Zero's Outlook test: a sent or deleted draft id is DraftNotFound, never the sent message"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "reading_a_draft_uses_the_blob_once_its_message_is_imported"
+covers = "Content is immutable per message id: no Gmail call when the current message's blob exists, drafts.get?format=raw (60 units) otherwise"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_draft_edited_elsewhere_is_repointed_after_a_refresh"
+covers = "History shows the old message deleted and a new DRAFT message; the refresh maps the draft id to it and the feed gets DraftSaved"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_draft_deleted_elsewhere_is_removed_after_a_refresh"
+covers = "Drafts deleted or sent from another client leave the index with DraftRemoved"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "two_writers_on_one_draft_converge_after_a_refresh"
+covers = "Records can land in another order than Gmail applied the writes; the tombstone of the losing message marks the row stale and the refresh repairs it"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "history_expiry_refreshes_the_draft_index"
+covers = "A full reconciliation ends with a drafts refresh, since draft changes during the lost window left no history"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "draft_writes_are_refused_in_read_only_mode"
+covers = "Shadow mode: create, update, delete and send raise ReadOnlyMode before any Gmail call; the index is still mirrored"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_deferred_draft_write_sends_nothing"
+covers = "The quota gate defers past the caller's budget: Deferred{until}, no request, no record"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_message_over_the_inline_limit_is_refused_before_calling_gmail"
+covers = "TooLarge{limit} for raw content above draft_inline_limit until the upload endpoint (send feature) exists"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_refused_draft_write_does_not_block_the_account"
+covers = "403 (missing gmail.compose scope) or 400 from a draft call is the caller's error; sync keeps running"
+
+# Python
+
+[[test]]
+target = "tests/test_drafts.py"
+name = "test_draft_lifecycle"
+covers = "create, update, drafts, read_draft and delete through the async Runner against FakeGmail"
+
+[[test]]
+target = "tests/test_drafts.py"
+name = "test_send_draft_returns_the_sent_message"
+covers = "send_draft returns SentDraft; changes() yields DraftSent and later the SENT message"
+
+[[test]]
+target = "tests/test_drafts.py"
+name = "test_stale_update_raises_draft_conflict"
+covers = "DraftConflict carries the current message id"
+
+[[test]]
+target = "tests/test_drafts.py"
+name = "test_draft_changed_elsewhere_reaches_the_feed"
+covers = "FakeGmail edits a draft as another client; run() then changes() yields DraftSaved with the new message id"
+
+[[test]]
+target = "tests/test_drafts.py"
+name = "test_blocking_runner_has_the_draft_methods"
+covers = "BlockingRunner mirrors the async draft API"
+
+
+# Added with the decisions (send safety, thread ids, periodic refresh)
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_second_send_while_one_is_in_flight_is_refused"
+covers = "saved -> sending is an atomic store transition: a concurrent send_draft, from this or another process, gets SendInProgress and makes no Gmail call"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_retry_waits_out_the_first_request_and_reads_the_draft_before_sending"
+covers = "A retry on a sending row is refused until the first request has timed out, then calls drafts.get; drafts.send follows only if the draft is still there with the same message"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_update_reads_the_thread_when_neither_caller_nor_index_knows_it"
+covers = "A draft the index has never seen: one drafts.get?format=minimal supplies the thread id, so an update never omits it"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_write_answer_without_ids_is_completed_by_a_get"
+covers = "A create or update answer lacking message.id or threadId is completed with drafts.get; if that fails the call is OutcomeUnknown and a refresh is scheduled"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_periodic_refresh_adopts_a_draft_history_never_showed"
+covers = "Whatever Gmail's consistency: a draft missing from the index with no history record to trigger a refresh appears after the periodic one"
+
+[[test]]
+target = "crates/mailtide-gmail/src/drafts.rs"
+name = "a_draft_answer_whose_message_lacks_the_draft_label_is_not_a_draft"
+covers = "Guard for drafts-id-namespace: a drafts.get answer that carries labelIds without DRAFT decodes to not found, never to an editable draft"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "the_draft_index_is_refreshed_at_most_every_fifteen_minutes_while_live"
+covers = "Decided from the persisted last-refresh time, so a restart neither skips nor repeats it; not while bootstrapping, reconciling or blocked; 5 units a page"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_refresh_that_changes_nothing_appends_no_feed_entry"
+covers = "A reconcile whose listing equals the index writes only the refresh time"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_lost_send_is_matched_by_message_id_in_any_thread"
+covers = "Confirmation does not assume the sent message stayed in the draft's thread; DraftSent carries the imported message's own thread id"
+
+# ------------------------------------------------------------------- unknowns
+# Gmail behaviour the design assumes without proof. Paths are relative to
+# https://gmail.googleapis.com/gmail/v1/users/me; run them on a test mailbox.
+# "To self" means a message addressed to the account itself, with a unique Subject.
+
+[[unknown]]
+id = "drafts-send-twice"
+question = "Does a second drafts.send of the same draft id return 404 and send nothing?"
+assumed = "Yes. A sent draft's id is gone: the second call answers 404 and no second message is created."
+if_wrong = "Still safe: a retry never calls drafts.send blind. On a row already marked sending it first calls drafts.get, and a 404 there ends as SendUnconfirmed without sending. Only if drafts-gone-is-404 is wrong too could a retry resend; then a retry on a sending row must be refused until the sync has confirmed or ruled out the first send."
+test = "1) POST /drafts {message:{raw}} to self with Subject S; note draft id D. 2) POST /drafts/send {id:D}; expect 200, note message id M1. 3) POST /drafts/send {id:D} again; record status and error body (expect 404). 4) Wait 60 s. GET /messages?q=subject:S in:sent and GET /messages?q=subject:S in:inbox; expect exactly one message in each."
+
+[[unknown]]
+id = "drafts-send-concurrent"
+question = "Do concurrent drafts.send calls for one draft send at most one message?"
+assumed = "Yes: Gmail serialises them; one answers 200, the rest 404 or an error, and one message leaves."
+if_wrong = "mailtide itself never issues two: saved -> sending is an atomic store transition across processes, and a retry waits out the request timeout and reads the draft first. What stays exposed is a send from another client at the same instant, or a request Gmail is still processing after our timeout; then the wait before a retry must grow to cover Gmail's processing time, or retries on a sending row must be refused until the sync settles it."
+test = "1) POST /drafts to self with Subject S; note D. 2) Send 5 POST /drafts/send {id:D} in parallel on separate connections. 3) Record every status. 4) Wait 60 s. GET /messages?q=subject:S in:sent and in:inbox; expect one 200, one sent message, one received copy. Repeat 20 times with fresh drafts."
+
+[[unknown]]
+id = "drafts-message-id-kept"
+question = "Does Gmail keep a client-supplied Message-ID header through drafts.create, drafts.update and drafts.send?"
+assumed = "Yes: the draft read back with format=raw and the SENT message both carry the header exactly as supplied."
+if_wrong = "A send whose answer was lost cannot be matched to its SENT message: the row ends as DraftRemoved{send_unconfirmed} after draft_send_grace, and nothing is resent. DraftView.rfc822_message_id must then be read from Gmail's stored copy instead of our bytes, and confirmation needs another key (step 2 and 5 show whether a private X- header survives)."
+test = "1) POST /drafts with raw containing `Message-ID: <mailtide-probe-1@example.com>` and `X-Mailtide-Probe: 1`, to self; note D. 2) GET /drafts/D?format=raw; base64url-decode; record both headers. 3) PUT /drafts/D with a new body and the same two headers; GET /drafts/D?format=raw; record them. 4) POST /drafts/send {id:D}; note message id M. 5) GET /messages/M?format=raw; record both headers. 6) GET /messages?q=rfc822msgid:mailtide-probe-1@example.com; expect M (and the received copy). 7) Repeat with a Message-ID on the account's own domain and with a send-as alias in From. Run together with send-message-id-kept and compose-mime-date-kept (one set of probe messages, sent both ways)."
+
+[[unknown]]
+id = "drafts-raw-json-limit"
+question = "What is the largest message drafts.create, drafts.update and messages.send accept in the JSON `raw` field (metadata URI)?"
+assumed = "At least 3 MiB of RFC 5322 bytes (a JSON body a little over 4 MiB). draft_inline_limit defaults to 3 MiB until this is measured."
+if_wrong = "If the limit is lower, Gmail refuses the save: nothing is stored and the host gets Refused; lower the default below the measured size. If it is much higher, raise the default so fewer drafts wait for the upload endpoint."
+test = "For each size in 1, 2, 3, 4, 5, 8, 12, 16, 24, 32 MiB: build a message with one attachment padding it to that size; POST /drafts {message:{raw}} as application/json; record status and error reason. For the largest size accepted: PUT /drafts/D with a message of the same size, then GET /drafts/D?format=raw and compare the decoded length. DELETE every draft created. Then POST /messages/send {raw} to self for the same sizes and record status: send's 2 MiB send_inline_limit rests on this figure too. Run together with drafts-upload-limit and send-size-limit (one ladder of padded messages)."
+
+[[unknown]]
+id = "drafts-upload-limit"
+question = "What is the largest message the upload URIs accept for a draft?"
+assumed = "35 MB, the figure older reference pages gave; today's pages state none. This feature does not use the upload URIs: larger content is refused locally with TooLarge until the send feature's upload path exists."
+if_wrong = "Only the documented ceiling changes. Gmail refuses an oversize upload itself, which maps to TooLarge."
+test = "POST https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=media with Content-Type: message/rfc822 and bodies of 20, 25, 30, 34, 35, 36, 40 MiB; record status. Retry the smallest refused size with uploadType=resumable. For the largest accepted draft addressed to self, POST /drafts/send {id} and record whether send applies a lower limit. DELETE the rest. Run together with drafts-raw-json-limit and send-size-limit (one ladder of padded messages)."
+
+[[unknown]]
+id = "drafts-sent-thread"
+question = "Is the message that drafts.send returns in the draft's thread?"
+assumed = "Yes, for a new conversation and for a reply draft."
+if_wrong = "Nothing breaks: SentDraft and DraftSent carry the thread id from Gmail's answer or from the imported SENT message, never the row's, and a lost send is matched by Message-ID in any thread. A host that showed the draft in a thread must move it on DraftSent."
+test = "1) POST /drafts to self without threadId; note message.threadId T1. POST /drafts/send {id}; record the answer's keys, its threadId (expect T1) and labelIds (expect SENT, no DRAFT). 2) Pick an INBOX message with thread T2 and Message-ID X. POST /drafts {message:{raw with In-Reply-To: X, References: X, Subject `Re: ...`, threadId:T2}}; POST /drafts/send; expect threadId T2. 3) GET /threads/T1?format=minimal and /threads/T2?format=minimal; expect the sent messages listed."
+
+[[unknown]]
+id = "drafts-update-keeps-thread"
+question = "Does drafts.update without threadId keep a reply draft in its thread?"
+assumed = "Not relied on. The design assumes the worse answer (Gmail may re-thread it), so update_draft always sends a thread id: the caller's, else the index's, else one read with drafts.get."
+if_wrong = "Either answer is safe. If Gmail does keep the thread, the drafts.get fallback (20 units, only for a draft the index has never seen) can be dropped."
+test = "1) Create a reply draft D in thread T2 as in drafts-sent-thread step 2. 2) PUT /drafts/D {message:{raw}} with the same headers, a new body and no threadId; record the answer's message.threadId. 3) PUT again without threadId and with a changed Subject; record it. 4) PUT again without threadId and without In-Reply-To and References; record it. 5) GET /drafts/D?format=minimal after each."
+
+[[unknown]]
+id = "drafts-update-resend-thread"
+question = "Is an update that sends the draft's own thread id accepted when the draft is the only message in that thread, and does the draft keep that thread?"
+assumed = "Yes."
+if_wrong = "The rule `update always sends the thread id` would fail or re-thread standalone drafts. Then send threadId only when the mirror shows another message in the thread, and depend on drafts-update-keeps-thread for the rest."
+test = "1) POST /drafts without threadId; note D, message id M1, thread T1. 2) PUT /drafts/D {message:{raw, threadId:T1}}; expect 200, a new message id, threadId T1. 3) PUT again with threadId T1 and a different Subject; record status and threadId. 4) GET /threads/T1?format=minimal; expect one message, the draft's current one."
+
+[[unknown]]
+id = "drafts-list-consistent"
+question = "Does drafts.list show a draft change as soon as history.list has shown it?"
+assumed = "Yes."
+if_wrong = "The index can lag but heals. A listing naming a message the mirror knows is deleted is discarded and retried; one that omits a new draft or still lists a deleted one is corrected by the next draft change or by the periodic refresh, at most 15 minutes later. No write or send depends on the index being current: writes go by draft id and if_message_id asks Gmail."
+test = "GET /profile; note historyId H. Repeat 50 times: a) POST /drafts; poll GET /history?startHistoryId=H until the new message's messagesAdded appears; at once GET /drafts?maxResults=500 (all pages); record whether D with that message id is listed. b) PUT /drafts/D; poll history for the old message's messagesDeleted; list at once; record whether D carries the new message id. c) DELETE /drafts/D; poll history for messagesDeleted; list at once; record whether D is absent. Report the number of stale listings and the longest lag. Run together with label-edit-list-consistency and identities-read-after-write (the same loop: write, then list at once; a different endpoint each, so a separate answer each)."
+
+[[unknown]]
+id = "drafts-history-on-save"
+question = "Do draft create, update and delete appear in history.list as messagesAdded (labelIds with DRAFT) and messagesDeleted for the draft's messages?"
+assumed = "Yes: create adds M1 [DRAFT]; update adds M2 [DRAFT] and deletes M1; delete deletes M2."
+if_wrong = "Rows would not turn stale and drafts made elsewhere would not trigger a refresh, so the index would be only as fresh as the periodic refresh, and replaced draft messages would stay in the mirror until a reconciliation. The periodic interval would have to drop for accounts with drafts."
+test = "GET /profile; note H. POST /drafts; note D, M1. PUT /drafts/D; note M2. DELETE /drafts/D. GET /history?startHistoryId=H (all pages, no historyTypes or labelId filter); expect, in order, messagesAdded M1 with labelIds [DRAFT], messagesAdded M2 with [DRAFT], messagesDeleted M1, messagesDeleted M2. Repeat while typing, then discarding, a draft in Gmail's web UI. Run together with drafts-history-on-send and send-history-on-send (one history window read after each call)."
+
+[[unknown]]
+id = "drafts-history-on-send"
+question = "Does sending a draft appear in history.list as messagesDeleted for the draft's message and messagesAdded for a new SENT message?"
+assumed = "Yes: the sent message has a new id and the SENT label, and the draft's message id answers 404 afterwards."
+if_wrong = "If Gmail relabels the same message instead (labelsRemoved DRAFT, labelsAdded SENT), no tombstone marks the row stale and a draft sent elsewhere stays saved until a refresh. The mirror rule must then also schedule a refresh when DRAFT leaves a message a row points at; until it does, the periodic refresh bounds the lag."
+test = "GET /profile; note H. POST /drafts to self; note D, M1. POST /drafts/send {id:D}; note S. GET /history?startHistoryId=H (all pages); record every record naming M1 or S. GET /messages/S?format=minimal; record labelIds. GET /messages/M1?format=minimal; expect 404. Repeat sending the draft from Gmail's web UI. Run together with drafts-history-on-save and send-history-on-send (one history window read after each call)."
+
+[[unknown]]
+id = "drafts-gone-is-404"
+question = "Do drafts.get, drafts.update, drafts.delete and drafts.send answer 404 for a draft that was deleted or sent?"
+assumed = "Yes. himalaya's live check records 404 for get after delete; the other calls and the after-send case are inferred."
+if_wrong = "NotFound and AlreadyGone key on 404 alone; any other status is Refused, which never counts as success. A delete retry would then report an error instead of AlreadyGone and a send retry would send nothing. Map the measured status once known."
+test = "1) POST /drafts; note D. DELETE /drafts/D; expect 204. Then GET /drafts/D, PUT /drafts/D {message:{raw}}, DELETE /drafts/D, POST /drafts/send {id:D}; record status and error reason of each. 2) POST /drafts to self; note D2. POST /drafts/send {id:D2}. Then the same four calls for D2; record each."
+
+[[unknown]]
+id = "drafts-id-namespace"
+question = "Does drafts.get answer 404 when given a message id instead of a draft id?"
+assumed = "Yes: draft ids and message ids are separate namespaces."
+if_wrong = "Already guarded: a drafts.get answer whose message lacks the DRAFT label decodes to not found, so a non-draft is never returned as an editable draft."
+test = "GET /drafts/{id}?format=minimal with a) the id of an INBOX message, b) the message id of an existing draft (not its draft id), c) the message id drafts.send returned for a sent draft; record status and, on 200, the answer's id and labelIds."
+
+[[unknown]]
+id = "drafts-write-answer-ids"
+question = "Do drafts.create and drafts.update answers always carry id, message.id and message.threadId?"
+assumed = "Yes."
+if_wrong = "A write whose answer lacks them is completed with one drafts.get?format=minimal (20 units) before it is recorded; if that fails the call returns OutcomeUnknown and a refresh is scheduled. No row is ever written with an empty id."
+test = "POST /drafts and PUT /drafts/D on the metadata URI, 20 times each, for a standalone draft and for a reply draft with threadId; record the JSON keys of every answer and of answer.message."
+
+[[unknown]]
+id = "drafts-no-precondition"
+question = "Does Gmail honour an HTTP precondition (ETag with If-Match) on drafts.update or drafts.send?"
+assumed = "No: the reference pages mention none, so if_message_id is a read with drafts.get followed by the write, with a small race between them."
+if_wrong = "Good news: send the precondition with the write and drop the separate read (20 units and the race)."
+test = "1) POST /drafts; note D. GET /drafts/D?format=minimal; record any ETag header and any etag field. 2) PUT /drafts/D with header `If-Match: \"bogus\"`; record status (200 means ignored, 412 means honoured). 3) If an ETag was returned: PUT with it (expect 200), then PUT with the old one again (expect 412 if honoured). 4) Same with POST /drafts/send {id:D} and `If-Match: \"bogus\"` on a draft to self."

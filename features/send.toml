@@ -1,0 +1,1501 @@
+id = "send"
+title = "Send: new, reply and forward, large uploads, at most once, undo and schedule"
+summary = "A send is a durable submission (host key, staged bytes or a draft id, optional send-at) that a Foreground job delivers through messages.send or a resumable upload exactly once per claim, that Gmail confirms by Message-ID when the answer is lost, and that can be cancelled until the job claims it."
+roadmap = ["C3", "C5"]
+status = "approved"
+design = "docs/features/send.md"
+# drafts: a submission may name a draft (delivered by drafts' send routine) and
+#   the import-time confirmation hook is shared.
+# compose-mime: the reply, forward and quoting helpers are built in its crate
+#   after it and reuse its Address and MessageId types; admission reads the
+#   Message-ID with MessageId::parse.
+# search: the lookup that confirms a lost answer, and the admission check that
+#   a Message-ID fits in a query, are search's by_message_id().
+# identities decides From and is not needed: the API takes RFC 5322 bytes.
+depends_on = ["drafts", "compose-mime", "search"]
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/submission.rs"
+change = "new"
+role = "SubmissionKey-keyed rows, SubmissionState, SubmissionOp, SendPlan and the pure rules: admit, claim, answer, confirm by Message-ID, cancel, reschedule, resend, expire"
+
+[[file]]
+path = "crates/mailtide/src/lib.rs"
+change = "modify"
+role = "Export the submission module"
+
+[[file]]
+path = "crates/mailtide/src/ids.rs"
+change = "modify"
+role = "SubmissionKey and UploadSession"
+
+[[file]]
+path = "crates/mailtide/src/command.rs"
+change = "modify"
+role = "GmailRequest variants Send, StartUpload, Upload, UploadStatus and FindSent"
+
+[[file]]
+path = "crates/mailtide/src/event.rs"
+change = "modify"
+role = "Results MessageSent, SendRefused, SendUnanswered, UploadStarted, UploadOffset, UploadGone, SentLookup"
+
+[[file]]
+path = "crates/mailtide/src/quota.rs"
+change = "modify"
+role = "Costs of the send, upload and lookup requests"
+
+[[file]]
+path = "crates/mailtide/src/commit.rs"
+change = "modify"
+role = "Commit.submissions (SubmissionOp) and the JobPlan times send_confirm_due_at and submission_expiry_due_at"
+
+[[file]]
+path = "crates/mailtide/src/jobs.rs"
+change = "modify"
+role = "JobKind::Send keyed by SubmissionKey; ClaimedWork::Send carries the SendPlan read at the claim"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "Submission rows in AccountMirror; the claim moves pending to sending; importing a SENT message with a waiting Message-ID settles the submission"
+
+[[file]]
+path = "crates/mailtide/src/revision.rs"
+change = "modify"
+role = "Feed entry SubmissionChanged"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "Run Send jobs (inline, resumable, lookup), commit their results, force a history pass after a send; tunables"
+
+[[file]]
+path = "crates/mailtide/src/status.rs"
+change = "modify"
+role = "Submission counts by state in AccountStatus"
+
+[[file]]
+path = "crates/mailtide/src/invariants.rs"
+change = "modify"
+role = "Send invariants: one request per sending transition, a cancelled submission is never sent, no sending row without a job"
+
+# ------------------------------------------------------------------ wire layer
+
+[[file]]
+path = "crates/mailtide-gmail/src/send.rs"
+change = "new"
+role = "messages.send (JSON raw), the resumable upload session (start, chunk, status), the rfc822msgid lookup (its query term comes from search's by_message_id()), and their decoders"
+
+[[file]]
+path = "crates/mailtide-gmail/src/request.rs"
+change = "modify"
+role = "Build the send variants of GmailRequest"
+
+[[file]]
+path = "crates/mailtide-gmail/src/http.rs"
+change = "modify"
+role = "Request headers, a non-JSON body, a session URI target checked against Gmail's origin, and PUT for upload chunks. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-gmail/src/errors.rs"
+change = "modify"
+role = "Classify a failed send: refused for good, certainly not sent, or outcome unknown"
+
+[[file]]
+path = "crates/mailtide-gmail/src/lib.rs"
+change = "modify"
+role = "Export the send module"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::submit, cancel_submission, reschedule_submission, resend_submission (unfenced, like admit), submission, submissions"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "Submission methods over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "The next migration: mailtide_submissions and its Message-ID index; load and write the rows a commit or claim touches"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance cases for submissions: idempotent admission, the claim, cancel against claim, feed entries"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/send.rs"
+change = "new"
+role = "Runner send methods: submit, send, cancel_submission, reschedule_submission, resend_submission, submission, submissions, submission_content, reply_plan, forward_plan; SendError"
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Perform the send requests from staged bytes; refuse them in read-only mode"
+
+[[file]]
+path = "crates/mailtide-io/src/transport.rs"
+change = "modify"
+role = "Send request headers, raw bodies, session URIs (Gmail's origin only) and PUT. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+
+[[file]]
+path = "crates/mailtide-io/src/blobs.rs"
+change = "modify"
+role = "outbox_key: where a submission's bytes are staged"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the send types"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Sending in the fake Gmail (applied with the answer lost, applied late, refused, rate limited, upload sessions) and the send invariants"
+
+# ------------------------------------------------------------ reply and forward
+
+[[file]]
+path = "crates/mailtide-mime/src/respond.rs"
+change = "new"
+role = "Pure reply_plan and forward_plan over a parsed original (threading headers, subject, recipients, text to quote, parts to carry) and quote_plain; built after compose-mime, on its Address and MessageId types"
+
+[[file]]
+path = "crates/mailtide-mime/src/lib.rs"
+change = "modify"
+role = "Export respond; attachment parts keep their Content-Type parameters and get a fallback name"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Runner and BlockingRunner send methods, Submission, SendOutcome, ReplyPlan, ForwardPlan, the feed entry, exceptions"
+
+[[file]]
+path = "crates/mailtide-py/src/settings.rs"
+change = "modify"
+role = "send_inline_limit, send_max_size, send_chunk_size, send_confirm_delay_s, send_confirm_window_s, submission_retention_s"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers for the send methods"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the send API"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export the send types, reply_plan, forward_plan and the exceptions"
+
+[[file]]
+path = "python/mailtide/config.py"
+change = "modify"
+role = "The six send tunables"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail send, upload sessions and rfc822msgid search, with switches to lose an answer or refuse a send"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 submission rows, §7 sending as an intent, §8 costs, §9 send invariants, §10-11 interfaces, §14 phase 7"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-io/tests/send.rs"
+change = "new"
+role = "Driver tests against a fake Gmail: send, lost answers, uploads, undo, schedule, drafts as source"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_draft_providers.rs"
+change = "new"
+role = "Shared with drafts: the forward test drafts left for send"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_driver_imap.rs"
+change = "new"
+role = "Shared with drafts: the send test drafts left for send"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_send_outcome.rs"
+change = "new"
+role = "Test ported from himalaya's send outcomes"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_jmap_backend.rs"
+change = "new"
+role = "The submission refusal tests of himalaya's JMAP backend, by behaviour"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_backend.rs"
+change = "new"
+role = "The Message-ID query test of himalaya's Gmail backend"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_email_submission.rs"
+change = "new"
+role = "Admission test ported from himalaya's submission envelope"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_pimdir_queue_cancel.rs"
+change = "new"
+role = "Cancel of a row whose outcome is unknown, from himalaya's queue"
+
+[[file]]
+path = "crates/mailtide/tests/ref_himalaya_pimdir_queue_show.rs"
+change = "new"
+role = "View of a row whose outcome is unknown, from himalaya's queue"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_zero_assistant_forward.rs"
+change = "new"
+role = "Forward plan tests ported from Zero"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_zero_assistant_addressing.rs"
+change = "new"
+role = "Reply recipient tests ported from Zero"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_message_builder.rs"
+change = "new"
+role = "Shared with compose-mime: the reply, forward and quoting tests of himalaya's builder"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
+change = "new"
+role = "Shared with message-facts: the two quote-text tests it left for send"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_message_reply.rs"
+change = "new"
+role = "Reply-all test ported from himalaya's CLI suite"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_message_forward.rs"
+change = "new"
+role = "Forward attachment tests ported from himalaya's CLI suite"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_pimalaya_core_template_reply.rs"
+change = "new"
+role = "Reply recipient and subject tests ported from pimalaya core"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_pimalaya_core_template_forward.rs"
+change = "new"
+role = "Forward subject test ported from pimalaya core"
+
+[[file]]
+path = "tests/test_send.py"
+change = "new"
+role = "Python tests of the Runner send API against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["create", "sendDraft", "parseOutgoing", "getMessageAttachments", "threadId"]
+note = "A send is one messages.send with base64 `raw` and the thread id, straight from the request handler: no key, no record, no retry. A forward re-fetches the original's attachments from Gmail and fails when one cannot be read."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/types.ts"
+symbols = ["create", "sendDraft", "IOutgoingMessage"]
+note = "The driver contract: send returns Gmail's message id; the caller keeps nothing else."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/assistant.ts"
+symbols = ["decideAction", "never retried automatically"]
+note = "The one place Zero guards a send: an action row is claimed once (pending -> running) before the call, and a timeout after sending stays indeterminate because duplicate mail is worse than an error. Our claim rule is the same, plus confirmation."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["messages.send", "drafts.send", "upload"]
+note = "100 units for either send; the upload path is costed as the method it uploads to."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/outgoing-mime.ts"
+symbols = ["buildOutgoingMime", "toMessageIdList", "messageId"]
+note = "Reply headers are passed in by the caller and normalised to angle-bracket lists; a Message-ID is set only for the SMTP path. Composition is compose-mime's; cited for the threading headers."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-addressing.ts"
+symbols = ["resolveReplyEnvelope", "normalizeEnvelope"]
+note = "Reply and reply-all recipients from the original: Reply-To first, own addresses left out, original recipients when the owner wrote it, case-insensitive dedupe. The rule our reply_plan follows."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-forward.ts"
+symbols = ["buildForwardContent", "materializeForwardAttachments", "forward_attachment_unavailable"]
+note = "A forward built on the server from the stored original: `Fwd:` subject with older prefixes stripped, no Bcc, and a refusal when any original attachment is missing. We keep the rules and leave the HTML to the host."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/forward-attachments.ts"
+symbols = ["pickForwardedAttachments"]
+note = "Picks originals by name and size because Gmail's attachment ids change on every fetch. Our parts come from the immutable blob, so position is a stable handle."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/imap.ts"
+symbols = ["stripBccHeader", "serverSavesSent"]
+note = "The SMTP path: strip Bcc, submit, append a Sent copy. Gmail's API does all three itself; cited for the contrast and for the test drafts deferred."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-delivery-failure.ts"
+symbols = ["gmailDeliveryFailure"]
+note = "Retry classes for Zero's sync and label jobs: a network failure is retried. A send cannot take that rule (the request may have arrived), which is why SendUnanswered is its own class."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/messages/send.rs"
+symbols = ["GmailMessageSendCommand", "encode_raw", "IdReceipt"]
+note = "users.messages.send as one thin command over raw bytes; the answer is the message id."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["send_message", "reply_thread_id", "reply_parents", "file_sent"]
+note = "Gmail threads a sent message by threadId only, so the backend finds the parent's thread with an rfc822msgid: search and skips ids a query cannot carry. We read the thread from the mirror and use the same query form to confirm a send. Gmail files the SENT copy itself."
+
+[[reference]]
+impl = "himalaya"
+path = "src/shared/message/builder.rs"
+symbols = ["compute_references", "reply_recipients", "reply_all_cc", "carry_source_attachments", "has_prefix"]
+note = "Reply and forward derivation: In-Reply-To and References from the source, Re:/Fwd: prefixes, reply-all without own addresses, a forward carrying the source's attachment parts."
+
+[[reference]]
+impl = "himalaya"
+path = "src/email/submission.rs"
+symbols = ["SubmissionEnvelope"]
+note = "The envelope read from the headers for SMTP; a message with no sender or no recipient is refused before anything is sent. We keep the recipient check at admission; Gmail derives the envelope."
+
+[[reference]]
+impl = "himalaya"
+path = "src/jmap/backend.rs"
+symbols = ["send_message", "on_success_update_email", "resolve_send_mailbox_ids"]
+note = "JMAP send: stage as $draft, submit, and on a request that fails without an answer destroy nothing because the message may have gone out."
+
+[[reference]]
+impl = "himalaya"
+path = "src/jmap/submission/cancel.rs"
+symbols = ["JmapSubmissionCancelCommand", "email_submission_cancel"]
+note = "Undo in JMAP: set undoStatus to canceled; the server refuses once the message has left."
+
+[[reference]]
+impl = "himalaya"
+path = "src/pimdir/queue/cancel.rs"
+symbols = ["PimdirQueueCancelCommand", "unconfirmed"]
+note = "A queued send whose request went out without an answer is `unconfirmed`: cancelling it undoes nothing, and the user is told it may have taken effect."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/backends.md"
+symbols = ["A Gmail answer joins its parent's thread", "Sending transport", "pimdir sends by queueing a submit intent"]
+note = "Written requirements: self-sending backends use their own API; a Gmail reply carries its parent's threadId; a queued send stages the bytes and enqueues one submit intent."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/commands.md"
+symbols = ["Saving a sent message follows the send", "A forward carries the attachments of its source", "Reply to all recipients", "A sent reply or forward flags its source"]
+note = "A message that went out is never reported as a failure; Gmail has no answered or forwarded flag to set; the reply-all and forward-attachment rules."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/email/message/template/reply/mod.rs"
+symbols = ["ReplyTemplateBuilder", "trim_prefix"]
+note = "The older reply template: who is answered (Reply-To, From, Sender, a message written by oneself) and prefix trimming. Its template bodies and signatures are not taken."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/email/message/template/forward/mod.rs"
+symbols = ["ForwardTemplateBuilder", "trim_prefix"]
+note = "Forward subject prefix trimming."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email_submission/mod.rs"
+symbols = ["EmailSubmission", "UndoStatus", "send_at", "Pending", "Final", "Canceled"]
+note = "The shape our Submission follows: an object apart from the Email, with sendAt and an undoStatus of pending, final or canceled."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email_submission/helpers.rs"
+symbols = ["email_submission_create", "email_submission_change_status"]
+note = "Create and cancel are the two writes a client has; cancel is a status change the server may refuse."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email_submission/set.rs"
+symbols = ["undo_status", "on_success_update_email", "parameter"]
+note = "Delayed sending in JMAP is an envelope parameter (HOLDFOR/HOLDUNTIL) the server turns into sendAt. Gmail has no such parameter, so the delay lives in our row."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/submission/set.rs"
+symbols = ["CannotUnsend", "undo_status", "send_at", "hold_until"]
+note = "Names only (AGPL). Where a server decides whether a submission can still be cancelled and derives sendAt from the hold parameters."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/email/src/submission/mod.rs"
+symbols = ["EmailSubmission", "undo_status", "send_at"]
+note = "Names only (AGPL). The stored submission object."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/smtp/src/inbound/mail.rs"
+symbols = ["future_release", "hold_for", "hold_until"]
+note = "Names only (AGPL). FUTURERELEASE: the server holds the message, bounded by a configured maximum."
+
+# --------------------------------------------------------------------- sources
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send"
+note = "Read 2026-11-20. Metadata URI and upload URI; sends to the recipients in To, Cc and Bcc; the answer is a Message; scopes. States no size limit and no accepted media types."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/uploads"
+note = "Read 2026-11-20. uploadType media, multipart, resumable; simple and multipart for 5 MB or less; the resumable session (X-Upload-Content-Type, X-Upload-Content-Length, Location), chunks in multiples of 256 KiB, the status query (empty PUT, Content-Range: */N), 308 with Range, 200 or 201 when the upload already completed, 404 for an expired session, 410 for a dead one, retry of 5xx with backoff. Session lifetime is given as one week in one place and about a day in another."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/sending"
+note = "Read 2026-11-20. messages.send or drafts.send; RFC 2822 bytes as base64url in `raw`. Says nothing about Message-ID, From rewriting, Bcc or limits."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/threads"
+note = "Read 2026-11-20. A message joins a thread when threadId is given, References and In-Reply-To follow RFC 2822 and the Subject headers match. Does not say what happens otherwise."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Read 2026-11-20. messages.send 100, drafts.send 100, messages.list 5; 500 recipients per message. Nothing on upload requests."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/handle-errors"
+note = "Read 2026-11-20. 429 `User-rate limit exceeded (Mail sending)` carries a retry time and can last hours; 500 backendError is retried with backoff; a 200 does not mean the mail was delivered."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621#section-7"
+note = "JMAP EmailSubmission: sendAt, undoStatus (pending, final, canceled), cannotUnsend, onSuccessUpdateEmail. The vocabulary of our Submission."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4"
+note = "Message-ID, In-Reply-To and References: how a reply names its parent and how the chain is built."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/driver/draft-providers.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_draft_providers.rs"
+
+[[suite.test]]
+name = "provider draft safety > fails closed when a fresh original Gmail attachment cannot be retrieved"
+test = "a_forward_plan_whose_original_cannot_be_read_is_refused"
+note = "Zero re-fetches attachments from Gmail; ours come from the stored blob. Same rule: no forward plan with parts missing."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/driver/imap.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_driver_imap.rs"
+
+[[suite.test]]
+name = "ImapMailManager > sends via SMTP without Bcc, files a Sent copy and threads the reply"
+test = "a_reply_goes_out_once_with_its_bcc_lands_in_sent_and_joins_the_thread"
+note = "By behaviour against the fake Gmail: one messages.send carrying the bytes as given (Bcc header included, Gmail removes it), the original's threadId, a SENT message mirrored in that thread. The SMTP envelope and the APPEND do not apply."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-forward.test.ts"
+target = "crates/mailtide-mime/tests/ref_zero_assistant_forward.rs"
+
+[[suite.test]]
+name = "server-built forward content > preserves original HTML, links and signatures without exposing Bcc or accepting reconstructed body text"
+test = "a_forward_plan_strips_old_prefixes_and_never_lists_bcc"
+note = "The subject and header half. The HTML body is returned untouched for the host to quote; mailtide builds no quote."
+
+[[suite.test]]
+name = "server-built forward content > fails closed on missing or empty original attachment data"
+test = "a_forward_plan_with_an_unreadable_part_is_an_error"
+
+[[suite.test]]
+name = "server-built forward content > carries ordinary files and rehydrates original inline images instead of dropping them"
+test = "a_forward_plan_carries_files_and_inline_parts_with_their_content_ids"
+note = "Inline parts are carried as parts with their Content-ID; Zero's rewrite to data: URLs is its editor's."
+
+[[suite.test]]
+name = "server-built forward content > refuses a forward with an unresolved inline image"
+na = "Zero rewrites the HTML's cid: links and refuses when one has no part. mailtide never reads or rewrites the host's HTML; the plan lists the inline parts the original has"
+
+[[suite.test]]
+name = "server-built forward content > versions the actual original body and attachment bytes, not provider attachment IDs"
+na = "A content hash for Zero's approval step. A Gmail message's content never changes under its id (SPEC §5.1), so the message id is the version"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/forward-attachments.test.ts"
+
+[[suite.test]]
+name = "pickForwardedAttachments > matches by name and size, using each original once"
+na = "Selection by name and size exists because Gmail attachment ids change per fetch. A forward plan lists parts by position in the immutable blob; the host keeps the positions it wants"
+
+[[suite.test]]
+name = "pickForwardedAttachments > falls back to the name when the size differs"
+na = "Same: parts are picked by position, not matched by name"
+
+[[suite.test]]
+name = "pickForwardedAttachments > skips missing files and files without content"
+na = "A part with no content makes the whole plan an error (fail closed) instead of being skipped"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/assistant-addressing.test.ts"
+target = "crates/mailtide-mime/tests/ref_zero_assistant_addressing.rs"
+
+[[suite.test]]
+name = "deterministic reply envelope > replies to Reply-To without copying original Cc or Bcc"
+test = "a_reply_answers_reply_to_and_copies_nobody"
+
+[[suite.test]]
+name = "deterministic reply envelope > reply-all includes other To/Cc participants with case-insensitive deduplication"
+test = "reply_all_keeps_other_to_and_cc_once_ignoring_case"
+
+[[suite.test]]
+name = "deterministic reply envelope > uses original recipients when replying to an email sent by the owner"
+test = "a_reply_to_ones_own_message_answers_its_recipients"
+
+[[suite.test]]
+name = "deterministic reply envelope > applies explicit overrides, distinguishes omitted fields from empty lists, and deduplicates"
+na = "The plan is a suggestion the host edits before composing; explicit recipient lists never pass through mailtide"
+
+[[suite.test]]
+name = "deterministic reply envelope > allows an explicitly requested copy to self but not accidental default copies"
+test = "a_reply_plan_never_copies_ones_own_addresses"
+note = "The default half; an explicit copy to self is the host's edit."
+
+[[suite.test]]
+name = "deterministic reply envelope > requires a real remaining recipient rather than inventing one"
+test = "a_reply_plan_with_nobody_left_has_an_empty_to"
+note = "The plan reports an empty To; the refusal is admission's (a_message_without_recipients_is_refused)."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/smtp/client.test.ts"
+
+[[suite.test]]
+name = "SmtpClient > upgrades with STARTTLS, authenticates and sends with dot-stuffing"
+na = "SMTP transport; mailtide sends through Gmail's API"
+
+[[suite.test]]
+name = "SmtpClient > falls back to AUTH LOGIN"
+na = "SMTP transport; mailtide sends through Gmail's API"
+
+[[suite.test]]
+name = "SmtpClient > maps auth failures and total recipient rejection"
+na = "SMTP reply codes. Gmail's refusals are HTTP errors; our own a_refusal_is_final_and_keeps_gmails_reason covers them"
+
+[[suite.test]]
+name = "helpers > prepareData normalizes newlines and terminates"
+na = "SMTP DATA framing; the API takes the bytes as given"
+
+[[suite.test]]
+name = "helpers > stripBccHeader removes folded Bcc headers only from the header block"
+na = "Gmail takes the Bcc recipients from the header and removes it from delivered copies (unknown send-bcc-stripped); mailtide never rewrites the bytes"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_backend.rs"
+# Shared suite, no rest_na: `search` lists every one of its 17 tests and
+# defers this one here; the others go to label-edit, message-facts, purge
+# and delivery-retries.
+
+[[suite.test]]
+name = "a_reply_names_the_parents_a_query_can_carry"
+test = "a_message_id_a_query_cannot_carry_is_never_put_in_one"
+note = "himalaya searches rfc822msgid: for a reply's parents; we search it to confirm a send. Same guard: an id with a space, quote, brace or parenthesis is not sent as a query (admission refuses it)."
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/message/builder.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_message_builder.rs"
+
+[[suite.test]]
+name = "reply_sets_subject_recipients_and_threading"
+test = "a_reply_plan_sets_subject_recipients_and_threading"
+
+[[suite.test]]
+name = "reply_keeps_existing_re_prefix"
+test = "a_reply_subject_keeps_one_re_prefix"
+
+[[suite.test]]
+name = "reply_prefixes_subject_that_merely_starts_with_re_letters"
+test = "a_subject_that_only_starts_with_the_letters_re_gets_the_prefix"
+
+[[suite.test]]
+name = "reply_explicit_to_overrides_source_from"
+na = "The plan takes no explicit recipients; the host edits it before composing"
+
+[[suite.test]]
+name = "reply_without_all_leaves_cc_empty"
+test = "a_plain_reply_plan_has_no_cc"
+
+[[suite.test]]
+name = "reply_all_copies_the_other_recipients_once"
+test = "reply_all_lists_every_other_recipient_once"
+note = "Placement follows Gmail: the original's other To stay in To and its Cc in Cc (himalaya moves both to Cc). The set of people is the test's."
+
+[[suite.test]]
+name = "reply_all_keeps_the_display_names"
+test = "reply_all_keeps_display_names"
+
+[[suite.test]]
+name = "reply_all_leaves_out_who_is_already_in_to"
+test = "reply_all_never_repeats_a_to_address_in_cc"
+
+[[suite.test]]
+name = "reply_all_with_explicit_to_dedupes_against_it"
+na = "The plan takes no explicit recipients; the host edits it before composing"
+
+[[suite.test]]
+name = "reply_all_explicit_cc_wins"
+na = "The plan takes no explicit recipients; the host edits it before composing"
+
+[[suite.test]]
+name = "reply_all_without_own_email_keeps_every_recipient"
+test = "reply_all_without_own_addresses_keeps_every_recipient"
+
+[[suite.test]]
+name = "reply_all_leaves_out_the_reply_s_from_and_the_logins"
+test = "reply_all_leaves_out_every_own_address_given"
+note = "Own addresses are a list the host passes (primary address and send-as aliases, from identities); there are no logins."
+
+[[suite.test]]
+name = "forward_prefixes_subject_and_omits_in_reply_to"
+test = "a_forward_plan_prefixes_the_subject_and_has_references_but_no_in_reply_to"
+
+[[suite.test]]
+name = "has_prefix_requires_the_colon_case_insensitively"
+test = "a_subject_prefix_needs_its_colon_and_ignores_case"
+
+[[suite.test]]
+name = "compute_references_appends_source_id"
+test = "references_are_the_originals_chain_then_its_own_id"
+
+[[suite.test]]
+name = "forward_carries_the_attachments_with_their_parameters_unencoded"
+test = "forward_parts_keep_their_content_type_parameters_and_decoded_bytes"
+
+[[suite.test]]
+name = "compose_body_honours_posting_style_and_signature"
+na = "Where the new text, the quote and the signature go is layout: the host's. compose-mime leaves it out too; signatures are identities'"
+
+[[suite.test]]
+name = "compose_body_writes_the_signature_delimiter_verbatim"
+na = "Signature layout: the host's, as above"
+
+[[suite.test]]
+name = "compose_body_quotes_an_empty_line_without_a_trailing_blank"
+test = "quoting_prefixes_every_line_and_leaves_no_trailing_blank_after_an_empty_one"
+note = "The quoting half only, as quote_plain(text): `> a`, `>` for an empty line, `>> b` for a line already quoted."
+
+[[suite.defer]]
+name = "compose_populates_headers_and_body"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "compose_names_the_from_address"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "message_id_sits_on_the_sender_domain"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "message_id_needs_a_plain_domain"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "parse_mailboxes_splits_name_and_address"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "compose_from_keeps_a_spelled_out_display_name_apart"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "compose_to_keeps_a_spelled_out_display_name_apart"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "compose_to_keeps_every_mailbox_of_every_value"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "a_single_part_message_ends_with_a_line_break"
+to = "compose-mime"
+
+[[suite.defer]]
+name = "an_attached_message_is_not_base64"
+to = "compose-mime"
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/message/part.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
+# Declared by message-facts, which left these two (the text a reply quotes) to send.
+
+[[suite.test]]
+name = "an_html_only_body_is_quoted_as_text"
+test = "an_html_only_original_offers_plain_text_to_quote"
+
+[[suite.test]]
+name = "a_flowed_text_is_unwrapped_whatever_its_charset"
+test = "flowed_text_is_unwrapped_before_it_is_offered_for_quoting"
+
+[[suite]]
+impl = "himalaya"
+path = "tests/message_reply.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_message_reply.rs"
+
+[[suite.test]]
+name = "reply_all_copies_the_other_recipients"
+test = "reply_all_from_raw_bytes_lists_the_other_recipients"
+note = "The CLI test runs the binary on a stored message; ours calls reply_plan on the same raw bytes."
+
+[[suite.test]]
+name = "explicit_to_and_cc_win_over_the_derived_lists"
+na = "The plan takes no explicit recipients; the host edits it before composing"
+
+[[suite]]
+impl = "himalaya"
+path = "tests/message_forward.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_message_forward.rs"
+
+[[suite.test]]
+name = "forward_carries_the_attachment_of_the_source"
+test = "a_forward_plan_lists_the_originals_attachment"
+
+[[suite.test]]
+name = "forward_keeps_the_quoted_body_alone_without_attachments"
+na = "A CLI flag (--no-attachments) over a composed body. The plan only lists parts; carrying none and quoting the body are the host's"
+
+[[suite.test]]
+name = "forward_of_a_source_without_attachment_keeps_the_text_form"
+test = "a_forward_plan_of_a_plain_message_lists_no_parts"
+note = "The half that applies: no parts are invented. The single-part text form is compose-mime's output."
+
+[[suite.test]]
+name = "forward_carries_an_attachment_without_a_file_name"
+test = "a_nameless_part_is_named_from_its_media_type"
+
+[[suite.test]]
+name = "forward_names_an_attached_message_from_its_subject"
+test = "an_attached_message_is_named_from_its_subject"
+
+[[suite.test]]
+name = "forward_skips_a_multipart_container_named_like_an_attachment"
+test = "a_multipart_container_is_never_a_forward_part"
+
+[[suite]]
+impl = "himalaya"
+path = "tests/send_outcome.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_send_outcome.rs"
+
+[[suite.test]]
+name = "a_copy_refused_after_the_send_is_an_item_error"
+na = "Gmail files the SENT copy itself in the same call; there is no second write that can fail after the send"
+
+[[suite.test]]
+name = "a_reply_whose_source_is_not_flagged_prints_one_receipt"
+na = "Gmail has no answered or forwarded flag (himalaya's own spec skips it for Gmail); a sent reply changes nothing on its source"
+
+[[suite.test]]
+name = "a_refused_smtp_send_is_the_result"
+test = "a_send_gmail_refuses_is_the_submissions_result"
+note = "By behaviour: Gmail's 400 becomes the submission's final `refused` state with the reason; nothing is retried and the account keeps syncing."
+
+[[suite]]
+impl = "himalaya"
+path = "src/email/submission.rs"
+target = "crates/mailtide/tests/ref_himalaya_email_submission.rs"
+
+[[suite.test]]
+name = "every_recipient_header_feeds_the_envelope"
+na = "Gmail derives the envelope from To, Cc and Bcc itself (messages.send reference); mailtide builds none"
+
+[[suite.test]]
+name = "no_sender_or_no_recipient_is_refused"
+test = "a_message_without_recipients_is_refused"
+note = "The recipient half, at admission, before anything is staged. A missing From is left to Gmail and to identities."
+
+[[suite.test]]
+name = "an_address_holding_a_control_character_is_refused"
+na = "An SMTP envelope guard. mailtide passes the headers to Gmail unparsed; a bad address is Gmail's refusal, recorded as `refused`"
+
+[[suite]]
+impl = "himalaya"
+path = "src/pimdir/queue/cancel.rs"
+target = "crates/mailtide/tests/ref_himalaya_pimdir_queue_cancel.rs"
+
+[[suite.test]]
+name = "cancelling_an_unconfirmed_row_says_it_may_have_taken_effect"
+test = "cancelling_a_submission_whose_outcome_is_unknown_is_refused_as_maybe_sent"
+note = "himalaya drops the row and warns; we refuse with CannotUnsend{maybe_sent} and keep the row until Gmail settles it."
+
+[[suite]]
+impl = "himalaya"
+path = "src/pimdir/queue/show.rs"
+target = "crates/mailtide/tests/ref_himalaya_pimdir_queue_show.rs"
+
+[[suite.test]]
+name = "an_unconfirmed_row_says_it_may_have_taken_effect"
+test = "an_unconfirmed_submission_reads_as_maybe_sent"
+
+[[suite.test]]
+name = "an_applied_add_prints_its_seq"
+na = "pimdir store sequence numbers of a local Maildir-like store; no counterpart"
+
+[[suite.test]]
+name = "an_applied_row_prints_the_refusals_on_its_message"
+na = "pimdir per-source refusals; a submission has one target, Gmail, and its refusal is its state"
+
+[[suite.test]]
+name = "an_applied_row_of_a_deleted_mailbox_names_no_collection"
+na = "pimdir collections; a submission belongs to an account, not a mailbox"
+
+[[suite.test]]
+name = "an_unknown_row_prints_its_id_and_state"
+na = "CLI rendering of a queue row id; an unknown key is simply absent (`submission` returns None)"
+
+[[suite]]
+impl = "himalaya"
+path = "src/jmap/backend.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_jmap_backend.rs"
+# The suite is shared with `purge` and `threads`, so no rest_na: this plan lists the
+# writes and refusals of himalaya's JMAP backend, `threads` its reads and queries.
+
+[[suite.test]]
+name = "a_refused_submission_destroys_the_email_it_created"
+na = "JMAP stages an Email before submitting it. messages.send stages nothing in the mailbox, so a refusal leaves nothing there to destroy"
+
+[[suite.test]]
+name = "a_refused_submission_keeps_an_existing_email"
+test = "a_refused_draft_submission_leaves_the_draft_in_place"
+
+[[suite.test]]
+name = "refused_recipients_are_coded_and_named"
+test = "a_refusal_for_its_recipients_carries_gmails_message"
+
+[[suite.test]]
+name = "a_refused_id_is_an_item_error_coded_by_its_type"
+na = "Per-id errors of a JMAP Email/set, coded by JMAP error type. A Gmail send is one message with one answer; purge's per-id outcome is `purge`'s (a_destroy_applied_in_part_names_both_halves)"
+
+[[suite.test]]
+name = "a_duplicate_import_names_the_existing_email"
+na = "JMAP Email/import; mailtide never inserts or imports a message into a mailbox"
+
+[[suite.test]]
+name = "an_import_refusal_names_its_type"
+na = "JMAP Email/import; mailtide never inserts or imports a message into a mailbox"
+
+[[suite.test]]
+name = "a_receipt_names_the_keyword_written"
+na = "JMAP keywords written after a send ($answered, $forwarded); Gmail has no answered flag and files the SENT copy itself"
+
+[[suite.test]]
+name = "a_failed_destroy_keeps_the_refusal"
+na = "Cleanup of an email JMAP staged for a submission; messages.send stages nothing in the mailbox, and a draft submission never deletes the draft"
+
+[[suite.test]]
+name = "a_method_error_is_the_result"
+na = "himalaya's raw `jmap` command passing a JMAP method error through; no Gmail counterpart"
+
+[[suite.test]]
+name = "a_refused_create_is_the_result"
+na = "himalaya's raw `jmap` command passing a JMAP SetError through; no Gmail counterpart"
+
+[[suite.test]]
+name = "a_request_refused_whole_is_the_result"
+na = "himalaya's raw `jmap request` command passing a request-level refusal (RFC 8620 §3.6.1) through; no Gmail counterpart"
+
+[[suite]]
+impl = "pimalaya-core"
+path = "email/src/email/message/template/reply/mod.rs"
+target = "crates/mailtide-mime/tests/ref_pimalaya_core_template_reply.rs"
+
+[[suite.test]]
+name = "default"
+na = "An MML template with cursor position and quoted body; mailtide plans headers and recipients and builds no body"
+
+[[suite.test]]
+name = "with_body"
+na = "Template body placement; the body is the host's"
+
+[[suite.test]]
+name = "with_signature"
+na = "Signature placement; signatures are identities' and placing them is the host's"
+
+[[suite.test]]
+name = "with_quote"
+na = "Quote posting style (above or below the reply); layout is the host's"
+
+[[suite.test]]
+name = "with_body_and_signature"
+na = "Template body and signature placement; the host's"
+
+[[suite.test]]
+name = "with_signature_and_quote"
+na = "Template signature and quote placement; the host's"
+
+[[suite.test]]
+name = "with_body_and_quote"
+na = "Template body and quote placement; the host's"
+
+[[suite.test]]
+name = "with_body_signature_and_quote"
+na = "Template body, signature and quote placement; the host's"
+
+[[suite.test]]
+name = "reply_to_self"
+test = "a_reply_to_ones_own_message_goes_to_its_to_recipients"
+
+[[suite.test]]
+name = "reply_mailing_list_using_sender"
+test = "a_message_with_sender_and_no_from_is_answered_to_sender"
+note = "The reply half. The list-address handling under reply-all follows our Gmail placement rule."
+
+[[suite.test]]
+name = "reply_mailing_list_using_from"
+test = "a_message_without_reply_to_is_answered_to_from"
+
+[[suite.test]]
+name = "reply_mailing_list_using_reply_to"
+test = "reply_to_wins_over_from"
+
+[[suite.test]]
+name = "reply_mailing_list_multiple_senders"
+test = "every_from_address_is_answered"
+
+[[suite.test]]
+name = "trim_subject_prefix"
+test = "a_chain_of_re_prefixes_is_trimmed_to_the_subject"
+
+[[suite.test]]
+name = "should_hide_part_markup_in_html_reply_thread"
+na = "MML part markup inside a quoted HTML thread; mailtide quotes plain text only and writes no MML"
+
+[[suite]]
+impl = "pimalaya-core"
+path = "email/src/email/message/template/forward/mod.rs"
+target = "crates/mailtide-mime/tests/ref_pimalaya_core_template_forward.rs"
+
+[[suite.test]]
+name = "default"
+na = "An MML forward template with the quoted original; mailtide builds no body"
+
+[[suite.test]]
+name = "with_signature"
+na = "Signature placement; the host's"
+
+[[suite.test]]
+name = "trim_subject_prefix"
+test = "a_chain_of_fwd_prefixes_is_trimmed_to_the_subject"
+
+# ------------------------------------------------------------ our own tests
+
+# Wire layer
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "send_posts_base64url_raw_with_the_thread_id"
+covers = "POST /messages/send with {raw, threadId}; raw is unpadded base64url of exactly the staged bytes; no threadId key for a new conversation"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "a_session_starts_with_the_size_the_type_and_the_thread"
+covers = "POST /upload/gmail/v1/users/me/messages/send?uploadType=resumable with X-Upload-Content-Type: message/rfc822, X-Upload-Content-Length and a JSON body carrying threadId; the session URI is the Location header"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "chunks_are_multiples_of_256_kib_except_the_last"
+covers = "PUT to the session URI with Content-Range: bytes a-b/N; send_chunk_size is rounded down to a 256 KiB multiple"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "a_status_query_is_an_empty_put_with_an_open_range"
+covers = "PUT with Content-Range: bytes */N and no body; it can never carry message bytes"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "a_308_answer_names_the_next_byte_to_send"
+covers = "Range: bytes=0-42 resumes at 43; a 308 without Range resumes at 0"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "a_completed_session_answer_decodes_to_the_sent_message"
+covers = "200 or 201 on a chunk or a status query with a Message body is MessageSent; with an empty body it is `sent, id unknown`, never a resend"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "a_session_uri_outside_gmails_origin_is_refused"
+covers = "A Location header pointing anywhere but Gmail's upload origin over https is a permanent failure: the bearer token and the message never go to another host"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "a_send_answer_without_a_message_id_is_unanswered"
+covers = "A 200 that names no message is treated as a lost answer (confirm by Message-ID), not as success with an empty id"
+
+[[test]]
+target = "crates/mailtide-gmail/src/send.rs"
+name = "the_lookup_asks_for_the_message_id_among_sent_mail"
+covers = "GET /messages?q=rfc822msgid:<id>&labelIds=SENT&maxResults=5: a draft or an inbox copy with the same Message-ID never confirms a send"
+
+[[test]]
+target = "crates/mailtide-gmail/src/errors.rs"
+name = "a_mail_sending_limit_is_certainly_not_sent_and_retryable"
+covers = "429 `User-rate limit exceeded (Mail sending)` with its retry time: account cooldown, the submission returns to pending"
+
+[[test]]
+target = "crates/mailtide-gmail/src/errors.rs"
+name = "a_400_403_or_413_on_send_is_a_refusal"
+covers = "badRequest, a non-rate-limit 403 and 413 are SendRefused with Gmail's message; account problems (domainPolicy, revoked delegation) still block the account"
+
+[[test]]
+target = "crates/mailtide-gmail/src/errors.rs"
+name = "a_5xx_or_a_dropped_connection_on_send_is_unanswered"
+covers = "500, 502, 503, 504, a timeout and a connection lost after the request was written are SendUnanswered; a failure to connect is certainly not sent"
+
+[[test]]
+target = "crates/mailtide/src/quota.rs"
+name = "send_costs_follow_gmails_quota_table"
+covers = "Send 100, StartUpload 100, Upload and UploadStatus 0 (still leased), FindSent 5"
+
+# Core rules
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "admission_is_idempotent_per_key"
+covers = "A second submit with the same key and the same bytes returns the existing submission in whatever state it is; no second row, job or feed entry"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_key_reused_with_other_content_is_a_conflict"
+covers = "Same key, different content digest: KeyConflict, the stored submission is untouched"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_message_without_a_message_id_is_refused"
+covers = "Raw bytes must carry exactly one Message-ID: it is the handle Gmail confirms a lost answer by, and mailtide never rewrites bytes to add one"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_message_id_already_waiting_or_already_sent_is_refused"
+covers = "Another live submission with that Message-ID, or a mirrored SENT message carrying it, is DuplicateMessageId: one Message-ID confirms one send"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_reply_must_name_its_original_in_references"
+covers = "thread_of an imported message whose Message-ID is absent from the bytes' References is ThreadingMismatch; an original not imported yet passes on its thread id alone"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "thread_of_a_draft_a_tombstone_or_an_unknown_message_is_refused"
+covers = "UnknownOriginal: the thread id comes only from a live, non-draft mirror row"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_claim_moves_a_due_submission_to_sending_once"
+covers = "pending and due -> sending under the claim's attempt, with SendPlan::Deliver; the transition and the claim are one store transaction"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_claim_finding_an_older_attempt_sending_confirms_instead"
+covers = "The earlier attempt died mid-call or was superseded: the row turns confirming and the plan is Confirm (or Resume when it holds a session), never Deliver"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_submission_not_yet_due_is_not_claimed"
+covers = "send_at in the future: the Send job is not ready; next_due reports send_at"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "cancel_wins_only_while_pending"
+covers = "pending -> canceled and the job goes; sending and confirming answer CannotUnsend{maybe_sent: true}; sent answers CannotUnsend{maybe_sent: false}; canceled twice is a no-op"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_reschedule_applies_only_while_pending"
+covers = "send_at and the job's due time move together; any other state is CannotUnsend"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_not_sent_answer_reopens_only_its_own_attempt"
+covers = "A rate limit or a refused connection returns sending -> pending with backoff only when the row is still held by that attempt; a row already confirming stays confirming"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_sent_answer_settles_from_sending_or_confirming"
+covers = "Gmail's message id is the truth whichever attempt hears it: sent{message_id, thread_id}, job done, staged bytes scheduled for deletion"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_sent_import_with_the_waiting_message_id_settles_the_submission"
+covers = "Confirmation by Gmail, the rule drafts uses: MarkImported of a SENT message whose Message-ID a sending, confirming or unconfirmed row holds emits SubmissionChanged{sent} in the same commit"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_draft_or_received_copy_with_the_same_message_id_settles_nothing"
+covers = "Only a SENT-labelled message confirms: the draft the bytes came from and a copy sent to oneself carry the same Message-ID"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "lookups_that_find_nothing_end_as_unconfirmed_only_after_the_window"
+covers = "A negative lookup is no proof (listings are not snapshots): the row stays confirming until send_confirm_window has passed since the attempt, then unconfirmed, never pending"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_late_sent_import_turns_unconfirmed_into_sent"
+covers = "unconfirmed is provisional: Gmail showing the message later still settles it, with a feed entry"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "resend_is_allowed_only_from_unconfirmed"
+covers = "The host's explicit decision: unconfirmed -> pending with a new generation; every other state refuses, so mailtide alone can never issue a second request for a message that may be out"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_submission_past_not_after_expires_unsent"
+covers = "A claim later than not_after ends as expired without a request; without not_after a late send goes out late"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "a_refusal_is_final_and_keeps_gmails_reason"
+covers = "SendRefused -> refused{reason, message}; no retry, the staged bytes stay readable until retention"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "final_rows_and_their_bytes_go_after_retention"
+covers = "No row lives forever: sent, canceled, refused, expired and unconfirmed rows are deleted submission_retention after their last change, with a DeleteBlob for staged bytes"
+
+[[test]]
+target = "crates/mailtide/src/submission.rs"
+name = "deleting_the_original_does_not_cancel_a_reply"
+covers = "A tombstone of the thread_of message leaves the submission alone (it is the user's mail, not an intent on that message); Gmail's answer decides the thread"
+
+[[test]]
+target = "crates/mailtide/src/invariants.rs"
+name = "a_send_request_follows_exactly_one_sending_transition"
+covers = "Invariant: per (key, generation) the engine issues Send, or the final Upload chunk, at most once"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_send_is_followed_by_a_history_pass"
+covers = "After MessageSent the engine reads history at once, so the SENT message is discovered and its import queued in the same run"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "the_upload_protocol_is_chosen_from_the_size_alone"
+covers = "Deterministic (I10): at or under send_inline_limit one Send; above it StartUpload, a commit recording the session, then Upload"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_deferred_send_is_not_an_attempt"
+covers = "RequestDeferred before Send leaves the row sending under the same claim and retries at `until`; nothing was sent, no attempt is counted"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "submissions"
+covers = "Every store: idempotent admission, claim and cancel never both win, rows and feed entries written in one transaction, a stale epoch's answer is rejected, forget deletes the rows"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "sends_under_faults_are_never_duplicated_and_always_settle"
+covers = "Seeded campaign: submit, cancel, reschedule and resend against a Gmail that applies a send and loses the answer, applies it late, refuses, rate limits and drops upload sessions, with crashes between any two commands and engines superseding each other. Gmail never holds two messages for one (key, generation), a canceled submission is never in Gmail, and after healing every row is final and every message Gmail sent is `sent`"
+
+# Driver, against a fake Gmail
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_send_returns_the_sent_message_and_the_feed_ties_it_to_the_key"
+covers = "send(): SubmissionChanged{pending}, {sending}, {sent, message_id, thread_id}, then MessageDiscovered and MessageImported with SENT for that message id"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "bytes_are_staged_before_the_row_and_deleted_after_the_send"
+covers = "The blob at outbox_key exists before submit returns; a failed blob write admits nothing; after `sent` the bytes are gone and the mirror holds Gmail's copy"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_send_whose_answer_was_lost_is_found_by_message_id_and_not_resent"
+covers = "Gmail applies the send and the connection drops: one request, state confirming, then sent with the id the lookup or the import found"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_send_that_never_connected_is_retried"
+covers = "TransportError::NotSent: back to pending with backoff, delivered by a later attempt; exactly one message"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_send_gmail_never_shows_ends_unconfirmed_and_is_not_resent"
+covers = "The request was lost on the way: no automatic second request; after send_confirm_window the state is unconfirmed and resend_submission sends it once"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_crash_between_gmails_answer_and_its_record_ends_as_sent_once"
+covers = "The process dies after the 200: the next run claims the job, finds sending under an older attempt, confirms, and never calls messages.send"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "an_engine_superseded_mid_send_is_confirmed_by_its_successor"
+covers = "Two runners: the first one's result commit is rejected (StaleEpoch); the second confirms by Message-ID while the first request may still be in flight"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_cancelled_python_style_drop_mid_request_is_treated_as_unanswered"
+covers = "Dropping the send future after the request was written leaves the row sending; the next run confirms instead of sending"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_message_over_the_inline_limit_goes_through_a_session"
+covers = "StartUpload, the session recorded on the row before any byte is sent, chunks, MessageSent; the bytes Gmail holds equal the staged bytes"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "an_interrupted_upload_resumes_from_gmails_offset"
+covers = "A chunk fails: status query, 308 with Range, the rest is sent on the same session; one message"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_lost_final_chunk_answer_is_read_back_from_the_session"
+covers = "Gmail completed the upload and the answer was lost: the status query answers 200 with the message; sent without a lookup and without a second upload"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_dead_session_before_the_last_chunk_restarts_and_after_it_confirms"
+covers = "404 or 410 on the session: if the final chunk was never issued nothing can be out, so a new session starts; if it was, the row confirms by Message-ID"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_message_over_the_maximum_size_is_refused_before_staging"
+covers = "TooLarge{limit} for bytes above send_max_size: no blob, no row, no call"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "gmails_thread_answer_is_recorded_even_when_it_differs"
+covers = "The submission and the feed carry the threadId Gmail returned, not the one requested"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "an_undone_send_never_reaches_gmail"
+covers = "submit with send_at = now + 10 s, cancel_submission at 5 s, run past the due time: no request, state canceled, the bytes still readable with submission_content"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "undo_after_the_claim_reports_cannot_unsend"
+covers = "cancel_submission racing a delivery: exactly one of them wins; when the claim won the answer is CannotUnsend and the message goes out once"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_scheduled_send_survives_a_restart_and_goes_out_when_due"
+covers = "A new Runner over the same store and blobs, with the clock moved to send_at, delivers it; nothing is held in memory"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "run_reports_the_next_scheduled_send_as_its_due_time"
+covers = "RunOutcome idle{next_due} is no later than the earliest pending send_at, so a host's scheduler knows when to call run again"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_draft_submission_sends_the_draft_when_due_and_cancel_leaves_it"
+covers = "source = draft: nothing is staged; at send_at the job calls drafts' send routine (drafts.send, 100 units) and settles on DraftSent; a cancel before that leaves the draft untouched in Gmail"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_draft_changed_after_submission_is_refused_not_sent"
+covers = "if_message_id no longer matches at delivery: refused{draft_changed}; a draft deleted elsewhere is refused{draft_gone}"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "sends_are_refused_in_read_only_mode"
+covers = "submit and send raise ReadOnly before staging; a submission admitted earlier ends refused{read_only} without a request"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_refused_send_does_not_block_the_account"
+covers = "A 400 or a 403 for a missing gmail.send scope is the submission's result; sync keeps running"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_rate_limited_send_stays_pending_and_cancellable"
+covers = "429 Mail sending with a retry time: account cooldown, the row is pending again and due after it, and can still be cancelled"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_send_while_the_account_is_blocked_waits"
+covers = "Revoked credentials: the submission is admitted and stays pending; it goes out after resume()"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "forget_deletes_submissions_and_staged_bytes"
+covers = "Offboarding leaves no row and no blob under the account's outbox prefix"
+
+[[test]]
+target = "crates/mailtide-io/tests/send.rs"
+name = "a_reply_plan_for_an_original_not_imported_is_refused"
+covers = "Runner.reply_plan and forward_plan need the stored content: OriginalUnavailable, never a plan from header facts alone"
+
+[[test]]
+target = "crates/mailtide-mime/src/respond.rs"
+name = "a_forward_plan_gives_the_originals_header_block_as_data"
+covers = "From, Date, Subject, To and Cc of the original as structured values for the host's `Forwarded message` block; never Bcc"
+
+[[test]]
+target = "crates/mailtide-mime/src/respond.rs"
+name = "a_reply_to_a_message_without_a_message_id_has_no_threading_headers"
+covers = "No In-Reply-To or References is invented; the reply can still be sent into the thread by thread id"
+
+# Python
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_send_returns_a_sent_submission"
+covers = "send() through the async Runner against FakeGmail: Submission.state == 'sent' with message_id and thread_id; changes() yields SubmissionChanged then the SENT message"
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_undo_send_cancels_before_delivery"
+covers = "submit(send_at=...) then cancel_submission(); FakeGmail received nothing; a late cancel raises CannotUnsend"
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_scheduled_send_is_delivered_by_run"
+covers = "ManualClock moved to send_at; run() delivers and the outcome before that named the due time"
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_lost_answer_is_confirmed_not_resent"
+covers = "FakeGmail applies the send and drops the answer; the submission ends sent and FakeGmail saw one send"
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_large_message_uses_a_resumable_session"
+covers = "A message above send_inline_limit arrives intact through the upload endpoints"
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_reply_plan_and_forward_plan"
+covers = "The pure helpers on raw bytes and the Runner methods on a mirrored message return frozen dataclasses"
+
+[[test]]
+target = "tests/test_send.py"
+name = "test_blocking_runner_has_the_send_methods"
+covers = "BlockingRunner mirrors the async send API"
+
+# ------------------------------------------------------------------- unknowns
+# Gmail behaviour the design assumes without proof. Paths are relative to
+# https://gmail.googleapis.com/gmail/v1/users/me unless a full URL is given; run
+# them on two test mailboxes A (the sender) and B. `drafts-message-id-kept`,
+# `drafts-send-twice`, `drafts-raw-json-limit` and `drafts-history-on-send` (in
+# drafts.toml) cover the same facts for the drafts calls and are not repeated.
+
+[[unknown]]
+id = "send-message-id-kept"
+question = "Does Gmail keep a client-supplied Message-ID header through messages.send, on the metadata URI and on a resumable upload?"
+assumed = "Yes: the SENT message and the recipient's copy carry the header exactly as supplied, and rfc822msgid: finds it."
+if_wrong = "Safe: a lost answer can then never be matched, so it ends `unconfirmed` and nothing is resent. To get confirmation back, raw submissions would go through a draft (drafts.create then drafts.send, confirmed by the draft's disappearance) or be matched by a private header, which step 4 measures."
+test = "1) As A, POST /messages/send {raw} to B with `Message-ID: <mailtide-probe-1@example.com>` and `X-Mailtide-Probe: 1`; note id M. 2) GET /messages/M?format=raw; decode; record both headers. 3) GET /messages?q=rfc822msgid:mailtide-probe-1@example.com&labelIds=SENT; expect M. 4) As B, find the message and GET it format=raw; record both headers. 5) Repeat 1-4 with the same message sent through the resumable upload (uploadType=resumable, Content-Type message/rfc822). 6) Repeat 1-3 with a Message-ID on A's own domain, with one on gmail.com, and with a send-as alias in From. Run together with drafts-message-id-kept and compose-mime-date-kept (one set of probe messages, sent both ways)."
+
+[[unknown]]
+id = "send-lookup-latency"
+question = "How soon after messages.send answers 200 does messages.list with q=rfc822msgid:<id> and labelIds=SENT return the message, and can it stay absent?"
+assumed = "Within send_confirm_delay (15 s) nearly always, and always well inside send_confirm_window (10 min)."
+if_wrong = "Safe: a message Gmail did send would be reported `unconfirmed` (maybe sent) and flip to `sent` when the sync imports it; mailtide itself never resends. The window and the lookup times must then grow to the measured latency."
+test = "As A, send 100 messages to B, each with a unique Message-ID. For each, starting when the 200 arrives, GET /messages?q=rfc822msgid:<id>&labelIds=SENT&maxResults=5 at 0, 1, 2, 5, 10, 15, 30, 60 and 300 s; record the first time it lists the id. Report the maximum and any message never listed. Also record when GET /history from the profile's historyId taken before the send first shows the messagesAdded record. Run together with search-index-lag (both poll messages.list with q after a change that history already shows)."
+
+[[unknown]]
+id = "send-late-apply"
+question = "Can Gmail deliver a messages.send request after the client has given up on it, and how long after?"
+assumed = "It can, but within seconds: a request that reached Gmail is applied or dropped well inside send_confirm_window (10 min)."
+if_wrong = "Safe for mailtide: a message that appears later than the window still turns `unconfirmed` into `sent`. The exposure is a host that called resend_submission in between: both copies carry the same Message-ID. If late delivery is observed past a few minutes, lengthen the window and say so on resend."
+test = "As A, 200 times: open a connection, write a complete POST /messages/send request to B with a unique Message-ID and Subject, and close the socket without reading (also: abort after 50 ms, 200 ms, 1 s). For each, poll GET /messages?q=rfc822msgid:<id> every 5 s for 15 min. Record how many were sent and the longest delay between the abort and the message first being listed."
+
+[[unknown]]
+id = "send-bcc-stripped"
+question = "Does Gmail deliver to Bcc recipients while removing the Bcc header from the copies of To and Cc recipients, through messages.send and through drafts.send, and do the sender's SENT copy and a stored draft keep the header?"
+assumed = "Yes to all: the copies of To and Cc carry no Bcc; the SENT copy and a stored draft keep the header in format=raw. Both pinned Gmail clients send their Bcc this way, but neither tests it."
+if_wrong = "Not safe to ship as designed: Bcc recipients would be disclosed. mailtide never rewrites bytes and Gmail takes its envelope from the headers, so admission would have to refuse any message with a Bcc header until another route exists. Settle this before the first slice that sends. If only the SENT copy or the stored draft loses the header, nothing is disclosed: message-facts' `bcc` fact is then empty for sent mail, and a host must keep a draft's Bcc beside the draft (compose-mime)."
+test = "As A, POST /messages/send {raw} with To: B, Bcc: C (a third mailbox), unique Subject. 1) As B, GET the message format=raw; expect no Bcc header and C named nowhere. 2) As C, expect the message delivered; record whether its copy has a Bcc header. 3) As A, GET the SENT message format=raw; record whether Bcc is kept. 4) Repeat through the resumable upload, and with Bcc folded over two lines. 5) As A, send the same from Gmail's web UI and repeat step 3 on its SENT copy. 6) As A, POST /drafts with the same raw; GET /drafts/D?format=raw and record whether Bcc is kept; POST /drafts/send {id:D}; repeat steps 1 to 3. This is the one unknown for Bcc: compose-mime and message-facts rely on it. Run together with blob-dedupe-raw-differs-per-mailbox and blob-dedupe-body-identical (the same sends, the same copies read back raw)."
+
+[[unknown]]
+id = "send-thread-mismatch"
+question = "What does messages.send do when threadId is given but the Subject differs from the thread's, or References and In-Reply-To do not name a message of it?"
+assumed = "It answers 200 and returns the thread it actually used (the requested one or a new one); it does not refuse."
+if_wrong = "Safe either way: a 4xx becomes `refused` with Gmail's message and nothing is sent; a 200 is recorded with the threadId Gmail answers, never the one requested. If Gmail refuses a changed Subject, hosts must drop thread_of when the user edits the subject."
+test = "Pick an INBOX message of A with thread T, Message-ID X, Subject S. As A send to B, each with threadId T: a) Subject `Re: S`, In-Reply-To and References X (control; expect threadId T); b) the same with Subject `Something else`; c) Subject `Re: S` and no In-Reply-To or References; d) Subject `Fwd: S`, References X, no In-Reply-To (a forward); e) Subject `Re: S` with In-Reply-To naming a message of another thread. Record each status, the answered threadId, and GET /threads/T?format=minimal afterwards. As B, record how each arrives threaded."
+
+[[unknown]]
+id = "send-thread-gone"
+question = "What does messages.send answer for a threadId that does not exist any more (every message of it permanently deleted)?"
+assumed = "An error (404 or 400) and nothing is sent."
+if_wrong = "Safe: if Gmail sends it in a new thread instead, the answer's threadId is what is recorded. Either answer leaves one message or none; the row is `refused{thread_not_found}` or `sent`."
+test = "As A: send a message to A, note its thread T; DELETE /messages/{id} for every message of T; GET /threads/T expects 404. Then POST /messages/send {raw to B, threadId: T}; record status, error body, and whether B received anything. Repeat with a threadId that never existed (16 hex digits)."
+
+[[unknown]]
+id = "send-session-completed-status"
+question = "After a resumable upload to messages.send has completed, does a status query (empty PUT, Content-Range: bytes */N) on its session answer 200 or 201 with the sent Message, without sending again?"
+assumed = "Yes. Google's upload guide says a completed session may answer 200 or 201 to a status query; that the body is the Message and that the query has no side effect is inferred."
+if_wrong = "Safe: an empty body is `sent, id unknown` and the id is then found by Message-ID; a 404 or 410 goes to Message-ID confirmation. Only a query that sent the message again would break at-most-once, and then the status query must never be issued after the final chunk (confirm by Message-ID instead)."
+test = "As A: 1) POST https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=resumable with X-Upload-Content-Type: message/rfc822 and X-Upload-Content-Length: N; note the Location URI. 2) PUT all N bytes (a message to B with a unique Message-ID); note the answer. 3) PUT the same URI with no body and Content-Range: bytes */N; record status, headers and body. 4) Repeat step 3 after 1 min, 1 h, 1 day and 8 days. 5) GET /messages?q=rfc822msgid:<id>&labelIds=SENT; expect exactly one. As B, expect exactly one copy. 6) Repeat steps 1-3 but close the socket on step 2 after the last byte without reading the answer."
+
+[[unknown]]
+id = "send-session-thread"
+question = "Does a resumable upload to messages.send honour a threadId given as JSON metadata in the session's initiating request?"
+assumed = "Yes: the initiating POST with Content-Type: application/json and body {\"threadId\": T} threads the uploaded message/rfc822 into T."
+if_wrong = "Safe but wrong for the user: a large reply would start a new thread. It is visible at once (the answered threadId differs and is what we record). Large replies would then use uploadType=multipart, which carries the metadata in the same request and loses resumability."
+test = "Using thread T, Message-ID X and Subject S of an INBOX message of A: 1) start a resumable session with body {\"threadId\": T}; upload a 6 MiB reply to B (Subject `Re: S`, In-Reply-To and References X); record the answered threadId. 2) Repeat with uploadType=multipart (multipart/related: a JSON part {\"threadId\": T}, then a message/rfc822 part). 3) Repeat step 1 without the metadata body as a control. GET /threads/T?format=minimal after each."
+
+[[unknown]]
+id = "send-size-limit"
+question = "What is the largest RFC 5322 message messages.send accepts on the upload URI, and how does it refuse a larger one?"
+assumed = "35 MB of raw bytes (the figure older reference pages gave for this method; today's state none), refused with 413 or 400 and nothing sent. send_max_size defaults to 35,000,000 bytes."
+if_wrong = "Safe: a lower limit is Gmail's refusal, recorded as `refused{too_large}` with nothing sent, and the default is lowered to the measured size. A refusal that arrives only after the whole upload wastes bandwidth, not correctness."
+test = "As A, for sizes 20, 25, 30, 34, 35, 36 and 40 MiB (one attachment padding the message, To: A, unique Message-ID): start a resumable session, upload in 8 MiB chunks, record the status and error body of the initiating request and of every chunk, and whether the message is in SENT afterwards. Repeat the largest accepted size to an external recipient B and record whether delivery is refused later (a bounce in A's inbox). Run together with drafts-raw-json-limit and drafts-upload-limit (one ladder of padded messages)."
+
+[[unknown]]
+id = "send-upload-quota"
+question = "How many quota units does a resumable messages.send cost: 100 once, or per request of the session?"
+assumed = "100 units once per session; chunk and status requests are free. The ledger charges 100 on StartUpload and 0 on Upload and UploadStatus."
+if_wrong = "Safe: if chunks are charged, the ledger under-counts and Gmail answers 429, which is an account cooldown and a retry on the same session. Declare the measured per-request cost."
+test = "In a Cloud project used for nothing else: read the Gmail API `Queries per minute per user` usage in the Cloud Console quota metrics; send one 30 MiB message to self in 8 MiB chunks with one extra status query; wait for the metric to update and record the units added. Repeat with one JSON messages.send of 100 KiB as the 100-unit control, and with a session that is started and abandoned."
+
+[[unknown]]
+id = "send-history-on-send"
+question = "Does a message sent with messages.send appear in history.list as messagesAdded with the SENT label, by the time the send answers?"
+assumed = "Yes; a history pass run right after the 200 discovers it."
+if_wrong = "Nothing is lost, only late: SubmissionChanged{sent} already carries the message id, and the message row would arrive with a later pass or reconciliation. The fix is to enqueue a Verify job for the answered id (one messages.get, 20 units) in the commit that records the send."
+test = "As A: GET /profile; note H. POST /messages/send to B; on the 200 note M and at once GET /history?startHistoryId=H (all pages, no filter); record whether a messagesAdded for M with labelIds containing SENT is present; if not, poll every second and record the delay. Repeat 50 times, and with a message to A itself (expect one message with SENT and INBOX, or record what arrives). Run together with drafts-history-on-send and drafts-history-on-save (one history window read after each call)."

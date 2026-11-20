@@ -1,0 +1,743 @@
+id = "threads"
+title = "Thread views read from the mirror"
+summary = "A pure thread rule (messages in order, label union of non-draft messages with pending actions applied, unread, latest, counts, participants) read for a batch of thread ids through one new index; listing threads by label stays in the host's read model, fed by the change feed."
+roadmap = ["R7"]
+status = "approved"
+design = "docs/features/threads.md"
+# No hard dependency. `message-facts` may change how header facts hold addresses;
+# participants read whatever the facts hold. Migration numbers are taken in merge
+# order (this plan needs one statement, see the note).
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/thread.rs"
+change = "new"
+role = "ThreadView and the pure rule that folds a thread's MessageViews into it: order, label union, unread, latest, counts, participants"
+
+[[file]]
+path = "crates/mailtide/src/lib.rs"
+change = "modify"
+role = "Export the thread module"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "AccountMirror::thread_members (also used by thread action admission) and AccountMirror::thread"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::threads(account, ids)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "threads over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "The next migration (the thread index); threads as one joined statement per chunk of ids, shared by Postgres and SQLite"
+
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "Delegate threads; tests of the migration and of the query plan"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "Delegate threads"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance cases for thread views"
+
+# ---------------------------------------------------------- driver, simulator
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Runner::threads: a store read that claims nothing and calls nothing"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Convergence also compares each message's thread id and each thread's view with the fake Gmail"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "ThreadView class; Runner.threads and BlockingRunner.threads"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrapper for threads"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for ThreadView and threads"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export ThreadView"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail messages can share a thread and carry a date and address headers"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 the thread is derived, with its ordering rule; §10.3 and §11 threads; §15 the scope decision"
+
+[[file]]
+path = "README.md"
+change = "modify"
+role = "Mention threads and the host's part (listing)"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide/tests/ref_zero_thread_list_summary.rs"
+change = "new"
+role = "Tests ported from Zero's thread list summary, as rules of the thread view"
+
+[[file]]
+path = "crates/mailtide/tests/ref_zero_mail_count_store.rs"
+change = "new"
+role = "The two tests of Zero's count store that are about what a thread shows"
+
+[[file]]
+path = "crates/mailtide-store/tests/ref_zero_thread_list_page.rs"
+change = "new"
+role = "Tests ported from Zero's list page, as the batch read (memory and SQLite)"
+
+[[file]]
+path = "crates/mailtide-store/tests/ref_himalaya_jmap_backend.rs"
+change = "new"
+role = "himalaya's Thread/get not-found test, as unknown ids left out"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_mailbox_reader.rs"
+change = "new"
+role = "Zero's cached-read test: a thread read needs no credentials and no Gmail"
+
+[[file]]
+path = "crates/mailtide-io/tests/end_to_end.rs"
+change = "modify"
+role = "Thread views across a sync and an action, against the fake Gmail"
+
+[[file]]
+path = "tests/test_threads.py"
+change = "new"
+role = "Python tests of threads against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+symbols = ["union of non-draft message labels", "distinct threads with an unread", "threads(thread_id)"]
+note = "The stated rules: thread state is the union over non-draft messages with pending intent overlaid; counts are label-scoped; a lookup by thread id needed an index that a slow-query check found missing."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-label-store.ts"
+symbols = ["threadLabels", "mail_message_thread"]
+note = "The label union: one statement joining a thread's message rows with their intents, drafts left out, behind an index on thread_id. Our read has the same shape."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/agent/index.ts"
+symbols = ["getThreadFromDB", "getThreadsFromDB", "latest_received_on", "latest_label_ids", "refreshThreadLabels", "threads_thread_id", "json_each"]
+note = "Option (c) as built: a threads table with the latest date and a JSON copy of the label union, rewritten when labels change; the list filters that JSON row by row and pages with `latest_received_on < token`, which skips threads that share the cursor's timestamp."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/thread-list-summary.ts"
+symbols = ["toThreadListSummary", "StoredThreadSummary", "resolveStoredThreadSummary", "repairStoredThreadSummary", "isGroupThread"]
+note = "The list row: latest non-draft message without bodies, labels, unread, reply count, has-draft. Stored as a snapshot, then corrected from the label store on every read, with a fallback when the snapshot cannot answer."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/thread-list-page.ts"
+symbols = ["withThreadListSummaries"]
+note = "A page is ids from the list plus one batch read of summaries. The batch read is the part we take."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/types.ts"
+symbols = ["IGetThreadResponse", "IGetThreadsResponse", "hasUnread", "totalReplies"]
+note = "The thread shape a client consumes: messages, latest, hasUnread, totalReplies, labels."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-count-store.ts"
+symbols = ["countThreads", "localCounts"]
+note = "Per-label counts: one pass over every message row of the mailbox, used only once the import is complete. A whole-mailbox aggregate, left to the host with listing."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["threads.get", "threads.list"]
+note = "Declared costs (40 and 10), matching Google's table. We call neither."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/threads/get.rs"
+symbols = ["GmailThreadGetCommand", "GmailThreadGetOutput"]
+note = "A pass-through of users.threads.get: the thread as Gmail sent it. No derived state."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/threads/list.rs"
+symbols = ["GmailThreadsListCommand", "GmailThreadListOutput"]
+note = "A pass-through of users.threads.list (query, label ids, page token): id, history id and snippet per thread."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["envelope_from", "flags_from_labels", "LIST_MAX_RESULTS"]
+note = "Its unified envelope drops Gmail's thread id and maps labels to flags per message; listings rely on Gmail's newest-first order."
+
+[[reference]]
+impl = "himalaya"
+path = "src/pimdir/index.rs"
+symbols = ["PimdirMailThread", "search_mail_threads", "last_date"]
+note = "The closest thing to a thread summary in a local index: thread id, message count, first and last date. No labels, unread state or participants."
+
+[[reference]]
+impl = "himalaya"
+path = "src/jmap/thread/get.rs"
+symbols = ["JmapThreadGetCommand", "ThreadNotFound"]
+note = "Thread/get for several ids at once; ids the server does not know are reported, the others still answered."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/search.md"
+symbols = ["list the thread of one message, oldest first"]
+note = "Their written order for one thread: oldest first."
+
+[[reference]]
+impl = "himalaya"
+path = "src/imap/envelope/thread.rs"
+symbols = ["ImapEnvelopeThreadCommand", "build_entries"]
+note = "IMAP THREAD into a reply tree. Not taken: Gmail's threadId is our threading and reply structure is the host's."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/email/envelope/thread/mod.rs"
+symbols = ["ThreadEnvelopes", "build_thread_graph_all"]
+note = "A reply graph from In-Reply-To and Message-ID. Not taken, for the same reason."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/thread/mod.rs"
+symbols = ["Thread", "email_ids"]
+note = "A JMAP Thread is an id and its email ids, nothing else; labels, unread and counts are computed by the client from the Emails. Our view adds them because only the engine knows the pending actions."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/thread/helpers.rs"
+symbols = ["thread_get", "changes_thread"]
+note = "Thread/get and Thread/changes. We add no thread entries to the feed: every message entry already names its thread."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/mod.rs"
+symbols = ["collapse_threads"]
+note = "JMAP lists threads as an Email/query that keeps the first message of each thread: listing is a query over messages, not a thread table."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/query.rs"
+symbols = ["some_in_thread_have_keyword", "in_thread", "received_at"]
+note = "The thread-level filters and the receivedAt sort a JMAP list uses."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/mailbox/mod.rs"
+symbols = ["total_threads", "unread_threads"]
+note = "Per-mailbox thread counters: in JMAP they belong to the mailbox, not the thread."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/thread/get.rs"
+symbols = ["ThreadGet", "thread_get"]
+note = "Names only (AGPL). Thread/get groups the account's cached messages by thread id at read time; no thread table is kept."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/email/query.rs"
+symbols = ["collapse_threads"]
+note = "Names only (AGPL). Collapsing is done while paging a message query, by remembering the threads already emitted."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/email/src/cache/email.rs"
+symbols = ["in_thread", "mailbox_counters", "thread_keywords"]
+note = "Names only (AGPL). Thread membership, thread keyword tests and mailbox thread counters are all computed from per-message rows."
+
+# --------------------------------------------------------------------- sources
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/threads"
+note = "Read 2026-11-20. A thread lets a client 'retrieve all messages in a conversation, in order' (which order is not stated); a message joins a thread through threadId, References/In-Reply-To and a matching Subject."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.threads/list"
+note = "Read 2026-11-20. labelIds: 'Only return threads with labels that match all of the specified label IDs'; maxResults defaults to 100, at most 500; no order is stated; listed threads carry no messages."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Read 2026-11-20. threads.get is 40 units (120 with format=full), threads.list 10. This feature calls neither: it costs no quota."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621"
+note = "§3 Thread: emailIds 'sorted by the receivedAt date of the Email, oldest first', ties stable ('sorting by id is recommended'); the threading algorithm is not mandated. §2 Mailbox totalThreads/unreadThreads. §4.4.3 collapseThreads: a thread appears once in a query result."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/thread-list-summary.test.ts"
+target = "crates/mailtide/tests/ref_zero_thread_list_summary.rs"
+
+[[suite.test]]
+name = "summary repair > replaces an unchanged legacy/invalidated snapshot (%s)"
+na = "No stored summary: a thread view is computed from the message rows at read time, so there is no snapshot to repair"
+
+[[suite.test]]
+name = "summary repair > does not overwrite a newer snapshot written while the R2 read was in flight"
+na = "No stored summary, so no write that could race a sync"
+
+[[suite.test]]
+name = "toThreadListSummary > keeps row fields and strips every body"
+test = "a_thread_view_carries_the_latest_envelope_the_counts_and_no_body"
+
+[[suite.test]]
+name = "toThreadListSummary > flags group threads by latest recipient count"
+test = "participants_tell_a_group_thread_from_a_two_party_one"
+note = "Zero stores a flag derived from the latest message's recipient count. We expose the participants and the latest envelope; the test derives the same flag from them."
+
+[[suite.test]]
+name = "toThreadListSummary > returns null for threads that are not imported yet"
+test = "a_thread_with_nothing_imported_has_no_latest"
+note = "Zero imports whole threads, so 'not imported' means no messages. Ours imports per message: the view exists, with no latest and a count of messages awaiting import."
+
+[[suite.test]]
+name = "stored thread summary > stores no bodies and round-trips through JSON"
+na = "No stored summary to serialise. That a view carries no body is covered by a_thread_view_carries_the_latest_envelope_the_counts_and_no_body"
+
+[[suite.test]]
+name = "stored thread summary > applies current labels, unread state and counts from the label store"
+test = "labels_unread_and_counts_follow_the_current_message_labels"
+
+[[suite.test]]
+name = "stored thread summary > never serves deleted threads and drops deleted messages from counts"
+test = "a_deleted_thread_is_absent_and_deleted_messages_leave_the_counts"
+
+[[suite.test]]
+name = "stored thread summary > falls back to the full read when the snapshot cannot answer exactly"
+test = "deleting_the_latest_message_makes_the_one_before_it_latest"
+note = "Zero falls back because its snapshot holds only the latest envelope. A derived view answers directly; the 'labels not hydrated yet' half has no counterpart."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/thread-list-page.test.ts"
+target = "crates/mailtide-store/tests/ref_zero_thread_list_page.rs"
+
+[[suite.test]]
+name = "thread list page > reads all summaries together and preserves membership, order and cursor"
+test = "threads_come_back_from_one_call_in_the_order_asked"
+note = "Membership and the cursor belong to the host's list. What we keep: one batch read, answers in the caller's order, no bodies."
+
+[[suite.test]]
+name = "thread list page > preserves membership for row-level retries when the summary read fails"
+na = "Composition of a list page with a failed summary read is the host's: threads either answers or raises StoreUnavailable, and the host still holds its page of ids"
+
+[[suite.test]]
+name = "thread list page > does not perform another read for an empty page"
+test = "no_thread_ids_reads_nothing"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/mail-count-store.test.ts"
+target = "crates/mailtide/tests/ref_zero_mail_count_store.rs"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > counts distinct threads with label-scoped unread messages, totals drafts/sent, and excludes inbox/spam/trash from archive"
+test = "a_hosts_label_counts_can_be_folded_from_thread_views"
+note = "The count is the host's. The test builds Zero's fixture mailbox, folds Zero's counting rule over our views in the test body and expects Zero's numbers: proof that a view carries what the rule needs (per-message labels, drafts told apart)."
+
+[[suite.test]]
+name = "storage-backed mailbox counts > includes pending read and folder changes immediately and removes deleted messages"
+test = "pending_actions_and_deletions_show_in_the_thread_view_at_once"
+note = "The overlay and deletion half, on the thread view; the counting half is the host's."
+
+[[suite.test]]
+name = "storage-backed mailbox counts > persists a throttled refresh and a retryable notification after the browser invalidation is consumed"
+na = "Refresh of a count snapshot fetched from Gmail, and a browser notification. mailtide never asks Gmail for counts"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > defers failed background count refreshes across restart without serving them as complete"
+na = "Refresh of a count snapshot fetched from Gmail; no such snapshot exists here"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > requires finished enumeration, all jobs drained, and message coverage before using local totals"
+na = "Gating of a host's local counts on import progress. The host reads that from status() (phase and job counts), which exists; the engine keeps no count to gate"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > coalesces cold provider fan-out and preserves complete Gmail totals across imports and store reconstruction"
+na = "Coalescing of per-label count requests to Gmail; mailtide makes none"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > throttles history-driven refreshes and retains cached totals with a persisted failure backoff"
+na = "Throttle and backoff of count requests to Gmail; mailtide makes none"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > never replaces a valid snapshot with incomplete or invalid provider results"
+na = "Validation of count answers from Gmail; mailtide requests none"
+
+[[suite.defer]]
+name = "storage-backed mailbox counts > uses updated label names and removes deleted labels from cached provider totals"
+to = "label-edit"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > honors persisted failure backoff even before the first snapshot or catalogue exists"
+na = "Backoff of count requests to Gmail; mailtide makes none"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > serves fully synchronized counts without any provider calls, including after restart"
+na = "Per-label counts are a whole-mailbox aggregate, left with listing to the host's read model (Decisions 1). That a mirror read needs no Gmail call is covered by a_thread_read_asks_for_no_token_and_calls_no_gmail"
+
+[[suite.test]]
+name = "storage-backed mailbox counts > caches whole-mailbox aggregates until stored messages, intents, or threads change"
+na = "A memo of whole-mailbox aggregates and its invalidation; the engine keeps no aggregate"
+
+[[suite.defer]]
+name = "storage-backed mailbox counts > refreshes label names after invalidation and backs off failed catalogue refreshes"
+to = "label-edit"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/mailbox-reader.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_mailbox_reader.rs"
+
+[[suite.test]]
+name = "mailbox RPC initialization > does not wait on provider auth or socket setup for an authorized cached read"
+test = "a_thread_read_asks_for_no_token_and_calls_no_gmail"
+
+[[suite.test]]
+name = "mailbox RPC initialization > still initializes provider operations by default"
+na = "Zero's RPC stub initialises provider auth unless told not to. mailtide asks for a token only when a command needs Gmail"
+
+[[suite.test]]
+name = "mailbox RPC initialization > disposes the target when provider initialization fails"
+na = "Lifetime of a Durable Object RPC stub; mailtide has no RPC layer"
+
+[[suite.test]]
+name = "mailbox RPC initialization > resolves the active connection in a single user-scoped RPC"
+na = "Which mailbox a signed-in user is looking at is the host's session state"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/threads/get.rs"
+
+[[suite.test]]
+name = "a_thread_prints_as_gmail_sent_it"
+na = "A pass-through of users.threads.get (40 units). mailtide never calls it: a thread is read from the mirror, as a_thread_read_asks_for_no_token_and_calls_no_gmail asserts"
+
+[[suite]]
+impl = "himalaya"
+path = "src/jmap/backend.rs"
+target = "crates/mailtide-store/tests/ref_himalaya_jmap_backend.rs"
+# The suite is shared with `purge` and `send`, so no rest_na: this plan lists the
+# reads and queries of himalaya's JMAP backend, `send` its writes and refusals.
+
+[[suite.test]]
+name = "a_thread_get_reports_each_id_not_found"
+test = "unknown_thread_ids_are_left_out_and_the_others_answered"
+note = "JMAP names the ids it did not find. Ours follows messages(): unknown ids are left out, so the caller compares ids. The known ids are answered either way."
+
+[[suite.test]]
+name = "a_negated_date_clause_is_not_rechecked_as_a_positive_one"
+na = "JMAP Email/query date filters rechecked by the client. mailtide evaluates no query: `search` forwards Gmail's string and listing is the host's"
+
+[[suite.test]]
+name = "an_instant_bounds_the_received_at_and_rechecks_the_sent_at"
+na = "JMAP Email/query date filters rechecked by the client. mailtide evaluates no query: `search` forwards Gmail's string and listing is the host's"
+
+[[suite.test]]
+name = "a_date_east_of_utc_is_found_on_its_own_day"
+na = "JMAP Email/query date filters rechecked by the client. mailtide evaluates no query: `search` forwards Gmail's string and listing is the host's"
+
+[[suite.test]]
+name = "a_page_reaching_the_query_total_has_no_next"
+na = "JMAP query paging by position and total. threads() reads by ids and pages nothing; Gmail's own paging is by token (`search`)"
+
+[[suite.test]]
+name = "a_query_page_follows_below_its_total"
+na = "JMAP query paging by position and total. threads() reads by ids and pages nothing; Gmail's own paging is by token (`search`)"
+
+[[suite.test]]
+name = "an_email_that_does_not_deserialize_is_unreadable"
+na = "Decoding of a JMAP Email/get answer. Mirror reads decode mailtide's own rows; a row that does not parse is CorruptState (existing)"
+
+[[suite.test]]
+name = "a_read_of_an_unknown_id_is_not_found"
+na = "A read of one email from a JMAP server. messages() and threads() read the mirror and leave unknown ids out (existing for messages(); the Thread/get test above for threads)"
+
+[[suite.test]]
+name = "a_read_of_an_email_another_mailbox_holds_is_not_found"
+na = "Mailbox scoping of a read, to behave like IMAP; mailtide ids are account-wide"
+
+[[suite.test]]
+name = "an_email_get_reports_each_id_not_found"
+na = "JMAP Email/get notFound list; messages() leaves unknown ids out (existing)"
+
+[[suite.test]]
+name = "a_mailbox_get_reports_each_id_not_found"
+na = "JMAP Mailbox/get notFound list; label definitions are read whole with labels()"
+
+[[suite.test]]
+name = "an_identity_get_reports_each_id_not_found"
+na = "JMAP Identity/get notFound list; `identities` reads identities whole"
+
+[[suite.test]]
+name = "a_submission_get_reports_each_id_not_found"
+na = "JMAP EmailSubmission/get notFound list; `send` reads a submission by its key"
+
+[[suite.test]]
+name = "a_missing_mailbox_is_coded"
+na = "Lookup of a JMAP mailbox by id, name or role; mailtide takes label ids and resolves no names or roles"
+
+[[suite.test]]
+name = "a_create_of_an_existing_mailbox_is_a_duplicate"
+na = "JMAP Mailbox/set create; the Gmail counterpart (a_create_of_an_existing_label_is_a_duplicate in src/gmail/backend.rs) is mapped by `label-edit`"
+
+[[suite]]
+impl = "himalaya"
+path = "src/imap/envelope/thread.rs"
+
+[[suite.test]]
+name = "replies_follow_what_they_answer"
+na = "A reply tree built from an IMAP THREAD answer. mailtide orders a thread by internalDate and leaves reply structure to the host, which has in_reply_to and references in every message's header facts"
+
+[[suite.test]]
+name = "a_long_thread_listing_fetches_in_chunks"
+na = "IMAP FETCH chunking (255 ids a command). Our chunking of ids per SQL statement is covered by the conformance case thread_views_span_statement_chunks"
+
+[[suite]]
+impl = "himalaya"
+path = "src/pimdir/thread.rs"
+
+[[suite.test]]
+name = "replies_follow_their_parent"
+na = "A reply tree from In-Reply-To over a local Maildir-like store; mailtide builds no reply tree (SPEC §15: Gmail's threadId only)"
+
+[[suite]]
+impl = "pimalaya-core"
+path = "email/src/email/envelope/thread/imap.rs"
+rest_na = "Parsing of IMAP THREAD responses into a reply graph. mailtide takes Gmail's threadId as the thread and builds no reply graph (SPEC §15)"
+
+# ------------------------------------------------------------- our own tests
+
+# The pure rule (crates/mailtide/src/thread.rs)
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "messages_are_ordered_by_internal_date_then_id"
+covers = "Oldest first by internalDate; equal dates fall back to the message id, so the order is total and the same in every store"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "messages_awaiting_import_follow_the_dated_ones_and_are_counted"
+covers = "A message without content has no date: it is listed after the dated ones, by id, and awaiting_import says the order is provisional"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "latest_is_the_newest_imported_non_draft_message"
+covers = "A newer message that is not imported yet, and a newer draft, do not become latest: latest always has an envelope a list row can show"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "a_thread_of_drafts_only_has_no_labels_no_latest_and_a_draft_count"
+covers = "A new unsent draft is a thread of its own: message_count 0, draft_count 1, empty labels, not unread"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "a_drafts_labels_never_reach_the_thread"
+covers = "DRAFT, and STARRED or UNREAD set on a draft, stay out of labels and unread; the draft itself is still in messages"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "a_blocked_action_no_longer_shows_in_the_thread_labels"
+covers = "The union is over effective labels: pending and delivered actions overlay, an action Gmail refused does not"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "trashed_and_spam_members_stay_in_the_view"
+covers = "A trashed message of a thread still counts and contributes TRASH: the view is the whole thread, a per-label view is the host's filter over messages"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "participants_keep_first_appearance_order_and_are_deduplicated_by_address"
+covers = "From, then To, then Cc of each imported non-draft message, oldest first; one entry per address, keeping the first spelling seen"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "an_address_is_compared_without_its_display_name_or_case"
+covers = "\"Doe, Jane\" <Jane@X> and jane@x are one participant; a value with no angle brackets is compared whole"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "participants_ignore_drafts_and_messages_awaiting_import"
+covers = "Recipients typed into an unsent draft are not participants; a message without header facts adds none"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "the_view_does_not_depend_on_the_order_members_are_given_in"
+covers = "Stores load rows in different orders; every permutation of the same members folds to the same view"
+
+[[test]]
+target = "crates/mailtide/src/thread.rs"
+name = "no_members_is_no_thread"
+covers = "The fold of an empty member list is None, which is how a deleted thread and an unknown id both read"
+
+# The mirror (crates/mailtide/src/mirror.rs)
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_thread_action_reaches_exactly_the_views_non_draft_messages"
+covers = "Admission and the view share thread_members: what a thread action targets is what message_count counts"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_reply_found_by_history_joins_its_thread_before_it_is_imported"
+covers = "The thread's labels and unread state change in the commit that discovers the reply; latest changes when the import commits"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_full_observation_in_another_thread_moves_the_message"
+covers = "Fail-safe for threads-thread-id-is-stable: the row follows the thread id of the newest full observation and leaves its old thread's view"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "an_empty_thread_id_is_never_a_thread"
+covers = "Fail-safe for threads-history-names-the-thread: rows whose thread id is empty are not grouped together, and a thread action on the empty id admits nothing"
+
+# Stores
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "thread_views"
+covers = "On every store: members, order, labels with a pending action, a deletion, a thread that disappears, unknown ids, an untracked account, and each member equal to its messages() view"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "thread_views_span_statement_chunks"
+covers = "1,200 thread ids in one call and one thread of 600 messages with intents: chunked statements return every thread once, whole"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "thread_views_never_mix_accounts"
+covers = "Two accounts holding the same thread id (one mailbox delegated twice, or a coincidence) read only their own rows"
+
+[[test]]
+target = "crates/mailtide-store/src/sqlite.rs"
+name = "the_thread_index_migration_applies_to_a_populated_database"
+covers = "A database at the previous schema version with rows gains the index and reads the same views; schema() reports behind before and current after"
+
+[[test]]
+target = "crates/mailtide-store/src/sqlite.rs"
+name = "thread_reads_and_thread_actions_use_the_thread_index"
+covers = "EXPLAIN QUERY PLAN of the view statement and of the admission lookup names mailtide_messages_thread, not a scan of the account's rows"
+
+[[test]]
+target = "crates/mailtide-store/src/sqlite.rs"
+name = "the_index_a_host_created_beforehand_is_kept"
+covers = "A host that built the index itself (CREATE INDEX CONCURRENTLY on Postgres) under the same name runs the migration as a no-op"
+
+# Simulator
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "converged_mirrors_group_messages_as_gmail_does"
+covers = "After healing, every message's thread id equals Gmail's and every thread's view (members, label union, unread, counts) equals the fold of the fake Gmail's messages, over many seeds with replies, drafts, deletions and thread actions"
+
+# Driver
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "a_reply_synced_from_history_shows_in_its_thread_view"
+covers = "Sync, reply arrives, sync: the view gains the message, UNREAD and the new latest, with the envelope read from the stored content"
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "a_thread_action_shows_in_the_thread_view_before_it_is_delivered"
+covers = "admit(thread, mark read) then threads: not unread although Gmail has not been called yet; after delivery and confirmation the view is unchanged"
+
+# Python
+
+[[test]]
+target = "tests/test_threads.py"
+name = "test_thread_view_fields"
+covers = "Runner.threads returns frozen ThreadView objects whose messages are the MessageView objects messages() returns"
+
+[[test]]
+target = "tests/test_threads.py"
+name = "test_a_host_list_follows_the_feed"
+covers = "The host's part, as a worked example: thread ids taken from a changes() page, one threads() call, an upsert or delete per id; the resulting table equals the mailbox after a reply, an archive and a deletion"
+
+[[test]]
+target = "tests/test_threads.py"
+name = "test_unknown_threads_and_untracked_accounts_read_as_empty"
+covers = "No exception: an empty list, as messages() answers"
+
+[[test]]
+target = "tests/test_threads.py"
+name = "test_blocking_runner_threads"
+covers = "BlockingRunner.threads returns the same views without an event loop"
+
+# ------------------------------------------- Gmail behaviour assumed, not proven
+
+[[unknown]]
+id = "threads-thread-id-is-stable"
+question = "Does a message keep its threadId for life, or can Gmail move an existing message to another thread (for example when a later message references two threads)?"
+assumed = "A message's threadId never changes after the message is created."
+if_wrong = "History has no record for such a move, so the mirror would show the message in its old thread until the next full observation of it (a verification fetch or a reconciliation), which rewrites the row's thread id and moves it in the views. The feed would carry no entry for the move, so a host's own list would keep the old grouping until it rebuilds: we would then add a ThreadChanged feed entry to the commit that rewrites a thread id."
+test = "With messages.insert create message A (new thread, note threadId TA) and message B with an unrelated Subject (threadId TB). Insert C with `References: <A's Message-ID> <B's Message-ID>`, the Subject of A and threadId TA. Then messages.get(format=minimal) A and B, and history.list from the historyId read before inserting C. Expect A in TA and B in TB, unchanged, and no history record naming B. Repeat by sending C through messages.send instead of insert."
+
+[[unknown]]
+id = "threads-internal-date-is-gmails-order"
+question = "Is the order of `messages` in a users.threads.get answer the order of internalDate, and is Gmail's 'latest' message the one with the greatest internalDate?"
+assumed = "Yes: Gmail orders a thread by internalDate, oldest first, as JMAP orders by receivedAt."
+if_wrong = "Only presentation differs: our order and `latest` would disagree with Gmail's own UI for messages whose internalDate is not their arrival time (imports with a back-dated Date header). No state is lost. We would then keep the documented internalDate rule and add Gmail's position as a second sort key only if a host needs parity."
+test = "In one thread, messages.insert message A with internalDateSource=receivedTime, then message B with internalDateSource=dateHeader and a Date header one year in the past, then message C normally. Call threads.get(format=minimal) and compare the order of `messages` and each internalDate. Expect B first (order follows internalDate, not insertion). Also note whether two messages inserted within the same millisecond come back in id order."
+
+[[unknown]]
+id = "threads-label-union-matches-gmails-listing"
+question = "Does users.threads.list(labelIds=[L]) return exactly the threads in which at least one message carries L, and does a draft's label count?"
+assumed = "A thread is listed under L when any of its messages carries L; a thread whose only message with a given label is a draft is listed under DRAFT but our `labels` leaves that draft's labels out."
+if_wrong = "The engine stays correct (it mirrors message labels); a host list built from ThreadView.labels would differ from Gmail's own list for mixed threads. The view carries every member with its labels and draft_count, so the host can apply Gmail's actual rule without an engine change; we would document that rule next to `labels`."
+test = "Create a thread of two messages with messages.insert: M1 labelled INBOX, M2 labelled only with a user label U. Call threads.list(labelIds=[U]), threads.list(labelIds=[INBOX]) and threads.list(labelIds=[INBOX, U]); expect the thread in all three (labels match across messages of the thread). Then drafts.create a reply in that thread, messages.modify the draft's message to add STARRED, and call threads.list(labelIds=[STARRED]) and threads.list(labelIds=[DRAFT]); record whether the thread is listed."
+
+[[unknown]]
+id = "threads-history-names-the-thread"
+question = "Do the message objects in history.list records (messagesAdded, labelsAdded, labelsRemoved) and in messages.list always carry threadId?"
+assumed = "Yes, always. The decoder nevertheless accepts a record without it and stores an empty thread id."
+if_wrong = "Rows discovered that way would share the empty id until their first full observation (the import or a verification fetch, both of which carry threadId and rewrite it). Fail-safe: the empty id is never a thread, so such messages are not grouped with each other, a read of the empty id answers nothing and a thread action on it admits nothing; the message joins its real thread when its import commits."
+test = "On a mailbox with recent activity of every kind (new mail, a label added and removed, a delete, a draft saved), call history.list from an old historyId with every historyTypes value and messages.list(includeSpamTrash=true) over all pages; assert every message object in every record and page has a non-empty threadId."

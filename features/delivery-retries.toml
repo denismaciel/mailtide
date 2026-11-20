@@ -1,0 +1,99 @@
+id = "delivery-retries"
+title = "Retry and failure classes of Gmail writes and batches"
+summary = "No new feature: test coverage for behaviour the engine already has. Two reference suites test how a failed Gmail write is classified and retried (a quota deferral, a rate limit with Retry-After, revoked credentials, network and server errors, an invalid request, throttled parts of a batch); this plan maps each onto an existing mailtide test, plans the missing delivery-level tests, and marks the HTTP batch tests not applicable."
+roadmap = []
+status = "approved"
+design = "docs/features/delivery-retries.md"
+# Nothing to build first: every path tested here exists on `main`.
+depends_on = []
+
+# ------------------------------------------------------------------- files
+# Tests only. No source file changes.
+
+[[file]]
+path = "crates/mailtide/tests/ref_zero_gmail_delivery_failure.rs"
+change = "new"
+role = "The two tests of Zero's delivery-failure suite that no existing test covers at the level of a Deliver job, against the engine and the shared mirror rules"
+
+[[file]]
+path = "crates/mailtide/tests/delivery_retries.rs"
+change = "new"
+role = "Our own engine-level tests of a throttled delivery: the whole group is retried after the cooldown, and there is no attempt cap"
+
+[[file]]
+path = "crates/mailtide-io/tests/end_to_end.rs"
+change = "modify"
+role = "One driver test: a 401 drops the cached token and is retried, without blocking the account"
+
+# -------------------------------------------------------------- references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-delivery-failure.ts"
+symbols = ["gmailDeliveryFailure"]
+note = "One pure function classifies a failed label delivery: a local quota deferral (retry at the gate's time), a rate limit (429 or a rate-limit reason on a 403; Retry-After is a minimum), revoked credentials and 401 (blocked, reauth), other 4xx (blocked), everything else transient with backoff. mailtide has the same classes in two places: crates/mailtide-gmail/src/errors.rs classifies, the engine decides what a class does to the job. It differs on 401 on purpose."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["batch_all", "BATCH_RETRIES", "BATCH_SIZE"]
+note = "Writes go out as HTTP batches of 50 parts; a throttled part is sent again alone, up to three times, and then reported rate-limited. mailtide sends no HTTP batch: nothing to take but the question `what happens to a throttled write`, which our own tests answer for a delivery."
+
+# ------------------------------------------------------------------ suites
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-delivery-failure.test.ts"
+target = "crates/mailtide/tests/ref_zero_gmail_delivery_failure.rs"
+
+[[suite.test]]
+name = "Gmail durable retry classification > unwraps Effect failures and honors local admission retry times"
+test = "a_quota_deferral_of_a_delivery_is_no_failed_attempt_and_waits_as_long_as_the_gate_says"
+note = "The rule exists (SPEC §8: a denial is a deferral, not a failure) and is tested for an Import job by durable_gmail_history_checkpoints_pauses_backfill_without_blocking_newly_arrived_live_work_or_counting_a_quota_denial_as_a_failed_request in crates/mailtide/tests/zero_mail_history_store.rs. No test drives a Deliver job through it: this one defers a delivery that already has many failed attempts and expects the gate's time, not a backoff, and the attempt count unchanged."
+
+[[suite.test]]
+name = "Gmail durable retry classification > retries 403 rate limits and honors Retry-After"
+target = "crates/mailtide-gmail/src/errors.rs"
+test = "rate_limits_come_as_403_or_429"
+note = "Exists: a 403 userRateLimitExceeded is a retryable account rate limit. Retry-After is covered beside it: retry_after_is_kept (same file) and retry_after_is_a_lower_bound (crates/mailtide/src/retry.rs). What it does to a delivery is our own a_throttled_modify_retries_the_whole_delivery_after_the_cooldown."
+
+[[suite.test]]
+name = "Gmail durable retry classification > pauses revoked credentials rather than retrying them forever"
+target = "crates/mailtide-gmail/src/errors.rs"
+test = "account_problems_block"
+note = "The half that applies: a revoked delegation (unauthorized_client) or a deleted user (invalid_grant naming the user) blocks the account instead of retrying. The other half is the opposite on purpose: Zero blocks on any 401, mailtide treats a 401 as a stale access token, drops it and retries; only the token source can say the grant is gone. Our own a_401_on_a_gmail_call_drops_the_token_and_retries_without_blocking pins that."
+
+[[suite.test]]
+name = "Gmail durable retry classification > retries network and server failures, but blocks invalid requests"
+test = "a_delivery_retries_a_network_failure_and_a_503_and_a_400_blocks_only_its_intents"
+note = "The classes exist (not_found_and_server_errors in crates/mailtide-gmail/src/errors.rs: 503 transient, 400 blocking; the driver reports a transport error as transient). No engine test applies them to a Deliver job: a retry with backoff for the first two, and for the 400 the intents sent are blocked and the job finished while the account keeps syncing (SPEC §7.3)."
+
+# `search` declares this suite and defers these two here.
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+
+[[suite.test]]
+name = "a_batch_retries_only_the_throttled_parts"
+na = "mailtide sends no HTTP batch request: crates/mailtide-gmail/src/batch.rs can encode one, but nothing in the driver uses it. A delivery is one messages.modify per message or one batchModify (crates/mailtide-gmail/src/request.rs), each answered whole, so there are no parts to retry singly. The nearest behaviour is our own a_throttled_modify_retries_the_whole_delivery_after_the_cooldown"
+
+[[suite.test]]
+name = "a_part_throttled_after_the_retries_is_rate_limited"
+na = "No batch parts and no retry cap inside a call: a throttled delivery goes back to its job and is retried with backoff for as long as it takes. Our own a_delivery_throttled_again_and_again_keeps_backing_off_and_is_never_dropped states that"
+
+# ------------------------------------------------------------ our own tests
+
+[[test]]
+target = "crates/mailtide/tests/delivery_retries.rs"
+name = "a_throttled_modify_retries_the_whole_delivery_after_the_cooldown"
+covers = "429, or 403 userRateLimitExceeded, on messages.modify or batchModify: the account cools down for at least Retry-After, the Deliver job is retried in full, and the versions already delivered are not acknowledged twice (I8); resending a change Gmail already applied is harmless because changes are absolute"
+
+[[test]]
+target = "crates/mailtide/tests/delivery_retries.rs"
+name = "a_delivery_throttled_again_and_again_keeps_backing_off_and_is_never_dropped"
+covers = "No attempt cap for a Deliver job: the delay grows to its cap, the intents stay pending and overlaid, nothing is blocked, and the job is still scheduled (I6)"
+
+[[test]]
+target = "crates/mailtide-io/tests/end_to_end.rs"
+name = "a_401_on_a_gmail_call_drops_the_token_and_retries_without_blocking"
+covers = "A 401 on a delivery invalidates the cached token and is a transient failure: the next attempt mints a new token and succeeds; no block is committed"

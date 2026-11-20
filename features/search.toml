@@ -1,0 +1,910 @@
+id = "search"
+title = "Search: a Gmail query to message and thread ids"
+summary = "A read-only driver call that sends the host's query string to Gmail's own search through the quota gate and returns one page of ids, each marked with what the mirror holds for it; it parses no query, builds no index, caches nothing and writes nothing."
+roadmap = ["R9"]
+status = "approved"
+design = "docs/features/search.md"
+# No hard dependency. Soft links, none needed to build this:
+#   threads (R7) hydrates thread hits; prioritise (S1) bumps a hit whose body is
+#   not imported yet; send (C3) can reuse the search request and `by_message_id`
+#   to confirm a send by Message-ID; drafts (C2) maps a DRAFT hit to its draft id.
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/search.rs"
+change = "new"
+role = "SearchQuery, SearchScope, the listing and page types, request rules (blank query, limit clamp, canonical label ids), the page-token binding, and the pure rule that marks each hit against the mirror"
+
+[[file]]
+path = "crates/mailtide/src/lib.rs"
+change = "modify"
+role = "Export the search module"
+
+[[file]]
+path = "crates/mailtide/src/command.rs"
+change = "modify"
+role = "GmailRequest::Search (issued by the driver, never by the engine)"
+
+[[file]]
+path = "crates/mailtide/src/event.rs"
+change = "modify"
+role = "EventKind::Searched, the decoded page of a search"
+
+[[file]]
+path = "crates/mailtide/src/quota.rs"
+change = "modify"
+role = "Costs: messages.list 5, threads.list 10"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "Ignore Searched: it never answers an engine command"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "AccountMirror::locate: row (imported or not), tombstone or absent, per id"
+
+# ------------------------------------------------------------------ wire layer
+
+[[file]]
+path = "crates/mailtide-gmail/src/search.rs"
+change = "new"
+role = "Pure helpers for hosts that build a query from user text: literal() and by_message_id()"
+
+[[file]]
+path = "crates/mailtide-gmail/src/request.rs"
+change = "modify"
+role = "Build messages.list and threads.list with q, labelIds, maxResults, pageToken and includeSpamTrash"
+
+[[file]]
+path = "crates/mailtide-gmail/src/decode.rs"
+change = "modify"
+role = "Decode a search page: ids, thread history ids, resultSizeEstimate, nextPageToken"
+
+[[file]]
+path = "crates/mailtide-gmail/src/lib.rs"
+change = "modify"
+role = "Export the search module"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::locate (a read; no migration)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "locate over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "locate: two id-keyed reads (messages, tombstones) for at most 500 ids"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Conformance case for locate"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/src/search.rs"
+change = "new"
+role = "Runner::search and Runner::search_threads, SearchPage, ThreadSearchPage, SearchError"
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Perform and decode the search request; its log name (the query is never logged). Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the search types"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "Runner and BlockingRunner search and search_threads, the result classes, exceptions, search_literal and search_by_message_id. Shared groundwork: the QuotaDeferred exception is added by whichever of drafts, identities, label-edit, purge, search lands first"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers for search and search_threads"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the search API"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export the search types, helpers and exceptions"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail: scripted results per query (the fake does not interpret queries either), q and paging on messages and threads"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§1 the search non-goal reworded (an index is the host's; a pass-through exists), §8 threads.list cost, §10-11 interfaces"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_search.rs"
+change = "new"
+role = "Tests ported from himalaya's Gmail query translator, for literal() and by_message_id()"
+
+[[file]]
+path = "crates/mailtide-gmail/tests/ref_himalaya_gmail_messages_list.rs"
+change = "new"
+role = "Test ported from himalaya's messages.list command"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_gmail_backend.rs"
+change = "new"
+role = "The paging tests of himalaya's Gmail backend"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_pimdir_search.rs"
+change = "new"
+role = "The token-paging tests of himalaya's local search, as the paging contract"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_mail_search_store.rs"
+change = "new"
+role = "Tests ported from Zero's search cache, as request, token and staleness rules"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_mail_search_overlay.rs"
+change = "new"
+role = "The one test of Zero's search overlay that applies: hits hydrate with overlaid labels"
+
+[[file]]
+path = "crates/mailtide-io/tests/search.rs"
+change = "new"
+role = "Driver tests against a fake Gmail: mirror state of hits, quota, errors, read-only, blocked accounts"
+
+[[file]]
+path = "tests/test_search.py"
+change = "new"
+role = "Python tests of the Runner search API against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["list", "listDrafts", "normalizeSearch", "count", "resultSizeEstimate"]
+note = "Search is threads.list with the user's q passed to Gmail; a folder is folded into q (in:trash, in:archive AND (...)). Draft search is drafts.list?q=. count() reads the archive size from resultSizeEstimate of a one-result search. We take the pass-through, not the folder rewriting or the estimate as a count."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/types.ts"
+symbols = ["IGetThreadsResponse"]
+note = "A page is thread ids with Gmail's per-thread historyId and an opaque next token: the shape of our thread page."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-search-store.ts"
+symbols = ["MailSearchStore", "mail_search_revision", "invalidate", "historyStamp", "inFlight"]
+note = "A 30 s durable cache of membership pages (ids and tokens only), keyed by folder, query, size, label set and token, fenced by a revision plus the history position, with in-flight sharing. We keep its rules about identity and staleness as request and token rules and return the mirror's feed state so a host can build this cache; we do not ship the cache."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-search-overlay.ts"
+symbols = ["compileLabelMatcher", "LABEL_TERMS", "compileLocalLabelQuery"]
+note = "Parses a Gmail query and evaluates its label terms, three-valued, against locally pending labels to drop threads that can no longer match. Not taken (design note, Decisions 8): it needs a parser for a grammar Google does not specify."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/routes/agent/index.ts"
+symbols = ["rawListThreads", "overlayPendingLabels", "invalidateSearches"]
+note = "Where search runs: an empty query is a folder list answered locally; a query goes through the cache with the stamp [cursor, requested, snapshot_baseline], then the overlay. invalidateSearches is called at label admission and delivery, sends, deletes, draft creation and label edits: the events our feed state already moves on."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+symbols = ["Search membership caching", "Foreground reads/search also share the foreground pool with mutations."]
+note = "The stated rules: search goes through the shared quota gate in the foreground class; cached membership is fenced by history and by local actions; backfill imports do not invalidate searches; errors are never cached and a stale page is never served as fresh."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["threads.list", "messages.list"]
+note = "Declared costs 10 and 5, matching Google's table."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/utils.ts"
+symbols = ["cleanSearchValue"]
+note = "Strips category terms from the user's query before prefixing a folder. Not taken: we never edit the query."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/imap/search.ts"
+symbols = ["translateSearch"]
+note = "Gmail syntax translated to IMAP SEARCH for the IMAP driver. Another provider; cited for the na of its suite."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/search.rs"
+symbols = ["filter_to_q", "value_q", "any_of", "day_start", "flag_q"]
+note = "Translates himalaya's own filter tree into q. We take value_q only (a user's text as a literal: quotes, braces and parentheses become spaces, OR and AND are lowercased, anything but a bare word is quoted) and its notes on dates (bare dates are midnight PST; Unix seconds are exact)."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["search_envelopes", "page_ids", "list_ids", "include_spam_trash", "reply_parents"]
+note = "Search is messages.list with q inside one label, then batched messages.get for envelopes. Page n is emulated by listing n pages' worth of ids plus one; a page with no id ends a listing whatever token it carries. reply_parents skips a Message-ID a query cannot carry instead of loosening it, the rule by_message_id() follows."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/messages/list.rs"
+symbols = ["GmailMessagesListCommand", "page_token", "include_spam_trash"]
+note = "The raw command: q, label ids, max results, page token and includeSpamTrash passed through, the page returned as Gmail sent it. The shape of our request."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/threads/list.rs"
+symbols = ["GmailThreadsListCommand", "historyId"]
+note = "The same for threads.list; each thread carries id, snippet and historyId. No tests."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/search.md"
+symbols = ["search-unsupported", "page-token-invalid"]
+note = "Their requirements: one query language translated per backend, a clause a backend cannot answer is refused, never dropped; a page token is refused under another query. We take the two refusal rules and not the language."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/backends.md"
+symbols = ["asking 500 messages a page"]
+note = "500 is Gmail's largest page; an unpaged listing follows every token."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/testing/gmail-specific.md"
+symbols = ["nextPageToken"]
+note = "Their live check of messages list with a label, q and 120 messages."
+
+[[reference]]
+impl = "himalaya"
+path = "src/jmap/backend.rs"
+symbols = ["compute_position_limit", "calculate_total"]
+note = "Their JMAP search pages by position and asks for a total: what Gmail cannot give."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/core/query.rs"
+symbols = ["QueryRequest", "position", "anchor", "anchor_offset", "calculate_total", "query_state", "can_calculate_changes"]
+note = "The JMAP /query shape our API is named after: filter, sort, a window by position or anchor, an optional total, and a queryState with canCalculateChanges. The design note maps each to what Gmail offers."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/core/query_changes.rs"
+symbols = ["QueryChangesRequest", "since_query_state", "up_to_id"]
+note = "/queryChanges, which a pass-through cannot offer; ours is the canCalculateChanges = false case: run the query again."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/query.rs"
+symbols = ["InMailbox", "HasKeyword", "Text", "ReceivedAt"]
+note = "JMAP's structured Email filter and comparators: the alternative to a raw query string that we reject for Gmail."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/mod.rs"
+symbols = ["collapse_threads"]
+note = "collapseThreads: one result per thread. Ours is search_threads (threads.list)."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/helpers.rs"
+symbols = ["email_query", "email_query_changes"]
+note = "Query returns ids only; the caller follows with a get. We keep that split: search returns ids, messages() hydrates."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/email/query.rs"
+symbols = ["email_query", "collapse_threads", "query_state"]
+note = "Names only (AGPL). Where the server answers Email/query, collapses threads and stamps the answer with a state."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap/src/changes/query.rs"
+symbols = ["query_changes", "CannotCalculateChanges"]
+note = "Names only (AGPL). Email/queryChanges and its refusal when changes cannot be calculated."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap-proto/src/method/query.rs"
+symbols = ["QueryResponse", "can_calculate_changes", "anchor_offset"]
+note = "Names only (AGPL). The /query request and response fields."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/jmap-proto/src/error/method.rs"
+symbols = ["AnchorNotFound", "UnsupportedFilter", "CannotCalculateChanges"]
+note = "Names only (AGPL). JMAP's query errors; ours are InvalidPageToken, Refused and 'run it again'."
+
+# --------------------------------------------------------------------- sources
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list"
+note = "Read 2026-11-20. q 'supports the same query format as the Gmail search box' and 'cannot be used when accessing the api using the gmail.metadata scope'; labelIds match all given ids; maxResults defaults to 100, at most 500; each message has only id and threadId; resultSizeEstimate is an estimate."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.threads/list"
+note = "Read 2026-11-20. The same parameters for threads; a listed thread has no messages."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/guides/filtering"
+note = "Read 2026-11-20. The API does not do the UI's alias expansion or thread-wide search; a bare date is midnight PST, a value in seconds is exact."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Read 2026-11-20. messages.list 5 units, threads.list 10 units; 6,000 units per minute per user."
+
+[[source]]
+url = "https://support.google.com/mail/answer/7190"
+note = "Read 2026-11-20. The search operators: label:, rfc822msgid:, in:anywhere ('includes emails in Spam and Trash'), OR and braces, quotes for an exact phrase, parentheses, after: and before:. It does not specify precedence, escaping, or how a label name with spaces is written."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8620#section-5.5"
+note = "JMAP /query: filter, sort, position or anchor, limit, calculateTotal, queryState, canCalculateChanges."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621#section-4.4"
+note = "JMAP Email/query: the filter conditions and collapseThreads."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/mail-search-store.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_mail_search_store.rs"
+
+[[suite.test]]
+name = "mailbox search membership cache > coalesces repeated searches, persists pages across restart, and expires them after 30 seconds"
+na = "No result cache and no in-flight sharing: every call asks Gmail (5 or 10 units). A host that wants this cache keys it on the page's mirror_state (design note, Decisions 6)"
+
+[[suite.test]]
+name = "mailbox search membership cache > canonicalizes label sets but preserves quoted query whitespace and opaque page tokens"
+test = "label_ids_are_canonical_and_the_query_and_gmails_page_token_go_out_byte_for_byte"
+note = "Zero's cache key becomes our request: label ids are deduplicated and sorted; q keeps its case and inner whitespace; Gmail's token is carried verbatim inside ours. Unlike Zero we do not trim q either."
+
+[[suite.test]]
+name = "mailbox search membership cache > separates folder, page size, label filters, pages, and mailbox storage"
+test = "a_page_token_is_bound_to_its_account_query_filters_and_page_size"
+note = "Cache identity becomes page-token identity: a token issued for one request is refused for another account, query, label filter, scope, spam/trash flag or limit. There is no folder parameter."
+
+[[suite.test]]
+name = "mailbox search membership cache > refreshes when history advances and fences an invalidated in-flight response"
+test = "mirror_state_is_read_before_gmail_is_asked_so_a_change_during_the_call_marks_the_page_stale"
+note = "The fence a host cache needs: a commit or an admitted action that lands while the request is in flight is after the page's mirror_state, so changes(since = mirror_state) is not empty."
+
+[[suite.test]]
+name = "mailbox search membership cache > does not cache provider errors or substitute stale membership for a failed refresh"
+test = "a_failed_or_deferred_search_is_an_error_never_an_empty_or_older_page"
+
+[[suite.test]]
+name = "mailbox search membership cache > bounds persistent cache growth and prunes expired pages on new searches"
+na = "Nothing is stored: search adds no table and writes no row"
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/mail-search-overlay.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_mail_search_overlay.rs"
+
+[[suite.test]]
+name = "label-aware search overlay > excludes a thread from the Unread + Important category once it is read locally"
+na = "mailtide does not parse Gmail queries (design note, Decisions 8). A label-only view like this one is a query on the mirror, which the host answers with the overlay applied and without calling Gmail"
+
+[[suite.test]]
+name = "label-aware search overlay > matches a thread when any message still satisfies the query"
+na = "mailtide does not parse Gmail queries (design note, Decisions 8): a hit Gmail returns is returned, and messages() shows its effective labels for the host to filter on"
+
+[[suite.test]]
+name = "label-aware search overlay > defers to the provider for terms that labels cannot decide"
+na = "mailtide does not parse Gmail queries (design note, Decisions 8): every term is Gmail's to decide"
+
+[[suite.test]]
+name = "label-aware search overlay > binds OR tighter than implicit AND and supports brace groups"
+na = "mailtide does not parse Gmail queries (design note, Decisions 8); Google does not document this precedence"
+
+[[suite.test]]
+name = "label-aware search overlay > keeps provider results for unparsable queries and threads without stored messages"
+na = "mailtide does not parse Gmail queries (design note, Decisions 8): Gmail's results are always kept, except hits the mirror has tombstoned"
+
+[[suite.test]]
+name = "pending thread message labels > returns overlaid labels only for threads with queued intents"
+test = "only_hits_with_unsettled_actions_hydrate_with_overlaid_labels"
+note = "The half that applies: after search, messages() on the hits shows effective labels and pending_actions > 0 for the message the user just changed, and observed labels for the others."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/imap/search.test.ts"
+rest_na = "IMAP only: translates Gmail query syntax into IMAP SEARCH criteria. mailtide is Gmail only and sends q to Gmail as written"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/search.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_search.rs"
+
+[[suite.test]]
+name = "message_id_conditions"
+test = "a_message_id_is_searched_bare_with_or_without_its_angle_brackets"
+note = "by_message_id(). The negated form (-rfc822msgid:) is the host's to write."
+
+[[suite.test]]
+name = "patterns_with_spaces_get_quoted"
+test = "a_value_with_spaces_is_quoted_and_a_bare_word_is_not"
+
+[[suite.test]]
+name = "patterns_cannot_widen_the_search"
+test = "a_value_cannot_add_operators_or_groups"
+
+[[suite.test]]
+name = "operator_lookalikes_get_quoted"
+test = "a_value_that_looks_like_an_operator_is_quoted"
+
+[[suite.test]]
+name = "patterns_without_a_word_bail"
+test = "a_value_with_no_word_is_refused"
+
+[[suite.test]]
+name = "an_instant_is_sent_in_seconds"
+na = "No filter type to translate: the host writes after:/before: itself. The design note says to use Unix seconds, since a bare date is midnight PST"
+
+[[suite.test]]
+name = "leaf_conditions"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it; literal() is the only helper"
+
+[[suite.test]]
+name = "conjunctions_flatten_into_whitespace"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it and has no and/or/not"
+
+[[suite.test]]
+name = "disjunctions_become_brace_groups"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it and has no and/or/not"
+
+[[suite.test]]
+name = "conjunctions_under_disjunctions_keep_their_group"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it and has no and/or/not"
+
+[[suite.test]]
+name = "negated_leaves_get_a_dash"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it and has no and/or/not"
+
+[[suite.test]]
+name = "double_negation_cancels"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it and has no and/or/not"
+
+[[suite.test]]
+name = "negated_compounds_expand_through_de_morgan"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it and has no and/or/not"
+
+[[suite.test]]
+name = "exact_dates_bracket_the_utc_day"
+na = "No date clause: the host writes after:/before: itself, in Unix seconds for an exact bound"
+
+[[suite.test]]
+name = "after_starts_on_the_next_utc_day"
+na = "No date clause: the host writes after:/before: itself, in Unix seconds for an exact bound"
+
+[[suite.test]]
+name = "flag_operators"
+na = "No flag clause: IMAP-style flags are label ids in mailtide, and a label-only question is answered from the mirror, not by a search"
+
+[[suite.test]]
+name = "unsupported_flags_bail"
+na = "No flag clause, so nothing to refuse; Gmail decides what a term means"
+
+[[suite.test]]
+name = "copies_addresses_dates_and_attachments"
+na = "Translation of himalaya's filter tree into q. mailtide takes q as the host wrote it"
+
+[[suite.test]]
+name = "the_unread_count_query_translates"
+na = "Counts are label aggregation over the mirror, not a search"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/messages/list.rs"
+target = "crates/mailtide-gmail/tests/ref_himalaya_gmail_messages_list.rs"
+
+[[suite.test]]
+name = "a_page_prints_as_gmail_sent_it"
+test = "a_search_page_keeps_ids_estimate_and_token_and_a_page_without_messages_is_empty"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_gmail_backend.rs"
+
+[[suite.test]]
+name = "an_exactly_full_last_page_has_no_next"
+test = "a_token_after_an_exactly_full_last_page_leads_to_an_empty_final_page"
+note = "himalaya hides the extra token by asking for one id more than the page. We return Gmail's token: the following page is empty and has no token, which ends the paging."
+
+[[suite.test]]
+name = "a_listing_past_the_largest_page_goes_on_by_token"
+test = "a_limit_above_gmails_maximum_is_one_page_of_500_with_a_token"
+note = "himalaya reads 501 ids in two calls. We clamp the limit to 500, make one call and return the token."
+
+[[suite.test]]
+name = "a_later_page_is_read_in_one_call"
+na = "No page numbers: Gmail pages by token only, and reaching page n by listing n pages of ids costs more the further the user scrolls"
+
+[[suite.test]]
+name = "a_listing_without_page_size_reads_every_page"
+na = "No unpaged search: each page is one quota-gated call the host asks for, so the host bounds the spend"
+
+[[suite.test]]
+name = "a_listing_reports_the_parts_gmail_could_not_answer"
+na = "himalaya hydrates a listing with batched messages.get, which can fail per item. Our hits are marked from the mirror with one store read; no Gmail call follows the list"
+
+[[suite.defer]]
+name = "a_lookup_keeps_the_ids_carrying_the_label"
+to = "purge"
+
+[[suite.test]]
+name = "a_read_of_a_message_another_label_holds_is_not_found"
+na = "himalaya scopes reads to a mailbox to behave like IMAP; mailtide ids are account-wide"
+
+[[suite.defer]]
+name = "a_batch_retries_only_the_throttled_parts"
+to = "delivery-retries"
+
+[[suite.defer]]
+name = "a_part_throttled_after_the_retries_is_rate_limited"
+to = "delivery-retries"
+
+[[suite.defer]]
+name = "a_write_answered_404_is_not_found"
+to = "purge"
+
+[[suite.defer]]
+name = "unknown_ids_are_told_from_other_failures"
+to = "purge"
+
+[[suite.test]]
+name = "a_flag_set_leaves_the_draft_label_alone"
+na = "IMAP-style 'set the flags to exactly these'; mailtide's actions are explicit and can never set or remove DRAFT (SPEC §7)"
+
+[[suite.defer]]
+name = "a_reply_names_the_parents_a_query_can_carry"
+to = "send"
+
+[[suite.defer]]
+name = "a_rename_moves_the_sublabels_and_only_them"
+to = "label-edit"
+
+[[suite.defer]]
+name = "a_create_of_an_existing_label_is_a_duplicate"
+to = "label-edit"
+
+[[suite.defer]]
+name = "an_address_header_reads_as_the_other_backends_read_it"
+to = "message-facts"
+
+[[suite.defer]]
+name = "a_wrong_weekday_keeps_its_date"
+to = "message-facts"
+
+[[suite]]
+impl = "himalaya"
+path = "tests/pimdir_search.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_pimdir_search.rs"
+
+[[suite.test]]
+name = "a_search_pages_by_next_page_and_page_token"
+test = "paging_follows_next_page_token_until_there_is_none"
+note = "The reference pages a local index; ported for the paging contract only (a page, a token, the next page, no token on the last)."
+
+[[suite.test]]
+name = "a_token_of_another_query_is_refused"
+test = "a_page_token_of_another_query_is_refused_before_gmail_is_called"
+
+[[suite.test]]
+name = "a_message_the_store_cannot_read_is_an_item_error"
+na = "The reference reads every hit from its own store. Our hits are ids: one the mirror lacks is marked unknown, not an error (own test a_hit_gmail_has_and_the_mirror_does_not_is_unknown_until_the_next_sync)"
+
+[[suite.test]]
+name = "an_option_after_the_query_is_the_option"
+na = "Command-line parsing"
+
+# ------------------------------------------------------------ our own tests
+
+# Wire layer
+
+[[test]]
+target = "crates/mailtide-gmail/src/request.rs"
+name = "a_message_search_sends_q_label_ids_limit_and_token"
+covers = "GET /messages?q=..&labelIds=A&labelIds=B&maxResults=..&pageToken=..; includeSpamTrash=true only when asked"
+
+[[test]]
+target = "crates/mailtide-gmail/src/request.rs"
+name = "the_query_is_percent_encoded_and_otherwise_untouched"
+covers = "Quotes, braces, +, leading and trailing blanks and non-ASCII text decode back to the host's bytes; nothing is trimmed, folded or rewritten"
+
+[[test]]
+target = "crates/mailtide-gmail/src/request.rs"
+name = "a_thread_search_goes_to_threads_list"
+covers = "The same parameters on GET /threads"
+
+[[test]]
+target = "crates/mailtide-gmail/src/decode.rs"
+name = "a_thread_search_page_decodes_ids_and_history_ids"
+covers = "threads[].id and historyId (kept optional), the snippet ignored"
+
+[[test]]
+target = "crates/mailtide-gmail/src/decode.rs"
+name = "a_search_answer_that_is_not_a_page_is_refused"
+covers = "A body without the list shape is a decode error, never an empty page"
+
+[[test]]
+target = "crates/mailtide-gmail/src/search.rs"
+name = "a_message_id_gmail_cannot_carry_is_refused_not_loosened"
+covers = "by_message_id returns None for an id holding a blank, a quote, a brace or a parenthesis (himalaya: a_reply_names_the_parents_a_query_can_carry)"
+
+[[test]]
+target = "crates/mailtide/src/quota.rs"
+name = "search_costs_follow_gmails_quota_table"
+covers = "messages.list 5 units, threads.list 10 units"
+
+# Pure rules
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "a_blank_query_is_refused"
+covers = "A search needs a non-blank query: a label-only listing is the mirror's to answer"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "limit_is_clamped_to_one_through_five_hundred"
+covers = "0 becomes 1, anything above 500 becomes 500, the default is 100"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "a_page_token_round_trips_gmails_token_byte_for_byte"
+covers = "Encoding then decoding under the same request gives Gmail's token back, including +, /, = and dots"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "a_garbled_page_token_is_refused"
+covers = "A string mailtide did not issue (no version prefix, bad binding) is InvalidPageToken"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "the_token_binding_does_not_depend_on_label_id_order"
+covers = "Label ids are canonical before binding, so the same filter in another order continues the same paging run"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "tombstoned_hits_are_dropped_and_counted"
+covers = "A hit the mirror knows is deleted leaves the page; SearchPage.deleted counts it"
+
+[[test]]
+target = "crates/mailtide/src/search.rs"
+name = "hits_keep_gmails_order_and_carry_their_mirror_state"
+covers = "imported, not_imported (a row without content) or unknown (no row, no tombstone), in the order Gmail returned them"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "locate"
+covers = "Every store: a row with content, a row without, a tombstone and an absent id are told apart for up to 500 ids, in one read that claims nothing"
+
+# Driver
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_search_returns_gmails_hits_with_their_mirror_state"
+covers = "One messages.list call, then one store read: ids, thread ids, state, estimate, token, mirror_state, cursor and phase"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_search_writes_nothing"
+covers = "No commit, row, job or feed entry: the store's feed head, message count and job counts are the same before and after, also for unknown hits"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_hit_gmail_has_and_the_mirror_does_not_is_unknown_until_the_next_sync"
+covers = "Gmail's index ahead of the cursor: the hit is unknown; after run() the same search marks it not_imported or imported"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_hit_the_mirror_tombstoned_is_not_returned"
+covers = "Gmail's index behind history: a deleted message still listed is dropped and counted, never resurrected"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_search_during_bootstrap_reports_the_phase"
+covers = "Before the first cursor the page says phase bootstrapping and cursor None; hits are mostly unknown and the call still succeeds"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_search_does_not_supersede_a_running_sync"
+covers = "Search reads status and locate and never claims the account: a concurrent run keeps its epoch and finishes"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "search_is_charged_five_units_and_thread_search_ten"
+covers = "Each page is admitted through the quota gate at its declared cost"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_deferred_search_waits_within_its_budget"
+covers = "The gate says not yet: the call waits and succeeds if the budget allows, else returns Deferred{until} with no request sent"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_background_search_yields_to_foreground_work"
+covers = "priority = backfill is deferred once the backfill share of the budget is used, while a foreground search is admitted"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_rate_limited_search_cools_the_gate_down"
+covers = "429 or userRateLimitExceeded: Retryable is returned and the gate defers the account's next request for Retry-After"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_refused_search_does_not_block_the_account"
+covers = "400 on a first page (a label id Gmail rejects) and 403 (gmail.metadata scope) are Refused: the caller's error; the account's sync state is unchanged"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_continuation_gmail_rejects_is_a_rejected_page_token"
+covers = "A 4xx on a request that carried a token mailtide issued for this very request is PageTokenRejected: restart from the first page"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "search_works_in_read_only_mode"
+covers = "access = read_only: search is a read and needs only gmail.readonly"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "search_on_a_blocked_account_makes_no_credential_or_gmail_call"
+covers = "A blocked account is AccountBlocked before the token source is asked"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "search_on_an_untracked_account_is_refused"
+covers = "NotTracked: search never starts mirroring an account"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "the_query_never_reaches_the_logs"
+covers = "Log events carry the request kind, cost and duration; never q, label ids, message ids or Gmail's error text"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "thread_search_returns_thread_ids_with_gmails_history_ids"
+covers = "threads.list: thread id and Gmail's historyId per hit, the page's cursor to compare it with; no mirror state (threads feature)"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "pages_of_a_changing_mailbox_may_repeat_or_skip_ids"
+covers = "Paging is not a snapshot: a message added between two pages can repeat an id; mailtide returns what Gmail says and removes nothing but tombstoned hits"
+
+# Python
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_search_returns_hits_and_pages"
+covers = "search() against FakeGmail with scripted results: hits, next_page_token, the second page, the end"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_hits_hydrate_with_messages"
+covers = "messages(account, [hit.message_id ...]) returns the views of imported and not-imported hits; unknown hits are left out"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_page_token_for_another_query_raises"
+covers = "InvalidPageToken, with no request reaching FakeGmail"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_refused_search_raises_search_refused"
+covers = "FakeGmail answers 400: SearchRefused, and a following run() still syncs"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_search_threads"
+covers = "search_threads() returns ThreadHit(thread_id, history_id)"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_blocking_runner_has_search"
+covers = "BlockingRunner mirrors search and search_threads"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_search_literal_quotes_user_text"
+covers = "mailtide.search_literal and search_by_message_id; ValueError for text with no word"
+
+# ------------------------------------------------- unproven Gmail behaviour
+
+[[unknown]]
+id = "search-page-token-rejection"
+question = "How does Gmail answer messages.list or threads.list with a pageToken it does not accept (altered, made up, or issued for other parameters)?"
+assumed = "With HTTP 400, never with 200 and some other page."
+if_wrong = "If Gmail answers 200, a bad token cannot be told from a good one and paging may repeat or end early without an error. mailtide already refuses, before calling Gmail, any token it did not issue for the same request, so only a token Gmail itself has forgotten is exposed; the contract then gains 'restart a paging run older than N', with N from search-page-token-lifetime. Any other 4xx is handled as the 400 is (PageTokenRejected)."
+test = "On a mailbox with at least 5 messages: (1) GET users/me/messages?q=in:anywhere&maxResults=2&includeSpamTrash=true; keep nextPageToken T. (2) Repeat with pageToken=T: expect 200 and two other ids. (3) Repeat with T's last character changed, then with pageToken=garbage: record status and error body. (4) Send T with q=from:nobody@example.invalid, then with the original q and maxResults=1: record the status and whether the ids continue the first query. Repeat the four steps on users/me/threads."
+
+[[unknown]]
+id = "search-page-token-lifetime"
+question = "How long does a nextPageToken stay valid, and does it survive changes to the mailbox?"
+assumed = "At least an hour, also when messages arrive or are deleted in between; not for ever."
+if_wrong = "If shorter, a host sees PageTokenRejected while the user scrolls and restarts from the first page, which is already the documented recovery; nothing is lost. mailtide never stores a token, so a longer life changes nothing."
+test = "Take T as in search-page-token-rejection step 1. messages.insert one message that matches and messages.trash another. Use T after 1 minute, 1 hour, 24 hours and 7 days; each time record the status and, against a fresh full listing, whether ids repeat or are skipped."
+
+[[unknown]]
+id = "search-index-lag"
+question = "How far does Gmail's search index trail a change that history.list already reports: a new message, a label change by messages.modify, a permanent delete?"
+assumed = "Seconds, and less than confirm_timeout (60 s): by the time the mirror imports a new message or settles an action, a new search reflects it."
+if_wrong = "A host that re-runs a search whenever the feed moves past the page's mirror_state could keep a page that is stale with no later feed entry to say so. The design note therefore tells hosts to pair mirror_state with a time limit; the measured lag sets the advised limit (Zero uses 30 s). mailtide keeps no page, so the mirror is not affected."
+test = "(1) messages.insert a message with a unique subject token and labelIds [INBOX, UNREAD]; every second call messages.list?q=subject:<token> and history.list until both show it; record both delays. (2) messages.modify removeLabelIds [UNREAD]; poll q='subject:<token> is:unread' until it is empty; record the delay after the 200. (3) messages.delete it; poll q=subject:<token> with includeSpamTrash=true until it is gone; record the delay and whether the id was still listed after history.list showed messagesDeleted. Run together with send-lookup-latency (both poll messages.list with q after a change that history already shows)."
+
+[[unknown]]
+id = "search-literal-quoting"
+question = "Inside a double-quoted value, does Gmail still read OR, AND, braces and parentheses as syntax; is there an escape character; are lowercase or/and plain words?"
+assumed = "As himalaya's translator assumes: they are syntax even inside quotes, nothing escapes them, lowercase or/and are words, and punctuation is skipped when words are matched."
+if_wrong = "literal() turns those characters into spaces and lowercases a standalone OR or AND, so its output can match the same messages or fewer than the text meant, never more: over-cautious, not wrong. If quotes do protect them, literal() can keep the characters."
+test = "messages.insert three messages with subjects 'zebrafish report', 'kangaroo report' and 'zebrafish OR kangaroo (draft) {x}'. List with q=subject:\"zebrafish OR kangaroo\", subject:\"zebrafish or kangaroo\", subject:\"zebrafish} OR {kangaroo\", subject:\"(draft)\", subject:\"draft\" and subject:\"from:alice\"; record the ids each returns. Under the assumption the first returns all three and the second only the third."
+
+[[unknown]]
+id = "search-msgid-match"
+question = "Does rfc822msgid: match exactly one Message-ID when given without angle brackets, and how must an id holding characters such as - = / $ ! % be written: bare or quoted?"
+assumed = "A bare id of letters, digits and @ . _ + matches exactly that message; any other id matches when double-quoted."
+if_wrong = "by_message_id() returns None for every id outside the set proven to match, instead of a term that may match nothing or another message. A caller (send, confirming by Message-ID) then treats the lookup as unavailable, never as 'not found'."
+test = "messages.insert four messages with Message-ID <plain.1@x.test>, <a+b-c@x.test>, <a=b/c$d!e%f@x.test> and <plain.1@x.test.extra>. For each id run q=rfc822msgid:ID, q=rfc822msgid:<ID> and q=rfc822msgid:\"ID\" with includeSpamTrash=true. Expect exactly its own message each time; record every spelling that returns nothing or returns the .extra message."
+
+[[unknown]]
+id = "search-label-terms"
+question = "What does the label: operator in q accept: label names only or also label ids (Label_123), and how are spaces, slashes and case in a name written?"
+assumed = "Names only, case-insensitive, with spaces and slashes written as hyphens; an id is not accepted. The labelIds parameter takes ids only."
+if_wrong = "Nothing in mailtide depends on it: q is never rewritten and label_ids is the exact filter either way. Only the guidance changes ('filter by label with label_ids, not with label:')."
+test = "labels.create 'Proj X/Sub a' (keep its id L) and add it to one message. List with q=label:proj-x-sub-a, q=label:\"Proj X/Sub a\", q=label:Proj-X/Sub-a, q=label:L, and with labelIds=L and no q; record which return the message. labels.patch the name and repeat the name forms and labelIds=L."
+
+[[unknown]]
+id = "search-unknown-label-id"
+question = "How do messages.list and threads.list answer a labelIds value that does not exist (never created, or deleted)?"
+assumed = "With HTTP 400 naming the label, not with 200 and no results."
+if_wrong = "A filter on a deleted label would look like an empty result. mailtide would then check label_ids against the mirror's label definitions and refuse an id it does not hold (UnknownLabel) before calling Gmail."
+test = "GET users/me/messages?labelIds=Label_doesnotexist&q=in:anywhere; then labels.create a label, labels.delete it and list with its id. Repeat on users/me/threads. Record status and error body. Run together with label-edit-modify-deleted-label (one deleted label id, used in a listing and in a modify)."
+
+[[unknown]]
+id = "search-spam-trash-default"
+question = "With includeSpamTrash unset, do the q terms in:trash, in:spam and in:anywhere return messages in Trash and Spam?"
+assumed = "in:trash and in:spam do (Zero lists its bin with in:trash and no flag); in:anywhere needs includeSpamTrash=true."
+if_wrong = "Hosts pass include_spam_trash=true for those searches. mailtide passes the flag through unchanged and its default (false) stays; only the guidance changes."
+test = "messages.trash one message and add SPAM to another, both with a unique subject token. Run q='subject:<token> in:trash', '... in:spam', '... in:anywhere' and 'subject:<token>' alone, each with includeSpamTrash absent, false and true; record the ids returned."
+
+[[unknown]]
+id = "search-thread-history-id"
+question = "Does every thread in a threads.list page carry historyId, and is it the id of the last change to any message of the thread?"
+assumed = "Yes: Zero and himalaya both read it from the list, and the Thread resource describes historyId as the last history record that modified the thread."
+if_wrong = "ThreadHit.history_id is optional. Without it a host cannot tell that the mirror trails Gmail for that thread and runs a sync before hydrating thread hits."
+test = "threads.list?q=subject:<token> for a thread of two messages; record whether historyId is present. messages.modify one of its messages, read history.list from the earlier historyId, list again: expect the thread's historyId to be the id of that history record or a later one."
+
+[[unknown]]
+id = "search-drafts-in-results"
+question = "Does messages.list with q return draft messages (label DRAFT), under the draft's current message id?"
+assumed = "Yes: 'in:draft <words>' returns the current message of each matching draft."
+if_wrong = "Searching drafts would need drafts.list?q= (5 units), which returns draft ids directly. That call would be added to the drafts feature; nothing here changes."
+test = "drafts.create a draft with a unique subject token. messages.list?q='in:draft subject:<token>' and ?q='subject:<token>': expect the draft's message id in both. drafts.update it and list again: expect only the new message id."

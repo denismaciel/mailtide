@@ -1,0 +1,73 @@
+# Reference implementations that feature plans cite (see docs/features/README.md).
+#
+# Each is pinned to a commit so `scripts/features.py` can check that every cited
+# file and test still exists. Checkouts live under $MAILTIDE_REFS (default
+# ~/.cache/mailtide/refs) in `checkout`; `scripts/features.py refs --fetch` clones them.
+#
+# `copy` says what may be carried into mailtide (MIT OR Apache-2.0):
+#   code   permissive licence: code and tests may be ported, with the licence notice.
+#   names  copyleft: record file paths and test names only. Never copy code or test bodies.
+
+[zero]
+repo = "https://github.com/Mail-0/Zero"
+commit = "4b642dfd9890a1fdcb1b98a177fe74ca3142c445"
+license = "MIT"
+copy = "code"
+checkout = "zero"
+lang = "typescript"
+
+[himalaya]
+repo = "https://github.com/pimalaya/himalaya"
+commit = "a5623dcac6150f1a8d8ee2d381c4569d7dc815b8"
+license = "MIT OR Apache-2.0"
+copy = "code"
+checkout = "pimalaya__himalaya"
+lang = "rust"
+
+[pimalaya-core]
+repo = "https://github.com/pimalaya/core"
+commit = "b3a9640a2b2e882f07655e711197b3dbd72ea176"
+license = "MIT"
+copy = "code"
+checkout = "pimalaya__core"
+lang = "rust"
+
+[mail-builder]
+repo = "https://github.com/stalwartlabs/mail-builder"
+commit = "2fc4a942754f5f81efdc5afae035a66a2c6bba3d"
+license = "MIT OR Apache-2.0"
+copy = "code"
+checkout = "stalwartlabs__mail-builder"
+lang = "rust"
+
+[mail-parser]
+repo = "https://github.com/stalwartlabs/mail-parser"
+commit = "1d449bb5ef1783583ec27f4ca2fa0ecd4bf5de49"
+license = "MIT OR Apache-2.0"
+copy = "code"
+checkout = "stalwartlabs__mail-parser"
+lang = "rust"
+
+[mail-send]
+repo = "https://github.com/stalwartlabs/mail-send"
+commit = "d67abf24bb2a0312fdb6976c53c671d833676dab"
+license = "MIT OR Apache-2.0"
+copy = "code"
+checkout = "stalwartlabs__mail-send"
+lang = "rust"
+
+[jmap-client]
+repo = "https://github.com/stalwartlabs/jmap-client"
+commit = "f5556ff521c6b5a76702bdca180014a726add3ff"
+license = "MIT OR Apache-2.0"
+copy = "code"
+checkout = "stalwartlabs__jmap-client"
+lang = "rust"
+
+[stalwart]
+repo = "https://github.com/stalwartlabs/stalwart"
+commit = "3adead91f3c87e7415b58c9ed8e6ec05a5dda521"
+license = "AGPL-3.0-only (parts under the Stalwart Enterprise License)"
+copy = "names"
+checkout = "stalwartlabs__stalwart"
+lang = "rust"

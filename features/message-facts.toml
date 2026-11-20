@@ -1,0 +1,1354 @@
+id = "message-facts"
+title = "Message facts: more envelope headers, an attachment summary, and reading one part"
+summary = "At import the driver parses the raw message once and stores, inside the content record a message row already has, ten more envelope facts and a bounded attachment summary whose entries carry a byte range into the stored blob; one part is then read, or streamed, with a ranged blob read and no Gmail call, and rows imported earlier are brought up to date by a host-scheduled refresh that costs no quota."
+roadmap = ["R2", "R3", "R8"]
+status = "approved"
+design = "docs/features/message-facts.md"
+# No hard dependency.
+#   threads (R7) reads From/To/Cc from the existing header facts, which this plan leaves as they are.
+#   feed-pages (R6) bounds the pages a refresh's entries arrive in; without it a refresh batch is one page of at most `limit` entries.
+#   send (C3) forwards attachments by reading parts through `read_part`.
+depends_on = []
+
+# ---------------------------------------------------------------- core (pure)
+
+[[file]]
+path = "crates/mailtide/src/gmail.rs"
+change = "modify"
+role = "MessageFacts (envelope extras, attachment counts and list), AttachmentFact, PartRef, SentAt, FACTS_VERSION, the inline rule; ImportedMessage carries the facts"
+
+[[file]]
+path = "crates/mailtide/src/mirror.rs"
+change = "modify"
+role = "StoredContent.facts (optional, absent in rows written before); the pure refresh rule; AccountMirror::refresh_facts; feed entries read with their content"
+
+[[file]]
+path = "crates/mailtide/src/commit.rs"
+change = "modify"
+role = "MessageOp::MarkImported carries the facts"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "Pass the facts from the import event into the commit"
+
+[[file]]
+path = "crates/mailtide/src/revision.rs"
+change = "modify"
+role = "Change::FactsRefreshed; ChangeEntry.content is filled for it as for imports"
+
+# ------------------------------------------------------------ parsing (pure)
+
+[[file]]
+path = "crates/mailtide-mime/Cargo.toml"
+change = "modify"
+role = "Depend on the core for the fact types"
+
+[[file]]
+path = "crates/mailtide-mime/src/lib.rs"
+change = "modify"
+role = "Export facts, parts and decode; parse() gives each attachment its part reference"
+
+[[file]]
+path = "crates/mailtide-mime/src/facts.rs"
+change = "new"
+role = "facts(raw): envelope extras, the listed parts, the cid scan, counts, caps; never fails and never panics on any input"
+
+[[file]]
+path = "crates/mailtide-mime/src/parts.rs"
+change = "new"
+role = "parts(raw): every leaf part in document order with role, type, name, size and byte range; PartRef text form"
+
+[[file]]
+path = "crates/mailtide-mime/src/decode.rs"
+change = "new"
+role = "Chunked transfer decoder (base64, quoted-printable, identity) whose output equals the parser's whole-part decode"
+
+[[file]]
+path = "crates/mailtide-gmail/src/headers.rs"
+change = "modify"
+role = "Unchanged rules for the eight existing facts; doc comment points at mailtide-mime for the rest"
+
+# ----------------------------------------------------------------------- store
+
+[[file]]
+path = "crates/mailtide-store/src/lib.rs"
+change = "modify"
+role = "Store::refresh_facts (unfenced like admit, conditional per row)"
+
+[[file]]
+path = "crates/mailtide-store/src/memory.rs"
+change = "modify"
+role = "refresh_facts over AccountMirror"
+
+[[file]]
+path = "crates/mailtide-store/src/sql.rs"
+change = "modify"
+role = "refresh_facts in one transaction under the account lock; feed reads attach content to FactsRefreshed. The next migration is a version-only step (no statement of its own): the facts live in the existing content column, and raising SCHEMA_VERSION keeps an older build from rewriting rows without them or reading FactsRefreshed"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "Delegate refresh_facts"
+
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "Delegate refresh_facts"
+
+[[file]]
+path = "crates/mailtide-store/src/conformance.rs"
+change = "modify"
+role = "Cases: content written before facts existed reads back; the refresh is conditional and atomic; entries carry facts"
+
+# ---------------------------------------------------------------------- driver
+
+[[file]]
+path = "crates/mailtide-io/Cargo.toml"
+change = "modify"
+role = "Depend on mailtide-mime"
+
+[[file]]
+path = "crates/mailtide-io/src/blobs.rs"
+change = "modify"
+role = "BlobStore::get_range and get_chunks with defaults over get; ObjectBlobs serves both with ranged reads"
+
+[[file]]
+path = "crates/mailtide-io/src/runner.rs"
+change = "modify"
+role = "Import computes the facts from the bytes it stored, off the async workers, and survives a parser panic"
+
+[[file]]
+path = "crates/mailtide-io/src/parts.rs"
+change = "new"
+role = "Runner::parts, read_part, open_part, refresh_facts; PartError, PartStream, FactsRefresh"
+
+[[file]]
+path = "crates/mailtide-io/src/lib.rs"
+change = "modify"
+role = "Export the parts module"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Imports carry facts; a refresh step interleaved with sync, deletes and crashes"
+
+# -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-py/src/lib.rs"
+change = "modify"
+role = "MessageContent fields, AttachmentInfo, PartInfo, PartStream, FactsRefresh, FactsRefreshed, parts/read_part/open_part/refresh_facts, parse_addresses, decode_header, PartNotFound, PartTooLarge"
+
+[[file]]
+path = "python/mailtide/_runner.py"
+change = "modify"
+role = "Coroutine wrappers; open_part as an async iterator and context manager"
+
+[[file]]
+path = "python/mailtide/_core.pyi"
+change = "modify"
+role = "Stubs for the new types, methods and the feed entry"
+
+[[file]]
+path = "python/mailtide/__init__.py"
+change = "modify"
+role = "Re-export the new names"
+
+[[file]]
+path = "python/mailtide/testing.py"
+change = "modify"
+role = "FakeGmail.add takes the raw bytes of a message, so tests can import one with attachments"
+
+[[file]]
+path = "SPEC.md"
+change = "modify"
+role = "§4 the facts and the summary, §5.5 parsing at import, §10.3 refresh_facts, §11 the part API and the new feed entry"
+
+[[file]]
+path = "ARCHITECTURE.md"
+change = "modify"
+role = "mailtide-mime is used by the driver at import; the blob store serves ranges"
+
+# ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
+change = "new"
+role = "Tests ported from himalaya's part walk and its has-attachment rule"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_shared_message_read.rs"
+change = "new"
+role = "Header and part cases ported from himalaya's read view"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_email_envelope.rs"
+change = "new"
+role = "Date cases ported from himalaya's envelope"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_gmail_backend.rs"
+change = "new"
+role = "The two envelope cases of himalaya's Gmail backend that the search plan left to this one"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_himalaya_shared_attachment_list.rs"
+change = "new"
+role = "The shared part id case of himalaya's attachment list"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_parser_classification.rs"
+change = "new"
+role = "The two classification cases the summary depends on"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_parser_issues.rs"
+change = "new"
+role = "Inline images and raw ranges, from mail-parser's issue tests"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_mail_parser_parser_tests.rs"
+change = "new"
+role = "Offsets, attached messages, limits and malformed input, from mail-parser's parser tests"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_zero_categorize.rs"
+change = "new"
+role = "The headers Zero's classifier reads are stored facts"
+
+[[file]]
+path = "crates/mailtide-mime/tests/ref_zero_imap_store.rs"
+change = "new"
+role = "Folded headers, encoded words and the Date header"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_zero_gmail_inline_asset.rs"
+change = "new"
+role = "A part read succeeds, is missing, or fails for retry, as Zero's inline asset loader"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_download.rs"
+change = "new"
+role = "A part read yields the decoded bytes, of the reported size, under a cap"
+
+[[file]]
+path = "crates/mailtide-io/tests/ref_himalaya_message_parse.rs"
+change = "new"
+role = "Part reads and refusals from himalaya's message parse command"
+
+[[file]]
+path = "crates/mailtide-io/tests/message_facts.rs"
+change = "new"
+role = "Driver tests against a fake Gmail: facts at import, the refresh"
+
+[[file]]
+path = "crates/mailtide-io/tests/parts.rs"
+change = "new"
+role = "Driver tests: ranged reads, streaming, refusals, a blob store without ranges"
+
+[[file]]
+path = "tests/test_message_facts.py"
+change = "new"
+role = "Python tests of the facts, the part API and the refresh against FakeGmail"
+
+# ------------------------------------------------------------------ references
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/driver/google.ts"
+symbols = ["getMessageAttachments", "getAttachment", "downloadAttachment", "findAttachments", "listUnsubscribe", "listUnsubscribePost", "replyTo"]
+note = "Attachments are read from Gmail: messages.get for the part list, then attachments.get per part. A part is an attachment when it has a filename and is not (inline with a Content-ID); inline images are fetched during import and spliced into the HTML as data URIs. Envelope: List-Unsubscribe, List-Unsubscribe-Post and Reply-To as raw strings; bcc is always empty."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-inline-asset.ts"
+symbols = ["loadGmailInlineAsset"]
+note = "A 404 on one attachment is 'missing', never a missing thread; every other failure propagates for retry. We keep the distinction (part not found, blob not found, blob unavailable) without the Gmail call."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/mail-asset-cache.ts"
+symbols = ["MailAssetCache"]
+note = "An object-store cache of attachment bytes keyed by message and attachment id, in front of attachments.get. Our raw blob already holds every part, so there is nothing to cache. Its suite belongs to scripts/zero_tests.py."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/MAILBOX_SYNC.md"
+symbols = ["MailAssetCache", "attachment descriptors", "a missing attachment's 404 does not tombstone its thread"]
+note = "The stated rules: descriptors are cached apart from bytes; failed downloads are never cached; a missing attachment is not a missing thread."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/imap/message.ts"
+symbols = ["listedAttachments", "attachmentPayload", "attachmentId"]
+note = "Zero's IMAP driver is the closer model: it holds the raw message, parses it, lists attachments that are not (related with a Content-ID), and addresses one by its index in the parser's list, re-parsing the whole message on every read. We take 'parts come from the raw message' and replace the index and the re-parse with a byte range."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/imap/categorize.ts"
+symbols = ["CATEGORY_HEADER_FIELDS", "classifyMessage"]
+note = "A host-side classifier and the headers it needs: List-Id, List-Unsubscribe, Precedence, Auto-Submitted (and Feedback-ID, X-Auto-Response-Suppress, X-Campaign, which we do not store). It shows which markers a host wants as facts; the classification itself stays the host's."
+
+[[reference]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-quota-cost.ts"
+symbols = ["messages.attachments.get"]
+note = "20 units per attachment read, which matches Google's table. Our part reads cost none."
+
+[[reference]]
+impl = "himalaya"
+path = "src/shared/message/part.rs"
+symbols = ["leaves", "find_section", "PartRole", "marks_attachment", "is_protocol_part", "has_attachment"]
+note = "One walk shared by every command so a part id means the same everywhere; an attached message is one leaf; the has-attachment rule (a disposition other than inline marks; with none, anything but text or a part named by a Content-ID; RFC 1847 protocol parts never). Our rule agrees on every case its tests cover but one."
+
+[[reference]]
+impl = "himalaya"
+path = "src/shared/attachment/list.rs"
+symbols = ["attachments", "Attachment", "content_id"]
+note = "The row shape we follow: id, decoded filename, type, decoded size, role, Content-ID without brackets. It takes the RFC 8621 attachment list from its parser, as we do from ours."
+
+[[reference]]
+impl = "himalaya"
+path = "src/shared/attachment/download.rs"
+symbols = ["PartBytes", "bounded"]
+note = "A part's bytes are its transfer-decoded body; a size cap refuses before any work. The file naming rules are for a tool that writes files; we return bytes."
+
+[[reference]]
+impl = "himalaya"
+path = "src/email/envelope.rs"
+symbols = ["Envelope", "has_attachment", "parse_rfc2822_date", "strip_weekday"]
+note = "The shared envelope: has_attachment is optional ('null when the backend cannot tell'), the Date header is optional and survives a wrong weekday."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+symbols = ["has_attachment", "parse_addresses"]
+note = "Its Gmail backend lists envelopes from format=metadata and leaves has_attachment unset: Gmail's metadata does not say. A mirror that holds the raw message can."
+
+[[reference]]
+impl = "himalaya"
+path = "src/gmail/attachments/get.rs"
+symbols = ["GmailAttachmentGet", "decode_raw"]
+note = "The pass-through alternative: one users.messages.attachments.get per part, whole body in one answer. Rejected for the quota and because it cannot stream."
+
+[[reference]]
+impl = "himalaya"
+path = "cairn/spec/commands.md"
+symbols = ["message-too-complex", "attachment-too-large"]
+note = "Their written requirements for parts: every leaf listed depth first under one id, size counted after transfer decoding, Content-ID without brackets, a too-complex message refused whole. We degrade instead of refusing: a message must still be imported."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/email/envelope/imap.rs"
+symbols = ["has_at_least_one_attachment", "is_attachment"]
+note = "The older rule: only Content-Disposition: attachment counts. It misses files sent without a disposition; not taken."
+
+[[reference]]
+impl = "pimalaya-core"
+path = "email/src/email/message/mod.rs"
+symbols = ["attachments", "tree_magic_mini"]
+note = "Returns every attachment's bytes at once and sniffs the media type from the content. We report the declared type and leave sniffing to the host."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/view/part.rs"
+symbols = ["offset_body", "offset_end", "decoded_len", "decoded_checked", "is_inline", "attachment_name", "content_id", "encoding", "role"]
+note = "What a fact is read from: a part's byte offsets in its source buffer, its declared transfer encoding, its decoded length, whether decoding met a problem, and the declared-inline test."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/view/message.rs"
+symbols = ["attachments", "has_attachments", "reply_to", "bcc", "list_id", "list_unsubscribe", "date", "Source"]
+note = "Typed header getters for the new envelope facts, the RFC 8621 lists, and Source, which says whether a nested message's offsets are in the raw input or in a decoded buffer."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/parser/classify.rs"
+symbols = ["renders_inline", "rfc8621_lists", "MultipartRelated"]
+note = "The RFC 8621 body-list algorithm and the inline test (declared inline, or no disposition as a later child of multipart/related). It knows no RFC 1847 protocol parts and applies no cid: exception; we add both."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/decoders/mod.rs"
+symbols = ["decode_append", "decoded_len", "decode_checked"]
+note = "Encoding::decode* decode a byte slice exactly as MessagePart::decoded does, so a part can be decoded from its range without a parsed message."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/parser/mod.rs"
+symbols = ["max_depth", "max_parts", "max_encoded_nesting"]
+note = "Parse limits: beyond them a part is kept as a leaf and flagged, nothing fails."
+
+[[reference]]
+impl = "mail-parser"
+path = "src/view/address.rs"
+symbols = ["Mailbox", "first", "name", "address"]
+note = "The first From mailbox, with its decoded display name: the sender facts."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/email/mod.rs"
+symbols = ["HasAttachment", "Attachments", "BodyStructure", "SentAt", "ReplyTo", "Bcc", "Cid", "Disposition", "BlobId"]
+note = "The JMAP names we follow: bcc, replyTo, sentAt, hasAttachment, attachments; a body part has a blobId, size, name, type, disposition and cid. Our part reference plays the part of blobId."
+
+[[reference]]
+impl = "jmap-client"
+path = "src/blob/download.rs"
+symbols = ["download", "download_url"]
+note = "A blob download returns the whole body as bytes; the client has no streaming or range call. No test covers it."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/types/src/blob.rs"
+symbols = ["BlobSection", "EncodedRange", "offset_start", "encoding"]
+note = "Names only (AGPL). A part's blob id is the message blob plus a section: start offset, size and transfer encoding. The same addressing as our part reference."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/common/src/storage/blob.rs"
+symbols = ["fetch_blob_section"]
+note = "Names only (AGPL). Where a section is read from the blob store and transfer-decoded."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/email/src/message/jmap/body.rs"
+symbols = ["part_blob_id", "inner_blob_id"]
+note = "Names only (AGPL). Where a body part's blob id is built from its body range and encoding."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/email/src/message/metadata/build.rs"
+symbols = ["has_attachments"]
+note = "Names only (AGPL). hasAttachment is computed once at ingest and stored with the message metadata."
+
+[[reference]]
+impl = "stalwart"
+path = "crates/store/src/backend/s3/mod.rs"
+symbols = ["get_blob", "range"]
+note = "Names only (AGPL). Every blob backend reads a byte range."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages"
+note = "Read 2026-11-20. raw: 'The entire email message in an RFC 2822 formatted and base64url encoded string'; MessagePart.partId is 'The immutable ID of the message part'. The page does not say that the raw bytes are the same on every read."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages.attachments"
+note = "Read 2026-11-20. attachmentId 'contains the ID of an external attachment that can be retrieved in a separate messages.attachments.get request'; nothing says the id is stable. The call this plan does not make."
+
+[[source]]
+url = "https://developers.google.com/workspace/gmail/api/reference/quota"
+note = "Read 2026-11-20. messages.get is 20 units, 60 with format full or raw; messages.attachments.get is 20; messages.insert and messages.import are 25. This feature adds no Gmail call: the facts come from the raw fetch an import already pays for."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8621"
+note = "§4.1.4: the textBody, htmlBody and attachments algorithm, and hasAttachment ('at least one item that does not have Content-Disposition: inline'; a server 'MAY ignore parts ... referenced as embedded images'). §4.1.2-4.1.3: bcc, replyTo, sentAt. §4.1.4 body part: partId, blobId, size, name, type, disposition, cid."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2183"
+note = "Content-Disposition: inline and attachment, the filename parameter, and §2.8: an unrecognised disposition is treated as attachment."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2392"
+note = "The cid: URL names a part by its Content-ID with the angle brackets removed and the id percent-encoded."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2387"
+note = "multipart/related: the first part is the root, the others are its components."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc1847"
+note = "multipart/signed (second part is the signature) and multipart/encrypted (control part and ciphertext): the protocol parts the summary leaves out."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2919"
+note = "List-Id: an optional phrase, then the identifier in angle brackets."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc2369"
+note = "List-Unsubscribe: a comma-separated list of URIs in angle brackets."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc8058"
+note = "One-click unsubscribe: List-Unsubscribe-Post: List-Unsubscribe=One-Click beside an https URI; the receiver should require a valid DKIM signature covering both fields."
+
+[[source]]
+url = "https://www.rfc-editor.org/rfc/rfc3834"
+note = "Auto-Submitted: no, auto-generated, auto-replied, with optional parameters; §3.1.8 on the non-standard Precedence field."
+
+[[source]]
+url = "https://docs.rs/object_store/0.14.2/object_store/trait.ObjectStore.html"
+note = "get_opts with GetOptions::with_range returns a GetResult whose into_stream yields the range in chunks and whose meta.size is the whole object's size; the cloud, local and in-memory backends all serve ranges."
+
+# ------------------------------------------------ Gmail behaviour not proven
+
+[[unknown]]
+id = "message-facts-raw-bytes-stable"
+question = "Does messages.get?format=raw return byte-identical content for one message id on every read?"
+assumed = "Yes. Google says content is immutable but does not say the raw serialisation is. A part reference is a byte range in the blob we stored, and a retried import may write the blob again."
+if_wrong = "A second write of different bytes would leave ranges pointing at the wrong place. Safe side as designed: a reference names the raw length it was computed against, a part read refuses (stale) when the stored object's length differs, and refresh_facts re-extracts any row whose blob length differs from the row's size. Bytes of the same length in a different arrangement would go unnoticed, so if this is refuted the blob write becomes create-only and the facts are computed from the bytes already stored."
+test = "For three messages (plain text; multipart with a base64 attachment; one sent from the Gmail web UI): GET users/me/messages/{id}?format=raw and record sha256 of the decoded raw. Change the message's labels with messages.modify, wait a day, GET again, and once more a week later. Expect the same sha256 each time."
+
+[[unknown]]
+id = "message-facts-has-attachment-parity"
+question = "Which parts does Gmail itself count as attachments (the has:attachment operator and the paperclip)?"
+assumed = "The same as our rule: a part counts unless an HTML body shows it through cid:, it is declared inline, it is an undeclared later child of multipart/related, or it is a signature or encryption part."
+if_wrong = "Our paperclip differs from Gmail's on those messages. Nothing is lost: the summary stores each part's declared disposition, whether it is referenced and whether it sits in multipart/related, so the rule is one pure function that can change without reading a blob again; only the two stored counts need a refresh, by bumping the facts version."
+test = "With messages.insert (25 units each) add seven messages to a test mailbox, each a text/html body plus one image: (a) multipart/related, inline, Content-ID referenced by cid:; (b) the same but Content-Disposition: attachment; (c) multipart/mixed, Content-Disposition: inline, not referenced; (d) multipart/mixed, no disposition, no Content-ID; (e) multipart/related, no disposition, Content-ID not referenced; (f) multipart/signed with an application/pgp-signature part and no other file; (g) multipart/alternative with a text/calendar part. Then messages.list?q=has:attachment and note which of the seven ids come back; also note which show a paperclip in the web UI. Our rule answers (d) and (g) only; record the actual set for both the operator and the paperclip."
+
+# ------------------------------------------------- reference suites, by name
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/gmail-inline-asset.test.ts"
+target = "crates/mailtide-io/tests/ref_zero_gmail_inline_asset.rs"
+
+[[suite.test]]
+name = "inline Gmail attachment failures > returns downloaded bytes"
+test = "an_inline_image_is_read_by_its_reference"
+
+[[suite.test]]
+name = "inline Gmail attachment failures > skips a wrapped missing attachment (%s)"
+test = "a_part_whose_blob_is_gone_is_not_found_and_the_message_row_is_untouched"
+note = "Zero turns a 404 from attachments.get into 'no image' so the import does not tombstone the thread. We make no Gmail call: the missing thing can only be the blob, reported as BlobNotFound, and a read never writes to the mirror."
+
+[[suite.test]]
+name = "inline Gmail attachment failures > skips a missing attachment wrapped by Effect and the driver"
+na = "The same case as the previous test seen through two TypeScript error wrappers; our errors are one enum with no wrapping"
+
+[[suite.test]]
+name = "inline Gmail attachment failures > preserves non-missing failure wrappers for import retry: %s"
+test = "a_blob_store_failure_during_a_part_read_is_unavailable_not_missing"
+note = "Quota and auth rows have no counterpart (no Gmail call); the transport rows map to BlobUnavailable, which a host retries."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/imap/categorize.test.ts"
+target = "crates/mailtide-mime/tests/ref_zero_categorize.rs"
+
+[[suite.test]]
+name = "classifyMessage > %j -> %s"
+test = "the_headers_a_classifier_reads_are_stored_facts"
+note = "Each row's headers, parsed by facts(): List-Unsubscribe, Precedence, Auto-Submitted and List-Id come back as facts with the values the classifier tests. Feedback-ID is not stored. The category itself is the host's."
+
+[[suite.test]]
+name = "classifyMessage > keeps contacts personal unless it is a mass mailing"
+na = "Classification with a known-contact input: a host rule over the facts, not a fact"
+
+[[suite.test]]
+name = "classifyMessage > parses addresses"
+test = "the_sender_address_is_read_from_a_named_from_and_lists_are_split"
+note = "sender_email from a quoted display name; the list half through parse_addresses. We keep the address as written, without lowercasing."
+
+[[suite]]
+impl = "zero"
+path = "apps/server/src/lib/imap/imap-store.test.ts"
+target = "crates/mailtide-mime/tests/ref_zero_imap_store.rs"
+
+[[suite.test]]
+name = "headers > parses folded headers and encoded words"
+test = "a_date_is_parsed_and_encoded_words_decode"
+note = "The Date half is the sent_at fact; the encoded-word half is decode_header and sender_name. Message-ID, References and Subject stay the existing facts, as written."
+
+[[suite.test]]
+name = "mapFolders > prefers SPECIAL-USE, falls back to names and skips virtual folders"
+na = "IMAP folder mapping; mailtide is Gmail only"
+
+[[suite.test]]
+name = "mapFolders > label ids are URL safe and reversible for unicode paths"
+na = "IMAP folder mapping; mailtide is Gmail only"
+
+[[suite.test]]
+name = "ImapIndexStore threading > threads replies by In-Reply-To and References"
+na = "Threading from RFC headers; mailtide threads by Gmail's threadId only (SPEC §15)"
+
+[[suite.test]]
+name = "ImapIndexStore threading > merges threads when a parent arrives after its replies"
+na = "Threading from RFC headers; mailtide threads by Gmail's threadId only (SPEC §15)"
+
+[[suite.test]]
+name = "ImapIndexStore threading > dedupes the same Message-ID across folders and keeps the key when moved"
+na = "IMAP folders hold copies; a Gmail message has one id and a label set"
+
+[[suite.test]]
+name = "ImapIndexStore threading > falls back to subject for replies without references"
+na = "Threading from RFC headers; mailtide threads by Gmail's threadId only (SPEC §15)"
+
+[[suite.test]]
+name = "ImapIndexStore threading > removes messages with their last location and tracks flag changes"
+na = "IMAP locations and flags; the engine's own delete and label rules are tracked by scripts/zero_tests.py"
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/message/part.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
+
+[[suite.test]]
+name = "a_multipart_without_a_boundary_does_not_count"
+na = "Himalaya's own tally of depth, parts and header lines; we set mail-parser's limits and keep no tally"
+
+[[suite.test]]
+name = "a_message_at_the_bounds_is_read"
+na = "Himalaya's own tally of depth, parts and header lines; we set mail-parser's limits and keep no tally"
+
+[[suite.test]]
+name = "a_message_past_the_bounds_is_refused_with_its_code"
+test = "a_message_past_the_parse_limits_still_yields_facts"
+note = "Opposite outcome on purpose: himalaya refuses the message whole, we must import it. The facts cover what was parsed and the part cut by the limit is listed as one attached leaf."
+
+[[suite.test]]
+name = "a_message_past_the_parser_cap_is_refused"
+na = "The same case as the previous test at the parser's own cap; mapped once"
+
+[[suite.test]]
+name = "folded_header_lines_count"
+na = "Himalaya's own tally of depth, parts and header lines; we set mail-parser's limits and keep no tally"
+
+[[suite.test]]
+name = "sibling_containers_do_not_add_up_in_depth"
+na = "Himalaya's own tally of depth, parts and header lines; we set mail-parser's limits and keep no tally"
+
+[[suite.test]]
+name = "an_attached_message_nests_one_level_deeper"
+na = "Himalaya's own tally of depth, parts and header lines; we set mail-parser's limits and keep no tally"
+
+[[suite.test]]
+name = "bytes_undo_the_transfer_encoding_and_keep_the_charset"
+test = "a_part_range_decodes_to_bytes_in_the_parts_own_charset"
+
+[[suite.test]]
+name = "bytes_of_an_attached_message_are_that_message"
+test = "the_range_of_an_attached_message_is_that_message"
+
+[[suite.test]]
+name = "a_part_disposed_as_attachment_counts"
+test = "a_part_disposed_as_attachment_is_attached"
+
+[[suite.test]]
+name = "a_single_binary_part_without_disposition_counts"
+test = "a_message_that_is_one_binary_part_has_one_attached_part"
+
+[[suite.test]]
+name = "an_attached_message_without_disposition_counts"
+test = "an_attached_message_without_disposition_is_attached"
+
+[[suite.test]]
+name = "a_binary_part_disposed_inline_does_not_count"
+test = "a_binary_part_disposed_inline_is_listed_as_inline"
+
+[[suite.test]]
+name = "an_image_disposed_inline_does_not_count"
+test = "an_image_disposed_inline_and_referenced_is_inline"
+
+[[suite.test]]
+name = "a_text_part_disposed_as_attachment_counts"
+test = "a_text_part_disposed_as_attachment_is_attached"
+
+[[suite.test]]
+name = "a_text_body_does_not_count"
+test = "a_text_body_is_not_listed"
+
+[[suite.test]]
+name = "the_bodies_of_an_alternative_do_not_count"
+test = "the_bodies_of_an_alternative_are_not_listed"
+
+[[suite.test]]
+name = "an_image_named_by_a_content_id_does_not_count"
+test = "an_undeclared_image_referenced_from_the_html_is_inline"
+
+[[suite.test]]
+name = "a_bare_image_counts"
+test = "an_undeclared_unreferenced_image_is_attached"
+note = "RFC 8621 puts such an image in the body lists and mail-parser's has_attachments is false for it. We side with himalaya: nobody declared it inline and nothing shows it."
+
+[[suite.test]]
+name = "a_bare_signature_does_not_count"
+test = "a_signature_part_is_not_listed"
+
+[[suite.test]]
+name = "a_signature_disposed_as_attachment_does_not_count"
+test = "a_signature_part_disposed_as_attachment_is_not_listed"
+
+[[suite.test]]
+name = "an_attachment_under_a_signature_counts"
+test = "an_attachment_inside_a_signed_body_is_attached"
+
+[[suite.test]]
+name = "the_parts_of_an_encrypted_message_do_not_count"
+test = "the_parts_of_an_encrypted_message_are_not_listed"
+
+[[suite.test]]
+name = "an_unknown_disposition_counts"
+na = "The fixture is a second text/plain part with an unknown disposition. RFC 8621's body lists, which we take from mail-parser, make it body text; himalaya applies RFC 2183 §2.8 to it. A non-text part with an unknown disposition is attached in both (own test)"
+
+[[suite.test]]
+name = "an_invalid_content_type_reads_as_text"
+na = "How an unparseable Content-Type is read is mail-parser's decision; we add no rule of our own and test none"
+
+[[suite.defer]]
+name = "an_html_only_body_is_quoted_as_text"
+to = "send"
+
+[[suite.defer]]
+name = "a_flowed_text_is_unwrapped_whatever_its_charset"
+to = "send"
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/attachment/list.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_shared_attachment_list.rs"
+
+[[suite.test]]
+name = "ids_are_those_of_the_read_view"
+test = "summary_references_are_those_of_the_part_listing"
+note = "Himalaya shares one walk so an id means the same in two commands. Ours: the reference a summary entry carries equals the one parts() gives the same part, with or without inline parts listed."
+
+[[suite.test]]
+name = "inline_keeps_a_hidden_short_alias"
+na = "Command-line flag"
+
+[[suite.test]]
+name = "an_attachment_prints_on_one_line"
+na = "Terminal rendering"
+
+[[suite.test]]
+name = "no_attachment_is_stated"
+na = "Terminal rendering; an empty list is an empty list"
+
+[[suite.test]]
+name = "control_characters_from_the_sender_are_not_printed"
+na = "Terminal rendering. We return the decoded filename as sent; the design note says a host must treat it as untrusted"
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/attachment/download.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_download.rs"
+rest_na = "Writing a download to disk: file names made safe, collisions, permissions, symlinks. mailtide returns bytes and a filename and never writes a file"
+
+[[suite.test]]
+name = "stdout_bytes_are_the_decoded_part"
+test = "read_part_returns_the_transfer_decoded_bytes_of_any_leaf"
+
+[[suite.test]]
+name = "stdout_bytes_match_the_size_message_read_reports"
+test = "read_part_yields_exactly_the_size_the_summary_reports"
+
+[[suite.test]]
+name = "a_part_over_the_cap_is_refused_before_it_is_encoded"
+test = "a_part_over_max_bytes_is_refused_before_the_blob_is_read"
+
+[[suite]]
+impl = "himalaya"
+path = "src/email/envelope.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_email_envelope.rs"
+
+[[suite.test]]
+name = "parses_a_well_formed_date"
+test = "a_well_formed_date_keeps_its_instant_and_offset"
+
+[[suite.test]]
+name = "parses_despite_a_wrong_weekday"
+test = "a_wrong_weekday_keeps_its_date"
+
+[[suite.test]]
+name = "parses_without_a_weekday"
+test = "a_date_without_a_weekday_is_parsed"
+
+[[suite.test]]
+name = "rejects_empty_and_garbage"
+test = "an_empty_or_unreadable_date_is_absent"
+
+[[suite.test]]
+name = "a_reply_to_several_parents_keeps_every_id"
+na = "In-Reply-To is an existing fact kept as one string as written; this plan does not change it"
+
+[[suite.test]]
+name = "a_bracketless_value_still_yields_its_ids"
+na = "In-Reply-To is an existing fact kept as one string as written; this plan does not change it"
+
+[[suite.test]]
+name = "an_empty_or_unterminated_value_yields_nothing"
+na = "In-Reply-To is an existing fact kept as one string as written; this plan does not change it"
+
+[[suite.test]]
+name = "an_id_normalises_the_same_way_wherever_it_came_from"
+na = "One backend, one spelling: Message-ID is stored as written"
+
+[[suite.test]]
+name = "a_missing_subject_prints_null"
+na = "Terminal rendering"
+
+[[suite]]
+impl = "himalaya"
+path = "src/gmail/backend.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_gmail_backend.rs"
+# Declared by other plans too; only the two tests the search plan left to this one are listed.
+
+[[suite.test]]
+name = "an_address_header_reads_as_the_other_backends_read_it"
+test = "a_quoted_name_with_a_comma_is_one_address_and_an_empty_group_is_none"
+note = "Through parse_addresses, and through sender_name for the quoted name."
+
+[[suite.test]]
+name = "a_wrong_weekday_keeps_its_date"
+test = "a_date_from_gmail_with_a_wrong_weekday_is_kept"
+note = "Himalaya reads the header from format=metadata, we from the raw message; the same Date value."
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/message/read.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_shared_message_read.rs"
+
+[[suite.test]]
+name = "encoded_words_are_decoded_adjacent_ones_joined"
+test = "a_sender_name_in_encoded_words_is_decoded_and_adjacent_words_joined"
+
+[[suite.test]]
+name = "a_quoted_name_holding_an_address_is_a_name"
+test = "a_quoted_sender_name_holding_an_address_is_a_name"
+
+[[suite.test]]
+name = "address_groups_are_flattened_and_invalid_entries_dropped"
+test = "parse_addresses_flattens_groups_and_drops_unreadable_entries"
+
+[[suite.test]]
+name = "date_keeps_its_offset_utc_as_z_and_an_unreadable_one_is_null"
+test = "sent_at_keeps_the_offset_the_sender_wrote"
+
+[[suite.test]]
+name = "list_headers_are_kept_as_found"
+test = "list_id_unsubscribe_precedence_and_auto_submitted_are_facts"
+note = "Himalaya keeps the unfolded text. We keep the list identifier, the unsubscribe URIs and the lowercased keywords."
+
+[[suite.test]]
+name = "nested_alternative_in_mixed_gives_bodies_and_an_attachment"
+test = "a_nested_alternative_in_mixed_lists_only_the_attachment"
+
+[[suite.test]]
+name = "an_attached_message_is_one_attachment_part"
+test = "an_attached_message_is_one_listed_part_and_its_own_parts_are_not"
+
+[[suite.test]]
+name = "rfc2231_filenames_are_decoded"
+test = "rfc_2231_filenames_are_decoded"
+
+[[suite.test]]
+name = "roles_follow_the_rule"
+test = "roles_follow_our_rule_on_himalayas_fixture"
+note = "Same fixture, our rule: the referenced image, the declared-inline image and the undeclared children of multipart/related are inline; the named text part, the calendar part and the image disposed as attachment are attached."
+
+[[suite.test]]
+name = "split_encoded_words_rebuild_names_and_filenames"
+test = "a_name_split_across_encoded_words_is_rebuilt"
+
+[[suite.test]]
+name = "a_character_split_across_encoded_words_is_rebuilt"
+na = "The same decoder path as split_encoded_words_rebuild_names_and_filenames, on a Subject, which stays as written"
+
+[[suite.test]]
+name = "multipart_walks_parts_and_bodies_html_and_attachment"
+test = "parts_lists_every_leaf_in_document_order"
+
+[[suite.test]]
+name = "ids_lose_their_angle_brackets"
+test = "content_id_and_list_id_lose_their_angle_brackets"
+note = "Only for the new facts. Message-ID, In-Reply-To and References stay as written."
+
+[[suite.test]]
+name = "a_parameter_value_that_is_no_token_is_quoted"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "bodies_do_not_emit_terminal_commands_or_bidi_controls"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "message_headers_and_part_metadata_are_sanitized"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "html_only_body_is_sanitized_too"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "plain_single_part_shows_minimal_headers_and_body"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "html_only_message_shows_its_markup"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "html_is_summarized_when_a_plain_alternative_exists"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "json_view_has_the_designed_shape"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "text_view_shows_unreadable_address_entries_as_the_json_view_lists_them"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "unreadable_entries_are_listed_apart"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "valid_headers_list_no_invalid_entry"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "invalid_entries_are_in_header_order"
+na = "Rendering of the read view"
+
+[[suite.test]]
+name = "bodies_are_decoded_by_their_charset_and_transfer_encoding"
+na = "Body text is parse_message's, which exists; a part read returns bytes in the part's own charset"
+
+[[suite.test]]
+name = "an_unknown_charset_reads_lossily"
+na = "Body text is parse_message's, which exists; a part read returns bytes in the part's own charset"
+
+[[suite.test]]
+name = "utf8_bytes_labelled_us_ascii_read_as_utf8"
+na = "Body text is parse_message's, which exists; a part read returns bytes in the part's own charset"
+
+[[suite.test]]
+name = "non_utf8_bytes_labelled_us_ascii_keep_their_decoding"
+na = "Body text is parse_message's, which exists; a part read returns bytes in the part's own charset"
+
+[[suite.test]]
+name = "a_raw_8bit_subject_reads_as_windows_1252_or_utf8"
+na = "Subject stays as written; and we add no charset guess for raw 8-bit header bytes on top of mail-parser"
+
+[[suite.test]]
+name = "raw_8bit_names_and_filenames_read_as_windows_1252"
+na = "We add no charset guess for raw 8-bit header bytes on top of mail-parser"
+
+[[suite.test]]
+name = "an_invalid_content_type_is_plain_us_ascii_text"
+na = "How an unparseable Content-Type is read is mail-parser's decision; we add no rule of our own"
+
+[[suite]]
+impl = "himalaya"
+path = "src/shared/message/header.rs"
+target = "crates/mailtide-mime/tests/ref_himalaya_shared_message_read.rs"
+rest_na = "Himalaya's own RFC 2047 decoder over raw header bytes. mailtide decodes through mail-parser; the two behaviours our facts need (adjacent words joined, a name split across words rebuilt) are claimed from src/shared/message/read.rs"
+
+[[suite]]
+impl = "himalaya"
+path = "tests/message_parse.rs"
+target = "crates/mailtide-io/tests/ref_himalaya_message_parse.rs"
+
+[[suite.test]]
+name = "a_part_comes_out_as_its_decoded_bytes"
+test = "every_part_of_a_mixed_message_reads_back_as_its_decoded_bytes"
+
+[[suite.test]]
+name = "an_unknown_or_container_part_is_refused"
+test = "a_reference_outside_the_blob_or_for_another_length_is_refused"
+note = "Containers have no reference at all, so the refusals left are a range outside the blob and a reference made for a blob of another length."
+
+[[suite.test]]
+name = "a_blank_source_is_refused_naming_it"
+test = "an_empty_message_is_imported_with_empty_facts_and_no_parts"
+note = "Opposite outcome on purpose: himalaya refuses a blank source, an import must record it."
+
+[[suite.test]]
+name = "a_message_too_complex_is_refused_with_its_code"
+test = "parts_of_a_message_past_the_limits_lists_what_was_parsed"
+
+[[suite.test]]
+name = "a_part_is_named_by_its_imap_section_too"
+na = "One address per part: the byte range. IMAP section numbers depend on how a parser reads a damaged structure (Decisions 3)"
+
+[[suite.test]]
+name = "runs_with_no_configuration_from_a_path_and_from_stdin"
+na = "Command-line behaviour"
+
+[[suite.test]]
+name = "the_view_and_parts_are_those_of_message_read"
+na = "Agreement of two commands; ours is summary_references_are_those_of_the_part_listing"
+
+[[suite]]
+impl = "mail-parser"
+path = "tests/classification.rs"
+target = "crates/mailtide-mime/tests/ref_mail_parser_classification.rs"
+
+[[suite.test]]
+name = "rfc8621_example"
+test = "the_rfc_8621_example_lists_its_attachments_with_ranges"
+
+[[suite.test]]
+name = "has_attachments_is_per_message"
+test = "an_attached_message_counts_once_and_its_own_attachments_do_not"
+
+[[suite.test]]
+name = "roles_partition_every_fixture"
+na = "A property of the crate's classifier over its own corpus; mailtide gets it by depending on the crate"
+
+[[suite]]
+impl = "mail-parser"
+path = "tests/issues.rs"
+target = "crates/mailtide-mime/tests/ref_mail_parser_issues.rs"
+rest_na = "Regression tests of parsing internals (delimiters, address order, legacy lists, text conversion) that mailtide gets by depending on the crate; only the cases the summary and the part ranges rest on are ported"
+
+[[suite.test]]
+name = "issue_70_inline_images_in_related"
+test = "inline_images_in_related_are_listed_inline_and_count_no_attachment"
+
+[[suite.test]]
+name = "issue_67_alternative_with_inline_image"
+test = "an_inline_image_beside_an_alternative_is_listed_inline"
+
+[[suite.test]]
+name = "issue_127_boundaries_and_raw_ranges"
+test = "a_part_range_is_the_body_as_written_without_the_line_break_before_the_delimiter"
+
+[[suite]]
+impl = "mail-parser"
+path = "src/parser/tests.rs"
+target = "crates/mailtide-mime/tests/ref_mail_parser_parser_tests.rs"
+rest_na = "Unit tests of the parser's internals (delimiters, header views, buffers, SIMD kernels, serialisation) that mailtide gets by depending on the crate; only the cases the part ranges and the limits rest on are ported"
+
+[[suite.test]]
+name = "single_part_offsets"
+test = "a_single_part_message_has_one_range_from_its_body_to_its_end"
+
+[[suite.test]]
+name = "nested_inline_message"
+test = "parts_of_an_attached_message_have_ranges_in_the_raw_message"
+
+[[suite.test]]
+name = "nested_encoded_message"
+test = "parts_of_a_transfer_encoded_attached_message_have_no_range"
+
+[[suite.test]]
+name = "depth_and_part_limits"
+test = "a_part_cut_by_a_limit_is_one_leaf_with_a_range"
+
+[[suite.test]]
+name = "decode_problems"
+test = "a_part_with_a_malformed_encoding_is_marked_irregular"
+
+[[suite.test]]
+name = "truncated_inputs_never_panic"
+test = "facts_and_parts_never_panic_on_truncated_messages"
+
+# ------------------------------------------------------------ our own tests
+
+# Extraction (pure)
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "bcc_and_reply_to_are_listed_as_written"
+covers = "Split like To and Cc today: on commas outside quotes and angle brackets, encoded words left as sent"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_from_without_a_display_name_has_only_an_address"
+covers = "sender_name is None, sender_email is the addr-spec; a From with several mailboxes gives the first"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "list_id_is_the_identifier_in_angle_brackets"
+covers = "The phrase before it is dropped; a value without brackets is kept whole, trimmed"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "one_click_unsubscribe_needs_the_post_header_and_an_https_uri"
+covers = "List-Unsubscribe gives its URIs in order; one_click is true only with List-Unsubscribe-Post: List-Unsubscribe=One-Click and an https URI"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "an_overlong_unsubscribe_uri_is_left_out"
+covers = "At most 4 URIs of at most 2,048 bytes each are stored; a longer one is dropped, never cut"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "auto_submitted_and_precedence_are_lowercased_keywords"
+covers = "Parameters and comments after the keyword are dropped: 'Auto-Replied; owner-email=x' is auto-replied"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_message_without_the_optional_headers_has_empty_facts_at_the_current_version"
+covers = "Absent headers give empty lists and None, with version = FACTS_VERSION and zero counts"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_referenced_image_disposed_as_attachment_is_inline"
+covers = "The cid: reference wins over the declared disposition (unknown message-facts-has-attachment-parity, row b)"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "an_unreferenced_image_disposed_inline_is_inline"
+covers = "Declared inline is inline without a reference (row c); the stored disposition and referenced flag let a host decide otherwise"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_cid_reference_matches_the_whole_percent_decoded_id"
+covers = "cid:logo%40x matches Content-ID <logo@x>; cid:logo does not match <logo2@x>; a cid: in a text/plain body references nothing"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_non_text_part_with_an_unknown_disposition_is_attached"
+covers = "RFC 2183 §2.8 for the parts the body lists do not take"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_calendar_alternative_is_attached"
+covers = "A text/calendar part of multipart/alternative is listed and attached (row g)"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "more_than_32_listed_parts_keep_exact_counts"
+covers = "The list holds the first 32 in document order; attached and inline count every listed part"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_long_filename_is_cut_at_a_character_boundary"
+covers = "Filenames are stored up to 255 bytes; the cut never splits a character"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_part_without_a_readable_type_is_octet_stream"
+covers = "A listed part with no or an unparseable Content-Type reports application/octet-stream; types are lowercased and never sniffed"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "facts_of_arbitrary_bytes_never_panic_and_stay_bounded"
+covers = "Property test: any input gives facts whose serialised form is under the size bound"
+
+[[test]]
+target = "crates/mailtide-mime/src/parts.rs"
+name = "a_part_reference_round_trips_through_its_text_form"
+covers = "offset.len.encoding.total, with the irregular mark; anything else is refused"
+
+[[test]]
+target = "crates/mailtide-mime/src/parts.rs"
+name = "every_fixture_range_decodes_to_what_the_parser_decodes"
+covers = "For every part with a range in mail-parser's corpus: decoding raw[range] by the reference equals the parser's decoded body, and its length equals the reported size"
+
+[[test]]
+target = "crates/mailtide-mime/src/parts.rs"
+name = "roles_cover_text_html_attached_inline_and_protocol"
+covers = "parts() names each leaf's role, and a part of an attached message names the reference of the message it is in"
+
+[[test]]
+target = "crates/mailtide-mime/src/decode.rs"
+name = "chunked_decoding_equals_the_whole_decode_at_every_split"
+covers = "Property test over base64, quoted-printable and identity bodies split at arbitrary points"
+
+[[test]]
+target = "crates/mailtide-mime/src/decode.rs"
+name = "a_soft_line_break_split_across_chunks_is_joined"
+covers = "Quoted-printable '=', CR and LF arriving in three chunks"
+
+[[test]]
+target = "crates/mailtide-mime/src/decode.rs"
+name = "base64_lines_that_are_not_multiples_of_four_carry_over"
+covers = "Symbols left over at a chunk end are kept for the next chunk; padding ends the stream"
+
+[[test]]
+target = "crates/mailtide-mime/src/decode.rs"
+name = "an_irregular_part_is_decoded_whole"
+covers = "A reference marked irregular is never chunk-decoded: its bytes are the parser's best-effort decode"
+
+# Core rules
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "content_stored_before_facts_existed_still_reads"
+covers = "A content record without the facts key deserialises with facts = None; one with unknown extra keys still reads"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "an_import_stores_the_facts_it_was_given"
+covers = "MarkImported puts the facts in the row and the import entry's content shows them"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_refresh_applies_only_to_the_same_blob_at_an_older_version"
+covers = "Same blob and size, stored version lower: applied. Same or higher version, other blob or other size: nothing"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_refresh_of_a_deleted_or_pending_message_applies_nothing"
+covers = "No row, a tombstone, or content still pending: the update is dropped and no entry is recorded"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_refresh_touches_only_the_facts"
+covers = "Labels, checkpoint, unverified floor, blob, size, header facts, intents and jobs are unchanged"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_refresh_records_one_entry_per_message_changed_in_one_state"
+covers = "FactsRefreshed for each applied update, none for the others, all under one new state"
+
+# Store conformance
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "content_written_without_facts_reads_back"
+covers = "Every store returns facts = None for a row written by the previous build's serialisation"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_facts_refresh_is_conditional_and_atomic"
+covers = "A batch applies its valid updates and skips the others in one transaction; an unknown account applies nothing"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "a_facts_refresh_is_not_fenced_and_does_not_supersede"
+covers = "It applies while an engine holds the account, does not change the epoch, and the engine's next commit is accepted"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "import_and_refresh_entries_carry_the_current_content"
+covers = "changes() attaches the stored content, facts included, to MessageImported and FactsRefreshed; None once the message is deleted"
+
+# Driver
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "an_import_stores_envelope_facts_and_the_attachment_summary"
+covers = "End to end against the fake Gmail: one raw fetch, facts in messages() and in the import entry"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "facts_are_computed_from_the_bytes_that_were_stored"
+covers = "The size in every reference equals the stored blob's length"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "a_message_the_extractor_gives_up_on_is_still_imported"
+covers = "An extractor panic (injected) leaves facts = None, logs a warning and reports the import"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "refresh_facts_fills_old_rows_without_a_gmail_call"
+covers = "Rows without facts get them; the fake Gmail sees no request and the quota ledger no charge"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "refresh_facts_resumes_from_next_and_ends_with_none"
+covers = "Calls chained on `next` visit every message once; the last returns next = None"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "refresh_facts_stops_at_its_budget_between_batches"
+covers = "A spent budget returns what was done and a `next` to continue from; no batch is half applied"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "refresh_facts_skips_current_rows_without_reading_their_blobs"
+covers = "A second pass reads no blob and writes nothing"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "refresh_facts_reports_a_missing_blob_and_goes_on"
+covers = "The message is named in `unreadable`, its row is untouched, the others are refreshed"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "refresh_facts_reextracts_a_row_whose_blob_length_changed"
+covers = "The safe side of unknown message-facts-raw-bytes-stable: a blob whose length differs from the row's size is extracted again and the row's size corrected"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
+name = "a_refresh_racing_a_delete_changes_nothing"
+covers = "The message is tombstoned between the read and the write: no row, no entry, no error"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "read_part_reads_only_the_parts_range"
+covers = "A counting blob store sees one ranged read of exactly the encoded length, not the object"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "read_part_matches_parse_message_for_every_attachment"
+covers = "Bytes from the range path equal the bytes the whole-message parse returns"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "open_part_yields_bounded_chunks_that_concatenate_to_read_part"
+covers = "No chunk exceeds chunk_size; memory stays bounded for a 30 MB part; the bytes are the same"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "dropping_a_part_stream_stops_the_blob_read"
+covers = "The store's stream is dropped with ours; nothing is read after"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "a_blob_store_failure_mid_stream_ends_it_with_an_error"
+covers = "The consumer gets an error item, never a silently short part"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "a_blob_store_without_ranges_still_serves_parts"
+covers = "The trait defaults read the whole object and slice it"
+
+[[test]]
+target = "crates/mailtide-io/tests/parts.rs"
+name = "parts_lists_the_parts_of_an_attached_message_with_their_container"
+covers = "Runner::parts reads the blob once, in Rust, and returns metadata only"
+
+[[test]]
+target = "crates/mailtide-io/src/blobs.rs"
+name = "object_blobs_serve_ranges_from_memory_and_local_disk"
+covers = "get_range returns exactly the range; get_chunks concatenates to it; a range past the end is an error"
+
+[[test]]
+target = "crates/mailtide-sim/src/lib.rs"
+name = "facts_refreshes_interleaved_with_sync_keep_the_invariants"
+covers = "Campaign with refresh steps between commits, deletes, crashes and supersessions: I1-I10 hold, no deleted message returns, no row's labels change"
+
+# Python
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_content_carries_the_new_facts_and_attachments"
+covers = "MessageContent fields, AttachmentInfo, attachment_count, has_attachment"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_import_entry_carries_the_facts"
+covers = "MessageImported.content shows the same facts as messages()"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_content_from_before_shows_version_zero_and_no_list"
+covers = "facts_version 0, attachments None, has_attachment None: unknown is told apart from none"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_read_part_returns_one_attachment"
+covers = "bytes of one part by the reference from the summary, async and blocking"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_open_part_streams_async_and_blocking"
+covers = "async for and for over PartStream; both usable as context managers"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_cancelling_a_part_stream_releases_it"
+covers = "A cancelled task or an early exit from the loop drops the Rust stream"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_part_errors_are_typed"
+covers = "PartNotFound for a bad or stale reference, PartTooLarge over max_bytes, BlobNotFound for a missing blob"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_refresh_facts_fills_old_rows_and_emits_facts_refreshed"
+covers = "FactsRefresh result fields and the feed entry with its content"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_parse_addresses_and_decode_header"
+covers = "The two pure helpers on To, Cc and Subject values as the facts hold them"
