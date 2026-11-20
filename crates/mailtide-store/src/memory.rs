@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use mailtide::commit::{Commit, CommitOutcome};
+use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::{AccountMirror, MessageView};
@@ -217,6 +218,10 @@ impl Store for MemoryStore {
         self.on_account(account, Vec::new(), |mirror| {
             ids.iter().filter_map(|id| mirror.view(id)).collect()
         })
+    }
+
+    async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
+        self.on_account(account, Vec::new(), |mirror| mirror.label_definitions())
     }
 }
 

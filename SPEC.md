@@ -446,6 +446,8 @@ engine's epoch, so results meant for a dead engine are ignored).
   after compaction); `compact(account, through)`;
   `message_ids(account, after, limit)` to rebuild a consumer.
 - `messages(account, ids)`: `MessageView`s for hosts.
+- `labels(account)`: the label definitions (`Label { id, name, kind }`) as
+  last synced, in id order; empty before the first label sync.
 
 The conformance suite (`mailtide_store::conformance`, 12 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
@@ -474,6 +476,10 @@ uses one at a time. Build one runner per process, after forking:
   block; `await forget(account)` deletes its rows and blobs;
 - `await messages(account, ids) -> list[MessageView]` (labels with pending
   actions applied, observed labels, and `content` once imported);
+- `await labels(account) -> list[Label]`: the label definitions (`id`,
+  `name`, `kind`: `system` or `user`) as the mirror last synced them, in id
+  order, to show label ids as names; empty before the first label sync. A
+  `LabelDefinitionsChanged` feed entry means: read them again;
 - `await changes(account, since) -> ChangePage | StateTooOld`: typed entries,
   each with a stable `(state, index)` identity: `MessageDiscovered`,
   `MessageImported` (once per message, with its labels then, e.g. `SENT`, and
@@ -599,7 +605,7 @@ metrics or OpenTelemetry dependency.
 | OSS | Publish under `denismaciel` (MIT OR Apache-2.0) | Timing: open question |
 
 Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4
-(`changes`, `messages`). Phase 3 needs a production host.
+(`changes`, `messages`, `labels`). Phase 3 needs a production host.
 
 ## 15. Decisions
 

@@ -1,6 +1,7 @@
 //! `SQLite` store: the reference store for open-source users and tests.
 
 use mailtide::commit::{Commit, CommitOutcome};
+use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::MessageView;
@@ -126,6 +127,10 @@ impl Store for SqliteStore {
         ids: &[MessageId],
     ) -> Result<Vec<MessageView>, StoreError> {
         crate::Store::messages(&self.inner, account, ids).await
+    }
+
+    async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
+        crate::Store::labels(&self.inner, account).await
     }
 }
 

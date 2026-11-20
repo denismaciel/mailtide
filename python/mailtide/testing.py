@@ -24,14 +24,25 @@ class Mailbox:
         self.requests = 0
         self.refuse: str | None = None  # a 403 reason every request gets
         self.history_id = 0
+        self.history_floor = 0  # history requests from before it answer 404
         self.messages: dict[str, dict] = {}
         self.history: list[dict] = []
+        self.labels: dict[str, dict] = {"INBOX": {"id": "INBOX", "name": "INBOX", "type": "system"}}
 
     def add(self, mid: str, labels: list[str]) -> None:
         self.history_id += 1
         self.messages[mid] = {"labels": labels, "history_id": self.history_id}
         ref = {"id": mid, "threadId": f"t-{mid}", "labelIds": labels}
         self.history.append({"id": str(self.history_id), "messagesAdded": [{"message": ref}]})
+
+    def label(self, lid: str, name: str, kind: str = "user") -> None:
+        """Create a label definition, or rename it (no history record, as in Gmail)."""
+        self.labels[lid] = {"id": lid, "name": name, "type": kind}
+
+    def expire_history(self) -> None:
+        """Gmail dropped the history so far: syncing from before now answers 404."""
+        self.history_id += 1
+        self.history_floor = self.history_id
 
     def modify(self, mid: str, add: list[str], remove: list[str]) -> None:
         m = self.messages[mid]
@@ -86,11 +97,11 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             if parts == ["profile"]:
                 return self.reply(200, {"historyId": str(mailbox.history_id)})
             if parts == ["labels"]:
-                return self.reply(
-                    200, {"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}
-                )
+                return self.reply(200, {"labels": list(mailbox.labels.values())})
             if parts == ["history"]:
                 start = int(query["startHistoryId"])
+                if start < mailbox.history_floor:
+                    return self.reply(404, {"error": {"code": 404, "message": "not found"}})
                 records = [h for h in mailbox.history if int(h["id"]) > start]
                 return self.reply(200, {"history": records, "historyId": str(mailbox.history_id)})
             if parts == ["messages"]:
@@ -145,8 +156,8 @@ class FakeGmail:
     """A fake Gmail mailbox served over HTTP on localhost.
 
     ``with FakeGmail() as gmail:`` starts it; ``gmail.origin`` is the URL to
-    configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``refuse``,
-    ``delay_s``, ``requests``).
+    configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``label``,
+    ``expire_history``, ``refuse``, ``delay_s``, ``requests``).
     """
 
     def __init__(self) -> None:

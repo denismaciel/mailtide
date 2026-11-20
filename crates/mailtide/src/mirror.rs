@@ -640,6 +640,12 @@ pub fn settles(intent: &Intent, confirmation: AttemptId) -> bool {
     }
 }
 
+/// Put label definitions in the order stores return them: by id, byte-wise
+/// (never a database collation, so every store agrees).
+pub fn sort_labels(labels: &mut [Label]) {
+    labels.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
 // ------------------------------------------------------------ the in-memory mirror
 
 /// One account's complete mirror, applying commits with the shared rules.
@@ -699,6 +705,14 @@ impl AccountMirror {
     #[must_use]
     pub fn view(&self, id: &MessageId) -> Option<MessageView> {
         Some(self.messages.get(id)?.view(&self.intents_of(id)))
+    }
+
+    /// The label definitions as last synced, in id order.
+    #[must_use]
+    pub fn label_definitions(&self) -> Vec<Label> {
+        let mut labels = self.labels.clone();
+        sort_labels(&mut labels);
+        labels
     }
 
     /// Hand the account to a new engine: bump the epoch, record the version,

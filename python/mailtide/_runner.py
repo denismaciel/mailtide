@@ -19,6 +19,7 @@ from mailtide._core import (
     DriftResult,
     ForgetResult,
     Health,
+    Label,
     MessageView,
     NotifyResult,
     Progress,
@@ -211,6 +212,12 @@ class Runner:
     async def health(self) -> Health:
         """Whether the database answers within the pool's acquire timeout."""
         return await self._core.health()
+
+    async def labels(self, account: str) -> list[Label]:
+        """``account``'s label definitions as the mirror last synced them, in id
+        order (empty before the first label sync): turns the label ids on
+        messages into names. Read again after a ``LabelDefinitionsChanged``."""
+        return await self._core.labels(account)
 
     async def messages(self, account: str, message_ids: list[str]) -> list[MessageView]:
         """How these messages should look; unknown ids are left out."""

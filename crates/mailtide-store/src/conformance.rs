@@ -7,11 +7,12 @@
 use std::future::Future;
 
 use mailtide::commit::{
-    Commit, CommitOutcome, CursorMove, DeletionEvidence, JobPlan, MessageOp, Rejection,
+    Commit, CommitOutcome, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
-use mailtide::gmail::MessageObservation;
+use mailtide::gmail::{Label, LabelKind, MessageObservation};
 use mailtide::ids::{
-    AccountId, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, MessageId, ThreadId, Timestamp,
+    AccountId, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId, ThreadId,
+    Timestamp,
 };
 use mailtide::jobs::{AttemptId, JobKind, JobOp, JobOutcome};
 use mailtide::labels::{LabelSet, set};
@@ -114,6 +115,9 @@ where
         }),
         ("claims skip classes below the floor", |s| {
             Box::pin(claims_respect_the_floor(s))
+        }),
+        ("label definitions read back as last synced", |s| {
+            Box::pin(label_definitions(s))
         }),
     ];
     let mut results = Vec::new();
@@ -1211,4 +1215,76 @@ async fn tracking<S: Store>(store: &S) -> Result<(), String> {
         .map_err(|e| format!("{e:?}"))?
         .ok_or("status")?;
     expect(status.generation == 5, "status names the generation")
+}
+
+fn label(id: &str, name: &str, kind: LabelKind) -> Label {
+    Label {
+        id: LabelId(id.into()),
+        name: name.into(),
+        kind,
+    }
+}
+
+async fn labels<S: Store>(store: &S, account: &AccountId) -> Result<Vec<Label>, String> {
+    store.labels(account).await.map_err(|e| format!("{e:?}"))
+}
+
+async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
+    let stranger = AccountId("stranger@example.com".into());
+    expect(
+        labels(store, &stranger).await?.is_empty(),
+        "an untracked account has no labels",
+    )?;
+    let snapshot = claim(store).await?;
+    expect(
+        labels(store, &account()).await?.is_empty(),
+        "no labels before the first label sync",
+    )?;
+    let mut first = commit(&snapshot, 0);
+    first.labels = vec![LabelOp::ReplaceAll(vec![
+        label("Label_2", "Receipts", LabelKind::User),
+        label("INBOX", "INBOX", LabelKind::System),
+        label("Label_1", "Travel", LabelKind::User),
+    ])];
+    apply(store, &first).await?;
+    expect(
+        labels(store, &account()).await?
+            == vec![
+                label("INBOX", "INBOX", LabelKind::System),
+                label("Label_1", "Travel", LabelKind::User),
+                label("Label_2", "Receipts", LabelKind::User),
+            ],
+        "labels round-trip in id order",
+    )?;
+    let mut refresh = commit(&snapshot, 1);
+    refresh.labels = vec![LabelOp::ReplaceAll(vec![
+        label("INBOX", "INBOX", LabelKind::System),
+        label("Label_2", "Invoices", LabelKind::User),
+    ])];
+    apply(store, &refresh).await?;
+    expect(
+        labels(store, &account()).await?
+            == vec![
+                label("INBOX", "INBOX", LabelKind::System),
+                label("Label_2", "Invoices", LabelKind::User),
+            ],
+        "a refresh replaces the definitions: renames show, removed labels go",
+    )?;
+    let page = store
+        .changes(&account(), StateSeq(0), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        page.changes
+            .iter()
+            .filter(|e| e.change == Change::LabelDefinitionsChanged)
+            .count()
+            == 2,
+        "each refresh is a feed entry",
+    )?;
+    expect(
+        labels(store, &stranger).await?.is_empty(),
+        "labels belong to their account",
+    )
 }

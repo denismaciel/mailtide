@@ -12,7 +12,7 @@ use mailtide::command::{Command, CommandKind, GmailCall, GmailRequest};
 use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
 use mailtide::engine::Stopped;
 use mailtide::event::{Event, EventKind};
-use mailtide::gmail::ImportedMessage;
+use mailtide::gmail::{ImportedMessage, Label};
 use mailtide::ids::{AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, Timestamp};
 use mailtide::jobs::ClaimOutcome;
 use mailtide::outbox::ActionRequest;
@@ -380,6 +380,13 @@ where
     /// Every account the store holds.
     pub async fn accounts(&self) -> Result<Vec<AccountId>, RunError> {
         self.store.accounts().await.map_err(RunError::Store)
+    }
+
+    /// `account`'s label definitions as the mirror last synced them, in id
+    /// order (empty before the first label sync); read again after a
+    /// `LabelDefinitionsChanged` feed entry. Resolves label ids to names.
+    pub async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, RunError> {
+        self.store.labels(account).await.map_err(RunError::Store)
     }
 
     /// Compare the mirror with Gmail for `ids` (a sample the host picks),

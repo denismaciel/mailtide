@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mailtide::commit::{Commit, CommitOutcome, LabelOp, MessageOp, Rejection};
-use mailtide::gmail::LabelKind;
+use mailtide::gmail::{Label, LabelKind};
 use mailtide::ids::{
     AccountId, EngineVersion, Epoch, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
@@ -1674,6 +1674,31 @@ impl crate::Store for SqlStore {
                     .map(|record| record.view(intents.get(id).unwrap_or(&none)))
             })
             .collect())
+    }
+
+    async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
+        let rows = sqlx::query("SELECT id, name, kind FROM mailtide_labels WHERE account = $1")
+            .bind(account.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        let mut labels = rows
+            .iter()
+            .map(|row| {
+                let kind: String = row.try_get("kind").map_err(|e| corrupt("kind", e))?;
+                Ok(Label {
+                    id: LabelId(row.try_get("id").map_err(|e| corrupt("id", e))?),
+                    name: row.try_get("name").map_err(|e| corrupt("name", e))?,
+                    kind: match kind.as_str() {
+                        "system" => LabelKind::System,
+                        "user" => LabelKind::User,
+                        other => return Err(corrupt("label kind", other)),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        mailtide::mirror::sort_labels(&mut labels);
+        Ok(labels)
     }
 }
 

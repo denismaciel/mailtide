@@ -12,6 +12,7 @@
 use std::future::Future;
 
 use mailtide::commit::{Commit, CommitOutcome};
+use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome};
 use mailtide::mirror::MessageView;
@@ -151,4 +152,12 @@ pub trait Store: Send + Sync {
         account: &AccountId,
         ids: &[MessageId],
     ) -> impl Future<Output = Result<Vec<MessageView>, StoreError>> + Send;
+
+    /// The account's label definitions as the mirror last synced them, in id
+    /// order: empty before the first label sync, and for an unknown account.
+    /// A `LabelDefinitionsChanged` feed entry means they changed: read again.
+    fn labels(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<Vec<Label>, StoreError>> + Send;
 }

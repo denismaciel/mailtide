@@ -55,6 +55,7 @@ await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from r
 status = await runner.status("alice@example.com")  # never preempts a running sync
 page = await runner.changes("alice@example.com", since=None)  # typed feed: match on entries
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
+labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
 ```
 
 Invalid configuration raises `ValueError` naming the field. Failures are typed:

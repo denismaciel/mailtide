@@ -543,6 +543,28 @@ mod _core {
         })
     }
 
+    /// A label definition: what a label id on a message is called.
+    #[pyclass(frozen, get_all)]
+    struct Label {
+        id: String,
+        name: String,
+        /// `system` (`INBOX`, `UNREAD`, …) or `user`.
+        kind: &'static str,
+    }
+
+    impl From<mailtide::gmail::Label> for Label {
+        fn from(label: mailtide::gmail::Label) -> Self {
+            Self {
+                id: label.id.0,
+                name: label.name,
+                kind: match label.kind {
+                    mailtide::gmail::LabelKind::System => "system",
+                    mailtide::gmail::LabelKind::User => "user",
+                },
+            }
+        }
+    }
+
     fn parse_action(
         action: &str,
         add_labels: Vec<String>,
@@ -1406,6 +1428,11 @@ mod _core {
             })
         }
 
+        async fn labels(self: Arc<Self>, account: AccountId) -> PyResult<Vec<Label>> {
+            let labels = self.inner.labels(&account).await.map_err(run_error)?;
+            Ok(labels.into_iter().map(Label::from).collect())
+        }
+
         async fn messages(
             self: Arc<Self>,
             account: AccountId,
@@ -1735,6 +1762,14 @@ mod _core {
             future(py, &self.shared, self.shared.clone().health())
         }
 
+        fn labels<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().labels(account_id(account)?),
+            )
+        }
+
         fn messages<'py>(
             &self,
             py: Python<'py>,
@@ -2008,6 +2043,15 @@ mod _core {
         /// Whether the database answers.
         fn health(&self, py: Python<'_>) -> PyResult<Health> {
             block(py, &self.shared, self.shared.clone().health())
+        }
+
+        /// The account's label definitions as last synced, in id order.
+        fn labels(&self, py: Python<'_>, account: &str) -> PyResult<Vec<Label>> {
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().labels(account_id(account)?),
+            )
         }
 
         /// How these messages should look; unknown ids are left out.
