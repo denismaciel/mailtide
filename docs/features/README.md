@@ -168,8 +168,11 @@ exception says so under its Decisions.
   `run` does, so a build that is too old refuses instead of misreading.
 - **An unproven Gmail behaviour that is unsafe if wrong ships switched off.** The
   code path exists and is tested, but needs an explicit setting until its
-  `[[unknown]]` is confirmed (today: Bcc on send, and permanent delete as a
-  whole). Everything else is built on the assumed behaviour and fails safe.
+  `[[unknown]]` is confirmed. Today that is permanent delete as a whole, whose
+  unknowns need a scope the tests did not have. Bcc on send was the other case
+  and is confirmed (`send-bcc-stripped`: the recipient's copy carries no Bcc
+  header), so it ships enabled. Everything else is built on the assumed behaviour
+  and fails safe.
 - **One size limit, and no uploads.** Drafts and sends put the message in the JSON
   body (`raw`), whatever its size, and refuse a message above `max_message_bytes`
   (default 35,651,584: 34 MiB) before calling Gmail. Settled 2026-11-20: the JSON
