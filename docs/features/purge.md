@@ -1,6 +1,6 @@
 # Purge: permanent delete, empty trash and empty spam
 
-Plan: `features/purge.toml` (roadmap W1). Status: planned.
+Plan: `features/purge.toml` (roadmap W1). Status: built.
 
 ## 1. Goal and scope
 
@@ -89,12 +89,17 @@ Rust (`mailtide_io::Runner`):
 - `unsent`: the budget or a quota deferral ended the call first.
 
 `PurgeError` (nothing was sent): `ReadOnly`, `Disabled`,
-`AnywhereNotAllowed`, `TooMany { limit }`, `MirrorStale`, `ScopeRequired`,
-`Deferred { until }`, `Retryable`.
+`AnywhereNotAllowed`, `TooMany { limit, given }`, `MirrorStale(Stale)`
+(`NoCursor`, `NotLive`, `HistoryExpired`, `TooFarBehind`), `ScopeRequired`,
+`Deferred { until }`, `Retryable`; and, as `search` has them, `Refused` (the
+check's history read refused for good), `AccountBlocked`, `NotTracked` and
+`Run` (the store or the gate failed).
 
 Config: `purge = off | trash_and_spam | anywhere`, default `off`. The config
 is the deployment's ceiling; `anywhere = true` on a call is the caller's
-explicit request and needs the `anywhere` ceiling.
+explicit request and needs the `anywhere` ceiling. In Rust it is
+`Runner::with_purge(PurgePolicy)` rather than a `RunnerConfig` field, so
+every existing construction of a runner stays off without a change.
 
 Python: `await runner.purge(account, message_ids=… | thread_id=…,
 anywhere=False, budget_s=…) -> PurgeOutcome`, `await runner.empty(account,
@@ -119,7 +124,14 @@ the exceptions `PurgeDisabled`, `PurgeScopeRequired`, `MirrorStale`,
    same rule the mirror uses, then overlay pending intents. The message is
    eligible if the result contains `TRASH` or `SPAM` (or the call is
    `anywhere`). So a restore made on a phone a second ago refuses the id,
-   and a trash made here and not yet delivered allows it.
+   and a trash made here and not yet delivered allows it. Built from the
+   view, the overlay also holds actions delivered and awaiting
+   confirmation, which Gmail has already applied and history may since
+   have undone; so an overlay may remove a label, but may add `TRASH` or
+   `SPAM` only where history since the checkpoint has not moved the message
+   in or out of that bin (a trash delivered here, then undone on a phone, is
+   refused although the view still shows it trashed). Found while building:
+   overlaying the view as it is would have purged that message.
 5. **Delete.** Fewer than 5 ids: one `messages.delete` each. Otherwise
    `batchDelete` in chunks of 1,000. Each call passes the quota gate at
    foreground priority.
@@ -156,8 +168,9 @@ database a purge has written is an ordinary one to an older build and the
 schema version does not move. Rolling back needs no statement; a purged
 message stays deleted in Gmail.
 
-- `Store::record_deleted(account, [(id, at)], now)`: tombstones with
-  `DeletionEvidence::History { at }` through the existing `tombstone` rule,
+- `Store::record_deleted(account, [(id, evidence)], now)`: tombstones with
+  `DeletionEvidence::History { at }` (or `VerifiedMissing` for a single
+  delete's 404) through the existing `tombstone` rule,
   in one transaction: the row goes, `MessageDeleted` is logged with the last
   thread and labels, the message's jobs and intents are cancelled, its blob
   cleanup is scheduled. Like `admit` it is **not fenced by an epoch**.

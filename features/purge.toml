@@ -2,7 +2,7 @@ id = "purge"
 title = "Purge: permanent delete, empty trash and empty spam"
 summary = "A switched-off-by-default call that permanently deletes named messages, a thread's messages, or everything the mirror holds in trash or spam: checked against Gmail's history since the mirror's cursor, sent by id only, never repeated by mailtide, and tombstoned only on Gmail's own evidence."
 roadmap = ["W1"]
-status = "in_progress"
+status = "done"
 design = "docs/features/purge.md"
 depends_on = []
 
@@ -41,7 +41,7 @@ role = "record_deleted: tombstones from history evidence outside an engine commi
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
 change = "modify"
-role = "Purge invariant for the simulator: a tombstone exists only for a message Gmail no longer has"
+role = "Purge invariants for the simulator: a tombstone exists only for a message Gmail no longer has; a purge deletes only what was in the bin at its check (or moved there by an action not yet delivered)"
 
 # ------------------------------------------------------------------ wire layer
 
@@ -56,11 +56,6 @@ change = "modify"
 role = "Build the delete variants of GmailRequest"
 
 [[file]]
-path = "crates/mailtide-gmail/src/http.rs"
-change = "modify"
-role = "DELETE method. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
-
-[[file]]
 path = "crates/mailtide-gmail/src/lib.rs"
 change = "modify"
 role = "Export the purge module"
@@ -70,7 +65,7 @@ role = "Export the purge module"
 [[file]]
 path = "crates/mailtide-store/src/lib.rs"
 change = "modify"
-role = "Store::record_deleted (unfenced, like admit) and Store::message_ids_labelled"
+role = "Store::record_deleted (unfenced, like admit; takes each id's DeletionEvidence: a history record or a single delete's 404) and Store::message_ids_labelled"
 
 [[file]]
 path = "crates/mailtide-store/src/memory.rs"
@@ -97,12 +92,7 @@ role = "Runner::purge and Runner::empty: policy, the history read before and aft
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "Config.purge policy; perform delete requests; keep a purge call's refusal away from the account-level block. Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
-
-[[file]]
-path = "crates/mailtide-io/src/transport.rs"
-change = "modify"
-role = "Send DELETE. Shared groundwork: PUT, PATCH and DELETE (crates/mailtide-gmail/src/http.rs and crates/mailtide-io/src/transport.rs) are added by whichever of drafts, identities, label-edit, purge, send lands first; a later plan adds only the method still missing"
+role = "The purge ceiling (Runner::with_purge, off by default); perform delete requests (MessagesDeleted; a single delete's 404 stays NotFound). The direct-call groundwork (Runner::call_gmail) and HTTP DELETE were already on main, so http.rs and transport.rs need no change"
 
 [[file]]
 path = "crates/mailtide-io/src/lib.rs"
@@ -115,6 +105,11 @@ change = "modify"
 role = "Purges from the driver in the fake Gmail, with lost answers, crashes before the record and restores made elsewhere in between; the purge invariant"
 
 # -------------------------------------------------------------------- bindings
+
+[[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "Count purges in the campaign totals"
 
 [[file]]
 path = "crates/mailtide-py/src/lib.rs"
@@ -177,6 +172,11 @@ role = "A destroy applied in part, ported by behaviour"
 path = "crates/mailtide-io/tests/ref_himalaya_google.rs"
 change = "new"
 role = "himalaya's live write lifecycle (trash, then delete for good, beside an unknown id), against the fake Gmail"
+
+[[file]]
+path = "crates/mailtide-io/tests/purge_host/mod.rs"
+change = "new"
+role = "The fake Gmail the purge test files share: deletes with history records (or late ones), a token without the full scope, another client's restore between calls, lost answers, a partial batch"
 
 [[file]]
 path = "crates/mailtide-io/tests/purge.rs"

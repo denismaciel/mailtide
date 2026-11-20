@@ -18,6 +18,7 @@ use mailtide::ids::{
 };
 use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
 use mailtide::outbox::ActionRequest;
+use mailtide::purge::PurgePolicy;
 use mailtide::quota::{Admission, Priority};
 use mailtide::retry::{Backoff, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::revision::{AckOutcome, ConsumerList, ConsumerName, FeedPosition, Retention};
@@ -157,6 +158,7 @@ pub struct Runner<S, B, T, Q, A> {
     config: RunnerConfig,
     clock: crate::Clock,
     extract: fn(&[u8]) -> MessageFacts,
+    purge: PurgePolicy,
 }
 
 /// What one run did.
@@ -416,6 +418,7 @@ where
             config,
             clock: crate::Clock::system(),
             extract: mailtide_mime::facts,
+            purge: PurgePolicy::Off,
         }
     }
 
@@ -449,6 +452,26 @@ where
     /// The facts extractor imports and refreshes use.
     pub(crate) fn facts_extractor(&self) -> fn(&[u8]) -> MessageFacts {
         self.extract
+    }
+
+    /// Allow permanent deletion up to `policy` (off by default): see
+    /// [`Self::purge`] and [`Self::empty`].
+    #[must_use]
+    pub fn with_purge(mut self, policy: PurgePolicy) -> Self {
+        self.purge = policy;
+        self
+    }
+
+    /// The purge ceiling this runner was built with.
+    #[must_use]
+    pub fn purge_policy(&self) -> PurgePolicy {
+        self.purge
+    }
+
+    /// Whether the runner may change the mailbox.
+    #[must_use]
+    pub fn access(&self) -> Access {
+        self.config.access
     }
 
     /// The store, for reads.
