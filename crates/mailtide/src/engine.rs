@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::audit::{AuditOutcome, AuditProgress, AuditReport, AuditRequest, AuditStep};
+use crate::audit::{
+    self, AuditAbandonment, AuditOutcome, AuditProgress, AuditReport, AuditRequest, AuditStep,
+};
 use crate::command::{Command, CommandKind, GmailCall, GmailRequest};
 use crate::commit::{
     AccountOp, Commit, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
@@ -202,11 +204,23 @@ struct Audit {
 /// A pending label confirmation that can be carried between short runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelConfirmation {
+    account: crate::ids::AccountId,
+    incarnation: u64,
+    epoch: crate::ids::Epoch,
+    listed_at: Timestamp,
     generation: u64,
     lacking: LabelSet,
     rounds: u8,
     at: Timestamp,
     reconciling: bool,
+}
+
+impl LabelConfirmation {
+    /// Time after which the listing is too old to use on another claim.
+    #[must_use]
+    pub fn expires_at(&self) -> Timestamp {
+        self.listed_at.plus(3 * schedule::UNKNOWN_LABEL_GAP)
+    }
 }
 
 /// Why the engine stopped accepting events.
@@ -328,12 +342,23 @@ impl Engine {
     /// In-memory continuation for hosts that run the engine in short slices.
     #[must_use]
     pub fn label_confirmation(&self) -> Option<LabelConfirmation> {
-        self.labels.confirmation.clone()
+        self.labels
+            .confirmation
+            .as_ref()
+            .filter(|confirmation| confirmation.epoch == self.state.epoch)
+            .cloned()
     }
 
     /// Restore a pending label confirmation before calling `start`.
-    pub fn restore_label_confirmation(&mut self, confirmation: LabelConfirmation) {
-        if confirmation.reconciling == self.capturing_baseline() {
+    pub fn restore_label_confirmation(&mut self, confirmation: LabelConfirmation, now: Timestamp) {
+        if confirmation.account == self.state.account
+            && confirmation.incarnation == self.state.account_generation
+            && confirmation.epoch.0.checked_add(1) == Some(self.state.epoch.0)
+            && confirmation.generation == self.state.label_generation
+            && now >= confirmation.listed_at
+            && now < confirmation.expires_at()
+            && confirmation.reconciling == self.capturing_baseline()
+        {
             if confirmation.reconciling {
                 self.reconcile_not_before = Some(confirmation.at);
             }
@@ -424,6 +449,13 @@ impl Engine {
             EventKind::MessagesListed { command, page } => self.on_listed(command, page, now),
             EventKind::AuditListed { command, ids, next } => {
                 self.on_audit_page(command, ids, next, now)
+            }
+            EventKind::AuditPageMalformed { command } => {
+                if self.waiting.remove(&command) == Some(Waiting::AuditPage) {
+                    self.abandon_audit(AuditAbandonment::MalformedPage, now)
+                } else {
+                    Vec::new()
+                }
             }
             EventKind::AuditAdvanced { command, outcome } => {
                 self.on_audit_advanced(command, outcome, now)
@@ -851,7 +883,10 @@ impl Engine {
         for label in &labels {
             lacking.remove(&label.id);
         }
-        let previous = self.labels.confirmation.take();
+        let previous = self.labels.confirmation.take().filter(|evidence| {
+            evidence.epoch == self.state.epoch
+                || (evidence.generation == generation && now < evidence.expires_at())
+        });
         let confirmed = lacking.is_empty()
             || previous.as_ref().is_some_and(|first| {
                 first.generation == generation && lacking.is_subset(&first.lacking)
@@ -873,6 +908,10 @@ impl Engine {
             now
         };
         self.labels.confirmation = Some(LabelConfirmation {
+            account: self.state.account.clone(),
+            incarnation: self.state.account_generation,
+            epoch: self.state.epoch,
+            listed_at: now,
             generation,
             lacking,
             rounds,
@@ -1199,11 +1238,16 @@ impl Engine {
     // ------------------------------------------------------------ mailbox audit
 
     fn audit_due(&self, now: Timestamp) -> Timestamp {
-        if self.state.audit_progress.is_some() {
+        let due = if self.state.audit_progress.is_some() {
             now
         } else {
             schedule::label_refresh_due(self.state.audited_at, now, self.config.audit_interval)
-        }
+        };
+        audit::retry_at(
+            self.state.audit_progress.as_ref(),
+            self.state.audit_schedule,
+        )
+        .map_or(due, |retry| due.max(retry))
     }
 
     fn schedule_audit(&mut self, now: Timestamp) -> Option<Command> {
@@ -1254,6 +1298,7 @@ impl Engine {
                 expected: self.state.audit_progress.clone(),
                 step,
                 now,
+                interval: self.config.audit_interval,
             }),
         }
     }
@@ -1270,14 +1315,8 @@ impl Engine {
         {
             return Vec::new();
         }
-        let repeats = next.as_ref().is_some_and(|next| {
-            self.state.audit_progress.as_ref().is_some_and(
-                |progress| matches!(progress, AuditProgress::Listing(token) if token == next),
-            )
-        });
-        if ids.len() > crate::audit::AUDIT_PAGE_SIZE || next.is_some() && ids.is_empty() || repeats
-        {
-            return self.audit_failed(true, now);
+        if !audit::valid_page(&ids, next.as_ref()) {
+            return self.abandon_audit(AuditAbandonment::MalformedPage, now);
         }
         vec![self.advance_audit(AuditStep::Page { ids, next }, now)]
     }
@@ -1295,10 +1334,14 @@ impl Engine {
             AuditOutcome::Applied {
                 completed_at,
                 report,
+                retry_at,
             } => {
                 self.audit.report = report;
-                self.audit.next_run =
-                    Some(completed_at.map_or(now, |at| at.plus(self.config.audit_interval)));
+                self.audit.next_run = Some(
+                    retry_at
+                        .or_else(|| completed_at.map(|at| at.plus(self.config.audit_interval)))
+                        .unwrap_or(now),
+                );
                 if report.found_missing > 0 || report.found_unlisted > 0 {
                     vec![self.schedule_jobs(now)]
                 } else {
@@ -1313,15 +1356,38 @@ impl Engine {
         }
     }
 
-    fn audit_failed(&mut self, restart: bool, now: Timestamp) -> Vec<Command> {
-        if restart
-            && self.state.sync == SyncState::Live
-            && matches!(self.state.audit_progress, Some(AuditProgress::Listing(_)))
-        {
-            vec![self.advance_audit(AuditStep::Restart, now)]
+    fn abandon_audit(&mut self, reason: AuditAbandonment, now: Timestamp) -> Vec<Command> {
+        if self.state.sync == SyncState::Live {
+            vec![self.advance_audit(AuditStep::Abandon(reason), now)]
         } else {
-            self.audit.next_run = Some(now.plus(Duration::from_mins(1)));
             Vec::new()
+        }
+    }
+
+    fn defer_audit(&mut self, until: Timestamp, now: Timestamp) -> Vec<Command> {
+        if self.state.sync == SyncState::Live {
+            vec![self.advance_audit(AuditStep::Defer(until), now)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn audit_failed(&mut self, failure: &Failure, now: Timestamp) -> Vec<Command> {
+        match failure {
+            Failure::Retryable(retryable) => {
+                let mut out = self.cool_down(retryable, now);
+                let retry = self.backoff.next(0, retryable, now, self.jitter_seed());
+                let until = self
+                    .state
+                    .cooldown
+                    .as_ref()
+                    .map_or(retry, |cooldown| retry.max(cooldown.until));
+                out.extend(self.defer_audit(until, now));
+                out
+            }
+            Failure::Blocking(_) | Failure::NotFound => {
+                self.abandon_audit(AuditAbandonment::Rejected, now)
+            }
         }
     }
 
@@ -1699,6 +1765,9 @@ impl Engine {
                     None => Vec::new(),
                 };
                 out.push(self.schedule_jobs(now));
+                if !self.parked.is_empty() {
+                    out.extend(self.pump_labels(now));
+                }
                 out
             }
             AfterCommit::ReconcileDone(cursor) => {
@@ -1786,7 +1855,16 @@ impl Engine {
                     }
                 }
                 vec![
-                    self.finish_job(&job, JobOutcome::Defer { due_at: until }, Vec::new(), until),
+                    self.finish_job(
+                        &job,
+                        JobOutcome::Defer {
+                            due_at: until,
+                            at: now,
+                            priority: job.priority,
+                        },
+                        Vec::new(),
+                        now,
+                    ),
                     self.schedule_jobs(until),
                 ]
             }
@@ -1815,10 +1893,7 @@ impl Engine {
                 out.extend(self.listing_ended(now));
                 out
             }
-            Some(Waiting::AuditPage) => {
-                self.audit.next_run = Some(until);
-                Vec::new()
-            }
+            Some(Waiting::AuditPage) => self.defer_audit(until, now),
             Some(Waiting::Watch) => vec![self.schedule(TimerKind::WatchRenewal, until)],
             Some(Waiting::AuditStore) | None => Vec::new(),
         }
@@ -1829,15 +1904,7 @@ impl Engine {
             return Vec::new();
         };
         if waiting == Waiting::AuditPage {
-            let bad_token = matches!(
-                failure,
-                Failure::NotFound
-                    | Failure::Blocking(BlockingFailure {
-                        class: Blocking::Permanent,
-                        ..
-                    })
-            );
-            return self.audit_failed(bad_token, now);
+            return self.audit_failed(failure, now);
         }
         let listing = matches!(waiting, Waiting::Labels | Waiting::LabelRefresh);
         let mut out = match failure {
@@ -2252,6 +2319,9 @@ mod tests {
             labels_refreshed_at: None,
             audited_at: None,
             audit_progress: None,
+            audit_schedule: audit::AuditSchedule::default(),
+            account_generation: 1,
+            label_generation: 0,
             label_ids: LabelSet::new(),
             drafts_refreshed_at: None,
         };
@@ -3054,6 +3124,9 @@ mod tests {
             labels_refreshed_at: None,
             audited_at: None,
             audit_progress: None,
+            audit_schedule: audit::AuditSchedule::default(),
+            account_generation: 1,
+            label_generation: 0,
             label_ids: LabelSet::new(),
             drafts_refreshed_at: None,
         };
@@ -3375,6 +3448,152 @@ mod tests {
     }
 
     #[test]
+    fn carried_label_evidence_requires_consecutive_epochs_same_versions_and_freshness() {
+        let mut first = live(100);
+        let now = Timestamp(10_000);
+        let command = first.list_labels(Priority::Live, Waiting::LabelRefresh, now);
+        let _ = first.handle(Event {
+            now,
+            kind: EventKind::LabelsListed {
+                command: command.id,
+                labels: ["INBOX", "UNREAD"]
+                    .into_iter()
+                    .map(|id| Label::plain(LabelId(id.into()), id, crate::gmail::LabelKind::System))
+                    .collect(),
+                generation: first.state.label_generation,
+                stored_user_labels: crate::labels::set(["Label_1"]),
+            },
+        });
+        let evidence = first.label_confirmation().expect("first omission");
+        for (epochs, incarnation, generation, age, accepted) in [
+            (1, 0, 0, 60, true),
+            (0, 0, 0, 60, false),
+            (2, 0, 0, 60, false),
+            (1, 1, 0, 60, false),
+            (1, 0, 1, 60, false),
+            (1, 0, 0, 180, false),
+        ] {
+            let mut snapshot = first.state.clone();
+            snapshot.epoch.0 += epochs;
+            snapshot.account_generation += incarnation;
+            snapshot.label_generation += generation;
+            let mut engine = Engine::new(snapshot.validate().unwrap(), first.config.clone());
+            engine.restore_label_confirmation(evidence.clone(), now.plus(Duration::from_secs(age)));
+            assert_eq!(
+                engine.labels.confirmation.is_some(),
+                accepted,
+                "epoch offset {epochs}, incarnation {incarnation}, generation {generation}, age {age}"
+            );
+            assert!(
+                engine.label_confirmation().is_none(),
+                "a claim without a fresh listing cannot renew evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_rate_limits_publish_shared_cooldowns() {
+        for class in [Retryable::ProjectRateLimited, Retryable::AccountRateLimited] {
+            let mut engine = live(100);
+            let now = Timestamp(10_000);
+            let request = engine.on_timer(TimerKind::Audit, now).remove(0);
+            let commands = engine.on_failed(
+                request.id,
+                &Failure::Retryable(RetryableFailure {
+                    class,
+                    retry_after: Some(Duration::from_secs(300)),
+                    detail: "quota".into(),
+                }),
+                now,
+            );
+            let target = if class == Retryable::ProjectRateLimited {
+                crate::retry::QuotaTarget::Project
+            } else {
+                crate::retry::QuotaTarget::Account(engine.state.account.clone())
+            };
+            assert!(commands.iter().any(|command| matches!(&command.kind,
+                CommandKind::Commit(commit) if commit.account_ops.iter().any(|op|
+                    matches!(op, AccountOp::SetCooldown(cooldown) if
+                        cooldown.target == target && cooldown.until == now.plus(Duration::from_secs(300)))))));
+        }
+    }
+
+    #[test]
+    fn a_late_baseline_hold_runs_its_follow_up_and_frees_four_slots() {
+        let mut driven = Driven::new(&["INBOX", "Label_ok"], Vec::new());
+        driven.engine.state.sync =
+            SyncState::Reconciling(ReconcileProgress::begin(ReconcileReason::HistoryExpired));
+        driven
+            .mirror
+            .record
+            .sync
+            .clone_from(&driven.engine.state.sync);
+        driven.mirror.record.cursor = Some(HistoryId(100));
+        let listing = driven
+            .engine
+            .list_labels(Priority::Backfill, Waiting::Labels, Timestamp(0));
+        driven.settle(vec![listing]);
+        let row = driven.mirror.messages[&MessageId("m".into())].clone();
+        for i in 0..JOB_CONCURRENCY {
+            let id = MessageId(format!("held-{i}"));
+            driven.mirror.messages.insert(
+                id.clone(),
+                crate::mirror::MessageRecord {
+                    id: id.clone(),
+                    ..row.clone()
+                },
+            );
+            driven.mirror.admit_action(
+                &ActionRequest::Messages {
+                    ids: vec![id],
+                    action: add_labels(&["Label_ok"]),
+                },
+                Timestamp(0),
+            );
+        }
+        let claim = driven.engine.claim_jobs(Timestamp(0));
+        driven.settle(claim);
+        for _ in 0..JOB_CONCURRENCY {
+            driven.refuse();
+        }
+        let import = MessageId("queued-import".into());
+        driven.mirror.jobs.insert(
+            JobKind::Import(import.clone()),
+            crate::jobs::Job {
+                kind: JobKind::Import(import.clone()),
+                priority: Priority::Backfill,
+                failed_attempts: 0,
+                state: crate::jobs::JobState::Ready {
+                    due_at: Timestamp(0),
+                },
+            },
+        );
+        driven.answer_labels(["INBOX", "UNREAD", "Label_ok"]);
+        assert!(!driven.has(&GmailRequest::ListLabels));
+        let profile = driven
+            .requests
+            .iter()
+            .find(|(_, request)| *request == GmailRequest::GetProfile)
+            .unwrap()
+            .0;
+        let commands = driven.engine.handle(event(EventKind::ProfileFetched {
+            command: profile,
+            history_id: HistoryId(100),
+        }));
+        driven.settle(commands);
+        assert!(
+            driven.has(&GmailRequest::ListLabels),
+            "the queued follow-up is sent at baseline capture"
+        );
+        driven.answer_labels(["INBOX", "UNREAD", "Label_ok"]);
+        for _ in 0..JOB_CONCURRENCY {
+            driven.deliver();
+        }
+        assert!(driven.engine.parked.is_empty());
+        assert!(driven.has(&GmailRequest::ImportMessage { id: import }));
+    }
+
+    #[test]
     fn audit_due_time_survives_restart_and_uses_backfill_quota() {
         let mut engine = live(100);
         let completed = Timestamp(10_000);
@@ -3424,12 +3643,14 @@ mod tests {
         let report = AuditReport {
             found_missing: 1,
             found_unlisted: 0,
+            abandoned: None,
         };
         let jobs = engine.on_audit_advanced(
             checked.id,
             AuditOutcome::Applied {
                 completed_at: None,
                 report,
+                retry_at: None,
             },
             now,
         );
@@ -3461,12 +3682,14 @@ mod tests {
         let report = AuditReport {
             found_missing: 0,
             found_unlisted: 1,
+            abandoned: None,
         };
         restarted.on_audit_advanced(
             request.id,
             AuditOutcome::Applied {
                 completed_at: None,
                 report,
+                retry_at: None,
             },
             now,
         );
@@ -3480,8 +3703,17 @@ mod tests {
         let request = engine.on_timer(TimerKind::Audit, now).remove(0);
         let ids =
             vec![MessageId("invalid oversized page".into()); crate::audit::AUDIT_PAGE_SIZE + 1];
-        assert!(engine.on_audit_page(request.id, ids, None, now).is_empty());
-        assert!(engine.audit_next_run().is_some_and(|retry| retry > now));
+        let commands = engine.on_audit_page(request.id, ids, None, now);
+        assert!(matches!(
+            commands.as_slice(),
+            [Command {
+                kind: CommandKind::AdvanceAudit(AuditRequest {
+                    step: AuditStep::Abandon(AuditAbandonment::MalformedPage),
+                    ..
+                }),
+                ..
+            }]
+        ));
     }
 
     #[test]

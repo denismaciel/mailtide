@@ -58,6 +58,11 @@ pub enum JobState {
         /// Not before.
         due_at: Timestamp,
     },
+    /// Deferred by the quota gate at the job's current priority.
+    Deferred {
+        /// Not before, unless promoted to a higher class.
+        due_at: Timestamp,
+    },
     /// Claimed by an attempt.
     Running(AttemptId),
     /// Parked until an operator retries.
@@ -249,6 +254,10 @@ pub enum JobOutcome {
     Defer {
         /// When to try again.
         due_at: Timestamp,
+        /// When admission was refused.
+        at: Timestamp,
+        /// The class the gate considered.
+        priority: Priority,
     },
     /// Park until an operator retries.
     Block(BlockingFailure),
@@ -283,8 +292,13 @@ pub fn pick_next_from(jobs: &[Job], now: Timestamp, floor: Priority) -> Option<&
     jobs.iter()
         .filter(|job| job.priority >= floor)
         .filter_map(|job| match job.state {
-            JobState::Ready { due_at } if due_at <= now => Some((job, due_at)),
-            JobState::Ready { .. } | JobState::Running(_) | JobState::Blocked(_) => None,
+            JobState::Ready { due_at } | JobState::Deferred { due_at } if due_at <= now => {
+                Some((job, due_at))
+            }
+            JobState::Ready { .. }
+            | JobState::Deferred { .. }
+            | JobState::Running(_)
+            | JobState::Blocked(_) => None,
         })
         .min_by(|(a, a_due), (b, b_due)| {
             b.priority
@@ -347,6 +361,9 @@ pub fn prioritise(job: &Job, now: Timestamp) -> Job {
         return job.clone();
     }
     let state = match job.state {
+        JobState::Deferred { due_at } => JobState::Ready {
+            due_at: due_at.min(now),
+        },
         JobState::Ready { due_at } if due_at > now && job.failed_attempts == 0 => {
             JobState::Ready { due_at: now }
         }
@@ -367,7 +384,7 @@ pub fn prioritise(job: &Job, now: Timestamp) -> Job {
 pub fn next_due(jobs: &[Job]) -> Option<Timestamp> {
     jobs.iter()
         .filter_map(|job| match job.state {
-            JobState::Ready { due_at } => Some(due_at),
+            JobState::Ready { due_at } | JobState::Deferred { due_at } => Some(due_at),
             JobState::Running(_) | JobState::Blocked(_) => None,
         })
         .min()

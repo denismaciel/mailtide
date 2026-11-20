@@ -7,7 +7,7 @@ use mailtide::audit::{
 use mailtide::state::SyncState;
 
 use mailtide::commit::Rejection;
-use mailtide::ids::{MessageId, Timestamp};
+use mailtide::ids::{MessageId, PageToken, Timestamp};
 use mailtide::jobs::JobKind;
 use mailtide::quota::Priority;
 use sqlx::any::AnyRow;
@@ -33,39 +33,36 @@ impl SqlStore {
             return Ok(AuditOutcome::Rejected(reason));
         }
         let account = request.account.as_str();
-        let mut report = AuditReport::default();
-        let mut completed_at = None;
-        let progress = match (&request.step, request.expected.as_ref()) {
-            (AuditStep::Page { ids, next }, _) => {
-                let missing = found_missing(&mut tx, account, ids).await?;
-                queue_checks(&mut tx, account, &missing, request.now).await?;
-                report.found_missing = u32::try_from(missing.len()).unwrap_or(u32::MAX);
-                Some(audit::after_listing(next.clone()))
-            }
-            (AuditStep::Continue, Some(AuditProgress::Sweep(after))) => {
-                let (ids, unlisted) = sweep(&mut tx, account, after.as_ref()).await?;
-                queue_checks(&mut tx, account, &unlisted, request.now).await?;
-                report.found_unlisted = u32::try_from(unlisted.len()).unwrap_or(u32::MAX);
-                Some(audit::after_sweep(&ids))
-            }
-            (AuditStep::Continue, Some(AuditProgress::Cleanup { after, complete })) => {
-                let ids = clear_seen(&mut tx, account, after.as_ref()).await?;
-                let (next, finished) = audit::after_cleanup(&ids, *complete, request.now);
-                completed_at = finished;
-                next
-            }
-            (AuditStep::Restart, _) => Some(audit::cleanup(false)),
-            (AuditStep::Continue, _) => unreachable!("validated audit step"),
+        let mut schedule = record.audit_schedule;
+        let rows = if schedule.pages_left.is_none()
+            && matches!(
+                (&request.step, request.expected.as_ref()),
+                (AuditStep::Page { .. }, _) | (AuditStep::Continue, Some(AuditProgress::Sweep(_)))
+            ) {
+            self.count(
+                &mut tx,
+                "SELECT COUNT(*) AS n FROM mailtide_messages WHERE account = $1",
+                &request.account,
+            )
+            .await?
+        } else {
+            0
         };
+        let (progress, completed_at, report) =
+            apply_step(&mut tx, request, &mut schedule, rows).await?;
+        if completed_at.is_some() {
+            schedule = audit::AuditSchedule::default();
+        }
         let audited_at = completed_at
             .map(|at| record.audited_at.map_or(at, |previous| at.max(previous)))
             .or(record.audited_at);
         sqlx::query(
-            "UPDATE mailtide_accounts SET audited_at = $2, audit_progress = $3 WHERE account = $1",
+            "UPDATE mailtide_accounts SET audited_at = $2, audit_progress = $3, audit_schedule = $4 WHERE account = $1",
         )
         .bind(account)
         .bind(audited_at.map(|at| at.0))
         .bind(progress.as_ref().map(json).transpose()?)
+        .bind((schedule != audit::AuditSchedule::default()).then(|| json(&schedule)).transpose()?)
         .execute(&mut *tx)
         .await
         .map_err(|e| unavailable(&e))?;
@@ -75,8 +72,80 @@ impl SqlStore {
         Ok(AuditOutcome::Applied {
             completed_at,
             report,
+            retry_at: audit::retry_at(progress.as_ref(), schedule),
         })
     }
+}
+
+async fn apply_step(
+    tx: &mut Transaction<'static, Any>,
+    request: &AuditRequest,
+    schedule: &mut audit::AuditSchedule,
+    rows: u64,
+) -> Result<(Option<AuditProgress>, Option<Timestamp>, AuditReport), StoreError> {
+    let account = request.account.as_str();
+    let mut report = AuditReport::default();
+    let mut completed_at = None;
+    let progress = match (&request.step, request.expected.as_ref()) {
+        (AuditStep::Page { ids, next }, _) => {
+            let repeated = if let Some(token) = next {
+                !mark_token(tx, account, token).await?
+            } else {
+                false
+            };
+            let (added, missing) = found_missing(tx, account, ids).await?;
+            queue_checks(tx, account, &missing, request.now).await?;
+            report.found_missing = u32::try_from(missing.len()).unwrap_or(u32::MAX);
+            let bounded = schedule.page_completed(rows, next.is_some());
+            let stalled = !added && (request.expected.is_some() || next.is_some());
+            report.abandoned = audit::listing_failure(repeated, stalled, bounded);
+            Some(audit::after_listing(next.clone()))
+        }
+        (AuditStep::Continue, Some(AuditProgress::Sweep(after))) => {
+            let (ids, unlisted) = sweep(tx, account, after.as_ref()).await?;
+            queue_checks(tx, account, &unlisted, request.now).await?;
+            report.found_unlisted = u32::try_from(unlisted.len()).unwrap_or(u32::MAX);
+            report.abandoned = schedule
+                .page_completed(rows, ids.len() == AUDIT_PAGE_SIZE)
+                .err();
+            Some(audit::after_sweep(&ids))
+        }
+        (AuditStep::Continue, Some(AuditProgress::Cleanup { after, complete })) => {
+            let ids = clear_seen(tx, account, after.as_deref()).await?;
+            let (next, finished) = audit::after_cleanup(&ids, *complete, request.now);
+            completed_at = finished;
+            if next.is_none() && !complete {
+                schedule.wait_after_abandonment(request);
+            }
+            next
+        }
+        (AuditStep::Defer(until), _) => {
+            schedule.defer(*until);
+            request.expected.clone()
+        }
+        (AuditStep::Abandon(reason), _) => {
+            report.abandoned = Some(*reason);
+            None
+        }
+        (AuditStep::Continue, _) => unreachable!("validated audit step"),
+    };
+    let progress = if report.abandoned.is_some() {
+        Some(schedule.abandon(request))
+    } else {
+        progress
+    };
+    Ok((progress, completed_at, report))
+}
+
+async fn mark_token(
+    tx: &mut Transaction<'static, Any>,
+    account: &str,
+    token: &PageToken,
+) -> Result<bool, StoreError> {
+    let insert = sqlx::query("INSERT INTO mailtide_audit_seen (account, id) VALUES ($1, $2) ON CONFLICT (account, id) DO NOTHING")
+        .bind(account).bind(audit::token_key(token)).execute(&mut **tx).await
+        .map_err(|e| unavailable(&e))?;
+    Ok(insert.rows_affected() == 1)
 }
 
 /// Mark what Gmail listed, then examine only newly observed audit ids. A
@@ -85,9 +154,9 @@ async fn found_missing(
     tx: &mut Transaction<'static, Any>,
     account: &str,
     ids: &[MessageId],
-) -> Result<Vec<MessageId>, StoreError> {
+) -> Result<(bool, Vec<MessageId>), StoreError> {
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok((false, Vec::new()));
     }
     let values = (2..ids.len() + 2)
         .map(|index| format!("($1, ${index})"))
@@ -99,7 +168,7 @@ async fn found_missing(
     )))
     .bind(account);
     for id in ids {
-        query = query.bind(id.0.as_str());
+        query = query.bind(audit::message_key(id));
     }
     let rows = query
         .fetch_all(&mut **tx)
@@ -107,16 +176,16 @@ async fn found_missing(
         .map_err(|e| unavailable(&e))?;
     let added: Vec<_> = rows.iter().map(id_from_row).collect::<Result<_, _>>()?;
     if added.is_empty() {
-        return Ok(added);
+        return Ok((false, added));
     }
     let placeholders = (2..added.len() + 2)
         .map(|index| format!("${index}"))
         .collect::<Vec<_>>()
         .join(", ");
     let mut query = sqlx::query(AssertSqlSafe(format!(
-        "SELECT s.id FROM mailtide_audit_seen s WHERE s.account = $1 AND s.id IN ({placeholders})
-           AND NOT EXISTS (SELECT 1 FROM mailtide_messages m WHERE m.account = s.account AND m.id = s.id)
-           AND NOT EXISTS (SELECT 1 FROM mailtide_tombstones t WHERE t.account = s.account AND t.id = s.id)"
+        "SELECT SUBSTR(s.id, 3) AS id FROM mailtide_audit_seen s WHERE s.account = $1 AND s.id IN ({placeholders})
+           AND NOT EXISTS (SELECT 1 FROM mailtide_messages m WHERE m.account = s.account AND m.id = SUBSTR(s.id, 3))
+           AND NOT EXISTS (SELECT 1 FROM mailtide_tombstones t WHERE t.account = s.account AND t.id = SUBSTR(s.id, 3))"
     ))).bind(account);
     for id in &added {
         query = query.bind(id.0.as_str());
@@ -125,7 +194,10 @@ async fn found_missing(
         .fetch_all(&mut **tx)
         .await
         .map_err(|e| unavailable(&e))?;
-    rows.iter().map(id_from_row).collect()
+    Ok((
+        true,
+        rows.iter().map(id_from_row).collect::<Result<_, _>>()?,
+    ))
 }
 
 fn after_key(after: Option<&MessageId>) -> &str {
@@ -146,7 +218,7 @@ async fn sweep(
     let rows = sqlx::query(
         "SELECT page.id, s.id AS seen
          FROM (SELECT id FROM mailtide_messages WHERE account = $1 AND id > $2 ORDER BY id LIMIT $3) page
-         LEFT JOIN mailtide_audit_seen s ON s.account = $1 AND s.id = page.id
+         LEFT JOIN mailtide_audit_seen s ON s.account = $1 AND s.id = ('m:' || page.id)
          ORDER BY page.id",
     )
     .bind(account).bind(after_key(after)).bind(i64::try_from(AUDIT_PAGE_SIZE).unwrap_or(i64::MAX))
@@ -167,9 +239,9 @@ async fn sweep(
 async fn clear_seen(
     tx: &mut Transaction<'static, Any>,
     account: &str,
-    after: Option<&MessageId>,
-) -> Result<Vec<MessageId>, StoreError> {
-    let after = after_key(after);
+    after: Option<&str>,
+) -> Result<Vec<String>, StoreError> {
+    let after = after.unwrap_or_default();
     let rows = sqlx::query(
         "SELECT id FROM mailtide_audit_seen WHERE account = $1 AND id > $2 ORDER BY id LIMIT $3",
     )
@@ -179,12 +251,15 @@ async fn clear_seen(
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| unavailable(&e))?;
-    let ids: Vec<_> = rows.iter().map(id_from_row).collect::<Result<_, _>>()?;
+    let ids: Vec<_> = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id").map_err(|e| corrupt("id", e)))
+        .collect::<Result<_, _>>()?;
     if let Some(last) = ids.last() {
         sqlx::query("DELETE FROM mailtide_audit_seen WHERE account = $1 AND id > $2 AND id <= $3")
             .bind(account)
             .bind(after)
-            .bind(last.0.as_str())
+            .bind(last.as_str())
             .execute(&mut **tx)
             .await
             .map_err(|e| unavailable(&e))?;

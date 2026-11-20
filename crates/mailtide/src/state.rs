@@ -94,6 +94,12 @@ pub struct StoreSnapshot {
     pub audited_at: Option<Timestamp>,
     /// The next page of an unfinished audit.
     pub audit_progress: Option<crate::audit::AuditProgress>,
+    /// Persisted audit retry time and page budget.
+    pub audit_schedule: crate::audit::AuditSchedule,
+    /// The account incarnation, changed when the account is tracked again.
+    pub account_generation: u64,
+    /// The generation of the stored label definitions.
+    pub label_generation: u64,
     /// The ids of the stored label definitions, to notice ids they lack.
     pub label_ids: LabelSet,
     /// When the drafts were last listed; `None` before the first listing
@@ -166,6 +172,9 @@ mod tests {
             labels_refreshed_at: None,
             audited_at: None,
             audit_progress: None,
+            audit_schedule: crate::audit::AuditSchedule::default(),
+            account_generation: 1,
+            label_generation: 0,
             label_ids: LabelSet::new(),
             drafts_refreshed_at: None,
         }

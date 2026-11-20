@@ -84,6 +84,8 @@ pub enum Fault {
     LostAfterApply,
     /// Answer 200 with a body that is not JSON, changing nothing.
     Undecodable,
+    /// Refuse with a rate-limit status and a Retry-After in seconds.
+    RateLimit(u16, &'static str, u64),
     /// Answer 200 with this body, changing nothing.
     Body(&'static str),
 }
@@ -493,6 +495,14 @@ impl GmailTransport for FakeGmail {
             .map(|(_, fault)| fault);
         match fault {
             Some(Fault::Status(status, reason)) => Ok(refusal(status, reason, "scripted")),
+            Some(Fault::RateLimit(status, reason, seconds)) => {
+                let mut response = refusal(status, reason, "scripted");
+                response
+                    .headers
+                    .push(("retry-after".into(), seconds.to_string()));
+                Ok(response)
+            }
+
             Some(Fault::LostAfterApply) => {
                 let _ = mailbox.answer(&request);
                 Err(TransportError::OutcomeUnknown("timed out".into()))
@@ -519,6 +529,12 @@ pub struct GateState {
     pub admitted: Mutex<Vec<(QuotaUnits, Priority)>>,
     /// Defer every admission by this long.
     pub deferring: Mutex<Option<Duration>>,
+    /// Deferral that applies only to a Backfill verification.
+    pub backfill_verify_deferral: Mutex<Option<Duration>>,
+    /// Deferral that applies only to a Backfill audit listing.
+    pub audit_deferral: Mutex<Option<Duration>>,
+    /// Pushback published to the shared gate.
+    pub cooldowns: Mutex<Vec<Cooldown>>,
 }
 
 /// The local gate, recording each admission's cost and class, deferring
@@ -547,6 +563,14 @@ impl QuotaGate for RecordingGate {
             .deferring
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let deferring = deferring.or_else(|| {
+            let lane = match (priority, cost) {
+                (Priority::Backfill, QuotaUnits(20)) => &self.state.backfill_verify_deferral,
+                (Priority::Backfill, QuotaUnits(5)) => &self.state.audit_deferral,
+                _ => return None,
+            };
+            *lane.lock().unwrap_or_else(PoisonError::into_inner)
+        });
         if let Some(by) = deferring {
             return Ok(Admission::Deferred {
                 until: now.plus(by),
@@ -560,6 +584,11 @@ impl QuotaGate for RecordingGate {
     }
 
     async fn cool_down(&self, cooldown: Cooldown) -> Result<(), GateError> {
+        self.state
+            .cooldowns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cooldown.clone());
         self.inner.cool_down(cooldown).await
     }
 

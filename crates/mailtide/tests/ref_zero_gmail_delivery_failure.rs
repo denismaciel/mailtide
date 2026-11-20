@@ -66,7 +66,7 @@ fn a_quota_deferral_of_a_delivery_is_no_failed_attempt_and_waits_as_long_as_the_
         deliver_job(&host, "a"),
         (
             6,
-            JobState::Ready {
+            JobState::Deferred {
                 due_at: gate_reopens
             }
         ),

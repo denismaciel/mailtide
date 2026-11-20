@@ -497,12 +497,19 @@ makes the change; this branch makes it, with
 3. **Confirm user-label omissions.** A partial answer can still contain
    every system label. Compare up to three complete listings under the
    generation fence. Confirm immediately for a held delivery, otherwise wait
-   one minute between attempts. The runner keeps an unfinished comparison
-   in memory across runs on that runner. A new process starts a fresh
-   comparison. `INBOX` and `UNREAD` are the core check because they back
-   the inbox and unread views. Retiring another system definition can then
-   update the catalogue without stripping the id from rows. Two consecutive
-   answers with the same omission still meet the confirmation rule.
+   one minute between attempts. A single cut keeps the catalogue and
+   message memberships in place and produces a confirmation wakeup.
+   Two consecutive answers with the same omission can strip a live label.
+   The runner keeps up to 128 unfinished comparisons in memory for three
+   minutes. Only the next claim of the same account incarnation and label
+   generation can use a comparison. An intervening claim that ends before
+   listing again consumes that evidence. A process that restarts every
+   short run can keep making a first listing and reporting a wakeup while the
+   old catalogue stays visible. Three inconsistent answers report failure.
+   A live refresh keeps the old catalogue and reconciliation retries from
+   baseline capture. INBOX and UNREAD are the core check because they back
+   the inbox and unread views. Retiring another system definition can
+   update the catalogue while preserving the id on message rows.
 4. **Per-message `LabelsChanged` entries for a removal**, up to one commit
    with as many entries as the label had messages. Would change to a single
    entry if `feed-pages` is not built and such commits prove too large.

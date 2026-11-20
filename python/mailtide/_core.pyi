@@ -89,6 +89,7 @@ class Status:
     label_listing_failures: int
     audit_found_missing: int
     audit_found_unlisted: int
+    audit_abandoned: str | None
     discovered: int | None
     imported: int | None
     discovery_complete: bool | None

@@ -70,6 +70,11 @@ pub enum EventKind {
         /// The next page, if any.
         next: Option<crate::ids::PageToken>,
     },
+    /// Gmail returned a malformed mailbox audit page.
+    AuditPageMalformed {
+        /// The Gmail command it answers.
+        command: CommandId,
+    },
     /// The store applied or rejected an audit step.
     AuditAdvanced {
         /// The store command it answers.

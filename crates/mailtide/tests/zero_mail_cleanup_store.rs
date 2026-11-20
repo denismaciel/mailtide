@@ -722,6 +722,8 @@ fn durable_spam_cleanup_rolls_back_target_removal_alongside_intent_admission_and
         claim: job.claim(),
         outcome: JobOutcome::Defer {
             due_at: Timestamp(60_000),
+            at: Timestamp(0),
+            priority: job.priority,
         },
     }];
     apply(&mut mirror, &deferred);
@@ -729,7 +731,7 @@ fn durable_spam_cleanup_rolls_back_target_removal_alongside_intent_admission_and
     assert_eq!(mirror.jobs[&kind].failed_attempts, 0);
     assert_eq!(
         mirror.jobs[&kind].state,
-        JobState::Ready {
+        JobState::Deferred {
             due_at: Timestamp(60_000)
         }
     );

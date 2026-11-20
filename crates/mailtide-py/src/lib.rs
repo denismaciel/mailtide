@@ -761,6 +761,7 @@ mod _core {
         label_listing_failures: u32,
         audit_found_missing: u32,
         audit_found_unlisted: u32,
+        audit_abandoned: Option<&'static str>,
         discovered: Option<u64>,
         imported: Option<u64>,
         discovery_complete: Option<bool>,
@@ -795,6 +796,10 @@ mod _core {
                 label_listing_failures: status.label_listing_failures,
                 audit_found_missing: status.audit.found_missing,
                 audit_found_unlisted: status.audit.found_unlisted,
+                audit_abandoned: status
+                    .audit
+                    .abandoned
+                    .map(mailtide::audit::AuditAbandonment::as_str),
                 discovered: status.import.map(|i| i.discovered),
                 imported: status.import.map(|i| i.imported),
                 discovery_complete: status.import.map(|i| i.discovery_complete),

@@ -561,7 +561,12 @@ fn durable_gmail_history_checkpoints_pauses_backfill_without_blocking_newly_arri
     });
     let old = &host.mirror.jobs[&JobKind::Import(m("old"))];
     assert_eq!(old.failed_attempts, 0, "a quota denial is not a failure");
-    assert_eq!(old.state, ready(60_000));
+    assert_eq!(
+        old.state,
+        JobState::Deferred {
+            due_at: Timestamp(60_000)
+        }
+    );
     assert_eq!(host.timers.get(&TimerKind::Jobs), Some(&Timestamp(60_000)));
 
     host.at(1_000).handle(EventKind::HistoryFetched {
@@ -572,7 +577,9 @@ fn durable_gmail_history_checkpoints_pauses_backfill_without_blocking_newly_arri
     host.only_call(&GmailRequest::ImportMessage { id: m("live") });
     assert_eq!(
         host.mirror.jobs[&JobKind::Import(m("old"))].state,
-        ready(60_000)
+        JobState::Deferred {
+            due_at: Timestamp(60_000)
+        }
     );
 }
 

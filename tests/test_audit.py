@@ -43,6 +43,7 @@ def test_the_audit_repairs_messages_history_missed() -> None:
         clock.advance(1)
         listing = runner.run(ACCOUNT)
         assert listing.status is not None
+        assert listing.next_run_at_ms == clock()
         assert listing.status.audit_found_missing == 1
         assert listing.status.audit_found_unlisted == 0
         assert runner.messages(ACCOUNT, ["missed"])[0].content is not None

@@ -124,10 +124,6 @@ where
         ("label definitions read back as last synced", |s| {
             Box::pin(label_definitions(s))
         }),
-        (
-            "mailbox audits persist progress and queue bounded verification",
-            |s| Box::pin(mailbox_audit(s)),
-        ),
     ];
     cases.extend(prioritise_cases());
     cases.extend(feed_page_cases());
@@ -137,6 +133,7 @@ where
     cases.extend(search_cases());
     cases.extend(message_facts_cases().into_iter().chain(draft_cases()));
     cases.extend(label_edit_cases().into_iter().chain(purge_cases()));
+    cases.extend(audit_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -2331,6 +2328,107 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
     )
 }
 
+fn audit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    use mailtide::audit::AuditAbandonment;
+    vec![
+        (
+            "mailbox audits persist progress and queue bounded verification",
+            |s| Box::pin(mailbox_audit(s)),
+        ),
+        ("audit abandons a token cycle with new ids", |s| {
+            Box::pin(abandon_audit(s, AuditAbandonment::RepeatedToken))
+        }),
+        ("audit abandons a continuation with no new ids", |s| {
+            Box::pin(abandon_audit(s, AuditAbandonment::NoProgress))
+        }),
+        (
+            "audit abandons a continually advancing listing at its durable page limit",
+            |s| Box::pin(abandon_audit(s, AuditAbandonment::PageBudget)),
+        ),
+    ]
+}
+
+async fn abandon_audit<S: Store>(
+    store: &S,
+    reason: mailtide::audit::AuditAbandonment,
+) -> Result<(), String> {
+    use mailtide::audit::AuditAbandonment;
+    let first = claim(store).await?;
+    let mut live = commit(&first, 0);
+    live.sync = Some(mailtide::state::SyncState::Live);
+    live.cursor = Some(CursorMove {
+        expected: None,
+        to: HistoryId(10),
+    });
+    apply(store, &live).await?;
+    let pages = match reason {
+        AuditAbandonment::RepeatedToken => vec![("A", "one"), ("B", "two"), ("A", "three")],
+        AuditAbandonment::NoProgress => vec![("A", "one"), ("B", "one")],
+        AuditAbandonment::PageBudget => vec![
+            ("A", "one"),
+            ("B", "two"),
+            ("C", "three"),
+            ("D", "four"),
+            ("E", "five"),
+            ("F", "six"),
+            ("G", "seven"),
+            ("H", "eight"),
+        ],
+        _ => unreachable!("these reasons are exercised by the runner"),
+    };
+    let final_page = pages.len() - 1;
+    for (index, (token, id)) in pages.into_iter().enumerate() {
+        let snapshot = claim(store).await?;
+        let outcome = audit_step(store, &snapshot, audit_page(&[id], Some(token)), 10).await?;
+        let AuditOutcome::Applied {
+            report,
+            completed_at: None,
+            retry_at: None,
+        } = outcome
+        else {
+            return Err(format!("unexpected page result {outcome:?}"));
+        };
+        expect(
+            report.abandoned == (index == final_page).then_some(reason),
+            "audit abandons on the expected page",
+        )?;
+    }
+    let snapshot = claim(store).await?;
+    expect(
+        matches!(
+            snapshot.audit_progress,
+            Some(AuditProgress::Cleanup {
+                complete: false,
+                ..
+            })
+        ),
+        "abandoned audit skips the sweep",
+    )?;
+    expect(
+        snapshot.audit_schedule.retry_at == Some(Timestamp(60_010)),
+        "abandonment sets a durable retry floor",
+    )?;
+    let result = audit_step(store, &snapshot, AuditStep::Continue, 70_000).await?;
+    expect(
+        matches!(
+            result,
+            AuditOutcome::Applied {
+                retry_at: Some(Timestamp(130_000)),
+                completed_at: None,
+                ..
+            }
+        ),
+        "cleanup preserves a future wake",
+    )?;
+    let snapshot = claim(store).await?;
+    expect(
+        snapshot.audit_progress.is_none()
+            && snapshot.audited_at.is_none()
+            && snapshot.audit_schedule.retry_at == Some(Timestamp(130_000)),
+        "restart keeps retry schedule without marking the audit complete",
+    )
+}
+
 async fn mailbox_audit<S: Store>(store: &S) -> Result<(), String> {
     use mailtide::audit::AUDIT_PAGE_SIZE;
     use mailtide::state::SyncState;
@@ -2367,7 +2465,7 @@ async fn mailbox_audit<S: Store>(store: &S) -> Result<(), String> {
         audit_step(
             store,
             &snapshot,
-            audit_page(&["kept", "missing", "missing", "tombstone"], Some("page2")),
+            audit_page(&["kept", "missing", "missing"], Some("page2")),
             11,
         )
         .await?
@@ -2386,7 +2484,13 @@ async fn mailbox_audit<S: Store>(store: &S) -> Result<(), String> {
         "an old worker cannot advance the audit",
     )?;
     expect(
-        audit_step(store, &next, audit_page(&["missing"], None), 12).await?
+        audit_step(
+            store,
+            &next,
+            audit_page(&["missing", "tombstone"], None),
+            12,
+        )
+        .await?
             == audit_applied(0, 0, None),
         "repeated id is counted once",
     )?;
@@ -2407,9 +2511,11 @@ fn audit_applied(
 ) -> AuditOutcome {
     AuditOutcome::Applied {
         completed_at,
+        retry_at: None,
         report: AuditReport {
             found_missing,
             found_unlisted,
+            abandoned: None,
         },
     }
 }
@@ -2427,6 +2533,7 @@ async fn audit_step<S: Store>(
             expected: snapshot.audit_progress.clone(),
             step,
             now: Timestamp(now),
+            interval: std::time::Duration::from_hours(24),
         })
         .await
         .map_err(|error| format!("{error:?}"))

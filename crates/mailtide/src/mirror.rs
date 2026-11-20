@@ -193,6 +193,8 @@ pub struct AccountRecord {
     pub audited_at: Option<Timestamp>,
     /// The next page of an unfinished audit.
     pub audit_progress: Option<crate::audit::AuditProgress>,
+    /// Persisted audit retry time and page budget.
+    pub audit_schedule: crate::audit::AuditSchedule,
     /// Change-feed entries at or before this state were compacted away.
     pub log_floor: StateSeq,
     /// Which incarnation of the account this is: set when it is tracked, so
@@ -233,6 +235,7 @@ impl AccountRecord {
             labels_refreshed_at: None,
             audited_at: None,
             audit_progress: None,
+            audit_schedule: crate::audit::AuditSchedule::default(),
             log_floor: StateSeq(0),
             generation,
             label_generation: 0,
@@ -614,6 +617,15 @@ pub fn enqueue(existing: Option<&Job>, new: &NewJob) -> Job {
             failed_attempts: 0,
             state: JobState::Ready { due_at: new.due_at },
         },
+        Some(job)
+            if new.priority > job.priority && matches!(job.state, JobState::Deferred { .. }) =>
+        {
+            Job {
+                priority: new.priority,
+                state: JobState::Ready { due_at: new.due_at },
+                ..job.clone()
+            }
+        }
         Some(job) => Job {
             priority: job.priority.max(new.priority),
             ..job.clone()
@@ -631,8 +643,12 @@ pub fn finish(job: &Job, outcome: &JobOutcome) -> Option<Job> {
             state: JobState::Ready { due_at: *due_at },
             ..job.clone()
         }),
-        JobOutcome::Defer { due_at } => Some(Job {
-            state: JobState::Ready { due_at: *due_at },
+        JobOutcome::Defer { at, priority, .. } if *priority < job.priority => Some(Job {
+            state: JobState::Ready { due_at: *at },
+            ..job.clone()
+        }),
+        JobOutcome::Defer { due_at, .. } => Some(Job {
+            state: JobState::Deferred { due_at: *due_at },
             ..job.clone()
         }),
         JobOutcome::Block(failure) => Some(Job {
@@ -906,7 +922,7 @@ pub struct AccountMirror {
     /// Reconciliation: scopes each message was listed in.
     pub seen: BTreeMap<MessageId, BTreeSet<ListScope>>,
     /// Ids collected by the current mailbox audit.
-    pub audit_seen: BTreeSet<MessageId>,
+    pub audit_seen: BTreeSet<String>,
     /// Label definitions.
     pub labels: Vec<Label>,
     /// Pending user actions, one per (message, label).
@@ -1041,6 +1057,9 @@ impl AccountMirror {
             labels_refreshed_at: self.record.labels_refreshed_at,
             audited_at: self.record.audited_at,
             audit_progress: self.record.audit_progress.clone(),
+            audit_schedule: self.record.audit_schedule,
+            account_generation: self.record.generation,
+            label_generation: self.record.label_generation,
             label_ids: self.labels.iter().map(|label| label.id.clone()).collect(),
             drafts_refreshed_at: self.record.drafts_refreshed_at,
         }
@@ -1057,17 +1076,26 @@ impl AccountMirror {
         }
         let mut report = AuditReport::default();
         let mut completed_at = None;
-        self.record.audit_progress = match (&request.step, request.expected.as_ref()) {
+        let mut schedule = self.record.audit_schedule;
+        let progress = match (&request.step, request.expected.as_ref()) {
             (AuditStep::Page { ids, next }, _) => {
+                let repeated = next
+                    .as_ref()
+                    .is_some_and(|token| !self.audit_seen.insert(audit::token_key(token)));
+                let mut added = false;
                 for id in ids {
-                    if self.audit_seen.insert(id.clone())
-                        && !self.messages.contains_key(id)
-                        && !self.tombstones.contains_key(id)
+                    let fresh = self.audit_seen.insert(audit::message_key(id));
+                    added |= fresh;
+                    if fresh && !self.messages.contains_key(id) && !self.tombstones.contains_key(id)
                     {
                         report.found_missing += 1;
                         self.enqueue(&audit::verify(id.clone(), request.now));
                     }
                 }
+                let rows = u64::try_from(self.messages.len()).unwrap_or(u64::MAX);
+                let bounded = schedule.page_completed(rows, next.is_some());
+                let stalled = !added && (request.expected.is_some() || next.is_some());
+                report.abandoned = audit::listing_failure(repeated, stalled, bounded);
                 Some(audit::after_listing(next.clone()))
             }
             (AuditStep::Continue, Some(AuditProgress::Sweep(after))) => {
@@ -1079,18 +1107,22 @@ impl AccountMirror {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in &ids {
-                    if !self.audit_seen.contains(id) {
+                    if !self.audit_seen.contains(&audit::message_key(id)) {
                         report.found_unlisted += 1;
                         self.enqueue(&audit::verify(id.clone(), request.now));
                     }
                 }
+                let rows = u64::try_from(self.messages.len()).unwrap_or(u64::MAX);
+                report.abandoned = schedule
+                    .page_completed(rows, ids.len() == AUDIT_PAGE_SIZE)
+                    .err();
                 Some(audit::after_sweep(&ids))
             }
             (AuditStep::Continue, Some(AuditProgress::Cleanup { after, complete })) => {
                 let lower = after.as_ref().map_or(Unbounded, Excluded);
                 let ids: Vec<_> = self
                     .audit_seen
-                    .range::<MessageId, _>((lower, Unbounded))
+                    .range::<String, _>((lower, Unbounded))
                     .take(AUDIT_PAGE_SIZE)
                     .cloned()
                     .collect();
@@ -1099,17 +1131,35 @@ impl AccountMirror {
                 }
                 let (next, finished) = audit::after_cleanup(&ids, *complete, request.now);
                 completed_at = finished;
+                if next.is_none() && !complete {
+                    schedule.wait_after_abandonment(request);
+                }
                 next
             }
-            (AuditStep::Restart, _) => Some(audit::cleanup(false)),
+            (AuditStep::Defer(until), _) => {
+                schedule.defer(*until);
+                request.expected.clone()
+            }
+            (AuditStep::Abandon(reason), _) => {
+                report.abandoned = Some(*reason);
+                None
+            }
             (AuditStep::Continue, _) => unreachable!("validated audit step"),
+        };
+        self.record.audit_progress = if report.abandoned.is_some() {
+            Some(schedule.abandon(request))
+        } else {
+            progress
         };
         if let Some(at) = completed_at {
             self.record.audited_at = Some(self.record.audited_at.map_or(at, |last| last.max(at)));
+            schedule = audit::AuditSchedule::default();
         }
+        self.record.audit_schedule = schedule;
         AuditOutcome::Applied {
             completed_at,
             report,
+            retry_at: audit::retry_at(self.record.audit_progress.as_ref(), schedule),
         }
     }
 
@@ -1396,13 +1446,13 @@ impl AccountMirror {
                 });
             let verify_queued = self.jobs.contains_key(&JobKind::Verify(id.clone()));
             let import_queued = self.jobs.contains_key(&JobKind::Import(id.clone()));
-            if awaiting && !verify_queued {
+            if awaiting {
                 self.enqueue(&NewJob {
                     kind: JobKind::Verify(id),
                     priority: Priority::Live,
                     due_at: commit.job_plan.confirm_due_at,
                 });
-            } else if unverified && !verify_queued && !import_queued {
+            } else if unverified && (verify_queued || !import_queued) {
                 self.enqueue(&NewJob {
                     kind: JobKind::Verify(id),
                     priority: commit.job_plan.priority,
@@ -2131,7 +2181,10 @@ impl AccountMirror {
             .filter(|job| {
                 matches!(job.kind, JobKind::Import(_))
                     && job.priority == Priority::Foreground
-                    && matches!(job.state, JobState::Ready { .. } | JobState::Running(_))
+                    && matches!(
+                        job.state,
+                        JobState::Ready { .. } | JobState::Deferred { .. } | JobState::Running(_)
+                    )
             })
             .count()
     }
@@ -2173,17 +2226,17 @@ impl AccountMirror {
                 (None, _) | (Some(Content::Pending), None) => &mut report.unknown,
                 (Some(Content::Pending), Some(job)) => match job.state {
                     JobState::Blocked(_) => &mut report.blocked,
-                    JobState::Ready { .. } | JobState::Running(_)
+                    JobState::Ready { .. } | JobState::Deferred { .. } | JobState::Running(_)
                         if job.priority == Priority::Foreground =>
                     {
                         &mut report.queued
                     }
-                    JobState::Ready { .. } | JobState::Running(_)
+                    JobState::Ready { .. } | JobState::Deferred { .. } | JobState::Running(_)
                         if foreground >= FOREGROUND_IMPORT_CAP =>
                     {
                         &mut report.over_limit
                     }
-                    JobState::Ready { .. } | JobState::Running(_) => {
+                    JobState::Ready { .. } | JobState::Deferred { .. } | JobState::Running(_) => {
                         let raised = crate::jobs::prioritise(job, now);
                         self.jobs.insert(kind, raised);
                         foreground += 1;

@@ -144,6 +144,7 @@ const MIGRATIONS: &[&[&str]] = &[&[
 &[
     "ALTER TABLE mailtide_accounts ADD COLUMN audited_at BIGINT",
     "ALTER TABLE mailtide_accounts ADD COLUMN audit_progress TEXT",
+    "ALTER TABLE mailtide_accounts ADD COLUMN audit_schedule TEXT",
     "CREATE TABLE mailtide_audit_seen (
         account TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (account, id))",
 ]];
@@ -580,7 +581,7 @@ impl SqlStore {
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
             "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at,
-               label_generation, deleted_labels, drafts_generation, drafts_refreshed_at, audited_at, audit_progress
+               label_generation, deleted_labels, drafts_generation, drafts_refreshed_at, audited_at, audit_progress, audit_schedule
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -607,6 +608,9 @@ impl SqlStore {
         let audit_progress: Option<String> = row
             .try_get("audit_progress")
             .map_err(|e| corrupt("audit_progress", e))?;
+        let audit_schedule: Option<String> = row
+            .try_get("audit_schedule")
+            .map_err(|e| corrupt("audit_schedule", e))?;
         let record = AccountRecord {
             epoch: Epoch(uint("epoch", get_i("epoch")?)?),
             engine_version: EngineVersion(
@@ -630,6 +634,11 @@ impl SqlStore {
                 .as_deref()
                 .map(|value| parse("audit_progress", value))
                 .transpose()?,
+            audit_schedule: audit_schedule
+                .as_deref()
+                .map(|value| parse("audit_schedule", value))
+                .transpose()?
+                .unwrap_or_default(),
             log_floor: StateSeq(uint("log_floor", get_i("log_floor")?)?),
             generation: uint("generation", get_i("generation")?)?,
             label_generation: uint("label_generation", get_i("label_generation")?)?,
@@ -1152,6 +1161,9 @@ impl SqlStore {
             labels_refreshed_at: record.labels_refreshed_at,
             audited_at: record.audited_at,
             audit_progress: record.audit_progress,
+            audit_schedule: record.audit_schedule,
+            account_generation: record.generation,
+            label_generation: record.label_generation,
             label_ids,
             drafts_refreshed_at: record.drafts_refreshed_at,
         })
@@ -1277,7 +1289,7 @@ impl SqlStore {
         };
         let sql = format!(
             "SELECT kind, message, priority, failed_attempts, state, due_at, attempt, failure FROM mailtide_jobs
-             WHERE account = $1 AND state = 'ready' AND due_at <= $2 AND priority >= $4
+             WHERE account = $1 AND state IN ('ready', 'deferred') AND due_at <= $2 AND priority >= $4
              ORDER BY priority DESC, due_at ASC, kind ASC, message ASC LIMIT $3{skip_locked}"
         );
         // Only a constant lock clause is appended.
@@ -1320,7 +1332,7 @@ impl SqlStore {
             });
         }
         let row = sqlx::query(
-            "SELECT MIN(due_at) AS due FROM mailtide_jobs WHERE account = $1 AND state = 'ready'",
+            "SELECT MIN(due_at) AS due FROM mailtide_jobs WHERE account = $1 AND state IN ('ready', 'deferred')",
         )
         .bind(account.as_str())
         .fetch_one(&mut *tx)
@@ -1886,6 +1898,9 @@ fn job_from_row(row: &AnyRow) -> Result<Job, StoreError> {
         "ready" => JobState::Ready {
             due_at: Timestamp(due_at.ok_or_else(|| corrupt("due_at", "missing"))?),
         },
+        "deferred" => JobState::Deferred {
+            due_at: Timestamp(due_at.ok_or_else(|| corrupt("due_at", "missing"))?),
+        },
         "running" => JobState::Running(AttemptId(
             attempt
                 .ok_or_else(|| corrupt("attempt", "missing"))?
@@ -1922,6 +1937,7 @@ async fn put_job(
     let (code, message) = kind_code(&job.kind);
     let (state, due_at, attempt, failure) = match &job.state {
         JobState::Ready { due_at } => ("ready", Some(due_at.0), None, None),
+        JobState::Deferred { due_at } => ("deferred", Some(due_at.0), None, None),
         JobState::Running(attempt) => ("running", None, Some(attempt.0.cast_signed()), None),
         JobState::Blocked(failure) => ("blocked", None, None, Some(json(failure)?)),
     };
@@ -2532,7 +2548,7 @@ impl crate::Store for SqlStore {
         Self::load_rows(&mut tx, account, &distinct, &mut mirror).await?;
         let row = sqlx::query(
             "SELECT COUNT(*) AS n FROM mailtide_jobs WHERE account = $1 AND kind = $2
-             AND priority = $3 AND state IN ('ready', 'running')",
+             AND priority = $3 AND state IN ('ready', 'deferred', 'running')",
         )
         .bind(account.as_str())
         .bind(kind_code(&JobKind::Import(MessageId(String::new()))).0)

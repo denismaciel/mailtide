@@ -387,7 +387,10 @@ pub fn check_state(mirror: &AccountMirror) -> Vec<Violation> {
                 .is_some_and(|job| {
                     matches!(
                         job.state,
-                        JobState::Ready { .. } | JobState::Running(_) | JobState::Blocked(_)
+                        JobState::Ready { .. }
+                            | JobState::Deferred { .. }
+                            | JobState::Running(_)
+                            | JobState::Blocked(_)
                     )
                 });
             if !has_job {

@@ -415,6 +415,7 @@ mod tests {
                 next: None,
             },
             now,
+            interval: std::time::Duration::from_hours(24),
         };
         refused("advance_audit", store.advance_audit(&audit).await.err());
         refused("labels", store.labels(account).await.err());
@@ -1226,8 +1227,10 @@ mod tests {
     fn audit_rollback() -> Vec<String> {
         let (_, migration) = audit_migration();
         vec![
+            "UPDATE mailtide_jobs SET state = 'ready' WHERE state = 'deferred'".to_owned(),
             "DROP TABLE mailtide_audit_seen".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN audit_progress".to_owned(),
+            "ALTER TABLE mailtide_accounts DROP COLUMN audit_schedule".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN audited_at".to_owned(),
             format!(
                 "DELETE FROM mailtide_schema WHERE version = {}",
@@ -1262,6 +1265,10 @@ mod tests {
             .expect("claim");
         assert_eq!(snapshot.audited_at, None);
         assert_eq!(snapshot.audit_progress, None);
+        assert_eq!(
+            snapshot.audit_schedule,
+            mailtide::audit::AuditSchedule::default()
+        );
         for statement in audit_rollback() {
             store
                 .inner

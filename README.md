@@ -8,7 +8,10 @@ carries user actions back to Gmail. Rust core with no I/O of its own
 Wheels for CPython ≥ 3.12 (abi3) and free-threaded 3.14t/3.15t; thread safe.
 
 A daily completeness audit verifies messages that Gmail history or a
-reconciliation missed. It runs in the background and resumes across runs.
+reconciliation missed. Schedule the next account run from `Idle.next`
+(`next_run_at_ms` in Python), including when no push arrives. Each claim
+advances at most one audit step. Stop old workers before migrating the
+database because running workers cache the schema check.
 
 ## Install
 

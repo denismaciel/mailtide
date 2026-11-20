@@ -159,6 +159,8 @@ pub struct Faults {
     /// A host draft call is not atomic: Gmail acts later (a send, within
     /// its request timeout) and the answer is recorded steps later.
     pub draft_late: Probability,
+    /// Always omit the first user label, to characterize identical cuts.
+    pub repeat_label_cut: bool,
     /// Use unsafe live offsets for message listings, for regression tests.
     pub offset_paging: bool,
 }
@@ -181,6 +183,7 @@ impl Faults {
             draft_record_lost: Probability::NEVER,
             draft_late: Probability::NEVER,
             offset_paging: false,
+            repeat_label_cut: false,
         }
     }
 
@@ -201,6 +204,7 @@ impl Faults {
             draft_record_lost: rng.probability(0.3),
             draft_late: rng.probability(0.5),
             offset_paging: false,
+            repeat_label_cut: false,
         }
     }
 }
@@ -2563,7 +2567,15 @@ impl Sim {
     fn list_labels(&mut self, command: CommandId) -> EventKind {
         self.stats.label_listings += 1;
         let mut labels = self.gmail.labels();
-        if self.rng.chance(self.faults.bad_listing) {
+        if self.faults.repeat_label_cut {
+            self.stats.bad_listings += 1;
+            if let Some(index) = labels
+                .iter()
+                .position(|label| !mailtide::mirror::is_system_label(label))
+            {
+                labels.remove(index);
+            }
+        } else if self.rng.chance(self.faults.bad_listing) {
             self.stats.bad_listings += 1;
             if self.rng.chance(Probability(0.5)) {
                 // No labels: the driver refuses to decode it and asks again
@@ -3560,6 +3572,69 @@ mod tests {
                 .iter()
                 .any(|r| r.faults.draft_late != Probability::NEVER),
             "draft calls were not atomic"
+    }
+
+    #[test]
+    fn two_identical_core_complete_cuts_can_strip_a_live_user_label() {
+        let mut sim = Sim::new(Rng(1), Faults::none(), None);
+        let live = LabelId("Label_1".into());
+        let id = sim.gmail.add(
+            ThreadId("label-test".into()),
+            labels::set(["Label_1", "INBOX"]),
+        );
+        sim.pending.extend(sim.engine.start(sim.now));
+        assert!(matches!(sim.heal(), Convergence::Reached { .. }));
+        assert!(sim.mirror.messages[&id].labels.contains(&live));
+        sim.faults.repeat_label_cut = true;
+        sim.now = sim.now.plus(EngineConfig::default().label_refresh);
+        for round in 0..2 {
+            let events = sim.engine.handle(Event {
+                now: sim.now,
+                kind: EventKind::TimerFired {
+                    timer: TimerKind::Labels,
+                },
+            });
+            let command = events
+                .into_iter()
+                .find(|command| {
+                    matches!(&command.kind,
+                        CommandKind::Gmail(call) if call.request == GmailRequest::ListLabels
+                    )
+                })
+                .expect("label listing");
+            let answer = sim.list_labels(command.id);
+            let EventKind::LabelsListed { labels, .. } = &answer else {
+                panic!("well-formed cut");
+            };
+            assert!(
+                LABELS
+                    .iter()
+                    .all(|id| labels.iter().any(|label| label.id.0 == *id))
+            );
+            assert!(labels.iter().all(|label| label.id != live));
+            let commands = sim.engine.handle(Event {
+                now: sim.now,
+                kind: answer,
+            });
+            if round == 0 {
+                assert!(
+                    commands
+                        .iter()
+                        .all(|command| !matches!(command.kind, CommandKind::Commit(_)))
+                );
+                assert!(sim.mirror.messages[&id].labels.contains(&live));
+            } else {
+                for command in commands {
+                    sim.execute(command);
+                }
+            }
+            sim.now = sim.now.plus(mailtide::schedule::UNKNOWN_LABEL_GAP);
+        }
+        assert!(
+            sim.violations
+                .iter()
+                .any(|observed| matches!(&observed.violation,
+            Violation::LiveLabelStripped { message, label } if message == &id && label == &live))
         );
     }
 

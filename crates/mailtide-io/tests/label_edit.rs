@@ -1180,3 +1180,57 @@ async fn a_listing_answered_after_a_local_write_is_not_applied() {
             .any(|label| label.id == id("Label_1"))
     );
 }
+
+#[tokio::test]
+async fn an_intervening_runner_listing_invalidates_a_carried_cut() {
+    use mailtide_store::{Store as _, sqlite::SqliteStore};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    };
+    let store = SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("store");
+    store.migrate().await.expect("migrate");
+    store.track(&account(), 1).await.expect("track");
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let gate = Arc::new(label_support::GateState::default());
+    let runner = || {
+        let gmail = label_support::FakeGmail::default();
+        label_support::with_defaults(&gmail);
+        let id = gmail.mailbox().create_label("Kept");
+        gmail.mailbox().add("m1", &[&id]);
+        label_support::runner_over(store.clone(), gmail, Access::ReadWrite, &clock, &gate)
+    };
+    let a = runner();
+    let b = runner();
+    a.run(&account(), BUDGET).await.expect("bootstrap");
+    clock.fetch_add(960_000, Ordering::SeqCst);
+    a.transport()
+        .mailbox()
+        .fail_next("GET labels", Fault::Body(CORE_LABELS));
+    a.run(&account(), BUDGET).await.expect("first cut");
+    b.run(&account(), BUDGET)
+        .await
+        .expect("intervening full listing");
+    clock.fetch_add(960_000, Ordering::SeqCst);
+    a.transport()
+        .mailbox()
+        .fail_next("GET labels", Fault::Body(CORE_LABELS));
+    a.run(&account(), BUDGET).await.expect("second cut");
+    assert!(
+        a.labels(&account())
+            .await
+            .expect("definitions")
+            .iter()
+            .any(|label| label.id == id("Label_1"))
+    );
+    assert_eq!(
+        store
+            .messages(&account(), &[MessageId("m1".into())])
+            .await
+            .expect("messages")[0]
+            .labels,
+        set(["Label_1"])
+    );
+}

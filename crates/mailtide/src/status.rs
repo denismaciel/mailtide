@@ -98,7 +98,9 @@ impl JobCounts {
     /// Count one job.
     pub fn add(&mut self, state: &crate::jobs::JobState) {
         match state {
-            crate::jobs::JobState::Ready { .. } => self.ready += 1,
+            crate::jobs::JobState::Ready { .. } | crate::jobs::JobState::Deferred { .. } => {
+                self.ready += 1;
+            }
             crate::jobs::JobState::Running(_) => self.running += 1,
             crate::jobs::JobState::Blocked(_) => self.blocked += 1,
         }

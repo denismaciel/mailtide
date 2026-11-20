@@ -191,6 +191,8 @@ impl Mailbox {
                     claim: job.claim(),
                     outcome: JobOutcome::Defer {
                         due_at: Timestamp(now),
+                        at: Timestamp(now),
+                        priority: job.priority,
                     },
                 })
                 .collect();

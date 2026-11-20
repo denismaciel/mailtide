@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tracing::Instrument as _;
@@ -16,7 +16,7 @@ use mailtide::engine::{LabelConfirmation, Stopped};
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{ImportedMessage, Label, MessageFacts};
 use mailtide::ids::{
-    AccountId, CommandId, ENGINE_VERSION, Epoch, HistoryId, MessageId, ThreadId, Timestamp,
+    AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, ThreadId, Timestamp,
 };
 use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
 use mailtide::labels::LabelSet;
@@ -196,7 +196,101 @@ pub struct Runner<S, B, T, Q, A> {
     pub(crate) clock: crate::Clock,
     extract: fn(&[u8]) -> MessageFacts,
     purge: PurgePolicy,
-    label_confirmations: Mutex<BTreeMap<AccountId, (Epoch, Option<LabelConfirmation>)>>,
+    label_confirmations: LabelConfirmations,
+}
+
+// Pending evidence is single-use. The active entry lets forget and
+// overlapping runs invalidate evidence even before a run finishes.
+const MAX_LABEL_CONFIRMATIONS: usize = 128;
+
+#[derive(Debug)]
+enum CachedConfirmation {
+    Running(Arc<()>),
+    Pending(LabelConfirmation),
+}
+
+#[derive(Debug, Default)]
+struct LabelConfirmations(Mutex<BTreeMap<AccountId, (Timestamp, CachedConfirmation)>>);
+
+impl LabelConfirmations {
+    fn remove(&self, account: &AccountId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(account);
+    }
+
+    fn start<'a>(
+        &'a self,
+        account: &'a AccountId,
+        now: Timestamp,
+    ) -> (ConfirmationRun<'a>, Option<LabelConfirmation>) {
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|_, (_, entry)| match entry {
+            CachedConfirmation::Running(_) => true,
+            CachedConfirmation::Pending(evidence) => now < evidence.expires_at(),
+        });
+        let previous = match cache.remove(account) {
+            Some((_, CachedConfirmation::Pending(evidence))) => Some(evidence),
+            _ => None,
+        };
+        if cache.len() >= MAX_LABEL_CONFIRMATIONS
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (started, _))| *started)
+                .map(|(id, _)| id.clone())
+        {
+            cache.remove(&oldest);
+        }
+        let run = ConfirmationRun {
+            cache: self,
+            account,
+            token: Arc::new(()),
+        };
+        cache.insert(
+            account.clone(),
+            (now, CachedConfirmation::Running(Arc::clone(&run.token))),
+        );
+        (run, previous)
+    }
+}
+
+struct ConfirmationRun<'a> {
+    cache: &'a LabelConfirmations,
+    account: &'a AccountId,
+    token: Arc<()>,
+}
+
+impl ConfirmationRun<'_> {
+    fn owns(&self, entry: &CachedConfirmation) -> bool {
+        matches!(entry, CachedConfirmation::Running(token) if Arc::ptr_eq(token, &self.token))
+    }
+
+    fn finish(self, report: SyncReport, engine: &Engine, stop: StopReason) -> RunOutcome {
+        if engine.stopped().is_none()
+            && let Some(evidence) = engine.label_confirmation()
+        {
+            let mut cache = self.cache.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((_, entry)) = cache.get_mut(self.account)
+                && self.owns(entry)
+            {
+                *entry = CachedConfirmation::Pending(evidence);
+            }
+        }
+        finish(report, engine, stop)
+    }
+}
+
+impl Drop for ConfirmationRun<'_> {
+    fn drop(&mut self) {
+        let mut cache = self.cache.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache
+            .get(self.account)
+            .is_some_and(|(_, entry)| self.owns(entry))
+        {
+            cache.remove(self.account);
+        }
+    }
 }
 
 /// What one run did.
@@ -646,7 +740,7 @@ where
             clock: crate::Clock::system(),
             extract: mailtide_mime::facts,
             purge: PurgePolicy::Off,
-            label_confirmations: Mutex::default(),
+            label_confirmations: LabelConfirmations::default(),
         }
     }
 
@@ -1121,7 +1215,10 @@ where
 
     /// Delete everything stored for `account`: rows, then raw content.
     pub async fn forget(&self, account: &AccountId) -> Result<Forgotten, RunError> {
-        let store = self.store.forget(account).await.map_err(RunError::Store)?;
+        self.label_confirmations.remove(account);
+        let forgotten = self.store.forget(account).await;
+        self.label_confirmations.remove(account);
+        let store = forgotten.map_err(RunError::Store)?;
         let blobs = self
             .blobs
             .delete_account(account)
@@ -1224,7 +1321,11 @@ where
 
     /// Claim the account and build its engine; `None` when a newer engine
     /// holds it.
-    async fn claim_engine(&self, account: &AccountId) -> Result<Option<Engine>, RunError> {
+    async fn claim_engine(
+        &self,
+        account: &AccountId,
+        previous: Option<LabelConfirmation>,
+    ) -> Result<Option<Engine>, RunError> {
         let snapshot = match self.store.claim(account, ENGINE_VERSION).await {
             Ok(snapshot) => snapshot,
             Err(StoreError::Rejected(_)) => return Ok(None),
@@ -1238,20 +1339,8 @@ where
             ..self.config.engine.clone()
         };
         let mut engine = Engine::new(snapshot, config);
-        {
-            let mut confirmations = self
-                .label_confirmations
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let (epoch, pending) = confirmations
-                .entry(account.clone())
-                .or_insert((engine.epoch(), None));
-            if *epoch <= engine.epoch() {
-                *epoch = engine.epoch();
-                if let Some(confirmation) = pending.take() {
-                    engine.restore_label_confirmation(confirmation);
-                }
-            }
+        if let Some(previous) = previous {
+            engine.restore_label_confirmation(previous, self.clock.now());
         }
         Ok(Some(engine))
     }
@@ -1294,7 +1383,9 @@ where
         let started = Instant::now();
         let mut reported = started;
         let deadline = started + budget;
-        let Some(mut engine) = self.claim_engine(account).await? else {
+        let (confirmation_run, previous) =
+            self.label_confirmations.start(account, self.clock.now());
+        let Some(mut engine) = self.claim_engine(account, previous).await? else {
             return Ok(RunOutcome {
                 report: SyncReport::default(),
                 stop: StopReason::Superseded,
@@ -1321,10 +1412,14 @@ where
                         (StopReason::Blocked(_), Some(_)) => StopReason::Superseded,
                         (stop, _) => stop,
                     };
-                    return Ok(self.finish(account, report, &engine, stop));
+                    return Ok(confirmation_run.finish(report, &engine, stop));
                 }
                 if Instant::now() > deadline {
-                    return Ok(self.finish(account, report, &engine, StopReason::BudgetExhausted));
+                    return Ok(confirmation_run.finish(
+                        report,
+                        &engine,
+                        StopReason::BudgetExhausted,
+                    ));
                 }
                 if let Some(progress) = progress
                     && reported.elapsed() >= PROGRESS_EVERY
@@ -1358,7 +1453,7 @@ where
                 }
             }
             if let Some(stop) = stopped(&engine) {
-                return Ok(self.finish(account, report, &engine, stop));
+                return Ok(confirmation_run.finish(report, &engine, stop));
             }
             let clock = self.clock.now();
             let due: Vec<TimerKind> = timers
@@ -1372,19 +1467,8 @@ where
                     reported = Instant::now();
                     continue;
                 }
-                let stop = match engine.status().cooldown {
-                    Some(cooldown) if cooldown.until > clock => StopReason::CoolingDown {
-                        until: cooldown.until,
-                    },
-                    Some(_) | None => StopReason::Idle {
-                        next: timers
-                            .values()
-                            .copied()
-                            .chain(engine.audit_next_run())
-                            .min(),
-                    },
-                };
-                return Ok(self.finish(account, report, &engine, stop));
+                let stop = idle_stop(&engine, timers.values().copied().min(), clock);
+                return Ok(confirmation_run.finish(report, &engine, stop));
             }
             for timer in due {
                 timers.remove(&timer);
@@ -1394,36 +1478,6 @@ where
                 }));
             }
         }
-    }
-
-    fn finish(
-        &self,
-        account: &AccountId,
-        report: SyncReport,
-        engine: &Engine,
-        stop: StopReason,
-    ) -> RunOutcome {
-        let mut confirmations = self
-            .label_confirmations
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if confirmations
-            .get(account)
-            .is_some_and(|(epoch, _)| *epoch == engine.epoch())
-        {
-            match engine
-                .label_confirmation()
-                .filter(|_| engine.stopped().is_none())
-            {
-                Some(confirmation) => {
-                    confirmations.insert(account.clone(), (engine.epoch(), Some(confirmation)));
-                }
-                None => {
-                    confirmations.remove(account);
-                }
-            }
-        }
-        finish(report, engine, stop)
     }
 
     /// Apply the queued commits of a stopped engine; drop everything else.
@@ -1659,6 +1713,9 @@ where
             .await;
         let duration_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &outcome {
+            Outcome::Event(EventKind::AuditPageMalformed { .. }) => {
+                request_failed(report, &call.request, "malformed_page", duration_ms);
+            }
             Outcome::Event(_) => tracing::debug!(
                 request = request_kind(&call.request),
                 cost = call.cost.0,
@@ -1841,6 +1898,9 @@ where
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
+            Err(_) if matches!(gmail_request, GmailRequest::AuditMessages { .. }) => {
+                Outcome::Event(EventKind::AuditPageMalformed { command })
+            }
             // An unusable catalogue can heal on the next listing.
             Err(error) if matches!(gmail_request, GmailRequest::ListLabels) => {
                 Outcome::Failed(transient(format!("unusable label listing: {error:?}")))
@@ -2104,6 +2164,22 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::Watch
         | GmailRequest::Search(_)
         | GmailRequest::GetLabel { .. } => false,
+    }
+}
+
+fn idle_stop(engine: &Engine, timer: Option<Timestamp>, now: Timestamp) -> StopReason {
+    if let Some(cooldown) = engine
+        .status()
+        .cooldown
+        .filter(|cooldown| cooldown.until > now)
+    {
+        StopReason::CoolingDown {
+            until: cooldown.until,
+        }
+    } else {
+        StopReason::Idle {
+            next: timer.into_iter().chain(engine.audit_next_run()).min(),
+        }
     }
 }
 

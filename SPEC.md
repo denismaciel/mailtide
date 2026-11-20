@@ -375,16 +375,29 @@ creation predates the baseline and is absent from every listing scope.
 `audit_interval` after the previous audit completed (default 24 h, due
 on the first live run if the time is unset). The audit has its own timer.
 One claim does one Gmail page or one bounded store step. A partial audit
-hands the next step to a new claim. Hosts using the raw engine can read
-that time with `Engine::audit_next_run()`. Backfill work waits for active
-history and job work to drain first.
+hands the next step to a new claim, often immediately. A host schedules that
+claim from `Idle.next` (`next_run_at_ms` in Python). A push-only host also
+needs to schedule these hints so the audit progresses while mail is quiet.
+Raw engine hosts can read `Engine::audit_next_run()`. Backfill work waits
+for active history and job work to drain first. An in-flight audit request
+or store step still occupies the serial runner until it returns.
 
 - Request `messages.list` with `includeSpamTrash=true`, `maxResults=500`
   and `fields=messages(id),nextPageToken` (5 quota units). Each page records
   its membership and next token atomically. Every id seen for the first
   time in the audit with neither a row nor a tombstone queues an ordinary
-  Backfill verification. A rejected continuation clears the partial seen
-  set in batches and restarts the listing.
+  Backfill verification. The listing and mirror sweep each get a budget of
+  twice the page count implied by the stored row count at the start of the
+  phase, plus eight. A malformed or refused page, a repeated token, an
+  unchanged seen set on a continuation, or budget exhaustion abandons the
+  audit and starts bounded cleanup. An empty first and final page is valid
+  for an empty Gmail mailbox.
+- The failure reason is reported in `audit.abandoned` (`audit_abandoned` in
+  Python). The replacement audit waits on durable exponential backoff,
+  starting at one minute and capped at the audit interval. Cleanup keeps
+  the next attempt in the future. Quota deferrals and transient failures
+  persist their retry floor across claims. Gmail rate limits also publish
+  the usual shared cooldown with `Retry-After`.
 - After the last page, sweep mirror ids in primary key order, at most 500
   per claim. A row missing from the seen set also queues a verification.
   An arrival during the listing can be verified by the sweep. A listing
@@ -398,7 +411,11 @@ history and job work to drain first.
   the committed step in that run.
 - After the sweep, bounded cleanup of the temporary ids completes the
   audit and records `audited_at`. Both the completion time and the
-  in-progress continuation survive a restart.
+  in-progress continuation survive a restart. A stable 500,000-message
+  mailbox takes 1,000 Gmail pages (5,000 units), 1,001 mirror-sweep steps,
+  and 1,002 cleanup steps for 500,000 ids and 999 tokens. That is 3,003
+  claims, each with normal history and job checks. A step that queues 500
+  verifications can add 10,000 units before any raw imports.
 
 ### 6.4 Body import jobs
 
@@ -502,6 +519,16 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   and logs `LabelDefinitionsChanged` and one `LabelsChanged` per row in
   the same commit. System labels are never stripped by this rule. When
   reconciliation lists the labels, it takes over from an in-flight refresh.
+- A single cut leaves the stored catalogue and message memberships in
+  place while the engine waits for confirmation. Two consecutive
+  core-complete answers with the same omission can strip a live label.
+  Evidence survives only in the same process, for three minutes, and can
+  cross to the immediately following claim of the same account incarnation
+  and label generation. Hosts that restart the process for every short
+  run can repeatedly see a first listing and a confirmation wakeup, while
+  the previous catalogue remains visible. Three inconsistent answers
+  report failure. Live refresh keeps the previous catalogue and
+  reconciliation stays at baseline capture for its retry.
 - **A deleted id has a 30-day filter.** An applied listing prunes its
   memory. Observations, history deltas, imports, reconciliation scopes,
   new admissions and late write answers omit remembered ids. After
@@ -947,8 +974,9 @@ engine's epoch, so results meant for a dead engine are ignored).
 - The SQL store refuses every one of these with
   `StoreError::SchemaOutOfDate { applied, expected }`, before reading or
   writing, while the database's schema is behind this build (migrations
-  missing) or ahead of it (a newer mailtide migrated it). It asks once: after
-  it has seen the schema current, it and its clones do not ask again.
+  missing) or ahead of it (a newer mailtide migrated it). A store and its
+  clones cache a successful schema check. Stop old workers before applying
+  migrations and start the upgraded workers after migration completes.
 
 Facts refresh (`Runner::refresh_facts(account, after, limit, budget)`) is
 a host-scheduled maintenance call, like `drift` and `compact`, with no Gmail
@@ -1311,15 +1339,20 @@ ALTER TABLE mailtide_accounts DROP COLUMN drafts_refreshed_at;
 DELETE FROM mailtide_schema WHERE version = 10;
 ```
 
-Migration 11 adds nullable `audited_at` and `audit_progress` to
+Migration 11 adds nullable `audited_at`, `audit_progress` and `audit_schedule` to
 `mailtide_accounts` and the temporary `mailtide_audit_seen` table (§6.3).
 The audit uses existing verification jobs and produces no new feed entry
-types. Older builds refuse the newer schema. Rollback discards the audit
+types. Jobs now persist quota deferral as `deferred` so a higher-priority
+confirmation can re-enter the quota gate while the old class waits. Rollback
+converts deferred jobs to ready with their existing due times. Newly opened
+stores on older builds refuse this schema. Stop old workers before migration. Rollback discards the audit
 schedule and unfinished listing. Already queued verifications can still
 run, and the first audit after upgrading starts at page one.
 
 ```sql
+UPDATE mailtide_jobs SET state = 'ready' WHERE state = 'deferred';
 DROP TABLE mailtide_audit_seen;
+ALTER TABLE mailtide_accounts DROP COLUMN audit_schedule;
 ALTER TABLE mailtide_accounts DROP COLUMN audit_progress;
 ALTER TABLE mailtide_accounts DROP COLUMN audited_at;
 DELETE FROM mailtide_schema WHERE version = 11;
