@@ -6,7 +6,7 @@ import mailtide
 import pytest
 from conftest import make_config, tokens
 from fake_gmail import Mailbox
-from mailtide.config import Blobs, Config, Database, Engine, Http, Topic
+from mailtide.config import Blobs, Config, Database, Engine, Http, Quota, Topic
 from mailtide.testing import ManualClock
 
 ACCOUNT = "alice@example.com"
@@ -199,3 +199,54 @@ def test_a_missing_blob_is_not_found(gmail: tuple[Mailbox, str]) -> None:
     with pytest.raises(mailtide.BlobNotFound) as raised:
         runner.read_blob("alice@example.com", "nope")
     assert "alice" not in str(raised.value)
+
+
+def backlog_runner(origin: str) -> mailtide.BlockingRunner:
+    """A runner whose quota admits the bootstrap and two Backfill imports
+    (70% of 250 units), and the clock never moves: the rest wait."""
+    config = dataclasses.replace(make_config(origin), quota=Quota(account_per_minute=250))
+    runner = mailtide.BlockingRunner(config, tokens, clock=ManualClock())
+    runner.migrate()
+    runner.track(ACCOUNT)
+    return runner
+
+
+def test_prioritise_then_the_feed_reports_the_import(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    for n in range(10):
+        mailbox.add(f"m{n}", ["INBOX"])
+    runner = backlog_runner(origin)
+    runner.run(ACCOUNT, budget_s=30)
+    waiting = [v.id for v in runner.messages(ACCOUNT, list(mailbox.messages)) if v.content is None]
+    assert len(waiting) >= 5, "the quota holds the backlog back"
+    opened = waiting[0]
+    since = runner.changes(ACCOUNT).next
+
+    result = runner.prioritise(ACCOUNT, [opened])
+    assert isinstance(result, mailtide.PrioritiseResult)
+    assert result.queued == [opened]
+    assert result.imported == result.unknown == result.blocked == result.over_limit == []
+    runner.run(ACCOUNT, budget_s=30)
+
+    page = runner.changes(ACCOUNT, since)
+    assert isinstance(page, mailtide.ChangePage)
+    imported = [e for e in page.changes if isinstance(e, mailtide.MessageImported)]
+    assert [e.id for e in imported] == [opened], "only the opened message jumped the queue"
+    assert imported[0].content is not None
+    [view] = runner.messages(ACCOUNT, [opened])
+    assert view.content is not None
+
+
+def test_prioritise_reports_imported_and_unknown_ids(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    mailbox.add("m1", ["INBOX"])
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    runner.track(ACCOUNT)
+    assert runner.run(ACCOUNT, budget_s=30).stop == "idle"
+
+    result = runner.prioritise(ACCOUNT, ["m1", "made-up", "m1"])
+    assert (result.queued, result.imported, result.unknown) == ([], ["m1"], ["made-up"])
+    assert result.blocked == result.over_limit == []
+    with pytest.raises(ValueError, match="at most 100"):
+        runner.prioritise(ACCOUNT, [f"x{n}" for n in range(101)])

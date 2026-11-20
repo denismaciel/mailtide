@@ -250,6 +250,23 @@ when an operator asks for it. Repeated expiries back off.
 - Deduplicated by `message_id`.
 - Priority classes: `foreground` (a user opened it) > `live` (newly arrived) >
   `backfill` (historical import) [Z]. Backfill runs newest first.
+- **A user opens a message** whose body is still queued:
+  `Store::prioritise(account, ids, now)` (what `Runner.prioritise` calls)
+  raises its import job to `foreground`. Like admission (§7.1) it is **not
+  fenced by any engine's epoch**, and it is safe without the fence because
+  it only ever raises a class and never creates or finishes a job. A ready
+  job delayed without a failure (a quota deferral, a draft's settle delay)
+  becomes due at once; a job backing off after a failure keeps its due time
+  [Z]; a running job keeps its claim and comes back as `foreground` if it is
+  retried or deferred. Nothing else changes: no row, no feed entry, and the
+  state string does not move. Each distinct id is reported as `queued`,
+  `imported` (read it now), `unknown` (no row: never discovered, or deleted;
+  nothing is fetched for it), `blocked`, or `over_limit`: an account holds
+  at most 24 `foreground` imports at once (the 30% of a minute's budget
+  Backfill can't use, at 60 units each), and a call takes at most 100 ids.
+  The engine holding the account takes the raised job on its next claim,
+  also while the gate holds Backfill back; the host calls `run` if no run is
+  in flight. The body's `MessageImported` feed entry says it arrived.
 - Fetch with `format=raw` and hand the bytes to the host as `StoreBlob`. Then
   `Commit` the header facts, `blob_ref` and `import_state=imported`.
 - Retries:
@@ -475,6 +492,8 @@ engine's epoch, so results meant for a dead engine are ignored).
   `CursorMismatch`, `StaleClaim`) are outcomes, not errors.
 - `claim_jobs(account, epoch, limit, now, attempt)`: refused for an older
   epoch; `Deliver` jobs carry their pending changes.
+- `admit(account, request, now)` and `prioritise(account, ids, now)`:
+  unfenced writes for users' actions (§7.1) and opened messages (§6.4).
 - `changes(account, since, limit)`: the change feed (`ChangeFeed::Page` of
   `ChangeEntry { state, index, change, content }`, whole commits only, or
   `TooOld` after compaction; `content` is the stored content of a
@@ -485,7 +504,7 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
   last synced, in id order; empty before the first label sync.
 
-The conformance suite (`mailtide_store::conformance`, 28 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 35 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -508,6 +527,13 @@ runner per process, after forking:
   admitted durably first (`outcome.admitted`), then delivered;
 - `await admit(account, action, …) -> int`: admit durably without
   delivering (the account's next run delivers); never preempts a sync;
+- `await prioritise(account, message_ids) -> PrioritiseResult`: a user
+  opened these messages; their bodies are fetched next, in the Foreground
+  class (§6.4), by whichever run holds the account (call `run` if none
+  does). One store write that never preempts a sync, allowed read-only.
+  The result lists each distinct id once: `queued`, `imported`, `unknown`,
+  `blocked`, `over_limit` (ask again as imports land). More than 100 ids
+  raise `ValueError`;
 - `await status(account)`, `await accounts()`, `await health()`: reads that
   never claim an account; `await resume(account)` after an operator fixed a
   block; `await forget(account)` deletes its rows and blobs;
@@ -547,8 +573,8 @@ safe because every commit is atomic and fenced. The token source may be sync
 Schema: `await migrate()` applies mailtide's versioned migrations under an
 advisory lock; hosts that run migrations with their own tool execute
 `mailtide.migrations()` (ordered SQL with its bookkeeping) instead.
-`schema()` reports `current`, `behind` or `ahead`, and `run`/`act`/`admit`
-refuse with `SchemaOutOfDate` unless it is current.
+`schema()` reports `current`, `behind` or `ahead`, and `run`/`act`/`admit`/
+`prioritise` refuse with `SchemaOutOfDate` unless it is current.
 
 Migrations are additive. Migration 4 adds the nullable
 `mailtide_accounts.labels_refreshed_at` (§6.6); a build from before it sees
@@ -606,7 +632,8 @@ the real `Runner` against a fake Gmail over HTTP.
 ## 12a. Running beside an existing system
 
 - **Read-only (shadow) mode**: `Config(access="read_only")` mirrors without
-  ever changing the mailbox: `act`/`admit` raise `ReadOnlyMode`, and actions
+  ever changing the mailbox: `act`/`admit` raise `ReadOnlyMode` (`prioritise`
+  works: an import changes nothing in Gmail), and actions
   admitted earlier are blocked (shown as blocked, no longer overlaying)
   instead of sent. It works with the `gmail.readonly` scope. Combine with
   `Poll()` when the host already owns the account's watch.

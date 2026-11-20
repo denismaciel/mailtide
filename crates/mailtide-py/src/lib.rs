@@ -1134,6 +1134,35 @@ mod _core {
         }
     }
 
+    /// What `prioritise` did with each distinct id, in request order.
+    #[pyclass(frozen, get_all)]
+    struct PrioritiseResult {
+        /// Fetched ahead of the backlog (raised now, or already).
+        queued: Vec<String>,
+        /// Already stored: read them now.
+        imported: Vec<String>,
+        /// The mirror has no row for them (not yet discovered, or deleted).
+        unknown: Vec<String>,
+        /// Their import is blocked; `resume` is the operator's tool.
+        blocked: Vec<String>,
+        /// The account already has the most Foreground imports; still
+        /// queued in their own class. Ask again as imports land.
+        over_limit: Vec<String>,
+    }
+
+    impl From<mailtide::jobs::Prioritised> for PrioritiseResult {
+        fn from(report: mailtide::jobs::Prioritised) -> Self {
+            let strings = |ids: Vec<MessageId>| ids.into_iter().map(|id| id.0).collect();
+            Self {
+                queued: strings(report.queued),
+                imported: strings(report.imported),
+                unknown: strings(report.unknown),
+                blocked: strings(report.blocked),
+                over_limit: strings(report.over_limit),
+            }
+        }
+    }
+
     /// What `forget` removed.
     #[pyclass(frozen, get_all)]
     struct ForgetResult {
@@ -1352,6 +1381,19 @@ mod _core {
             self.inner
                 .admit(&account, &request)
                 .await
+                .map_err(run_error)
+        }
+
+        async fn prioritise(
+            self: Arc<Self>,
+            account: AccountId,
+            ids: Vec<MessageId>,
+        ) -> PyResult<PrioritiseResult> {
+            self.ensure_schema().await?;
+            self.inner
+                .prioritise(&account, &ids)
+                .await
+                .map(PrioritiseResult::from)
                 .map_err(run_error)
         }
 
@@ -1715,6 +1757,20 @@ mod _core {
             )
         }
 
+        fn prioritise<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            message_ids: Vec<String>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let ids = message_ids.into_iter().map(MessageId).collect();
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().prioritise(account_id(account)?, ids),
+            )
+        }
+
         fn status<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
@@ -1987,6 +2043,22 @@ mod _core {
                 py,
                 &self.shared,
                 self.shared.clone().admit(account_id(account)?, request),
+            )
+        }
+
+        /// Fetch these messages' bodies ahead of the backlog; see
+        /// `mailtide.Runner.prioritise`.
+        fn prioritise(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            message_ids: Vec<String>,
+        ) -> PyResult<PrioritiseResult> {
+            let ids = message_ids.into_iter().map(MessageId).collect();
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().prioritise(account_id(account)?, ids),
             )
         }
 

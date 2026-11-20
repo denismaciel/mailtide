@@ -22,6 +22,7 @@ from mailtide._core import (
     Label,
     MessageView,
     NotifyResult,
+    PrioritiseResult,
     Progress,
     ResumeResult,
     RunOutcome,
@@ -161,6 +162,20 @@ class Runner:
             remove_labels=remove_labels or [],
             destination=destination,
         )
+
+    async def prioritise(self, account: str, message_ids: list[str]) -> PrioritiseResult:
+        """A user opened these messages: fetch their bodies ahead of the
+        backlog, in the Foreground quota class, by whichever process runs the
+        account (call ``run`` if none is running). One store write that never
+        preempts a sync; use it from request paths. Allowed read-only.
+
+        Each distinct id lands in one group: ``queued`` (fetched next),
+        ``imported`` (read it now), ``unknown`` (no row yet: the next sync
+        brings it), ``blocked``, or ``over_limit`` (the account already has 24
+        raised imports: ask again as they land). A ``MessageImported`` feed
+        entry, or ``content`` in ``messages()``, says when a body is stored.
+        At most 100 ids per call (``ValueError`` beyond)."""
+        return await self._core.prioritise(account, message_ids)
 
     async def status(self, account: str) -> AccountStatus | None:
         """What the store holds about ``account``, read without claiming it."""

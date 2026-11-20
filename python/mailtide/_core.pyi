@@ -254,6 +254,16 @@ class ResumeResult:
     jobs: int
 
 @final
+class PrioritiseResult:
+    """What ``prioritise`` did with each distinct id, in request order."""
+
+    queued: list[str]
+    imported: list[str]
+    unknown: list[str]
+    blocked: list[str]
+    over_limit: list[str]
+
+@final
 class ForgetResult:
     outcome: Literal["forgotten", "unknown"]
     messages: int
@@ -309,6 +319,7 @@ class Runner:
         remove_labels: list[str] = ...,
         destination: Literal["inbox", "archive"] = "inbox",
     ) -> Awaitable[int]: ...
+    def prioritise(self, account: str, message_ids: list[str]) -> Awaitable[PrioritiseResult]: ...
     def status(self, account: str) -> Awaitable[AccountStatus | None]: ...
     def accounts(self) -> Awaitable[list[str]]: ...
     def drift(
@@ -372,6 +383,7 @@ class BlockingRunner:
         remove_labels: list[str] = ...,
         destination: Literal["inbox", "archive"] = "inbox",
     ) -> int: ...
+    def prioritise(self, account: str, message_ids: list[str]) -> PrioritiseResult: ...
     def status(self, account: str) -> AccountStatus | None: ...
     def accounts(self) -> list[str]: ...
     def drift(
