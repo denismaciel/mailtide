@@ -2053,7 +2053,6 @@ mod _core {
         draft_refresh_delay_s: f64,
         draft_refresh_every_s: f64,
         draft_send_grace_s: f64,
-        draft_inline_limit: i64,
     }
 
     #[derive(FromPyObject)]
@@ -2086,6 +2085,7 @@ mod _core {
         quota: QuotaArg,
         log: LogArg,
         token_cache_margin_s: f64,
+        max_message_bytes: i64,
     }
 
     impl From<ConfigArg> for crate::settings::RawConfig {
@@ -2125,7 +2125,6 @@ mod _core {
                     draft_refresh_delay_s: c.engine.draft_refresh_delay_s,
                     draft_refresh_every_s: c.engine.draft_refresh_every_s,
                     draft_send_grace_s: c.engine.draft_send_grace_s,
-                    draft_inline_limit: c.engine.draft_inline_limit,
                 },
                 quota: crate::settings::RawQuota {
                     account_per_minute: c.quota.account_per_minute,
@@ -2141,6 +2140,7 @@ mod _core {
                     logger: c.log.logger,
                 },
                 token_cache_margin_s: c.token_cache_margin_s,
+                max_message_bytes: c.max_message_bytes,
             }
         }
     }
@@ -2187,7 +2187,7 @@ mod _core {
                 engine: settings.engine,
                 watch: settings.watch,
                 log_accounts: settings.log_accounts,
-                drafts: settings.drafts,
+                writes: settings.writes,
             },
         )
         .with_purge(settings.purge);

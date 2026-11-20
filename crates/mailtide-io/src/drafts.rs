@@ -9,6 +9,10 @@
 //! and reads the draft first; a lost answer is settled by the sync, never by
 //! sending again.
 //!
+//! A draft always goes in the JSON body, whatever its size; one above
+//! [`WriteSettings::max_message_bytes`](crate::runner::WriteSettings) is
+//! refused before any call (there is no upload path).
+//!
 //! The bytes a host saves must carry exactly one `X-Mailtide-Id`: Gmail
 //! replaces the Message-ID on every save and on send, and keeps that header,
 //! so it is what identifies the draft's sent message.
@@ -31,28 +35,6 @@ use crate::blobs::BlobStore;
 use crate::quota_gate::QuotaGate;
 use crate::runner::{CallError, QuotaDeferred, RunError, Runner};
 use crate::transport::GmailTransport;
-
-/// Draft settings of a runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DraftSettings {
-    /// The largest message a draft write sends inline (base64url in the
-    /// JSON body); larger ones are refused with [`DraftError::TooLarge`]
-    /// before any call.
-    pub inline_limit: usize,
-    /// The transport's request timeout: a send whose answer was lost may
-    /// still be in flight until then, so a retry waits it out.
-    pub request_timeout: Duration,
-}
-
-impl Default for DraftSettings {
-    /// 3 MiB inline (the JSON body stays near 4 MiB) and a 60 s timeout.
-    fn default() -> Self {
-        Self {
-            inline_limit: 3 * 1024 * 1024,
-            request_timeout: Duration::from_mins(1),
-        }
-    }
-}
 
 /// A draft and the message it holds after a save: Gmail's draft id is
 /// stable, the message id changes with every save.
@@ -96,7 +78,9 @@ pub enum DraftError {
         /// The message it holds.
         current: MessageId,
     },
-    /// The message is above the inline limit; nothing was sent.
+    /// The message is above the size limit
+    /// ([`WriteSettings::max_message_bytes`](crate::runner::WriteSettings));
+    /// nothing was sent.
     TooLarge {
         /// The limit, in bytes.
         limit: usize,
@@ -204,16 +188,18 @@ where
         if self.config.access == crate::runner::Access::ReadOnly {
             return Err(DraftError::ReadOnly);
         }
-        let limit = self.config.drafts.inline_limit;
+        let limit = self.config.writes.max_message_bytes;
         if raw.len() > limit {
             return Err(DraftError::TooLarge { limit });
         }
-        mailtide_mime::tracking_id(raw).ok_or_else(|| {
-            DraftError::Invalid(format!(
-                "a draft must carry exactly one valid {} header",
-                mailtide_mime::TRACKING_HEADER
-            ))
-        })
+        mailtide_mime::tracking_id(raw)
+            .filter(|_| mailtide_mime::tracking_headers(raw) == 1)
+            .ok_or_else(|| {
+                DraftError::Invalid(format!(
+                    "a draft must carry exactly one valid {} header",
+                    mailtide_mime::TRACKING_HEADER
+                ))
+            })
     }
 
     fn draft_writable(&self) -> Result<(), DraftError> {
@@ -535,7 +521,7 @@ where
         let begin = DraftWrite::BeginSend {
             draft: draft_id.clone(),
             if_message: if_message_id.clone(),
-            retry_at: self.clock.now().plus(self.config.drafts.request_timeout),
+            retry_at: self.clock.now().plus(self.config.writes.request_timeout),
         };
         let (row, retry) = match self.record_write(account, &begin).await? {
             DraftRecorded::Started { draft, retry } => (draft, retry),

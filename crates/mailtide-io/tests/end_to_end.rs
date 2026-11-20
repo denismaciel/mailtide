@@ -274,7 +274,7 @@ fn runner_for<T: GmailTransport, A: TokenSource>(
             access: mailtide_io::runner::Access::ReadWrite,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
-            drafts: mailtide_io::drafts::DraftSettings::default(),
+            writes: mailtide_io::runner::WriteSettings::default(),
         },
     )
 }
@@ -436,7 +436,7 @@ fn backlog(count: usize, access: Access) -> (TightRunner, Arc<Mutex<Vec<Priority
             access,
             watch: WatchMode::Disabled,
             log_accounts: mailtide_io::runner::LogAccounts::default(),
-            drafts: mailtide_io::drafts::DraftSettings::default(),
+            writes: mailtide_io::runner::WriteSettings::default(),
         },
     );
     (runner, imports)

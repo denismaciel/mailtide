@@ -81,8 +81,33 @@ pub struct RunnerConfig {
     pub watch: WatchMode,
     /// How accounts appear in logs.
     pub log_accounts: LogAccounts,
-    /// Draft calls: the inline size limit and the request timeout.
-    pub drafts: crate::drafts::DraftSettings,
+    /// Limits of the calls that write messages (drafts, and `send`).
+    pub writes: WriteSettings,
+}
+
+/// Limits of the calls that write a message to Gmail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteSettings {
+    /// The largest message a draft or a send carries, in RFC 5322 bytes.
+    /// It always goes inline (base64url in the JSON body, about 4/3 its
+    /// size); a larger one is refused before any call. Gmail stores drafts
+    /// of 40 MiB through that route but delivers sends only up to 34 MiB,
+    /// and a draft that cannot be sent is of no use.
+    pub max_message_bytes: usize,
+    /// The transport's request timeout: a send whose answer was lost may
+    /// still be in flight until then, so a retry waits it out. It must
+    /// cover the largest message (Gmail took 5 to 7 s for 40 MiB).
+    pub request_timeout: Duration,
+}
+
+impl Default for WriteSettings {
+    /// 34 MiB (35,651,584 bytes) and a 60 s timeout.
+    fn default() -> Self {
+        Self {
+            max_message_bytes: 34 * 1024 * 1024,
+            request_timeout: Duration::from_mins(1),
+        }
+    }
 }
 
 /// How accounts (email addresses) appear in log events.
@@ -520,7 +545,7 @@ mod direct_call_tests {
                 engine: EngineConfig::default(),
                 watch: WatchMode::Disabled,
                 log_accounts: LogAccounts::default(),
-                drafts: crate::drafts::DraftSettings::default(),
+                writes: crate::runner::WriteSettings::default(),
             },
         )
         .direct_call_with_cleanup(
@@ -2076,7 +2101,7 @@ mod tests {
                 engine: EngineConfig::default(),
                 watch: WatchMode::Disabled,
                 log_accounts: LogAccounts::default(),
-                drafts: crate::drafts::DraftSettings::default(),
+                writes: crate::runner::WriteSettings::default(),
             },
         )
     }

@@ -469,7 +469,7 @@ impl Fixture {
                     },
                     watch: WatchMode::Disabled,
                     log_accounts: LogAccounts::default(),
-                    drafts: mailtide_io::drafts::DraftSettings::default(),
+                    writes: mailtide_io::runner::WriteSettings::default(),
                 },
             ),
         }

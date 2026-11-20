@@ -18,7 +18,7 @@ Afterwards a host can, per account:
 Left out, with the feature that owns it:
 
 - building the MIME (`compose-mime`); reply and forward headers, new mail
-  without a draft, the upload endpoint for large messages (`send`); which
+  without a draft (`send`); which
   From addresses and signatures are allowed (`identities`);
 - undo-send and scheduled send (a host delay before `send_draft`);
 - an idempotent create (Decisions, D4).
@@ -135,10 +135,18 @@ debounce saves and pass `if_message_id` when a draft is opened, not on every
 keystroke. A gate deferral waits within `budget`, then returns `Deferred`:
 nothing sent, nothing recorded.
 
-Writes use the JSON `raw` field. Content above `draft_inline_limit`
-(default 3 MiB of message bytes, so the JSON body stays near 4 MiB) is
-refused with `TooLarge` before any call, until the upload endpoint that
-`send` plans exists.
+Writes always use the JSON `raw` field; there is no upload path, now or
+later (the repository rule "One size limit, and no uploads"). A message above
+`max_message_bytes` (default 35,651,584 bytes, 34 MiB; one setting shared
+with `send`, `RunnerConfig.writes`) is refused with `TooLarge { limit }`
+before any call: Gmail stores a 40 MiB draft but delivers sends only up to
+34 MiB, and a draft that cannot be sent is of no use. At the limit the JSON
+body is about 46 MB (base64 grows the bytes by a third) and the call holds
+the bytes, their base64 and the body at once, about 140 MB; Gmail took 5 to
+7 s for 40 MiB, so the default HTTP request timeout (60 s) covers it, and
+the send fence's wait (`RunnerConfig.writes.request_timeout`) is that same
+timeout. A caller's `budget` bounds only the quota gate's deferral, not the
+request.
 
 ### Store
 
@@ -304,7 +312,7 @@ the count and thread-summary suites (read projections), the suites
 `scripts/zero_tests.py` owns, and himalaya's `tests/send_outcome.rs` and
 JMAP tests (`send`).
 
-Our own 57 tests cover what no reference has: the request shapes and costs;
+Our own 62 tests cover what no reference has: the request shapes and costs;
 the index rules (stale rows, stale listings, the generation fence, the
 periodic refresh); every row of Appendix B, including a crash between
 Gmail's send and its record and the three send fences; drafts changed
@@ -399,17 +407,25 @@ e.g. as a `RunnerConfig` field.
   never seen.
 - **D8. Send has three fences** (above) rather than trusting Gmail to refuse
   a second send. Costs 20 units on a retry and one refused call during a
-  timeout window.
+  timeout window. `send-late-apply` (a request whose connection was closed
+  unread was still applied within about a second, never later) backs the
+  second: once the first request's timeout has passed, reading the draft
+  tells whether it was consumed.
 - **D9. A periodic refresh, at most every 15 minutes while live.** The index
-  heals whatever Gmail's consistency turns out to be, for 5 units. *Would
-  change it:* `drafts-history-on-save` or `-on-send` refuted (shorten it for
-  accounts with drafts), or both history unknowns and `drafts-list-consistent`
-  confirmed for a long time (lengthen it).
+  heals whatever Gmail's consistency turns out to be, for 5 units. Both
+  history unknowns and `drafts-list-consistent` are confirmed; it stays,
+  since it also covers drafts changed while history was expired and the
+  stale-listing guard costs nothing. *Would change it:* a host with many
+  accounts and few drafts (lengthen it).
 - **D10. `DraftSaved{remote}` arrives early**, before the content is
   imported; a host that wants the subject waits for `MessageImported`.
   Holding it back would hide a draft for `draft_settle` for no gain.
-- **D11. `draft_inline_limit` is 3 MiB** until `drafts-raw-json-limit` is
-  measured: under the 5 MB Google gives as an example of a small transfer.
+- **D11. One size limit, in the JSON body.** `max_message_bytes`, 34 MiB,
+  shared with `send`; above it a draft is refused before any call.
+  `drafts-raw-json-limit` measured the JSON route at 40 MiB and more,
+  `drafts-upload-limit` the upload URI at 36,700,160 bytes, and
+  `send-size-limit` delivery at 34 MiB, so uploads would buy nothing.
+  *Would change it:* Gmail delivering larger sends.
 - **D12. A draft is identified by `X-Mailtide-Id`, not its Message-ID.**
   `drafts-message-id-kept` was refuted: Gmail assigns a Message-ID on every
   create, update and send. The token is required on the bytes, stored on
@@ -430,15 +446,15 @@ Unknowns (`scripts/features.py unknowns drafts` prints each test):
 - `drafts-send-twice`: a second send of one draft id is a 404 and sends nothing.
 - `drafts-send-concurrent`: concurrent sends of one draft send at most once.
 - `drafts-message-id-kept`: refuted. Gmail replaces the `Message-ID` on create, update and send and keeps `X-` headers: confirmation keys on `X-Mailtide-Id` (D12).
-- `drafts-raw-json-limit`: the largest message the JSON `raw` field accepts.
-- `drafts-upload-limit`: the largest message the upload URIs accept.
+- `drafts-raw-json-limit`: confirmed: the JSON route took 40 MiB (D11).
+- `drafts-upload-limit`: settled at 36,700,160 bytes; unused (D11).
 - `drafts-sent-thread`: the sent message is in the draft's thread.
 - `drafts-update-keeps-thread`: an update without `threadId` keeps a reply draft's thread.
 - `drafts-update-resend-thread`: an update may send a standalone draft's own thread id.
-- `drafts-list-consistent`: `drafts.list` shows what history has just shown.
+- `drafts-list-consistent`: confirmed, 50 of 50 rounds; the periodic refresh stays (D9).
 - `drafts-history-on-save`: draft saves and deletes appear as `messagesAdded` and `messagesDeleted`.
 - `drafts-history-on-send`: a send appears as the draft's message deleted and a `SENT` one added.
-- `drafts-gone-is-404`: every call on a sent or deleted draft is a 404.
+- `drafts-gone-is-404`: confirmed, 24 of 24: NotFound and AlreadyGone key on 404.
 - `drafts-id-namespace`: a message id is not a draft id.
 - `drafts-write-answer-ids`: create and update answers carry the message and thread ids.
 - `drafts-no-precondition`: Gmail honours no `If-Match` on draft writes.

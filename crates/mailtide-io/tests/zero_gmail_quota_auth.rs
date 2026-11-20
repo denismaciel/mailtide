@@ -218,7 +218,7 @@ fn runner(gmail: FakeGmail, gate: RecordingGate) -> TestRunner {
                 access: mailtide_io::runner::Access::ReadWrite,
                 watch: WatchMode::Disabled,
                 log_accounts: mailtide_io::runner::LogAccounts::default(),
-                drafts: mailtide_io::drafts::DraftSettings::default(),
+                writes: mailtide_io::runner::WriteSettings::default(),
             },
         ),
     }

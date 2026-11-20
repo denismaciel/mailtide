@@ -72,11 +72,10 @@ class Engine:
     # Drafts (SPEC §7a): a draft change seen in history lists the drafts
     # this long after; they are listed at least every draft_refresh_every_s
     # while live; a send whose answer was lost waits draft_send_grace_s for
-    # its sent message; a draft above draft_inline_limit bytes is refused.
+    # its sent message.
     draft_refresh_delay_s: float = 10.0
     draft_refresh_every_s: float = 900.0
     draft_send_grace_s: float = 3600.0
-    draft_inline_limit: int = 3 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,3 +147,9 @@ class Config:
     quota: Quota = Quota()
     log: Log = Log()
     token_cache_margin_s: float = 60.0
+    #: The largest message a draft (or a send) carries, in RFC 5322 bytes;
+    #: a larger one is refused before calling Gmail (``DraftTooLarge``).
+    #: Gmail delivers sends only up to 34 MiB. The message always goes in
+    #: the JSON body: keep ``http.request_timeout_s`` above the 5 to 7 s
+    #: Gmail takes for 40 MiB.
+    max_message_bytes: int = 35_651_584

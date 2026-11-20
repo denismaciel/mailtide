@@ -19,9 +19,8 @@ use mailtide::quota::Budget;
 use mailtide_gmail::http::{HttpRequest, HttpResponse, Method};
 use mailtide_io::auth::{AccessToken, StaticTokens};
 use mailtide_io::blobs::ObjectBlobs;
-use mailtide_io::drafts::DraftSettings;
 use mailtide_io::quota_gate::LocalGate;
-use mailtide_io::runner::{Access, LogAccounts, Runner, RunnerConfig, WatchMode};
+use mailtide_io::runner::{Access, LogAccounts, Runner, RunnerConfig, WatchMode, WriteSettings};
 use mailtide_io::transport::{GmailTransport, TransportError};
 use mailtide_store::Store as _;
 use mailtide_store::memory::MemoryStore;
@@ -515,7 +514,7 @@ pub fn runner_with(access: Access, budget: Budget) -> (TestRunner, Setup) {
             engine: EngineConfig::default(),
             watch: WatchMode::Disabled,
             log_accounts: LogAccounts::Hashed,
-            drafts: DraftSettings::default(),
+            writes: WriteSettings::default(),
         },
     )
     .with_clock(mailtide_io::Clock::from_fn(move || shared.now()));

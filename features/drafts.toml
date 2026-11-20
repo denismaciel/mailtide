@@ -145,7 +145,7 @@ role = "Runner draft methods: create, update, delete, send, drafts, draft, read_
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "Perform and decode draft requests; refuse draft writes in read-only mode. Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
+role = "Perform and decode draft requests; refuse draft writes in read-only mode; RunnerConfig.writes (WriteSettings: max_message_bytes, shared with send, and the request timeout a send retry waits out). Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
 
 [[file]]
 path = "crates/mailtide-io/src/transport.rs"
@@ -160,17 +160,17 @@ role = "Export the draft types"
 [[file]]
 path = "crates/mailtide-io/Cargo.toml"
 change = "modify"
-role = "Depend on mailtide-mime for the tracking id reader"
+role = "Depend on mailtide-mime for the tracking id reader (compose-mime's tracking_id and tracking_headers)"
 
 [[file]]
 path = "crates/mailtide-mime/src/tracking.rs"
-change = "new"
-role = "Seam: TRACKING_HEADER (X-Mailtide-Id), the token grammar and tracking_id(raw), written to compose-mime's contract until it lands; the rebase replaces this copy with compose-mime's"
+change = "modify"
+role = "tracking_headers(raw): how many X-Mailtide-Id headers the header block carries, beside compose-mime's tracking_id (the first valid one): a draft must carry exactly one"
 
 [[file]]
 path = "crates/mailtide-mime/src/lib.rs"
 change = "modify"
-role = "Export the tracking seam"
+role = "Export tracking_headers"
 
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
@@ -187,7 +187,7 @@ role = "Runner and BlockingRunner draft methods, DraftRef, DraftView, DraftConte
 [[file]]
 path = "crates/mailtide-py/src/settings.rs"
 change = "modify"
-role = "draft_refresh_delay_s, draft_refresh_every_s, draft_send_grace_s, draft_inline_limit"
+role = "engine.draft_refresh_delay_s, draft_refresh_every_s, draft_send_grace_s; max_message_bytes (shared with send) and the HTTP request timeout reach RunnerConfig.writes"
 
 [[file]]
 path = "python/mailtide/_runner.py"
@@ -782,8 +782,8 @@ covers = "The quota gate defers past the caller's budget: Deferred{until}, no re
 
 [[test]]
 target = "crates/mailtide-io/tests/drafts.rs"
-name = "a_message_over_the_inline_limit_is_refused_before_calling_gmail"
-covers = "TooLarge{limit} for raw content above draft_inline_limit until the upload endpoint (send feature) exists"
+name = "a_message_over_the_size_limit_is_refused_before_calling_gmail"
+covers = "TooLarge{limit} for raw content above max_message_bytes (34 MiB, shared with send: Gmail delivers sends only that far), with no call; anything up to it goes in the JSON body (there is no upload path)"
 
 [[test]]
 target = "crates/mailtide-io/tests/drafts.rs"
@@ -870,8 +870,8 @@ covers = "Confirmation does not assume the sent message stayed in the draft's th
 
 [[test]]
 target = "crates/mailtide-mime/src/tracking.rs"
-name = "tracking_id_needs_exactly_one_valid_header"
-covers = "The reader behind the seam: one X-Mailtide-Id header of 16 to 64 characters of A-Za-z0-9_- in the top header block gives the token; none, two, a malformed token or one in a body part give nothing"
+name = "tracking_headers_are_counted_valid_or_not"
+covers = "Beside compose-mime's reader (which takes the first valid header): every X-Mailtide-Id header of the header block counts, valid or not, and none in the body, so a draft carrying two is refused"
 
 [[test]]
 target = "crates/mailtide-io/tests/drafts.rs"

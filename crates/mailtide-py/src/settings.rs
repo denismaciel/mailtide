@@ -50,7 +50,6 @@ pub struct RawEngine {
     pub draft_refresh_delay_s: f64,
     pub draft_refresh_every_s: f64,
     pub draft_send_grace_s: f64,
-    pub draft_inline_limit: i64,
 }
 
 /// `mailtide.config.Quota`.
@@ -93,6 +92,7 @@ pub struct RawConfig {
     pub quota: RawQuota,
     pub log: RawLog,
     pub token_cache_margin_s: f64,
+    pub max_message_bytes: i64,
 }
 
 /// A validated configuration.
@@ -107,7 +107,7 @@ pub struct Settings {
     pub watch: WatchMode,
     pub http: HttpConfig,
     pub engine: EngineConfig,
-    pub drafts: mailtide_io::drafts::DraftSettings,
+    pub writes: mailtide_io::runner::WriteSettings,
     pub budget: Budget,
     pub token_cache_margin: Duration,
     pub log_verbosity: crate::logbridge::Verbosity,
@@ -343,8 +343,8 @@ pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
     let engine = engine(&raw.engine, &watch)?;
     let http = http(raw.http)?;
     // A send retry waits out the request timeout the transport applies.
-    let drafts = mailtide_io::drafts::DraftSettings {
-        inline_limit: positive_u64("engine.draft_inline_limit", raw.engine.draft_inline_limit)
+    let writes = mailtide_io::runner::WriteSettings {
+        max_message_bytes: positive_u64("max_message_bytes", raw.max_message_bytes)
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))?,
         request_timeout: http.request_timeout,
     };
@@ -358,7 +358,7 @@ pub fn validate(raw: RawConfig) -> Result<Settings, Invalid> {
         watch,
         http,
         engine,
-        drafts,
+        writes,
         budget: budget(&raw.quota)?,
         token_cache_margin: duration("token_cache_margin_s", raw.token_cache_margin_s)?,
         log_verbosity,
@@ -407,7 +407,6 @@ mod tests {
                 draft_refresh_delay_s: 10.0,
                 draft_refresh_every_s: 900.0,
                 draft_send_grace_s: 3600.0,
-                draft_inline_limit: 3 * 1024 * 1024,
             },
             quota: RawQuota {
                 account_per_minute: 4_800,
@@ -423,6 +422,7 @@ mod tests {
                 logger: "mailtide".into(),
             },
             token_cache_margin_s: 60.0,
+            max_message_bytes: 35_651_584,
         }
     }
 

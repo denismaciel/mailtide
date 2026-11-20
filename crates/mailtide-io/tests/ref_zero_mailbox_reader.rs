@@ -116,7 +116,7 @@ async fn a_thread_read_asks_for_no_token_and_calls_no_gmail() {
             engine: EngineConfig::default(),
             watch: WatchMode::Disabled,
             log_accounts: LogAccounts::default(),
-            drafts: mailtide_io::drafts::DraftSettings::default(),
+            writes: mailtide_io::runner::WriteSettings::default(),
         },
     );
     let epoch = runner

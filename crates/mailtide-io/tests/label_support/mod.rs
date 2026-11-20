@@ -682,7 +682,7 @@ pub fn runner_over<S: mailtide_store::Store, T: GmailTransport>(
             },
             watch: WatchMode::Disabled,
             log_accounts: LogAccounts::default(),
-            drafts: mailtide_io::drafts::DraftSettings::default(),
+            writes: mailtide_io::runner::WriteSettings::default(),
         },
     )
     .with_clock(mailtide_io::Clock::from_fn(move || {
