@@ -1,6 +1,6 @@
 # Send: new, reply and forward, at most once, undo and schedule
 
-Plan `features/send.toml` (roadmap C3, C5), approved. Requires `drafts` for
+Plan `features/send.toml` (roadmap C3, C5), in progress. Requires `drafts` for
 saved-draft delivery, `compose-mime` for tracking tokens and reply/forward
 types, and `message-facts` for the token on imported mail.
 
@@ -154,26 +154,21 @@ paths. An account already blocked by sync holds delivery until resumed.
 A submission naming a draft uses `drafts.send` through the existing
 `Runner::send_draft` path. It uses the draft index's stable id, the
 `if_message_id` version check and the tracking token already on the saved
-bytes. Drafts owns its `BeginSend` fence, hard dispatch deadline, `retry_at`,
-at-most-one-request rule for the draft, and outcome after a lost reply.
+bytes. Drafts owns its `BeginSend` fence, hard dispatch deadline,
+`retry_at` and outcome after a lost reply. Gmail consumes the draft id on
+send. The sequential and concurrent probes in the drafts plan found one
+successful send and 404 for further calls on the same id.
 The host gets its standard immediate receipt or draft error, and its
 standard `DraftSent` or unknown-outcome notification for reconciliation.
 An immediate receipt acknowledges Gmail's answer. When the answer is
-lost, only a matching `SENT` import confirms the send. The draft retains its
-own deadline and stays fenced against another send after an unknown,
-including when a listing still shows the draft. Draft admission and
-validation take place in drafts. The draft path creates
+lost, a matching `SENT` import confirms the send. From `retry_at`, drafts
+can retry when a fresh `drafts.get` still finds the same draft version.
+It can also retry after a definitive HTTP refusal. A consumed id cannot
+send another message. Draft admission and validation take place in drafts.
+The draft path creates
 no raw outbox row, staged blob, raw claim or `SubmissionChanged` entry.
 Draft sends use the draft's saved content and thread. Raw options belong
 only to the raw variant.
-
-The shared draft path must enforce the one-wire contract before this
-feature uses it. Its `BeginSend` and dispatch deadline stay in place.
-`retry_at` allows rechecking the index and outcome. Another write can
-start only after definitive pre-dispatch failure. A Gmail refusal consumes
-the draft's wire request, and a post-attempt listing that still shows the
-draft cannot reopen send. Apply that rule in drafts' own state transitions
-so calls through either entry point obey it.
 
 Both paths use one import hook, owned by drafts. In the transaction applying
 `MarkImported`, the hook takes the imported account, `SENT` label and
@@ -196,8 +191,9 @@ blob reference, state, claim/dispatch data, receipt and due time. An
 `(account, due_at, key)` index bounds selection of ready work. A small
 `mailtide_send_tokens` table reserves `(account, tracking_id)` for one
 raw key or one draft id. Raw admission reserves the token with its row.
-Drafts' existing `BeginSend` claims that same namespace atomically with its
-fence. A different owner causes a draft validation error before dispatch.
+The raw admission slice adds the reservation to drafts' existing `BeginSend`
+transaction after drafts lands. A different owner causes a draft validation
+error before dispatch.
 The same draft id may reuse its reservation only as permitted by the
 draft fence. For draft tokens imported without a reservation from a
 pre-send build, the hook keeps its existing draft matching path.
@@ -301,9 +297,8 @@ after its answer is lost.
    decoder and public write guard without enabling delivery.
 2. **Raw admission and store.** Add key and token reservations, migration
    and its schema assertion, reads, due time, atomic claim/cancel and feed.
-   Integrate the draft token reservation with `BeginSend` and verify the
-   draft one-wire contract. Exercise all stores before exposing public
-   raw admission.
+   Integrate the draft token reservation with `BeginSend` after drafts
+   lands. Exercise all stores before exposing public raw admission.
 3. **Fenced delivery and confirmation.** Enable the account job, bounded
    direct call, history wake-up and shared import hook together. Add staging
    and expose raw admission, delivery, cancellation and reads. Cover
@@ -311,7 +306,7 @@ after its answer is lost.
    simulator faults here.
 4. **Draft routing.** Add the `send` source dispatch to the existing
    `send_draft` entry point and check its receipt, refusal and unknown
-   handling. The draft path keeps its single dispatch and its own record.
+   handling. The draft path keeps its own attempt rules and record.
 5. **Reply and forward.** Implement the pure helpers and mirror-backed
    Runner methods with their mapped tests.
 6. **Python and documentation.** Bind the methods and feed types, extend
@@ -330,8 +325,9 @@ after its answer is lost.
    window allows for sync and backoff. Ordinary late imports still settle
    `unknown`; observed import delays could change that window.
 4. Use the existing no-retry transport and detailed direct-call path.
-   A refusal ends the submission even when Gmail suggests retry. Only
-   definite pre-dispatch failures can requeue the same work.
+   A refusal ends a raw submission even when Gmail suggests retry. Only
+   definite pre-dispatch failures can requeue the same raw work. Drafts
+   relies on Gmail consuming the draft id and keeps its retry rules.
 5. Use one JSON path and one admission limit. Enable Bcc on that route
    based on the measured recipient copies.
 6. Persist the raw due time and make claim the undo boundary. Saved drafts

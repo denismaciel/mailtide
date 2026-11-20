@@ -2,7 +2,7 @@ id = "send"
 title = "Send: new, reply and forward, at most once, undo and schedule"
 summary = "Raw bytes go through one durable JSON messages.send submission, cancellable until claim and confirmed by an imported X-Mailtide-Id. A saved draft uses drafts' own fenced send."
 roadmap = ["C3", "C5"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/send.md"
 # drafts supplies the existing draft send, its account-level job shape and the
 # import confirmation hook. compose-mime and message-facts supply the token
@@ -19,7 +19,7 @@ role = "Raw submission rows, state, receipt, and pure admission, claim, dispatch
 [[file]]
 path = "crates/mailtide/src/drafts.rs"
 change = "new"
-role = "Shared with drafts at this base. Integrate the BeginSend token-owner check and keep the existing draft fence closed after possible dispatch."
+role = "Shared with drafts at this base. Integrate token ownership in BeginSend after drafts lands, using the existing draft send lifecycle."
 
 [[file]]
 path = "crates/mailtide/src/lib.rs"
@@ -79,7 +79,7 @@ role = "Raw submission job counts in AccountStatus"
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
 change = "modify"
-role = "No more than one wire send per submission token; canceled submissions never reach Gmail"
+role = "At most one wire send per raw submission token, and canceled raw submissions never reach Gmail"
 
 # ------------------------------------------------------------------ wire layer
 
@@ -135,7 +135,7 @@ role = "Runner submission admission, send source routing, cancellation and reads
 [[file]]
 path = "crates/mailtide-io/src/drafts.rs"
 change = "new"
-role = "Shared with drafts at this base. Surface token collision through draft validation and preserve the one-wire fence on the shared entry point."
+role = "Shared with drafts at this base. Surface BeginSend token collision through draft validation after drafts lands."
 
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
@@ -1154,7 +1154,7 @@ covers = "The resolved thread id is stored at admission; later source deletion d
 [[test]]
 target = "crates/mailtide/src/invariants.rs"
 name = "a_submission_makes_at_most_one_wire_send"
-covers = "Each submission token has at most one wire request attributed to it, with a committed dispatch marker before the request"
+covers = "Each raw submission token has at most one wire request attributed to it, with a committed dispatch marker before the request"
 
 # crates/mailtide/src/engine.rs
 
@@ -1301,13 +1301,13 @@ covers = "Route to the existing draft version check, BeginSend, bounded drafts.s
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
-name = "a_draft_unknown_is_reported_by_drafts_without_a_second_send"
-covers = "After a lost answer and a listing that still shows the draft, repeat both entry points. One drafts.send was issued, and only the draft import hook or deadline decides its outcome."
+name = "a_draft_unknown_uses_drafts_fences_and_confirmation"
+covers = "After losing the answer for a consumed draft, retry through the unified entry point. The draft precheck refuses a consumed id and the draft import hook or deadline decides the outcome."
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
-name = "a_draft_http_refusal_consumes_its_send_request"
-covers = "After a definitive HTTP refusal, repeat both draft entry points and observe no second wire send. A gate deferral before dispatch is eligible to try again."
+name = "a_draft_http_refusal_preserves_drafts_retry_rules"
+covers = "After a definitive draft send refusal, the existing draft path can retry the same draft id. Gmail consumes the id on successful send."
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
