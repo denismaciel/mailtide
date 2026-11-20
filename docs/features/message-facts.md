@@ -1,6 +1,6 @@
 # Message facts: more envelope headers, an attachment summary, and reading one part
 
-Plan: `features/message-facts.toml` (roadmap R2, R3, R8). Status: planned.
+Plan: `features/message-facts.toml` (roadmap R2, R3, R8). Status: in progress.
 
 ## 1. Goal and scope
 
@@ -149,17 +149,23 @@ Only the top-level message is examined; an attached `message/rfc822` is one
 part and its own parts are not listed.
 
 A leaf part is **listed** unless it is a text or HTML body part by RFC 8621's
-body lists (as mail-parser computes them), or an RFC 1847 protocol part: a
-child other than the first of `multipart/signed`, or any child of
-`multipart/encrypted`.
+body lists (as mail-parser computes them, the alternatives it drops
+included), or an RFC 1847 protocol part: a child other than the first of
+`multipart/signed`, or any child of `multipart/encrypted`. A container a
+parse limit left unopened is one listed leaf: it holds content nothing else
+reports.
 
 A listed part is **inline** when any of these holds, else **attached**:
 
 1. an HTML body part of the message contains `cid:` followed by its
    Content-ID (percent-decoded, whole id), whatever its disposition;
 2. its `Content-Disposition` is `inline`;
-3. it has no `Content-Disposition` and is a child, other than the first, of
-   `multipart/related`.
+3. it has no `Content-Disposition`, is not text, and is a child, other than
+   the first, of `multipart/related`.
+
+(Building it showed rule 3 needs "not text": on himalaya's own fixture an
+undeclared `notes.txt` or calendar invite inside `multipart/related` would
+otherwise be hidden as inline, where himalaya and a reader expect a file.)
 
 An attached message is always attached. `has_attachment` is `attached > 0`.
 The rule is one pure function over the stored ingredients, so changing it
@@ -191,7 +197,7 @@ ranged `get_opts`, which GCS, S3, Azure, local disk and memory all serve.
 
 | Method | Returns | Reads |
 |---|---|---|
-| `parts(account, message)` | every leaf part: reference, role, type, filename, size, Content-ID, charset, the attached message it is in | the whole blob, parsed in Rust; metadata only crosses to Python |
+| `parts(account, message)` | every leaf part: reference, role, type, filename, size, Content-ID, charset, the attached message it is in (its reference, and how many attached messages deep) | the whole blob, parsed in Rust; metadata only crosses to Python |
 | `read_part(account, message, part, max_bytes)` | the decoded bytes | one ranged read of the encoded length |
 | `open_part(account, message, part, chunk_size)` | `PartStream`: decoded chunks of at most `chunk_size` (default 256 KiB) | a streamed ranged read |
 | `refresh_facts(account, after, limit, budget)` | `FactsRefresh { examined, refreshed, unreadable, next }` | see Backfill |
@@ -362,8 +368,8 @@ failure; a blob store without ranges; the simulator campaign; the Python API.
    without a parse, and what Stalwart does. Cost: no address for parts inside
    a transfer-encoded attached message. *Would change it:* blobs that are
    re-encoded or compressed by mailtide, which would end byte offsets.
-4. **Inline is "shown by the HTML, declared inline, or an undeclared
-   component of `multipart/related`".** It agrees with himalaya's tests,
+4. **Inline is "shown by the HTML, declared inline, or an undeclared,
+   non-text component of `multipart/related`".** It agrees with himalaya's tests,
    adds RFC 8621's optional `cid:` exception, and leaves signature parts out.
    *Would change it:* `message-facts-has-attachment-parity`; the ingredients
    are stored so the rule can move.

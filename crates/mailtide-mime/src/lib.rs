@@ -1,21 +1,44 @@
 //! MIME for stored and outgoing messages (SPEC §5.5): [`parse`] reads a
 //! raw message into headers, text, HTML and attachments; [`compose`] writes
-//! one from structured input, deterministically. Neither is needed for sync
-//! correctness, and neither does any I/O.
+//! one from structured input, deterministically. The driver stores
+//! [`facts`] at import; [`parts`] lists every leaf part with its byte
+//! range, and [`PartDecoder`] decodes one part in chunks. None of it does
+//! any I/O, and the sync engine itself parses nothing.
 
 mod address;
 mod compose;
+mod decode;
+mod facts;
 mod message_id;
+mod parts;
 mod tracking;
 
 pub use address::{Address, parse_addresses};
 pub use compose::{
     ComposeError, ComposeOptions, Composed, OutgoingMessage, Purpose, Reason, compose,
 };
+pub use decode::PartDecoder;
+pub use facts::facts;
 pub use message_id::MessageId;
+pub use parts::{PartInfo, PartRole, parts};
 pub use tracking::{TRACKING_HEADER, is_tracking_id, new_tracking_id, tracking_id};
 
-use mail_parser::MessageParser;
+use mail_parser::{HeaderForm, MessageParser};
+use mailtide::gmail::PartRef;
+
+/// Nesting depth past which a container is kept as one leaf.
+const MAX_DEPTH: usize = 32;
+/// Parts past which the rest of a message is kept as one leaf.
+const MAX_PARTS: usize = 2_000;
+
+/// The parser every function here uses, so a part reference means the same
+/// thing to all of them. Never fails on malformed input; past its limits a
+/// container is kept as one part.
+fn parser() -> MessageParser {
+    MessageParser::new()
+        .max_depth(MAX_DEPTH)
+        .max_parts(MAX_PARTS)
+}
 
 /// A parsed message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +51,11 @@ pub struct ParsedMessage {
     pub html: Option<String>,
     /// Attachments.
     pub attachments: Vec<Attachment>,
+    /// Where each attachment's body is in the raw message, in the same
+    /// order, as [`parts`] and the attachment summary name it; `None`
+    /// inside a transfer-encoded attached message. Apart from
+    /// [`Attachment`], which [`compose`] takes as input too.
+    pub attachment_parts: Vec<Option<PartRef>>,
 }
 
 /// An attachment.
@@ -51,7 +79,7 @@ pub struct MimeError(pub String);
 /// written (encoded words included); bodies are transfer-decoded and
 /// converted to UTF-8.
 pub fn parse(rfc822: &[u8]) -> Result<ParsedMessage, MimeError> {
-    let message = MessageParser::default()
+    let message = parser()
         .parse(rfc822)
         .ok_or_else(|| MimeError("not an RFC 822 message".into()))?;
     let headers = message
@@ -74,14 +102,31 @@ pub fn parse(rfc822: &[u8]) -> Result<ParsedMessage, MimeError> {
             bytes: part.decoded().into_owned(),
         })
         .collect();
+    let attachment_parts = message
+        .attachments()
+        .map(|part| parts::reference(&message, part))
+        .collect();
     Ok(ParsedMessage {
         headers,
         text: message.body_text(0).map(std::borrow::Cow::into_owned),
         html: message.body_html(0).map(std::borrow::Cow::into_owned),
         attachments,
+        attachment_parts,
     })
 }
 
+/// Decode the RFC 2047 encoded words in an unstructured header value (a
+/// `Subject` as the header facts hold it), adjacent words joined.
+#[must_use]
+pub fn decode_header(value: &str) -> String {
+    let parsed = HeaderForm::Text.parse(value.as_bytes());
+    parsed
+        .value()
+        .as_text()
+        .map_or_else(|| value.trim().to_owned(), str::to_owned)
+}
+
+/// A header value as written, with its folding undone.
 fn unfold(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
     text.split(['\r', '\n'])

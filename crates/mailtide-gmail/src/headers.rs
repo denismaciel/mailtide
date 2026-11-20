@@ -1,8 +1,9 @@
-//! Minimal header extraction from raw messages: only what the engine stores.
-//! Encoded words (RFC 2047) are left as sent; full parsing is
-//! `mailtide-mime`'s job.
+//! Minimal header extraction from raw messages: the eight header facts the
+//! engine stores, as written. Encoded words (RFC 2047) are left as sent; the
+//! other envelope facts (decoded sender, dates, list headers) and the
+//! attachment summary come from `mailtide-mime`'s full parse.
 
-use mailtide::gmail::HeaderFacts;
+use mailtide::gmail::{HeaderFacts, split_addresses};
 
 /// Extract header facts from an RFC 822 message (the header block only).
 #[must_use]
@@ -54,34 +55,6 @@ fn header_block(rfc822: &[u8]) -> Vec<(String, String)> {
         }
     }
     headers
-}
-
-/// Split an address list on commas outside quotes and angle brackets.
-fn split_addresses(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut angle = 0u32;
-    for c in value.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            '<' => angle += 1,
-            '>' => angle = angle.saturating_sub(1),
-            ',' if !quoted && angle == 0 => {
-                if !current.trim().is_empty() {
-                    out.push(current.trim().to_owned());
-                }
-                current.clear();
-                continue;
-            }
-            _ => {}
-        }
-        current.push(c);
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_owned());
-    }
-    out
 }
 
 #[cfg(test)]

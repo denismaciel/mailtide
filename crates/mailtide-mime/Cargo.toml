@@ -1,6 +1,6 @@
 [package]
 name = "mailtide-mime"
-description = "Optional MIME for mailtide: parsing stored messages and composing outgoing ones"
+description = "MIME for mailtide: message facts and part ranges of stored messages, composing outgoing ones"
 version.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -9,12 +9,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+mailtide = { path = "../mailtide", version = "0.2.1" }
 encodify = "1"
 mail-builder = { version = "2", default-features = false }
 mail-parser = "1"
 
 [dev-dependencies]
 mailtide-gmail = { path = "../mailtide-gmail", version = "0.2.1" }
+base64 = "0.23"
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@ id = "message-facts"
 title = "Message facts: more envelope headers, an attachment summary, and reading one part"
 summary = "At import the driver parses the raw message once and stores, inside the content record a message row already has, ten more envelope facts and a bounded attachment summary whose entries carry a byte range into the stored blob; one part is then read, or streamed, with a ranged blob read and no Gmail call, and rows imported earlier are brought up to date by a host-scheduled refresh that costs no quota."
 roadmap = ["R2", "R3", "R8"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/message-facts.md"
 # No hard dependency.
 #   threads (R7) reads From/To/Cc from the existing header facts, which this plan leaves as they are.
@@ -15,7 +15,7 @@ depends_on = []
 [[file]]
 path = "crates/mailtide/src/gmail.rs"
 change = "modify"
-role = "MessageFacts (envelope extras, attachment counts and list), AttachmentFact, PartRef, SentAt, FACTS_VERSION, the inline rule; ImportedMessage carries the facts"
+role = "MessageFacts (envelope extras, attachment counts and list), AttachmentFact, PartRef, SentAt, FACTS_VERSION, the inline rule; ImportedMessage carries the facts; split_addresses, the header facts' address split, moved here so Bcc and Reply-To are split the same way"
 
 [[file]]
 path = "crates/mailtide/src/mirror.rs"
@@ -42,7 +42,7 @@ role = "Change::FactsRefreshed; ChangeEntry.content is filled for it as for impo
 [[file]]
 path = "crates/mailtide-mime/Cargo.toml"
 change = "modify"
-role = "Depend on the core for the fact types"
+role = "Depend on the core for the fact types, and on encodify (the codecs mail-parser decodes with) for chunked decoding"
 
 [[file]]
 path = "crates/mailtide-mime/src/lib.rs"
@@ -67,7 +67,7 @@ role = "Chunked transfer decoder (base64, quoted-printable, identity) whose outp
 [[file]]
 path = "crates/mailtide-gmail/src/headers.rs"
 change = "modify"
-role = "Unchanged rules for the eight existing facts; doc comment points at mailtide-mime for the rest"
+role = "Unchanged rules for the eight existing facts (the address split now comes from the core); doc comment points at mailtide-mime for the rest"
 
 # ----------------------------------------------------------------------- store
 
@@ -171,6 +171,11 @@ change = "modify"
 role = "mailtide-mime is used by the driver at import; the blob store serves ranges"
 
 # ----------------------------------------------------------------------- tests
+
+[[file]]
+path = "crates/mailtide-mime/tests/fixtures/mail-parser/NOTICE"
+change = "new"
+role = "Origin and licence of mail-parser's .eml corpus, copied beside it for the range property test and the ported mail-parser cases"
 
 [[file]]
 path = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
@@ -842,6 +847,7 @@ note = "Same fixture, our rule: the referenced image, the declared-inline image 
 [[suite.test]]
 name = "split_encoded_words_rebuild_names_and_filenames"
 test = "a_name_split_across_encoded_words_is_rebuilt"
+note = "The sender name half. Inside a quoted filename parameter, where RFC 2047 does not apply, mail-parser decodes each word but keeps the space between them; we add no rule of our own there, and the test pins that."
 
 [[suite.test]]
 name = "a_character_split_across_encoded_words_is_rebuilt"
