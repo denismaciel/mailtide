@@ -1,447 +1,365 @@
-# Send: new, reply and forward, large uploads, at most once, undo and schedule
+# Send: new, reply and forward, at most once, undo and schedule
 
-Plan: `features/send.toml` (roadmap C3, C5). Status: planned.
-Depends on `drafts` (draft submissions run its send routine), `compose-mime`
-(the reply, forward and quoting helpers are built in its crate, on its
-`Address` and `MessageId` types) and `search` (`by_message_id()` builds the
-lookup that confirms a lost answer).
+Plan `features/send.toml` (roadmap C3, C5), approved. Requires `drafts` for
+saved-draft delivery, `compose-mime` for tracking tokens and reply/forward
+types, and `message-facts` for the token on imported mail.
 
 ## 1. Goal and scope
 
-Afterwards a host can, per account:
+A host can send RFC 5322 bytes as a new message, reply or forward, or ask to
+send an existing Gmail draft. A raw submission survives a restart and makes
+at most one wire request. The host can give a raw submission a due time and
+cancel it until a worker claims it. The host can also derive recipients,
+headers, quote text and parts from a mirrored original.
 
-- send RFC 5322 bytes as a new message, a reply or a forward, and have it land
-  in the right Gmail thread;
-- send a message of any size Gmail takes (a resumable upload above 2 MiB);
-- retry anything after a timeout or a crash and know the message leaves
-  **at most once**, with Gmail itself saying whether a send whose answer was
-  lost went out;
-- delay a send (undo window, scheduled send), cancel it until delivery starts,
-  and have that survive a restart;
-- delay the send of an existing draft the same way;
-- get from a mirrored original what a reply or forward needs: threading
-  headers, subject, recipients, the text to quote and the parts to carry.
+The same `RunnerConfig.writes.max_message_bytes` setting applies to
+raw-send admission and draft writes. Its default is 35,651,584 bytes (34 MiB).
+Gmail accepted JSON `raw`
+at 40 MiB in live tests. Messages up to 34 MiB were delivered, and sends from
+35 MiB could answer 200 and then bounce. The feed reports Gmail acceptance
+and import. The mirror handles bounces as ordinary incoming mail.
 
-Left out, with the owner:
-
-- building the MIME, Message-ID generation (`compose-mime`); which From
-  addresses and signatures are allowed (`identities`); `send_draft` itself and
-  its rules (`drafts`); reading one attachment (`message-facts`); how a
-  Message-ID is written into a Gmail query (`search`: `by_message_id()`);
-- where body, quote and signature go in a reply (signature placement), HTML
-  quoting, the undo countdown, waking up at the scheduled time: the host's.
-  The plain-text quoting helper (`quote_plain`) is planned here;
-- delivery status after Gmail accepted the message. `sent` means "Gmail filed
-  it under `SENT`". Google says a 200 does not mean delivery; a bounce is a
-  new inbox message the mirror imports like any other.
+The host supplies its own addresses and chooses the From address, signatures,
+body layout, HTML quoting, undo window and wake-up. Identity settings belong
+to the separate `identities` plan. `compose-mime` builds RFC 5322 bytes and
+`message-facts` reads parts. The host schedules existing drafts by delaying
+its call to send them.
 
 ## 2. What the references do
 
-Gmail facts are from Google's pages listed under `[[source]]` in the plan,
-read 2026-11-20. What those pages do not say is an `[[unknown]]` (§7).
+Google's method, sending, threading, quota and error documentation is listed
+in the plan. The live probes in §7 settle where API behaviour differs from
+the documentation or leaves an ambiguity.
 
-**Zero** (MIT). `driver/google.ts` `create` is one `messages.send` with
-base64 `raw` and the thread id, called from the request handler: no key, no
-record, no retry. It has no undo or scheduled send, and never uploads. The
-one guard is in `routes/assistant.ts`: an action row is claimed once before
-the call, and "a timeout after sending remains indeterminate and is never
-retried automatically: duplicate mail is worse than an error".
-`assistant-addressing.ts` and `assistant-forward.ts` derive reply recipients
-and forward content on the server. *Take:* claim once before the call; never
-resend blind; the reply-recipient rules; a forward fails when an original
-part is missing. *Leave:* re-fetching attachments from Gmail (we hold the
-blob), rewriting `cid:` images into the HTML, the SMTP path (strip Bcc,
-append a Sent copy: Gmail does both).
+**Zero** (MIT). `driver/google.ts` sends JSON `raw` and an optional thread
+id directly. `routes/assistant.ts` claims the action row before calling
+Gmail and leaves an unanswered send indeterminate. We use the claim from
+the latter, the request shape from the former, and the recipient and
+fail-closed forwarding rules from `assistant-addressing.ts` and
+`assistant-forward.ts`. Gmail derives the envelope, strips Bcc from
+recipient copies and files the sent copy.
 
-**himalaya** (MIT/Apache). `src/gmail/messages/send.rs` is the same single
-call. `src/gmail/backend.rs` records that Gmail threads by `threadId` only and
-finds a reply's thread with an `rfc822msgid:` search, skipping ids a query
-cannot carry. Its JMAP backend stages a draft, submits it, and after a request
-that failed without an answer destroys nothing, "the message possibly sent".
-Its local queue calls a row whose request left without an answer
-`unconfirmed`; cancelling it "undoes nothing". `shared/message/builder.rs`
-derives reply and forward headers, recipients and carried attachments.
-*Take:* the query form and its guard, `unconfirmed` as a named state, the
-reply and forward derivation. *Leave:* the thread search (the mirror knows the
-thread), body templates.
+**himalaya** (MIT/Apache). `src/gmail/messages/send.rs` wraps one JSON
+send. `src/gmail/backend.rs` uses `threadId` to thread a reply. We take the
+id from our mirror. The JMAP backend and local queue keep an uncertain
+send visible and refuse to undo it. `shared/message/builder.rs` gives the
+reply-header, recipient and carried-attachment cases.
 
-**pimalaya core** (MIT). Older reply and forward templates: useful cases for
-who is answered (Reply-To, From, Sender, one's own message) and prefix
-trimming. Its sending is SMTP and sendmail.
+**pimalaya core** (MIT). The reply and forward templates give the cases
+for recipient fallback, replies to one's own mail and subject prefixes.
 
-**jmap-client, Stalwart server.** The model: an `EmailSubmission` apart from
-the Email, with `sendAt` and `undoStatus` (`pending`, `final`, `canceled`),
-cancel refused with `cannotUnsend` once the message left, the delay held by
-the server (FUTURERELEASE). No tests in either pinned tree; server paths are
-names only (AGPL).
+**jmap-client, Stalwart server.** `EmailSubmission` has a due time and a
+pending-to-final boundary for cancellation. The cited Stalwart paths are
+names only (AGPL). There are no matching tests in those pinned trees.
 
-**mail-send, mail-builder, mail-parser.** Nothing to take: SMTP transport,
-composition and parsing. Gmail derives the envelope from the headers.
+**mail-send, mail-builder, mail-parser.** The first covers SMTP. Composition
+and parsing already have their own feature plans.
 
 ## 3. Design in mailtide
 
-**Approach.** A send is a **submission**: a durable row admitted without
-calling Gmail, delivered by a Foreground job, confirmed by Gmail. This is the
-SPEC §7 pattern, which `drafts` set aside for draft writes; Decision 1 says
-why it fits here. The bytes are staged in blob storage; the row holds only
-ids and state.
+### Host interface
 
-### States
+Rust methods on `mailtide_io::Runner`:
 
-| State | Meaning | Cancel |
-|---|---|---|
-| `pending` | waiting for `send_at` (or for a retry that is proven safe) | yes |
-| `sending` | a job claimed it; a request may be in flight | `CannotUnsend` |
-| `confirming` | a request left and its answer is lost; Gmail is being asked | `CannotUnsend` |
-| `sent` | Gmail accepted it; has `message_id`, `thread_id` | final |
-| `unconfirmed` | Gmail did not show it within the window; may still be out | host may `resend` |
-| `refused` | Gmail (or the draft rules) said no; nothing sent; has a reason | final |
-| `canceled`, `expired` | never sent | final |
-
-**The one rule that makes it at most once:** a send request is issued only by
-the job claim that moved the row `pending → sending`, in the same store
-transaction as the claim. A later claim that finds `sending` under an older
-attempt (a crash, a dropped future, a superseded engine) never sends: it turns
-the row `confirming`. A row returns to `pending` only on proof that nothing
-was sent.
-
-### Public API
-
-Rust (`mailtide_io::Runner`):
-
-| Method | Does |
+| Method | Result |
 |---|---|
-| `submit(account, key, source, options)` | stage and admit; no Gmail call; returns `Submission` |
-| `send(account, key, source, options, budget)` | `submit`, then deliver within `budget` (as `act` does); returns `SendOutcome { submission, run }` |
-| `cancel_submission(account, key)` | `pending → canceled`, else `CannotUnsend { maybe_sent }` |
-| `reschedule_submission(account, key, send_at)` | only while `pending` |
-| `resend_submission(account, key)` | only from `unconfirmed`: the host's explicit decision |
-| `submission(account, key)`, `submissions(account, states, after, limit)` | from the store |
-| `submission_content(account, key)` | the staged bytes (e.g. to reopen a cancelled message) |
-| `reply_plan(account, message, own_addresses, all)`, `forward_plan(account, message)` | from the stored original |
+| `submit(account, key, raw, options)` | Admit a raw submission without calling Gmail and return its `Submission`. |
+| `send(account, source, budget)` | For `Raw { key, raw, options }`, submit then run within budget and return `SendOutcome::Raw { submission, run }`. For `Draft { draft_id, if_message_id }`, return `SendOutcome::Draft(SentDraft)` or the draft error. |
+| `cancel_submission(account, key)` | Cancel while `pending`. Repeated cancellation returns the same canceled row. After claim, return `CannotUnsend` with the known disposition. |
+| `submission(account, key)`, `submissions(account, states, after, limit)` | Read raw submissions from the schema-checked store. |
+| `submission_content(account, key)` | Read staged bytes while retained. |
+| `reply_plan(account, message, own_addresses, all)`, `forward_plan(account, message)` | Derive a plan from an imported original. |
 
-- `key`: the host's idempotency key, unique per account; the Message-ID when
-  the host gives none. `submit` with a known key and the same content returns
-  the existing submission; other content is `KeyConflict`.
-- `source`: `Raw(bytes)` or `Draft { draft_id, if_message_id }`.
-- `options`: `thread_of: Option<MessageId>` (the mirrored message answered or
-  forwarded) or `thread_id`; `send_at`; `not_after`.
-- Admission checks, before anything is staged: exactly one Message-ID, in a
-  form a query can carry (`search`'s `by_message_id()` returns a term for
-  it); no live submission or mirrored `SENT` message with
-  that Message-ID; at least one recipient header; size ≤ `send_max_size`;
-  `thread_of` names a live non-draft message, and when that message is
-  imported its Message-ID is in the bytes' `References`.
-- mailtide never rewrites the bytes: what the host reviewed is what leaves.
+Raw options are `send_at` and at most one of `thread_id` and `thread_of`.
+The latter resolves to the thread of a live, non-draft mirrored message at
+admission. A missing original is `UnknownOriginal`. Omitting both omits
+`threadId`, so Gmail creates a new thread. Gmail uses the supplied
+`threadId` alone on the sender's side even when the Subject or reply
+headers differ. A gone thread is refused. A confirmed submission reports
+the ids of the imported message.
 
-`SendError`: `KeyConflict`, `MissingMessageId`, `DuplicateMessageId`,
-`NoRecipients`, `TooLarge { limit }`, `UnknownOriginal`, `ThreadingMismatch`,
-`CannotUnsend { maybe_sent }`, `UnknownSubmission`, `ReadOnly`,
-`OriginalUnavailable`.
+The caller mints an unguessable tracking token of 16–64 `A-Za-z0-9_-`
+characters, passes it to `compose` or supplies it on the raw bytes as exactly
+one `X-Mailtide-Id` header. Admission reuses the MIME header count
+(`tracking_headers`) and token reader (`tracking_id`) used by drafts.
+The validated token is saved with the submission.
+Raw admission also requires a recipient in To, Cc or Bcc, and checks decoded
+RFC 5322 byte length against `max_message_bytes` before staging. The bytes
+go out as supplied. Gmail assigns Message-ID and Date.
 
-Python `Runner` and `BlockingRunner` get the same methods (`raw: bytes` or
-`draft_id=`, keyword options), frozen dataclasses `Submission`, `SendOutcome`,
-`ReplyPlan`, `ForwardPlan`, module functions `reply_plan(raw, own_addresses,
-all=False)`, `forward_plan(raw)`, `quote_plain(text)`, and one exception per
-error above.
+The optional host key defaults to the token. A repeated key with the same
+raw bytes and requested options returns the existing row, including after
+the original message disappears or staged bytes are removed. A different
+request under that key is `KeyConflict`. A token owned by another send is
+`DuplicateTrackingId`. Admission reports `InvalidTrackingId`,
+`NoRecipients`, `TooLarge { limit }` or `ReadOnly` as appropriate. A
+reply/forward without readable original content is `OriginalUnavailable`.
 
-**Reply and forward** are pure functions in `mailtide-mime`, built after
-`compose-mime` and on its `Address` and `MessageId` types, over the original:
-`In-Reply-To` and `References` (the original's chain, then its id), a subject
-with one `Re:` or `Fwd:`, recipients (Reply-To, else From; the original's
-recipients when the user wrote it; reply-all keeps other To in To and Cc in
-Cc, without own addresses, each once), the plain text to quote, and for a
-forward every attachment and inline part with its name, type parameters and
-Content-ID. A part that cannot be read makes the plan an error. The host
-composes with `compose-mime` and submits with `thread_of`.
+Python `Runner` and `BlockingRunner` mirror these methods and return frozen
+result types. `send` takes either raw input or `draft_id` and its optional
+version check. Draft errors and receipts are the same as for `send_draft`.
+Module-level `reply_plan(raw, own_addresses, all=False)`,
+`forward_plan(raw)` and `quote_plain(text)` expose the pure helpers.
 
-### Gmail calls and quota
+### Raw submission lifecycle
 
-| Call | Units | When |
-|---|---|---|
-| `messages.send`, JSON `raw` | 100 | bytes ≤ `send_inline_limit` (2 MiB) |
-| upload session start (`uploadType=resumable`) | 100 | larger messages |
-| chunk `PUT`, status query | 0, leased | within the session (`send-upload-quota`) |
-| `messages.list?q=rfc822msgid:…&labelIds=SENT` | 5 | confirming a lost answer |
-| `drafts.send` | 100 | a draft submission (drafts' call) |
+| State | Host-visible meaning |
+|---|---|
+| `pending` | Admitted and cancellable. Eligible at `send_at`, or immediately if omitted. |
+| `claimed` | The first worker closed the cancel window. Pre-dispatch work may resume on a later run. |
+| `sending` | A fenced dispatch marker has committed. Gmail may see the request. |
+| `confirming` | Waiting for import. A decoded 2xx can expose a provisional Gmail receipt. |
+| `sent` | Sync imported a `SENT` message carrying the token. The submission exposes that message and thread id. |
+| `unknown` | The exposed confirmation deadline passed. A later matching import can still make the row `sent`. The send can never be dispatched again. |
+| `refused`, `canceled` | Definitive refusal with a reason, or cancellation before claim. |
 
-All Foreground. An ordinary send costs 100 + 2 (the history pass) + 60 (the
-import of the sent message) = 162 units: about 29 a minute under the default
-account budget, far above Gmail's own sending limits. A gate deferral is not
-an attempt. A 429 "Mail sending" limit is an account cooldown and the row is
-`pending` again.
+The first job claim atomically changes a due `pending` row to `claimed`.
+Cancellation and claim serialize on the same row. The driver reads the
+staged blob, verifies its fingerprint and prepares the request before a
+fenced `BeginSubmissionSend` commit changes the row to `sending`. That
+commit must succeed before the worker can call Gmail. The marker records
+the attempt and absolute confirmation deadline (10 minutes from the
+marker). A successor can take over pre-dispatch work on a `claimed` row.
+If it finds an unresolved marker, it can only reconcile or expire it.
+Result commits carry the claim and epoch. A result racing a matching import
+cannot roll back `sent`.
 
-**Upload.** The engine picks the protocol from the size alone. Resumable:
-start the session, **commit its URI to the row**, then `PUT` chunks
-(`send_chunk_size`, 8 MiB, multiples of 256 KiB). A later claim that finds a
-session asks it first (empty `PUT`, `Content-Range: bytes */N`): 308 resumes
-at Gmail's offset on the same session; 200 or 201 is `sent`; 404 or 410
-restarts if the final chunk was never issued, else confirms by Message-ID. A
-session URI outside Gmail's origin is refused, so the token and the message
-go nowhere else.
+The driver uses the detailed, dispatch-bounded `direct_call_before`, through
+the same quota gate as ordinary sync. Its hard dispatch deadline is the
+earlier of the run budget and the marker's confirmation deadline. The
+transport makes one attempt, with redirects and automatic retries disabled.
+The public `Runner::call_gmail` excludes the send request. When quota release
+or cooldown cleanup fails after the write, the driver first records the
+returned HTTP disposition if its claim still holds, then surfaces the
+cleanup failure. Any crash or ambiguous error around the dispatch marker
+leaves it closed to further writes.
 
-### Store
+| Disposition | What the job records |
+|---|---|
+| Quota deferral, dispatch budget expired before a write, or explicit `NotSent` proving no HTTP request left | Clear that attempt's marker under its fence. Keep `claimed` with a retry time using the gate's deferral/cooldown, or existing bounded backoff. |
+| Definitive HTTP refusal, including 400, 401, 403, 404, 413 or 429 | `refused`, with Gmail's reason and any returned `retry_at`. A cooldown still applies to other work. |
+| Decoded 2xx | `confirming` with the provisional receipt. |
+| Unusable 2xx, 408, 5xx, unexpected response, timeout or disconnect after possible dispatch | `confirming`. |
+| Crash, dropped future or supersession with marker still present | The successor treats it as `confirming` without making a write. |
+| No matching import by the deadline | `unknown` when `run` processes the deadline, including when the account is blocked. |
+| Read-only mode | Admission fails before staging. Previously admitted work that has no dispatch marker is refused locally. Work with a marker can still settle through sync. |
 
-One migration (the next one; numbers are assigned at merge):
-`mailtide_submissions (account, key, rfc822_message_id, state,
-due_at, submission)` with primary key `(account, key)` and an index on
-`(account, rfc822_message_id)`. It is needed because a submission has no
-message id until Gmail answers, so it fits neither the message nor the intent
-table, and the import-time lookup by Message-ID must be indexed. Jobs need no
-change: `Send` uses the existing `(account, kind, message)` key with the
-submission key. Bytes are in blob storage at `outbox_key(account, key)`,
-written before the row and deleted once `sent` or at retention.
+A definitive HTTP response already consumed the wire request. Only proof
+that no HTTP request left allows another pre-dispatch attempt. Credential or
+blob failures before dispatch follow the existing backoff or local refusal
+paths. An account already blocked by sync holds delivery until resumed.
 
-`Store::submit`, `cancel_submission`, `reschedule_submission` and
-`resend_submission` are, like `admit`, **not fenced by an epoch**: a user's
-send or undo must survive one sync superseding another. Cancel and the job
-claim are two transactions on one row; exactly one wins.
+### Drafts and the import path
 
-**Compatibility.** Besides the table, the feature writes `SubmissionChanged`
-entries to the log and `Send` rows to `mailtide_jobs` (keyed by a submission
-key where every other kind has a message id), and stages bytes under
-`outbox_key`. A build from before it can decode none of these. The migration
-raises `SCHEMA_VERSION`, so such a build sees the database as `ahead` and
-refuses to sync (`SchemaOutOfDate`) before it claims a job. Its reads that
-check no schema (`changes()`) fail with `CorruptState` on the first
-`SubmissionChanged` entry of a page; they never skip it. Reverting, once no
-row is `pending`, `sending` or `confirming` (cancel or let them finish
-first):
+A submission naming a draft uses `drafts.send` through the existing
+`Runner::send_draft` path. It uses the draft index's stable id, the
+`if_message_id` version check and the tracking token already on the saved
+bytes. Drafts owns its `BeginSend` fence, hard dispatch deadline, `retry_at`,
+at-most-one-request rule for the draft, and outcome after a lost reply.
+The host gets its standard immediate receipt or draft error, and its
+standard `DraftSent` or unknown-outcome notification for reconciliation.
+An immediate receipt acknowledges Gmail's answer. When the answer is
+lost, only a matching `SENT` import confirms the send. The draft retains its
+own deadline and stays fenced against another send after an unknown,
+including when a listing still shows the draft. Draft admission and
+validation take place in drafts. The draft path creates
+no raw outbox row, staged blob, raw claim or `SubmissionChanged` entry.
+Draft sends use the draft's saved content and thread. Raw options belong
+only to the raw variant.
 
-```sql
-DELETE FROM mailtide_jobs WHERE kind = <Send>;
-DELETE FROM mailtide_changes WHERE change LIKE '{"SubmissionChanged"%';
-DROP TABLE mailtide_submissions;
-DELETE FROM mailtide_schema WHERE version = <this migration>;
-```
+The shared draft path must enforce the one-wire contract before this
+feature uses it. Its `BeginSend` and dispatch deadline stay in place.
+`retry_at` allows rechecking the index and outcome. Another write can
+start only after definitive pre-dispatch failure. A Gmail refusal consumes
+the draft's wire request, and a post-attempt listing that still shows the
+draft cannot reopen send. Apply that rule in drafts' own state transitions
+so calls through either entry point obey it.
 
-and delete the staged objects under the outbox prefix. Lost: the outbox and
-its history, and with it the idempotency keys: a host that retries a key
-after the next upgrade admits a new submission, unless the mirror already
-holds the `SENT` message with that Message-ID. A `pending` row dropped by a
-rollback is a message that is never sent; a `sending` or `confirming` one is
-a send that is never confirmed. Feed consumers keep their positions.
+Both paths use one import hook, owned by drafts. In the transaction applying
+`MarkImported`, the hook takes the imported account, `SENT` label and
+`content.facts.tracking_id` from `message-facts`. It dispatches to the
+token's owner. For a raw row with a dispatch marker, or in `confirming` or
+`unknown`, it records `sent` and emits `SubmissionChanged` in the import
+commit. A draft token goes to the existing draft confirmation rule.
+A draft or an incoming copy without `SENT` cannot settle a send. Ordinary
+sync finds the sent message. After a possible send or recovery of an
+unresolved marker, the engine requests a normal history pass without
+changing its cursor directly. A history pass costs 2 units per page and
+a raw import costs 60. Either send endpoint itself costs 100 units at
+Foreground priority.
 
-### Meeting the sync engine
+### Store, feed and compatibility
 
-- **Delivery.** `claim_jobs` hands a due `Send` job its `SendPlan`, read in
-  the claim: `Deliver`, `Resume { session }`, `Confirm`, `SendDraft` or
-  `Settled`. Results are committed under the claim and the epoch, so a
-  superseded engine's answer is rejected and its successor confirms instead.
-- **The sent message** is not synthesised. After `MessageSent` the engine
-  reads history at once; the `SENT` message is discovered and imported like
-  any other, usually in the same run.
-- **Confirmation by Gmail**, the rule `drafts` uses: when a commit imports a
-  `SENT` message whose Message-ID a `sending`, `confirming` or `unconfirmed`
-  row holds, the row becomes `sent` in that commit. A draft or a received
-  copy with the same Message-ID settles nothing.
-- **Feed:** `SubmissionChanged { key, state, message_id, thread_id }` on every
-  state change. `sent` precedes that message's `MessageDiscovered` and
-  `MessageImported` unless the import is what confirmed it.
-- **No overlay.** Message and thread views show Gmail's state. A host lists
-  `submissions` to draw an outbox.
-- **Schedule.** mailtide has no timers. A pending send is a job due at
-  `send_at`; `RunOutcome` `idle` already names the next due time, and the host
-  calls `run` then. `send` delivers at once.
-- **Draft submissions** stage nothing. At `send_at` the job runs drafts'
-  `send_draft` routine with `if_message_id`; its outcomes map to `sent`,
-  `refused{draft_changed | draft_gone}` or `confirming`, and it settles on
-  `DraftSent`. Cancel leaves the draft in Gmail untouched.
+The next free migration adds `mailtide_submissions`, keyed by
+`(account, key)`, with the request fingerprint, tracking token, thread,
+blob reference, state, claim/dispatch data, receipt and due time. An
+`(account, due_at, key)` index bounds selection of ready work. A small
+`mailtide_send_tokens` table reserves `(account, tracking_id)` for one
+raw key or one draft id. Raw admission reserves the token with its row.
+Drafts' existing `BeginSend` claims that same namespace atomically with its
+fence. A different owner causes a draft validation error before dispatch.
+The same draft id may reuse its reservation only as permitted by the
+draft fence. For draft tokens imported without a reservation from a
+pre-send build, the hook keeps its existing draft matching path.
 
-### Failure and retry
+A `SendSubmissions` Foreground job reuses the account-level job shape
+introduced for drafts' `RefreshDrafts`, with its own kind. The claim selects one due raw
+row in due-time/key order or processes its confirmation deadline or blob
+cleanup. Assigning the row to a claim and publishing the next due work
+use the existing account locking and epoch rules. The run's `Idle { next }`
+reports the next scheduled work so the host can call `run` at the right time.
+Admission and cancellation are unfenced, as with `admit`. The engine owns
+fenced delivery and reconciliation. When an account is blocked, `run`
+still applies due confirmation expiries locally under the account lock.
+The expiry compares the row's state and deadline so it can race an
+import safely. The host can use the exposed deadline to wake a blocked
+account for this step. A host reads submissions to draw the
+outbox. `SubmissionChanged` includes the key, token, state and any Gmail
+receipt. Message and thread views keep showing mirrored Gmail state.
 
-| What happened | Row | Next |
-|---|---|---|
-| Gate deferral, failure to connect, 429, rate-limit 403, 401 | `pending` (not sent) | retried with backoff; still cancellable |
-| 400, other 403, 413, 404 on the thread | `refused` with Gmail's message | nothing; the account is not blocked |
-| Timeout, connection lost after the request was written, 5xx, a 200 without an id | `confirming` | session status (uploads), then lookups at 15 s, 1, 3 and 10 min |
-| Crash, dropped future or supersession while `sending` | `confirming` at the next claim | same |
-| Lookup or import shows the message | `sent` | history pass |
-| Nothing shown after `send_confirm_window` (10 min) | `unconfirmed` | never resent by mailtide; a later import still makes it `sent` |
-| Account blocked (credentials) | stays `pending` | goes out after `resume()` |
-| Read-only mode | `submit` refused; an older row ends `refused{read_only}` | none |
+Stage each candidate blob under an attempt-unique key within the account
+prefix before committing admission. A known losing candidate can be
+deleted without touching the winner. A failed blob write leaves no row.
+After an ambiguous transaction result, keep the candidate until its
+ownership is known. Account offboarding removes orphan objects as well
+as referenced objects and the two tables' account rows. Terminal rows
+retain staged content for seven days from their first terminal state.
+Cleanup removes the blob idempotently and clears its reference. Small
+receipts and token reservations remain until `forget` so a late import
+can settle an unknown and replays cannot send again.
 
-**Where this differs from `drafts.send`, and why.**
+**Compatibility.** The migration raises `SCHEMA_VERSION` for the new
+store state, job kind and feed entry. Schema-checked operations on older
+builds return `SchemaOutOfDate`. For rollback, quiesce sends, cancel
+pending raw work and drain claimed work and confirmation deadlines first.
+Stop workers, delete `SendSubmissions` jobs and `SubmissionChanged` feed
+entries, drop the two send tables, remove the send migration's version
+record and delete staged objects under the account outbox prefixes. Draft
+index and draft feed entries follow drafts' own rollback contract. Removing
+send receipts loses raw idempotency history and cross-route reservations.
+Hosts must preserve those keys and tokens across rollback to avoid replay.
+Feed cursors can retain their positions across the deleted entries.
 
-| | `drafts.send` (drafts) | `messages.send` (here) |
-|---|---|---|
-| At most once comes from | Gmail consuming the draft | the claim rule above |
-| Marker before the call | row `sending` | row `sending`, set by the claim |
-| Proof it was sent | `SENT` import with the Message-ID | the same, plus the lookup and the session status |
-| Proof it was *not* sent | the draft is still there | none exists, so no automatic retry |
-| Ends without proof as | `send_unconfirmed` after 1 h | `unconfirmed` after 10 min (the lookup asks Gmail directly) |
+### Reply and forward
 
-Final rows and their bytes are deleted `submission_retention` (7 days) after
-their last change.
+In `mailtide-mime`, build on `compose-mime`'s `Address` and `MessageId`
+types. A reply derives In-Reply-To and References from the original and sets
+one `Re:` prefix. It addresses Reply-To, else From or Sender, or the original
+recipients when the user wrote it. Reply-all keeps other To in To and Cc in
+Cc, excluding the host's own addresses and deduplicating case-insensitively.
+Forwards set one `Fwd:` prefix and provide the original's headers as data,
+plain text to quote, and attachment and inline parts with type parameters
+and Content-ID. An unreadable original or part fails the plan. The host
+composes the outgoing bytes and can pass `thread_of` to join the source
+thread.
 
 ## 4. Alternatives rejected
 
-- **A synchronous driver call with no row (Zero, himalaya):** nothing tells a
-  crashed send from one never made, and every host would rebuild the outbox,
-  the delay and the cancel race.
-- **Send every message through a hidden draft** (`drafts.create`, then
-  `drafts.send`): retries would be safe by consumption, but a draft flickers
-  through the mailbox and the feed, it costs 110 units, and it rests on
-  `drafts-send-twice`. It is the fallback if `send-message-id-kept` is refuted.
-- **Resend when the lookup finds nothing:** absence is not proof (SPEC §5.6),
-  and a request can land late. Duplicate mail is worse than an error.
-- **Bytes in the database row:** up to 35 MB per row; blob storage exists for
-  this.
-- **`uploadType=multipart` or `media`:** a third path with no recovery story;
-  `media` cannot carry a thread id.
-- **Finding the reply's thread with `rfc822msgid:` (himalaya):** the mirror
-  already has the original's thread id.
-- **Adding or rewriting headers in the engine** (a Message-ID, threading
-  headers): the bytes sent would not be the bytes reviewed.
-- **Timers or a background task inside mailtide:** the engine is sans-IO and
-  hosts already schedule `run`.
-- **A row for the sent message from the send's answer:** the answer has no
-  checkpoint; history gives one two units later.
+- Synchronous raw sends with no row lose the dispatch fence on crash.
+- A hidden draft adds a mailbox object, another Gmail write and 10 quota units.
+- Resumable upload can duplicate a send after a misleading 308. JSON `raw`
+  covers the measured delivery range.
+- Searching by Message-ID cannot recover a lost answer because Gmail rewrites
+  it. A private tracking token survives and normal import exposes it.
+- Explicit resend and automatic retries after dispatch can duplicate mail.
+- Requiring matching subject or reply headers would reject cases Gmail threads
+  successfully by `threadId`.
+- Scheduling saved drafts inside raw submissions would add a second owner for
+  the draft's send and a delayed draft-version fence.
+- Reschedule, a separate latest-send cutoff, and background timers add queue
+  transitions or scheduling machinery. The raw row needs only a due time and
+  cancellation before claim.
+- A synthetic sent message from the HTTP receipt has no sync checkpoint.
+- Storing staged bytes in SQL would duplicate the existing blob storage path.
 
 ## 5. Tests
 
-Suites were found with `grep -ri` for send, submit, reply, forward, undo and
-schedule over every checkout's test files, then read.
+- **Zero.** The two deferred tests cover fail-closed forwarding and one
+  Gmail reply carrying Bcc, joining its thread and importing under `SENT`.
+  The remaining mappings cover reply recipients and forward parts. SMTP
+  mechanics, HTML layout and Gmail attachment re-fetching are marked `na`.
+- **himalaya.** The reply parent query guard is `na` because submission
+  confirmation and threading make no such query. The reply, forward,
+  plain quoting, refusal and uncertain queue mappings exercise the
+  corresponding raw-send behaviour. The existing-draft refusal goes through
+  drafts' own path. The other shared-suite cases belong to their listed owners.
+- **pimalaya core.** Recipient fallback and prefix trimming map. Template
+  layout stays with the host.
 
-- **Zero.** The two tests `drafts` left: the forward one maps to "no plan
-  with a part missing", the SMTP one is ported by behaviour (one send, Bcc
-  intact, `SENT`, same thread). `assistant-forward` (3 mapped, 2 `na`: HTML
-  rewriting, content hash), `assistant-addressing` (5 mapped, 1 `na`),
-  `forward-attachments` and `smtp/client` (all `na`, with reasons).
-- **himalaya.** `shared/message/builder.rs` is shared with `compose-mime`: we
-  take reply, forward and plain quoting (14 mapped, 5 `na`: explicit
-  recipients and layout); 10 are deferred to it. `tests/message_reply.rs`,
-  `tests/message_forward.rs`, the two quote-text tests `message-facts` left
-  in `part.rs`, `tests/send_outcome.rs` (1 mapped, 2 `na`: Gmail files the
-  copy and has no answered flag), `email/submission.rs`, the queue's two
-  `unconfirmed` tests. `gmail/backend.rs` and `jmap/backend.rs` are large,
-  mostly foreign and shared with other plans, so neither has a `rest_na`:
-  one test of the first is mapped (`search` lists the other 16 or defers
-  them to their owners), and of the second two are mapped and nine are `na`
-  one by one (its writes and refusals; `threads` lists its reads and
-  queries, `purge` its deletes).
-- **pimalaya core.** Reply and forward templates: who is answered and prefix
-  trimming map (7); template bodies are `na` (11).
-- **Not declared.** Zero `assistant.test.ts` (a host approval workflow; its
-  "never retried" rule is restated as ours), `gmail-delivery-failure.test.ts`
-  (retry classes of Zero's label deliveries, which retry a network failure:
-  the opposite of what a send needs; `delivery-retries` accounts for it),
-  `outgoing-mime.test.ts` and
-  `email-composition.test.ts` (siblings); himalaya's live suites
-  (`tests/google.rs`); mail-send's SMTP test; core's SMTP and sendmail tests.
-
-Our own 76 tests cover what no reference has: request shapes and costs; every
-admission check; the claim rule and each row of the failure table; a crash
-between Gmail's answer and its record; supersession mid-send; the upload
-session (resume, lost final answer, dead session, foreign origin); undo
-racing delivery; a scheduled send across a restart; draft submissions;
-read-only mode; conformance on every store; a simulator campaign whose Gmail
-applies a send and loses the answer, applies it late, refuses and rate
-limits, checking that Gmail never holds two messages for one submission; and
-the Python API.
+Own tests cover the JSON request, quota and write guards, one-request
+dispositions, admission and cross-route token collisions, the claim/cancel
+race, restart and schedule, atomic import confirmation, unknown and late
+import, receipt and blob retention, draft routing, reply/forward and Python.
+Store conformance runs on every backend. The simulator varies crashes,
+supersession, and Gmail accepting, refusing, dropping or applying a request
+after its answer is lost.
 
 ## 6. Slices
 
-1. **Wire.** JSON send, the lookup, failure classes, costs, command and event
-   variants.
-2. **Submissions in the store.** Rows and pure rules, the unfenced store
-   methods, migration, conformance, the feed entry. No Gmail call yet.
-3. **Immediate send.** Staging, the `Send` job, `submit` and `send`,
-   `thread_of`, success, refusal, proven-not-sent retry, the history pass,
-   read-only. Gate: `send-bcc-stripped`.
-4. **Lost answers.** `confirming`, lookups, the import rule, `unconfirmed`,
-   `resend`; simulator sends and invariants. Gate: `send-message-id-kept`,
-   `send-lookup-latency`.
-5. **Delay.** `send_at`, cancel, reschedule, `not_after`, retention.
-6. **Large messages.** Headers and raw bodies in the wire layer, the session,
-   resume and status. Gate: the `send-session-*` and `send-size-limit` unknowns.
-7. **Draft submissions.** After drafts' send slice.
-8. **Reply and forward plans** in `mailtide-mime`, and the Runner methods.
-9. **Python**, `FakeGmail`, SPEC §4, §7–§11, §14.
-
-**Shared groundwork.** No separate plan owns the pieces several plans need;
-each is added by whichever plan lands first, and the later ones use it as it
-is:
-
-- PUT (upload chunks; request headers and raw bodies are this plan's own) in `crates/mailtide-gmail/src/http.rs` and
-  `crates/mailtide-io/src/transport.rs` (today: GET and POST): added by
-  whichever of `drafts`, `identities`, `label-edit`, `purge`, `send` lands
-  first.
-
-**Landed.** PUT, PATCH and DELETE are on `main`; headers, raw bodies and
-session URIs stay this plan's. The transport now reports a connection dropped
-after the request went out as `OutcomeUnknown`, never `NotSent`.
+1. **Single JSON call.** Build the typed wire request and receipt, quota
+   cost and detailed direct-call disposition. Exercise the request,
+   decoder and public write guard without enabling delivery.
+2. **Raw admission and store.** Add key and token reservations, migration
+   and its schema assertion, reads, due time, atomic claim/cancel and feed.
+   Integrate the draft token reservation with `BeginSend` and verify the
+   draft one-wire contract. Exercise all stores before exposing public
+   raw admission.
+3. **Fenced delivery and confirmation.** Enable the account job, bounded
+   direct call, history wake-up and shared import hook together. Add staging
+   and expose raw admission, delivery, cancellation and reads. Cover
+   deadlines, cleanup, restart, read-only, the raw reference tests and
+   simulator faults here.
+4. **Draft routing.** Add the `send` source dispatch to the existing
+   `send_draft` entry point and check its receipt, refusal and unknown
+   handling. The draft path keeps its single dispatch and its own record.
+5. **Reply and forward.** Implement the pure helpers and mirror-backed
+   Runner methods with their mapped tests.
+6. **Python and documentation.** Bind the methods and feed types, extend
+   FakeGmail, and document the API and rollback in SPEC.
 
 ## 7. Decisions
 
-1. **A send is an intent with delivery and confirmation; draft writes are
-   not.** A draft write needs Gmail's id at once and is harmless to repeat. A
-   send needs neither: the host has its key, and the call must never repeat.
-   Undo and schedule need a durable row with a due time anyway. *Would
-   change:* nothing short of Gmail offering an idempotency key.
-2. **The key is the host's; the Message-ID is required and is what Gmail
-   confirms by.** A host already has an id for its compose session, and a
-   draft submission may not know its Message-ID yet. *Would change:*
-   `send-message-id-kept` refuted (then: hidden draft, or a private header).
-3. **mailtide never resends on its own after an unanswered request.** It ends
-   `unconfirmed` and the host decides. A 5xx counts as unanswered: Google asks
-   for a retry, but nothing says a 5xx send did not go out. *Would change:*
-   measurements showing a 5xx never sends, to retry those at once.
-4. **Bytes are staged in blob storage, not in Gmail and not in the row.**
-   *Would change:* a host without writable blob storage.
-5. **JSON `raw` up to 2 MiB, a resumable session above.** Both references
-   prove the JSON path; only the session can recover a lost answer. The limit
-   is a setting: once `send-session-completed-status` is confirmed, setting it
-   to 0 makes every send recoverable. *Would change:* that confirmation.
-6. **Undo and schedule: the engine owns `send_at`, the cancel race and
-   durability; the host owns the window, the wake-up and the UI.** The race
-   between undo and delivery must be one store transaction, and only the
-   engine can test it under faults. A late send goes out late unless the host
-   set `not_after`.
-7. **A delayed draft send is a submission too**, though `drafts` left the
-   delay to the host: a real "undo send" is almost always the send of a draft,
-   and cancel then simply leaves the draft. *Would change:* the maintainer
-   keeping every draft concern in `drafts`; slice 7 can be dropped alone.
-8. **The sent message reaches the mirror by ordinary sync.** *Would change:*
-   `send-history-on-send` refuted (then: a `Verify` job for the answered id).
-9. **Reply and forward: plans, not messages.** mailtide derives headers,
-   recipients, quote text and parts, quotes plain text, and builds no body.
-   Reply-all follows Gmail's placement, not himalaya's. The helpers
-   (`reply_plan`, `forward_plan`, `quote_plain`) stay planned here, as pure
-   functions in `mailtide-mime` built after `compose-mime`, whose note says
-   the same from its side. Signature placement and HTML quoting are
-   host-side in both plans.
-10. **Admission refuses instead of repairing** (no Message-ID, References
-    not naming the original, no recipient): the bytes are never rewritten.
-11. **No overlay; submissions are their own list.**
-12. **Read-only mode refuses `submit` and ends older rows `refused`**, as
-    actions are blocked there.
-13. **Final rows last 7 days**, long enough for a host's own retries to meet
-    the same key.
+1. Raw sends use durable claims because the host needs restart-safe delay,
+   cancellation and a fence before Gmail. A Gmail idempotency key would
+   justify revisiting the dispatch fence.
+2. The token identifies the outgoing message across both routes. Scoped
+   token ownership prevents either consuming a submission as a different
+   source. Retaining small receipts allows safe replays and late imports.
+3. Gmail-confirmed mail comes from import. A successful HTTP answer is
+   available as a receipt while the submission waits. The ten-minute raw
+   window allows for sync and backoff. Ordinary late imports still settle
+   `unknown`; observed import delays could change that window.
+4. Use the existing no-retry transport and detailed direct-call path.
+   A refusal ends the submission even when Gmail suggests retry. Only
+   definite pre-dispatch failures can requeue the same work.
+5. Use one JSON path and one admission limit. Enable Bcc on that route
+   based on the measured recipient copies.
+6. Persist the raw due time and make claim the undo boundary. Saved drafts
+   use the drafts send lifecycle; the host can delay entry into it.
+7. Keep delivery bytes in the existing blob store. Unique staging keys
+   prevent concurrent submissions from overwriting each other's content.
+   Seven-day retention lets a host recover canceled or refused content.
+8. Take the thread id from the mirror or the host. Use MIME reply headers
+   for message semantics and the host's own address list for recipient
+   suggestions.
 
-Unknowns (`scripts/features.py unknowns send` prints the tests):
+Recorded Gmail probes (`scripts/features.py unknowns send` prints the details):
 
-- `send-message-id-kept`: Gmail keeps our Message-ID through `messages.send`.
-- `send-lookup-latency`: how soon `rfc822msgid:` shows a sent message.
-- `send-late-apply`: how late Gmail can apply a request the client abandoned.
-- `send-bcc-stripped`: Bcc is delivered and hidden from other recipients,
-  and kept in the `SENT` copy and in a stored draft. The only one that is
-  unsafe if wrong; it gates slice 3. It is the one unknown for Bcc:
-  `compose-mime` and `message-facts` refer to it.
-- `send-thread-mismatch`: what `threadId` with a changed subject or missing
-  headers does.
-- `send-thread-gone`: what a deleted `threadId` answers.
-- `send-session-completed-status`: a finished session answers a status query
-  with the message and sends nothing again.
-- `send-session-thread`: a session's JSON metadata carries the thread id.
-- `send-size-limit`: the largest message the upload takes (35 MB assumed).
-- `send-upload-quota`: a session costs 100 units once.
-- `send-history-on-send`: the sent message is in history when the send answers.
-
-Owned elsewhere, not repeated: `drafts-message-id-kept`,
-`drafts-send-twice` and `drafts-send-concurrent` (draft submissions),
-`drafts-raw-json-limit` (our 2 MiB inline limit sits under its 3 MiB; its
-test also sizes `messages.send`), `drafts-history-on-send` (`drafts.send`;
-ours is the same question for `messages.send`, a different endpoint, run
-together), and `search-msgid-match` (which Message-IDs `rfc822msgid:` can
-find).
+- `send-message-id-kept` was refuted. Gmail rewrites Message-ID and Date
+  and preserves private X- headers.
+- `send-lookup-latency` was refuted for the client Message-ID. The same
+  test saw prompt history records.
+- `send-late-apply` confirmed all 200 fully written requests applied even
+  when the client aborted. The observed timing was within about a second.
+- `send-bcc-stripped` confirmed the recipient copy strips Bcc, 5 of 5.
+- `send-thread-mismatch` confirmed sender-side threading by `threadId`
+  alone.
+- `send-thread-gone` confirmed a gone or nonexistent thread id is refused.
+- `send-session-completed-status` was refuted as a recovery guarantee.
+  A re-upload following a transient 308 duplicated sends.
+- `send-session-thread` confirmed the historical upload metadata test.
+  Production uses the JSON send endpoint.
+- `send-size-limit` was refuted as a wire refusal limit. Gmail accepts
+  JSON `raw` at 40 MiB and can bounce accepted sends from 35 MiB.
+- `send-history-on-send` confirmed the sent id was in the first history
+  read after the response.
