@@ -26,7 +26,10 @@ use crate::outbox::{self, ActionRequest, Delivery, Intent, IntentOp, IntentState
 use crate::quota::Priority;
 use crate::reconcile::{ListScope, ReconcileProgress, ReconcileReason};
 use crate::retry::Cooldown;
-use crate::revision::{Change, ChangePage, FeedCursor, StateSeq, cut_page, page_window};
+use crate::revision::{
+    AckOutcome, Change, ChangePage, ConsumerCursor, ConsumerList, ConsumerName, FeedCursor,
+    FeedPosition, MAX_CONSUMERS, Retention, StateSeq, compaction_target, cut_page, page_window,
+};
 use crate::state::{StoreSnapshot, SyncState};
 
 /// A message as a store holds it.
@@ -686,6 +689,8 @@ pub struct AccountMirror {
     pub log: Vec<(StateSeq, Change)>,
     /// The latest change-log position.
     pub seq: StateSeq,
+    /// The registered feed consumers, by name. Commits never touch them.
+    pub consumers: BTreeMap<ConsumerName, ConsumerCursor>,
 }
 
 impl AccountMirror {
@@ -703,6 +708,7 @@ impl AccountMirror {
             intents: BTreeMap::new(),
             log: Vec::new(),
             seq: StateSeq(0),
+            consumers: BTreeMap::new(),
         }
     }
 
@@ -1462,15 +1468,78 @@ impl AccountMirror {
         Ok(claimed)
     }
 
-    /// Drop change-feed entries at or before `through` (clamped to the
-    /// current state) once every consumer has processed them. Returns how
-    /// many were removed.
-    pub fn compact(&mut self, through: StateSeq) -> u64 {
-        let through = through.min(self.seq);
+    /// Drop change-feed entries as `retention` allows (see
+    /// [`Self::retain`]). Returns how many were removed.
+    pub fn compact(&mut self, retention: &Retention) -> u64 {
         let before = self.log.len();
-        self.log.retain(|(seq, _)| *seq > through);
-        self.record.log_floor = self.record.log_floor.max(through);
+        if let Some(through) = self.retain(retention) {
+            self.log.retain(|(seq, _)| *seq > through);
+        }
         (before - self.log.len()) as u64
+    }
+
+    /// Decide a compaction without touching the log (stores that keep the
+    /// log elsewhere delete it themselves): every cursor at the head is seen
+    /// now, then the floor rises to the target of [`compaction_target`],
+    /// clamped to the head. Returns that target; `None` drops nothing.
+    /// Cursors are never removed: one left behind the floor is lost.
+    pub fn retain(&mut self, retention: &Retention) -> Option<StateSeq> {
+        let head = FeedCursor::from(self.seq);
+        for cursor in self.consumers.values_mut() {
+            if cursor.at >= head {
+                cursor.seen_at = cursor.seen_at.max(retention.now);
+            }
+        }
+        let through = compaction_target(
+            self.consumers.values(),
+            self.record.log_floor,
+            self.seq,
+            retention,
+        )?
+        .min(self.seq);
+        self.record.log_floor = self.record.log_floor.max(through);
+        Some(through)
+    }
+
+    /// Consumer `name` has processed the feed up to `at`, at `now`: set its
+    /// cursor there (also backwards: the consumer's own position is the
+    /// truth), registering it if the name is new. A position this log can't
+    /// be held from (behind the floor or inside the floor commit, beyond
+    /// the head, of another generation) is `TooOld` and stores nothing.
+    pub fn ack(&mut self, name: &ConsumerName, at: FeedPosition, now: Timestamp) -> AckOutcome {
+        let floor = self.record.log_floor;
+        if !at.fits(self.record.generation, self.seq) || at.at.is_compacted(floor) {
+            return AckOutcome::TooOld {
+                generation: self.record.generation,
+                oldest: floor,
+            };
+        }
+        if !self.consumers.contains_key(name) && self.consumers.len() >= MAX_CONSUMERS {
+            return AckOutcome::TooManyConsumers;
+        }
+        let cursor = ConsumerCursor {
+            name: name.clone(),
+            at: at.at,
+            seen_at: now,
+        };
+        self.consumers.insert(name.clone(), cursor.clone());
+        AckOutcome::Acked(cursor)
+    }
+
+    /// Forget consumer `name`: it no longer holds the log. Whether it was
+    /// registered.
+    pub fn drop_consumer(&mut self, name: &ConsumerName) -> bool {
+        self.consumers.remove(name).is_some()
+    }
+
+    /// The registered consumers, in name order.
+    #[must_use]
+    pub fn consumer_list(&self) -> ConsumerList {
+        ConsumerList {
+            generation: self.record.generation,
+            floor: self.record.log_floor,
+            cursors: self.consumers.values().cloned().collect(),
+        }
     }
 
     /// Up to `limit` message ids after `after`, in id order (to rebuild a
@@ -2298,7 +2367,7 @@ mod tests {
             mirror.feed(inside, 10),
             crate::revision::ChangeFeed::Page(_)
         ));
-        mirror.compact(states[0]);
+        mirror.compact(&Retention::new(Timestamp(0)).through(states[0]));
         assert_eq!(
             mirror.feed(inside, 10),
             crate::revision::ChangeFeed::TooOld {
@@ -2489,5 +2558,139 @@ mod tests {
         let t = mirror.thread(&ThreadId("t".into())).expect("t");
         assert_eq!(members(&t), ["a"]);
         assert_eq!(mirror.thread(&empty), None);
+    }
+
+    fn consumer(name: &str) -> ConsumerName {
+        ConsumerName::parse(name).expect("a valid name")
+    }
+
+    /// A position in `mirror`'s generation.
+    fn position(mirror: &AccountMirror, at: impl Into<FeedCursor>) -> FeedPosition {
+        FeedPosition {
+            generation: mirror.record.generation,
+            at: at.into(),
+        }
+    }
+
+    #[test]
+    fn ack_sets_the_position_and_the_time() {
+        let (mut mirror, states) = logged(&[1, 1, 1]);
+        let reader = consumer("reader");
+        let first = mirror.ack(&reader, position(&mirror, states[1]), Timestamp(10));
+        let expected = |at: StateSeq, seen_at| ConsumerCursor {
+            name: reader.clone(),
+            at: at.into(),
+            seen_at: Timestamp(seen_at),
+        };
+        assert_eq!(first, AckOutcome::Acked(expected(states[1], 10)));
+        assert_eq!(
+            mirror.consumer_list().cursors,
+            vec![expected(states[1], 10)]
+        );
+        // Moving on, then back to an older checkpoint the log still holds.
+        mirror.ack(&reader, position(&mirror, states[2]), Timestamp(20));
+        let back = mirror.ack(&reader, position(&mirror, states[0]), Timestamp(30));
+        assert_eq!(back, AckOutcome::Acked(expected(states[0], 30)));
+        assert_eq!(
+            mirror.consumer_list().cursors,
+            vec![expected(states[0], 30)]
+        );
+    }
+
+    #[test]
+    fn an_ack_behind_the_floor_is_too_old_and_stores_nothing() {
+        let (mut mirror, states) = logged(&[3, 1, 1]);
+        mirror.compact(&Retention::new(Timestamp(0)).through(states[1]));
+        let too_old = AckOutcome::TooOld {
+            generation: 1,
+            oldest: states[1],
+        };
+        let reader = consumer("reader");
+        let inside_floor = FeedCursor {
+            seq: states[1],
+            entry: Some(0),
+        };
+        for at in [states[0].into(), inside_floor] {
+            assert_eq!(
+                mirror.ack(&reader, position(&mirror, at), Timestamp(1)),
+                too_old
+            );
+            assert!(mirror.consumers.is_empty(), "nothing registered");
+        }
+        mirror.ack(&reader, position(&mirror, states[2]), Timestamp(1));
+        let registered = mirror.consumers.clone();
+        assert_eq!(
+            mirror.ack(&reader, position(&mirror, states[0]), Timestamp(2)),
+            too_old
+        );
+        let beyond = position(&mirror, StateSeq(states[2].0 + 1));
+        assert_eq!(mirror.ack(&reader, beyond, Timestamp(2)), too_old);
+        let other_generation = FeedPosition {
+            generation: 2,
+            at: states[2].into(),
+        };
+        assert_eq!(mirror.ack(&reader, other_generation, Timestamp(2)), too_old);
+        assert_eq!(mirror.consumers, registered, "the cursor is unchanged");
+    }
+
+    #[test]
+    fn a_consumer_at_the_head_is_seen_by_compaction() {
+        let day = std::time::Duration::from_hours(24);
+        let (mut mirror, states) = logged(&[1, 1]);
+        let reader = consumer("reader");
+        mirror.ack(&reader, position(&mirror, states[1]), Timestamp(0));
+        // A quiet mailbox: daily compactions for a month, no acks.
+        let mut now = Timestamp(0);
+        for _ in 0..30 {
+            now = now.plus(day);
+            mirror.compact(&Retention::new(now));
+            assert_eq!(mirror.consumers[&reader].seen_at, now, "seen at the head");
+        }
+        // Mail arrives; the reader falls behind and its idle clock starts.
+        let head = append(&mut mirror, 1);
+        let fell_behind = now;
+        now = now.plus(day);
+        mirror.compact(&Retention::new(now));
+        assert_eq!(mirror.consumers[&reader].seen_at, fell_behind);
+        assert_eq!(
+            mirror.record.log_floor, states[1],
+            "it still holds its entries"
+        );
+        assert_eq!(mirror.log.len(), 1);
+        // Silent for longer than the idle limit: it stops holding the log.
+        now = fell_behind
+            .plus(crate::revision::DEFAULT_MAX_IDLE)
+            .plus(day);
+        assert_eq!(mirror.compact(&Retention::new(now)), 1);
+        assert_eq!(mirror.record.log_floor, head);
+        assert!(mirror.consumers[&reader].is_lost(mirror.record.log_floor));
+    }
+
+    #[test]
+    fn the_number_of_consumers_per_account_is_bounded() {
+        let (mut mirror, states) = logged(&[1]);
+        let at = position(&mirror, states[0]);
+        for n in 0..MAX_CONSUMERS {
+            let name = consumer(&format!("c{n}"));
+            assert!(matches!(
+                mirror.ack(&name, at, Timestamp(0)),
+                AckOutcome::Acked(_)
+            ));
+        }
+        let extra = consumer("extra");
+        assert_eq!(
+            mirror.ack(&extra, at, Timestamp(0)),
+            AckOutcome::TooManyConsumers
+        );
+        assert!(!mirror.consumers.contains_key(&extra));
+        assert!(matches!(
+            mirror.ack(&consumer("c3"), at, Timestamp(1)),
+            AckOutcome::Acked(_)
+        ));
+        assert!(mirror.drop_consumer(&consumer("c3")));
+        assert!(matches!(
+            mirror.ack(&extra, at, Timestamp(1)),
+            AckOutcome::Acked(_)
+        ));
     }
 }

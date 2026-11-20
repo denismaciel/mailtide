@@ -155,10 +155,9 @@ impl Store for MemoryStore {
     }
 
     async fn compact(&self, account: &AccountId, through: StateSeq) -> Result<u64, StoreError> {
-        Ok(self
-            .lock()?
-            .get_mut(account)
-            .map_or(0, |mirror| mirror.compact(through)))
+        Ok(self.lock()?.get_mut(account).map_or(0, |mirror| {
+            mirror.compact(&mailtide::revision::Retention::new(Timestamp(0)).through(through))
+        }))
     }
 
     async fn message_ids(
