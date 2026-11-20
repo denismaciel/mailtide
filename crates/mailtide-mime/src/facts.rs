@@ -20,7 +20,7 @@ pub fn facts(raw: &[u8]) -> MessageFacts {
     };
     let root = message.root();
     let headers = root.headers();
-    let sender = headers.from().and_then(|from| from.first());
+    let sender = headers.all_from().next().and_then(|from| from.first());
     let list_unsubscribe = first_value(&headers, HeaderName::ListUnsubscribe)
         .map(|value| unsubscribe_uris(&value))
         .unwrap_or_default();
@@ -35,7 +35,11 @@ pub fn facts(raw: &[u8]) -> MessageFacts {
     let mut facts = MessageFacts {
         bcc: addresses(&headers, HeaderName::Bcc),
         reply_to: addresses(&headers, HeaderName::ReplyTo),
-        sent_at: headers.date().and_then(sent_at),
+        sent_at: headers
+            .all(HeaderName::Date)
+            .next()
+            .and_then(|date| date.value().as_datetime())
+            .and_then(sent_at),
         sender_name: sender.and_then(|mailbox| mailbox.name()).map(str::to_owned),
         sender_email: sender
             .and_then(|mailbox| mailbox.address())
@@ -46,13 +50,18 @@ pub fn facts(raw: &[u8]) -> MessageFacts {
         auto_submitted: first_value(&headers, HeaderName::AutoSubmitted)
             .and_then(|value| keyword(&value)),
         precedence: first_value(&headers, HeaderName::Precedence).and_then(|value| keyword(&value)),
+        tracking_id: crate::tracking_id(raw),
         ..MessageFacts::empty()
     };
     for leaf in leaves(&message, root) {
         match leaf.role {
             PartRole::Attached => facts.attached = facts.attached.saturating_add(1),
             PartRole::Inline => facts.inline = facts.inline.saturating_add(1),
-            PartRole::Text | PartRole::Html | PartRole::Protocol => continue,
+            PartRole::Protocol => {
+                facts.protocol = facts.protocol.saturating_add(1);
+                continue;
+            }
+            PartRole::Text | PartRole::Html => continue,
         }
         // Every part of the top-level message has a range in the raw input.
         let Some(part) = leaf.reference else { continue };
@@ -64,7 +73,6 @@ pub fn facts(raw: &[u8]) -> MessageFacts {
                     .attachment_name()
                     .map(|name| cut(name, MAX_FILENAME_BYTES).to_owned()),
                 content_type: leaf.content_type,
-                size: leaf.size,
                 content_id: leaf.part.content_id().map(str::to_owned),
                 disposition: leaf.disposition,
                 referenced: leaf.referenced,
@@ -87,7 +95,8 @@ fn addresses(headers: &Headers<'_>, name: HeaderName<'_>) -> Vec<String> {
 /// The first field named `name`, unfolded, as written.
 fn first_value(headers: &Headers<'_>, name: HeaderName<'_>) -> Option<String> {
     headers
-        .get(name)
+        .all(name)
+        .next()
         .map(|header| crate::unfold(header.raw_value()))
 }
 
@@ -413,6 +422,129 @@ mod tests {
                 "application/octet-stream"
             ]
         );
+    }
+
+    const TOKEN: &str = "k3Jd9_x-Q2mZ8pLw";
+
+    #[test]
+    fn a_tracking_id_is_read_from_the_first_well_formed_x_mailtide_id() {
+        let read = |headers: &str| {
+            let raw = message(headers);
+            let token = crate::tracking_id(&raw);
+            assert_eq!(token, facts(&raw).tracking_id, "{headers:?}");
+            token
+        };
+        let long = "A".repeat(64);
+        assert_eq!(
+            read(&format!("X-Mailtide-Id: {TOKEN}\r\n")).as_deref(),
+            Some(TOKEN)
+        );
+        assert_eq!(
+            read(&format!("x-MAILTIDE-id:   {TOKEN} \r\n")).as_deref(),
+            Some(TOKEN)
+        );
+        assert_eq!(
+            read(&format!("X-Mailtide-Id:\r\n {TOKEN}\r\n")).as_deref(),
+            Some(TOKEN)
+        );
+        assert_eq!(
+            read(&format!("X-Mailtide-Id: {long}\r\n")),
+            Some(long.clone())
+        );
+        assert_eq!(
+            read(&format!(
+                "X-Mailtide-Id: {TOKEN}\r\nX-Mailtide-Id: {long}\r\n"
+            ))
+            .as_deref(),
+            Some(TOKEN),
+            "the first one wins"
+        );
+        assert_eq!(
+            read(&format!(
+                "X-Mailtide-Id: not valid\r\nX-Mailtide-Id: {TOKEN}\r\n"
+            ))
+            .as_deref(),
+            Some(TOKEN),
+            "a malformed one is passed over"
+        );
+        assert_eq!(crate::TRACKING_HEADER, "X-Mailtide-Id");
+    }
+
+    #[test]
+    fn a_malformed_or_missing_tracking_id_is_none() {
+        let read = |headers: &str| facts(&message(headers)).tracking_id;
+        assert_eq!(read("Subject: no token\r\n"), None);
+        for bad in [
+            "",
+            "short_token_15c",
+            &"A".repeat(65),
+            "k3Jd9 x-Q2mZ8pLw",
+            "k3Jd9.x-Q2mZ8pLw",
+            "k3Jd9_x-Q2mZ8pL\u{e9}",
+            "<k3Jd9_x-Q2mZ8pLw>",
+        ] {
+            assert_eq!(read(&format!("X-Mailtide-Id: {bad}\r\n")), None, "{bad:?}");
+        }
+        assert_eq!(crate::tracking_id(b""), None);
+    }
+
+    #[test]
+    fn every_non_body_part_counts_for_gmail_has_attachment() {
+        let signed = b"Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"b\"\r\n\r\n\
+            --b\r\nContent-Type: text/html\r\n\r\n<p>hi</p>\r\n\
+            --b\r\nContent-Type: application/pgp-signature\r\n\r\nsig\r\n--b--\r\n";
+        let calendar = b"Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+            --b\r\nContent-Type: text/html\r\n\r\n<p>invite</p>\r\n\
+            --b\r\nContent-Type: text/calendar\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n--b--\r\n";
+        let html = "<img src=\"cid:i@x\">";
+        // The shapes of message-facts-has-attachment-parity, (a) to (g):
+        // Gmail's has:attachment matched all seven.
+        let shapes: [(&str, Vec<u8>, bool); 7] = [
+            (
+                "a",
+                with_image(
+                    "related",
+                    html,
+                    "Content-ID: <i@x>\r\nContent-Disposition: inline\r\n",
+                ),
+                false,
+            ),
+            (
+                "b",
+                with_image(
+                    "related",
+                    html,
+                    "Content-ID: <i@x>\r\nContent-Disposition: attachment\r\n",
+                ),
+                false,
+            ),
+            (
+                "c",
+                with_image("mixed", "<p>x</p>", "Content-Disposition: inline\r\n"),
+                false,
+            ),
+            ("d", with_image("mixed", "<p>x</p>", ""), true),
+            (
+                "e",
+                with_image("related", "<p>x</p>", "Content-ID: <i@x>\r\n"),
+                false,
+            ),
+            ("f", signed.to_vec(), false),
+            ("g", calendar.to_vec(), true),
+        ];
+        for (shape, raw, paperclip) in shapes {
+            let facts = facts(&raw);
+            assert!(facts.gmail_has_attachment(), "({shape})");
+            assert_eq!(facts.has_attachment(), paperclip, "({shape})");
+        }
+        let facts = facts(signed);
+        assert_eq!((facts.attached, facts.inline, facts.protocol), (0, 0, 1));
+        assert!(
+            facts.parts.is_empty(),
+            "a signature is counted, never listed"
+        );
+        let control = super::facts(b"Content-Type: text/html\r\n\r\n<p>only a body</p>\r\n");
+        assert!(!control.gmail_has_attachment() && !control.has_attachment());
     }
 
     /// splitmix64, for inputs that differ on every run of the loop.

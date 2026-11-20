@@ -130,7 +130,7 @@ pub(crate) fn leaves<'m>(message: &'m Message<'_>, owner: MessageRef<'m>) -> Vec
                 role,
                 reference: reference(message, part),
                 content_type,
-                size: u64::try_from(part.decoded_len()).unwrap_or(u64::MAX),
+                size: decoded_size(part),
                 disposition,
                 referenced,
                 related,
@@ -286,8 +286,13 @@ pub(crate) fn reference(message: &Message<'_>, part: MessagePart<'_>) -> Option<
         length: u64::try_from(body.len()).ok()?,
         encoding,
         irregular,
+        size: decoded_size(part),
         total: u64::try_from(message.raw().len()).ok()?,
     })
+}
+
+fn decoded_size(part: MessagePart<'_>) -> u64 {
+    u64::try_from(part.decoded_len()).unwrap_or(u64::MAX)
 }
 
 /// How many attached messages `owner` is inside.
@@ -313,9 +318,10 @@ mod tests {
             length: 6920,
             encoding: TransferEncoding::Base64,
             irregular: false,
+            size: 5_110,
             total: 48_211,
         };
-        assert_eq!(example.to_string(), "1042.6920.b.48211");
+        assert_eq!(example.to_string(), "1042.6920.b.5110.48211");
         for (encoding, code) in [
             (TransferEncoding::Identity, 'n'),
             (TransferEncoding::QuotedPrintable, 'q'),
@@ -327,6 +333,7 @@ mod tests {
                     length: 0,
                     encoding,
                     irregular,
+                    size: 0,
                     total: 7,
                 };
                 let text = part.to_string();
@@ -335,28 +342,31 @@ mod tests {
                 } else {
                     code
                 };
-                assert_eq!(text, format!("7.0.{expected}.7"));
+                assert_eq!(text, format!("7.0.{expected}.0.7"));
                 assert_eq!(PartRef::parse(&text), Ok(part));
                 assert_eq!(text.parse::<PartRef>(), Ok(part));
             }
         }
         let json = serde_json::to_string(&example).expect("serialises");
-        assert_eq!(json, "\"1042.6920.b.48211\"");
+        assert_eq!(json, "\"1042.6920.b.5110.48211\"");
         assert_eq!(serde_json::from_str::<PartRef>(&json).ok(), Some(example));
         for bad in [
             "",
-            "1042.6920.b",
-            "1042.6920.b.48211.1",
-            "1042.6920.x.48211",
-            "1042.6920.bb.48211",
-            "01042.6920.b.48211",
-            "+1042.6920.b.48211",
-            "-1.6920.b.48211",
-            " 1042.6920.b.48211",
-            "1042.6920.b.48211\n",
-            "48000.6920.b.48211",
-            "18446744073709551615.1.n.18446744073709551615",
-            "a.b.c.d",
+            "1042.6920.b.5110",
+            "1042.6920.b.48211",
+            "1042.6920.b.5110.48211.1",
+            "1042.6920.x.5110.48211",
+            "1042.6920.bb.5110.48211",
+            "01042.6920.b.5110.48211",
+            "1042.6920.b.05110.48211",
+            "+1042.6920.b.5110.48211",
+            "-1.6920.b.5110.48211",
+            " 1042.6920.b.5110.48211",
+            "1042.6920.b.5110.48211\n",
+            "48000.6920.b.5110.48211",
+            "1042.6920.b.6921.48211",
+            "18446744073709551615.1.n.1.18446744073709551615",
+            "a.b.c.d.e",
         ] {
             assert!(PartRef::parse(bad).is_err(), "{bad:?}");
             assert!(

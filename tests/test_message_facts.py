@@ -21,6 +21,7 @@ REPORT = (
     b"List-Unsubscribe: <mailto:leave@example.org>, <https://example.org/u>\r\n"
     b"List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"
     b"Precedence: Bulk\r\n"
+    b"X-Mailtide-Id:\r\n k3Jd9_x-Q2mZ8pLw\r\n"
     b'Content-Type: multipart/mixed; boundary="m"\r\n'
     b"\r\n"
     b"--m\r\n"
@@ -73,7 +74,8 @@ def test_content_carries_the_new_facts_and_attachments(gmail: tuple[Mailbox, str
     assert content.list_unsubscribe == ["mailto:leave@example.org", "https://example.org/u"]
     assert content.one_click_unsubscribe
     assert (content.auto_submitted, content.precedence) == (None, "bulk")
-    assert (content.attachment_count, content.inline_count) == (1, 1)
+    assert content.tracking_id == "k3Jd9_x-Q2mZ8pLw"
+    assert (content.attachment_count, content.inline_count, content.protocol_count) == (1, 1, 0)
     assert content.has_attachment is True
     assert content.attachments is not None
     image, pdf = content.attachments
@@ -86,7 +88,7 @@ def test_content_carries_the_new_facts_and_attachments(gmail: tuple[Mailbox, str
         False,
     )
     assert pdf.disposition == "attachment"
-    assert pdf.part.endswith(f".b.{content.size}")
+    assert pdf.part.endswith(f".b.9.{content.size}")
     [plain] = runner.messages(ACCOUNT, ["m2"])
     assert plain.content is not None
     assert plain.content.attachments == [] and plain.content.has_attachment is False
@@ -99,7 +101,16 @@ def test_import_entry_carries_the_facts(gmail: tuple[Mailbox, str]) -> None:
     [entry] = [c for c in page.changes if isinstance(c, mailtide.MessageImported) and c.id == "m1"]
     [view] = runner.messages(ACCOUNT, ["m1"])
     assert entry.content is not None and view.content is not None
-    for field in ("facts_version", "sender_name", "bcc", "sent_at_ms", "attachment_count"):
+    assert entry.content.tracking_id == "k3Jd9_x-Q2mZ8pLw"
+    fields = (
+        "facts_version",
+        "sender_name",
+        "bcc",
+        "sent_at_ms",
+        "attachment_count",
+        "tracking_id",
+    )
+    for field in fields:
         assert getattr(entry.content, field) == getattr(view.content, field), field
     assert entry.content.attachments is not None and view.content.attachments is not None
     assert [a.part for a in entry.content.attachments] == [a.part for a in view.content.attachments]
@@ -126,6 +137,7 @@ def test_content_from_before_shows_version_zero_and_no_list(
     assert content.attachments is None
     assert content.attachment_count is None and content.inline_count is None
     assert content.has_attachment is None, "unknown, not none"
+    assert content.protocol_count is None and content.tracking_id is None
     assert content.subject == "=?utf-8?Q?Caf=C3=A9_report?="
 
 

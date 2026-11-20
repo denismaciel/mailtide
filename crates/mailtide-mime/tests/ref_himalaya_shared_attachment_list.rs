@@ -47,7 +47,7 @@ fn summary_references_are_those_of_the_part_listing() {
             .find(|info| info.part == Some(entry.part))
             .expect("the summary's reference in the listing");
         assert_eq!(part.content_type, entry.content_type);
-        assert_eq!(part.size, entry.size);
+        assert_eq!(part.size, entry.part.size);
         let role = if entry.is_inline() {
             PartRole::Inline
         } else {

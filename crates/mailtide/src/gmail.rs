@@ -200,10 +200,18 @@ pub struct MessageFacts {
     pub auto_submitted: Option<String>,
     /// The `Precedence` keyword, lowercased, parameters dropped.
     pub precedence: Option<String>,
+    /// The token of the first `X-Mailtide-Id` header: the identity of a
+    /// message mailtide wrote, which Gmail keeps byte for byte (a sent copy
+    /// or a saved draft carries the token it was written with). `None` when
+    /// absent or not 16 to 64 characters of `A-Za-z0-9_-`.
+    pub tracking_id: Option<String>,
     /// How many listed parts are attached, beyond the list too.
     pub attached: u32,
     /// How many listed parts are inline, beyond the list too.
     pub inline: u32,
+    /// How many RFC 1847 signature and encryption parts the message has:
+    /// counted, never listed.
+    pub protocol: u32,
     /// The first [`MAX_LISTED_PARTS`] listed parts, in document order.
     pub parts: Vec<AttachmentFact>,
 }
@@ -223,6 +231,15 @@ impl MessageFacts {
     #[must_use]
     pub fn has_attachment(&self) -> bool {
         self.attached > 0
+    }
+
+    /// Whether Gmail's `has:attachment` search operator matches the message:
+    /// it counts every part that is not a text or HTML body, inline images
+    /// and signature parts included, so it is broader than
+    /// [`Self::has_attachment`].
+    #[must_use]
+    pub fn gmail_has_attachment(&self) -> bool {
+        self.attached > 0 || self.inline > 0 || self.protocol > 0
     }
 }
 
@@ -246,8 +263,6 @@ pub struct AttachmentFact {
     /// The declared media type, lowercased; `application/octet-stream` when
     /// absent or unreadable. Never sniffed.
     pub content_type: String,
-    /// Its size after transfer decoding: exactly what reading it returns.
-    pub size: u64,
     /// The `Content-ID`, without angle brackets.
     pub content_id: Option<String>,
     /// The declared `Content-Disposition` type, lowercased.
@@ -304,14 +319,16 @@ pub enum TransferEncoding {
 }
 
 /// Where one part's body is in a stored raw message: its byte range, its
-/// transfer encoding, and the length of the blob it was computed against.
-/// It names bytes in an immutable blob, so it stays valid across parser
-/// upgrades and refreshes, and reading the part needs nothing but the blob.
+/// transfer encoding, its size once decoded, and the length of the blob it
+/// was computed against. It names bytes in an immutable blob, so it stays
+/// valid across parser upgrades and refreshes, and reading the part needs
+/// nothing but the blob; a read larger than allowed is refused from the
+/// reference alone.
 ///
-/// Its text form is `offset.length.encoding.total`, e.g.
-/// `1042.6920.b.48211`, with `n`, `q` or `b` for the encoding, upper case
-/// when the body is malformed for it (such a part is decoded whole, never
-/// in chunks). Hosts treat it as opaque.
+/// Its text form is `offset.length.encoding.size.total`, e.g.
+/// `1042.6920.b.5110.48211`, with `n`, `q` or `b` for the encoding, upper
+/// case when the body is malformed for it (such a part is decoded whole,
+/// never in chunks). Hosts treat it as opaque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct PartRef {
@@ -323,6 +340,8 @@ pub struct PartRef {
     pub encoding: TransferEncoding,
     /// Whether the body is malformed for its encoding.
     pub irregular: bool,
+    /// Its size after transfer decoding: exactly what reading it returns.
+    pub size: u64,
     /// The length of the blob the range was computed against.
     pub total: u64,
 }
@@ -344,7 +363,7 @@ impl PartRef {
     pub fn parse(text: &str) -> Result<Self, InvalidPartRef> {
         let invalid = || InvalidPartRef(text.to_owned());
         let fields: Vec<&str> = text.split('.').collect();
-        let [offset, length, code, total] = fields.as_slice() else {
+        let [offset, length, code, size, total] = fields.as_slice() else {
             return Err(invalid());
         };
         let number = |field: &str| field.parse::<u64>().map_err(|_| invalid());
@@ -362,13 +381,15 @@ impl PartRef {
             length: number(length)?,
             encoding,
             irregular,
+            size: number(size)?,
             total: number(total)?,
         };
         let fits = part
             .offset
             .checked_add(part.length)
             .is_some_and(|end| end <= part.total);
-        if !fits || part.to_string() != text {
+        // Decoding never makes a body longer.
+        if !fits || part.size > part.length || part.to_string() != text {
             return Err(invalid());
         }
         Ok(part)
@@ -385,7 +406,11 @@ impl std::fmt::Display for PartRef {
             (TransferEncoding::Base64, false) => 'b',
             (TransferEncoding::Base64, true) => 'B',
         };
-        write!(f, "{}.{}.{code}.{}", self.offset, self.length, self.total)
+        write!(
+            f,
+            "{}.{}.{code}.{}.{}",
+            self.offset, self.length, self.size, self.total
+        )
     }
 }
 

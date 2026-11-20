@@ -179,9 +179,11 @@ class MessageContent:
     one_click_unsubscribe: bool
     auto_submitted: str | None
     precedence: str | None
+    tracking_id: str | None
     attachments: list[AttachmentInfo] | None
     attachment_count: int | None
     inline_count: int | None
+    protocol_count: int | None
     has_attachment: bool | None
 
 @final

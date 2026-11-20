@@ -40,7 +40,7 @@ fn a_single_part_message_has_one_range_from_its_body_to_its_end() {
     let parts = parts(raw);
     assert_eq!(parts.len(), 1);
     let part = parts[0].part.expect("range");
-    assert_eq!(part.to_string(), format!("23.5.n.{}", raw.len()));
+    assert_eq!(part.to_string(), format!("23.5.n.5.{}", raw.len()));
     assert_eq!(body(raw, &part), b"body\n");
     assert_eq!(parts[0].role, PartRole::Text);
 }

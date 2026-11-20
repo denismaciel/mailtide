@@ -167,7 +167,7 @@ fn a_message_that_is_one_binary_part_has_one_attached_part() {
         (attached, inline, types),
         (1, 0, vec!["application/pdf".into()])
     );
-    assert_eq!(facts(PDF_ALONE).parts[0].size, 9);
+    assert_eq!(facts(PDF_ALONE).parts[0].part.size, 9);
 }
 
 #[test]

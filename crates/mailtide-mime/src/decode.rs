@@ -122,13 +122,16 @@ mod tests {
 
     fn reference(encoding: TransferEncoding, irregular: bool, body: &[u8]) -> PartRef {
         let length = u64::try_from(body.len()).unwrap_or(u64::MAX);
-        PartRef {
+        let mut part = PartRef {
             offset: 0,
             length,
             encoding,
             irregular,
+            size: 0,
             total: length,
-        }
+        };
+        part.size = u64::try_from(whole(&part, body).len()).unwrap_or(u64::MAX);
+        part
     }
 
     fn whole(part: &PartRef, body: &[u8]) -> Vec<u8> {

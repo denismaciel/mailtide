@@ -9,7 +9,8 @@ Afterwards a host can, per message and without parsing anything itself:
 - read ten more envelope facts from `messages()` and from the import entry of
   the change feed: Bcc, Reply-To, the Date header, the sender's display name
   and address, List-Id, List-Unsubscribe (with one-click), Auto-Submitted and
-  Precedence;
+  Precedence; and the `X-Mailtide-Id` token of a message mailtide wrote, which
+  drafts and send settle a lost answer by;
 - show a paperclip and an attachment list: a count, and per part its filename,
   media type, decoded size, and whether it is inline or attached;
 - read one attachment or inline image by a reference taken from that list,
@@ -82,8 +83,8 @@ two things we move away from. **mail-builder, mail-send:** nothing here.
 once with `mailtide-mime` and reports the result with the import; the core
 stores it inside the content record the message row already has. Each listed
 part carries a **part reference**: the byte range of its body in the stored
-blob plus its transfer encoding. Reading a part is a ranged blob read and a
-decode: no parse, no store read, no Gmail call.
+blob plus its transfer encoding and decoded size. Reading a part is a ranged
+blob read and a decode: no parse, no store read, no Gmail call.
 
 ### What is stored
 
@@ -102,13 +103,16 @@ version-only migration step (see Compatibility below).
 | `list_unsubscribe` | its URIs, at most 4 of at most 2,048 bytes each |
 | `one_click_unsubscribe` | true with `List-Unsubscribe-Post: List-Unsubscribe=One-Click` and an https URI (RFC 8058) |
 | `auto_submitted`, `precedence` | the keyword, lowercased, parameters dropped |
+| `tracking_id` | the first well-formed `X-Mailtide-Id` header (16 to 64 characters of `A-Za-z0-9_-`; name in any case, folding undone; a malformed one is passed over), else absent, as `compose`'s `tracking_id(raw)` reads it: the identity of a message mailtide wrote, which Gmail keeps byte for byte (feature rules) |
 | `attached`, `inline` | exact counts of listed parts of each kind |
+| `protocol` | exact count of RFC 1847 signature and encryption parts, never listed |
 | `parts` | the first 32 listed parts, in document order |
 
 Each listed part: `part` (reference), `filename` (RFC 2231/2047 decoded, at
 most 255 bytes), `content_type` (declared, lowercased;
-`application/octet-stream` when absent or unreadable), `size` (decoded bytes:
-exactly what a read returns), `content_id` (no angle brackets), and the three
+`application/octet-stream` when absent or unreadable), its size (decoded
+bytes: exactly what a read returns; carried by the reference), `content_id`
+(no angle brackets), and the three
 ingredients of the inline rule: `disposition` as declared, `referenced`,
 `related`.
 
@@ -169,15 +173,33 @@ otherwise be hidden as inline, where himalaya and a reader expect a file.)
 
 An attached message is always attached. `has_attachment` is `attached > 0`.
 The rule is one pure function over the stored ingredients, so changing it
-needs no blob read (see `message-facts-has-attachment-parity`).
+needs no blob read.
+
+**It deliberately differs from Gmail's `has:attachment`.** Tested live
+(`message-facts-has-attachment-parity`, refuted), the operator matches every
+message with any part that is not a text or HTML body: an image a `cid:` link
+shows, an image declared inline, an undeclared component of
+`multipart/related`, a lone signature part, a `text/calendar` alternative.
+Our paperclip leaves out the first three (shown inside the message) and
+signatures (not files), which is what a message list wants. The summary keeps
+what reproduces Gmail's notion: `attached + inline + protocol > 0`
+(`MessageFacts::gmail_has_attachment`; in Python, `attachment_count +
+inline_count + protocol_count > 0`).
 
 ### Part reference
 
-`offset.length.encoding.total`, for example `1042.6920.b.48211`: where the
-part's body starts in the blob, its encoded length, its transfer encoding
-(`n` none, `q` quoted-printable, `b` base64; upper case when the body is
-malformed for its encoding), and the length of the blob it was computed
-against. Hosts treat it as opaque.
+`offset.length.encoding.size.total`, for example `1042.6920.b.5110.48211`:
+where the part's body starts in the blob, its encoded length, its transfer
+encoding (`n` none, `q` quoted-printable, `b` base64; upper case when the
+body is malformed for its encoding), its decoded size, and the length of the
+blob it was computed against. Hosts treat it as opaque.
+
+(Building it showed the size belongs in the reference: a read over
+`max_bytes` must be refused before any read, and the encoded length bounds
+the decoded size only loosely, so himalaya's 7-byte part under a 7-byte cap
+would be refused. With the size there, the refusal is exact, a stream knows
+its length up front, and a read whose decoded length differs is caught as a
+stale reference.)
 
 It is a fact about immutable bytes, so it stays valid across parser upgrades,
 rule changes and refreshes, and a read needs nothing but the blob. A part
@@ -209,8 +231,9 @@ before any read).
 
 Python: `MessageContent` gains `facts_version` (0 when not extracted), the ten
 envelope fields (`sent_at_ms`, `sent_at_offset_min` for the date),
-`attachments: list[AttachmentInfo] | None`, `attachment_count`,
-`inline_count` and `has_attachment`, the last four `None` when not extracted,
+`tracking_id`, `attachments: list[AttachmentInfo] | None`,
+`attachment_count`, `inline_count`, `protocol_count` and `has_attachment`,
+the last five `None` when not extracted,
 so "unknown" is never shown as "none". `AttachmentInfo` has `part`,
 `filename`, `content_type`, `size`, `inline`, `disposition`, `content_id`.
 `Runner` and `BlockingRunner` get the four methods; `open_part` returns an
@@ -371,8 +394,10 @@ failure; a blob store without ranges; the simulator campaign; the Python API.
 4. **Inline is "shown by the HTML, declared inline, or an undeclared,
    non-text component of `multipart/related`".** It agrees with himalaya's tests,
    adds RFC 8621's optional `cid:` exception, and leaves signature parts out.
-   *Would change it:* `message-facts-has-attachment-parity`; the ingredients
-   are stored so the rule can move.
+   Gmail's `has:attachment` is broader (it came back refuted); we keep this
+   rule for the paperclip and store the protocol count so a host can
+   reproduce Gmail's. *Would change it:* a host that wants Gmail's notion as
+   the paperclip; the ingredients are stored so the rule can move.
 5. **The existing eight facts keep their values; only the sender gets a
    decoded name.** Hosts already store them. Helpers decode the rest.
    *Would change it:* a maintainer preferring a decoded `subject` fact, which
@@ -410,6 +435,7 @@ Gmail behaviour assumed, not proven (`scripts/features.py unknowns`):
   steps 3, 5 and 6 show whether the sender's copy and a stored draft keep
   the Bcc header in `format=raw`. If not, `bcc` is empty for sent mail and
   nothing else changes.
-- `message-facts-has-attachment-parity`: Gmail counts the same parts as
-  attachments as our rule. If not, the rule function changes; no blob is
-  read again.
+- `message-facts-has-attachment-parity`: refuted. Gmail's `has:attachment`
+  matches any non-body part; our paperclip stays narrower on purpose, and
+  `protocol` was added so `attached + inline + protocol > 0` reproduces
+  Gmail's (Listed, attached, inline).

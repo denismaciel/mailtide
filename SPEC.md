@@ -138,6 +138,28 @@ The store keeps, per account:
   until imported), `import_state` (`pending | imported | failed | blocked`),
   and header facts the engine needs (`rfc822_message_id`, `in_reply_to`,
   `references`, `from`, `to`, `cc`, `subject`, `snippet`), filled on import.
+  - **Message facts** (`content.facts`, `None` in rows imported before them
+    and when the extractor gave up): extracted by the driver at import from
+    the bytes it stored, with `mailtide-mime`, at a `FACTS_VERSION`. Envelope:
+    `bcc`, `reply_to` (as written), `sent_at` (the Date header as an instant
+    and the sender's UTC offset), `sender_name`/`sender_email` (first From
+    mailbox, name decoded), `list_id`, `list_unsubscribe` (at most 4 URIs of
+    at most 2,048 bytes) with `one_click_unsubscribe` (RFC 8058),
+    `auto_submitted`, `precedence`, and `tracking_id` (the first
+    well-formed `X-Mailtide-Id` token, as `tracking_id(raw)` reads it: the
+    identity of a message mailtide wrote, §5.5). Attachment summary: every
+    leaf of the top-level message that is neither a text/HTML body part nor
+    an RFC 1847 signature or encryption part is *listed*; a listed part is
+    *inline* when an HTML body shows it through `cid:`, when it is declared
+    inline, or when it is an undeclared non-text component of
+    `multipart/related`, else *attached* (an attached message always is).
+    Stored: exact `attached`, `inline` and `protocol` counts and the first 32
+    listed parts (part reference, filename up to 255 bytes, declared type,
+    Content-ID, disposition and the rule's ingredients). `has_attachment`
+    (the paperclip) is `attached > 0`. It deliberately differs from Gmail's
+    `has:attachment` operator, which matches any non-body part (inline
+    images and signatures included): `attached + inline + protocol > 0`
+    reproduces that.
   - Read, starred, archived, spam, trash, draft and important are **never
     separate columns**. They are views of `label_ids`. JMAP keywords map as
     `$seen = ¬UNREAD`, `$flagged = STARRED` and `$draft = DRAFT`; mailbox

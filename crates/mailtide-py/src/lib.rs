@@ -691,12 +691,18 @@ mod _core {
         one_click_unsubscribe: bool,
         auto_submitted: Option<String>,
         precedence: Option<String>,
+        /// The `X-Mailtide-Id` token of a message mailtide wrote.
+        tracking_id: Option<String>,
         /// The first 32 listed parts, in document order.
         attachments: Option<Vec<Py<AttachmentInfo>>>,
         /// Attached parts, counted beyond the list.
         attachment_count: Option<u32>,
         /// Inline parts, counted beyond the list.
         inline_count: Option<u32>,
+        /// Signature and encryption parts, counted, never listed. Gmail's
+        /// `has:attachment` matches when `attachment_count + inline_count +
+        /// protocol_count > 0`; `has_attachment` is the narrower paperclip.
+        protocol_count: Option<u32>,
         /// Whether to show a paperclip.
         has_attachment: Option<bool>,
     }
@@ -754,7 +760,7 @@ mod _core {
                                 part: part.part.to_string(),
                                 filename: part.filename.clone(),
                                 content_type: part.content_type.clone(),
-                                size: part.size,
+                                size: part.part.size,
                                 inline: part.is_inline(),
                                 disposition: part.disposition.clone(),
                                 content_id: part.content_id.clone(),
@@ -784,6 +790,7 @@ mod _core {
                 attachments,
                 attachment_count: extracted.then_some(facts.attached),
                 inline_count: extracted.then_some(facts.inline),
+                protocol_count: extracted.then_some(facts.protocol),
                 has_attachment: extracted.then(|| facts.has_attachment()),
                 bcc: facts.bcc,
                 reply_to: facts.reply_to,
@@ -796,6 +803,7 @@ mod _core {
                 one_click_unsubscribe: facts.one_click_unsubscribe,
                 auto_submitted: facts.auto_submitted,
                 precedence: facts.precedence,
+                tracking_id: facts.tracking_id,
             },
         )
     }

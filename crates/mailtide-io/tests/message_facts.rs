@@ -32,6 +32,7 @@ const REPORT: &[u8] = b"From: =?utf-8?Q?Ren=C3=A9?= <rene@example.org>\r\n\
     List-Id: Reports <reports.example.org>\r\n\
     List-Unsubscribe: <https://example.org/u>\r\n\
     List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+    X-Mailtide-Id: k3Jd9_x-Q2mZ8pLw\r\n\
     Content-Type: multipart/mixed; boundary=\"m\"\r\n\
     \r\n\
     --m\r\n\
@@ -223,11 +224,12 @@ async fn an_import_stores_envelope_facts_and_the_attachment_summary() {
     assert_eq!(facts.sent_at.map(|sent| sent.offset_minutes), Some(120));
     assert_eq!(facts.list_id.as_deref(), Some("reports.example.org"));
     assert!(facts.one_click_unsubscribe);
+    assert_eq!(facts.tracking_id.as_deref(), Some("k3Jd9_x-Q2mZ8pLw"));
     assert_eq!((facts.attached, facts.inline), (1, 1));
     let parts: Vec<(&str, bool, u64)> = facts
         .parts
         .iter()
-        .map(|part| (part.content_type.as_str(), part.is_inline(), part.size))
+        .map(|part| (part.content_type.as_str(), part.is_inline(), part.part.size))
         .collect();
     assert_eq!(
         parts,
@@ -289,4 +291,26 @@ async fn a_message_the_extractor_gives_up_on_is_still_imported() {
     assert_eq!(content.facts, None);
     assert_eq!(content.headers.subject.as_deref(), Some("Report"));
     assert!(import_entries(&runner).await["m1"].is_some());
+}
+
+#[tokio::test]
+async fn the_tracking_id_reaches_the_import_entry() {
+    let runner = runner(
+        FakeGmail::with(&[("m1", REPORT), ("m2", PLAIN)]),
+        ObjectBlobs::memory(),
+    );
+    sync(&runner).await;
+    let entries = import_entries(&runner).await;
+    let tracking = |id: &str| {
+        entries[id]
+            .as_ref()
+            .and_then(|content| content.facts.as_ref())
+            .map(|facts| facts.tracking_id.clone())
+    };
+    assert_eq!(tracking("m1"), Some(Some("k3Jd9_x-Q2mZ8pLw".to_owned())));
+    assert_eq!(
+        tracking("m2"),
+        Some(None),
+        "a message mailtide did not write"
+    );
 }

@@ -171,7 +171,7 @@ fn a_nested_alternative_in_mixed_lists_only_the_attachment() {
     assert_eq!(facts.parts.len(), 1);
     assert_eq!(facts.parts[0].content_type, "application/pdf");
     assert_eq!(facts.parts[0].filename.as_deref(), Some("doc.pdf"));
-    assert_eq!(facts.parts[0].size, 5);
+    assert_eq!(facts.parts[0].part.size, 5);
     let roles: Vec<(PartRole, String)> = parts(raw)
         .into_iter()
         .map(|info| (info.role, info.content_type))
@@ -211,7 +211,7 @@ fn an_attached_message_is_one_listed_part_and_its_own_parts_are_not() {
     assert_eq!(message.content_type, "message/rfc822");
     assert_eq!(message.filename, None);
     let inner = b"Subject: Inner\r\nContent-Type: text/plain\r\n\r\ninner body";
-    assert_eq!(message.size, u64::try_from(inner.len()).expect("size"));
+    assert_eq!(message.part.size, u64::try_from(inner.len()).expect("size"));
     let all = parts(raw);
     assert_eq!(
         all.len(),
@@ -318,7 +318,7 @@ fn roles_follow_our_rule_on_himalayas_fixture() {
         facts.parts[0].content_id.as_deref(),
         Some("logo@example.com")
     );
-    assert_eq!(facts.parts[0].size, 4);
+    assert_eq!(facts.parts[0].part.size, 4);
     assert_eq!(facts.parts[4].content_type, "text/calendar");
 }
 

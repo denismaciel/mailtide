@@ -15,7 +15,7 @@ depends_on = []
 [[file]]
 path = "crates/mailtide/src/gmail.rs"
 change = "modify"
-role = "MessageFacts (envelope extras, attachment counts and list), AttachmentFact, PartRef, SentAt, FACTS_VERSION, the inline rule; ImportedMessage carries the facts; split_addresses, the header facts' address split, moved here so Bcc and Reply-To are split the same way"
+role = "MessageFacts (envelope extras, the X-Mailtide-Id tracking_id, attachment counts and list, the protocol-part count and gmail_has_attachment), AttachmentFact, PartRef (with the decoded size), SentAt, FACTS_VERSION, the inline rule; ImportedMessage carries the facts; split_addresses, the header facts' address split, moved here so Bcc and Reply-To are split the same way"
 
 [[file]]
 path = "crates/mailtide/src/mirror.rs"
@@ -67,7 +67,7 @@ role = "Depend on the core for the fact types, and on encodify (the codecs mail-
 [[file]]
 path = "crates/mailtide-mime/src/lib.rs"
 change = "modify"
-role = "Export facts, parts and decode; parse() gives each attachment its part reference"
+role = "Export facts, parts and decode; parse() gives each attachment its part reference (ParsedMessage.attachment_parts, beside the Attachment compose also takes); the facts use compose-mime's tracking_id(raw) and parse_addresses"
 
 [[file]]
 path = "crates/mailtide-mime/src/facts.rs"
@@ -1150,13 +1150,28 @@ covers = "A listed part with no or an unparseable Content-Type reports applicati
 
 [[test]]
 target = "crates/mailtide-mime/src/facts.rs"
+name = "a_tracking_id_is_read_from_the_first_well_formed_x_mailtide_id"
+covers = "Present, header name in any case, folded, 64 characters; with two headers the first wins, and a malformed one is passed over (compose-mime's tracking_id(raw), which the facts use)"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "a_malformed_or_missing_tracking_id_is_none"
+covers = "Absent, empty, 15 or 65 characters, a space, a dot, non-ASCII, angle brackets: None"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
+name = "every_non_body_part_counts_for_gmail_has_attachment"
+covers = "The seven shapes of message-facts-has-attachment-parity all match gmail_has_attachment (attached + inline + protocol), while the paperclip is (d) and (g) only; a signature is counted, never listed; a lone HTML body matches neither"
+
+[[test]]
+target = "crates/mailtide-mime/src/facts.rs"
 name = "facts_of_arbitrary_bytes_never_panic_and_stay_bounded"
 covers = "Property test: any input gives facts whose serialised form is under the size bound"
 
 [[test]]
 target = "crates/mailtide-mime/src/parts.rs"
 name = "a_part_reference_round_trips_through_its_text_form"
-covers = "offset.len.encoding.total, with the irregular mark; anything else is refused"
+covers = "offset.length.encoding.size.total, with the irregular mark; anything else, or a size larger than the length, is refused"
 
 [[test]]
 target = "crates/mailtide-mime/src/parts.rs"
@@ -1261,6 +1276,11 @@ covers = "An extractor panic (injected) leaves facts = None, logs a warning and 
 
 [[test]]
 target = "crates/mailtide-io/tests/message_facts.rs"
+name = "the_tracking_id_reaches_the_import_entry"
+covers = "The X-Mailtide-Id token of an imported message is in its MessageImported entry's content; a message without one has None"
+
+[[test]]
+target = "crates/mailtide-io/tests/message_facts.rs"
 name = "refresh_facts_fills_old_rows_without_a_gmail_call"
 covers = "Rows without facts get them; the fake Gmail sees no request and the quota ledger no charge"
 
@@ -1344,12 +1364,12 @@ covers = "Campaign with refresh steps between commits, deletes, crashes and supe
 [[test]]
 target = "tests/test_message_facts.py"
 name = "test_content_carries_the_new_facts_and_attachments"
-covers = "MessageContent fields, AttachmentInfo, attachment_count, has_attachment"
+covers = "MessageContent fields, tracking_id, AttachmentInfo, attachment_count, inline_count, protocol_count, has_attachment"
 
 [[test]]
 target = "tests/test_message_facts.py"
 name = "test_import_entry_carries_the_facts"
-covers = "MessageImported.content shows the same facts as messages()"
+covers = "MessageImported.content shows the same facts as messages(), the tracking_id included"
 
 [[test]]
 target = "tests/test_message_facts.py"

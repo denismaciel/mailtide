@@ -42,7 +42,7 @@ fn inline_images_in_related_are_listed_inline_and_count_no_attachment() {
             assert_eq!(part.filename.as_deref(), Some("image.jpg"));
             assert_eq!(read(&raw, &part.part), format!("{body}{eol}").as_bytes());
             assert_eq!(
-                part.size,
+                part.part.size,
                 u64::try_from(body.len() + eol.len()).expect("size")
             );
         }
