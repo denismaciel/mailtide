@@ -264,6 +264,58 @@ pub fn pick_next_from(jobs: &[Job], now: Timestamp, floor: Priority) -> Option<&
         .map(|(job, _)| job)
 }
 
+/// Most message ids one `prioritise` call takes (a long thread fits; more
+/// go in another call).
+pub const PRIORITISE_MAX_IDS: usize = 100;
+
+/// Most import jobs an account holds in the Foreground class at once (ready
+/// or running). Backfill may use 70% of the 4,800 units a minute; the 1,440
+/// it can't touch fetch 24 raw messages (60 units each), so the raised set
+/// is what one minute of reserved budget serves.
+pub const FOREGROUND_IMPORT_CAP: usize = 24;
+
+/// What a `prioritise` call did with each distinct id, in request order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Prioritised {
+    /// Its import is queued in the Foreground class (raised now, or already).
+    pub queued: Vec<MessageId>,
+    /// Its content is already stored: read it now.
+    pub imported: Vec<MessageId>,
+    /// The mirror has no row for it (never discovered, or deleted).
+    pub unknown: Vec<MessageId>,
+    /// Its import is parked after a permanent failure (`resume` is the
+    /// operator's tool).
+    pub blocked: Vec<MessageId>,
+    /// It could be raised, but the account already has
+    /// [`FOREGROUND_IMPORT_CAP`] Foreground imports; it stays queued in its
+    /// own class. Ask again as imports land.
+    pub over_limit: Vec<MessageId>,
+}
+
+/// Raise `job` to the Foreground class because a user is waiting for it
+/// (pure). A ready job that is delayed without ever failing (a quota
+/// deferral, a draft's settle delay) becomes due `now`; one backing off
+/// after a failure keeps its `due_at`. A running job keeps its claim and
+/// gets the class for its next attempt. A Foreground or blocked job is
+/// returned unchanged. Attempts and identity never change.
+#[must_use]
+pub fn prioritise(job: &Job, now: Timestamp) -> Job {
+    if job.priority == Priority::Foreground || matches!(job.state, JobState::Blocked(_)) {
+        return job.clone();
+    }
+    let state = match job.state {
+        JobState::Ready { due_at } if due_at > now && job.failed_attempts == 0 => {
+            JobState::Ready { due_at: now }
+        }
+        ref state => state.clone(),
+    };
+    Job {
+        priority: Priority::Foreground,
+        state,
+        ..job.clone()
+    }
+}
+
 /// When the earliest ready job among `jobs` is due: the engine wakes then
 /// even if it has no timer of its own for it (after a restart, or for work
 /// queued with a delay, like a delivery's confirmation). Running and blocked
@@ -332,5 +384,48 @@ mod tests {
             Some(&jobs[3].kind)
         );
         assert_eq!(pick_next(&jobs[..3], Timestamp(100)), None);
+    }
+
+    #[test]
+    fn prioritising_raises_the_class_and_keeps_attempts() {
+        for priority in [Priority::Backfill, Priority::Live] {
+            let mut queued = job("m", priority, ready(10));
+            queued.failed_attempts = 2;
+            let raised = prioritise(&queued, Timestamp(100));
+            assert_eq!(raised.priority, Priority::Foreground);
+            assert_eq!(raised.kind, queued.kind);
+            assert_eq!(raised.failed_attempts, 2);
+            assert_eq!(raised.state, ready(10), "already due: untouched");
+        }
+    }
+
+    #[test]
+    fn prioritising_makes_a_delayed_job_due_unless_it_is_backing_off() {
+        let deferred = job("deferred", Priority::Backfill, ready(500));
+        assert_eq!(prioritise(&deferred, Timestamp(100)).state, ready(100));
+        let mut failed = job("failed", Priority::Backfill, ready(500));
+        failed.failed_attempts = 1;
+        let raised = prioritise(&failed, Timestamp(100));
+        assert_eq!(raised.state, ready(500), "the backoff stands");
+        assert_eq!(raised.priority, Priority::Foreground);
+    }
+
+    #[test]
+    fn prioritising_a_running_or_foreground_job_changes_only_what_is_lower() {
+        let running = job("running", Priority::Live, JobState::Running(AttemptId(7)));
+        let raised = prioritise(&running, Timestamp(100));
+        assert_eq!(raised.state, JobState::Running(AttemptId(7)));
+        assert_eq!(raised.priority, Priority::Foreground);
+        let foreground = job("fg", Priority::Foreground, ready(500));
+        assert_eq!(prioritise(&foreground, Timestamp(100)), foreground);
+        let blocked = job(
+            "blocked",
+            Priority::Backfill,
+            JobState::Blocked(BlockingFailure {
+                class: Blocking::Permanent,
+                detail: String::new(),
+            }),
+        );
+        assert_eq!(prioritise(&blocked, Timestamp(100)), blocked);
     }
 }

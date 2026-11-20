@@ -2,7 +2,7 @@ id = "prioritise"
 title = "Prioritise: fetch a message a user opened ahead of the backlog"
 summary = "`Runner.prioritise(account, message_ids)` raises the queued body imports of those messages to the Foreground class in one unfenced store write, bounded per call and per account; the import still runs as the same durable job and the feed's `MessageImported` entry says when the body is there."
 roadmap = ["S1"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/prioritise.md"
 depends_on = []
 

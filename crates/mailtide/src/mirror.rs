@@ -18,7 +18,8 @@ use crate::ids::{
     stable_hash,
 };
 use crate::jobs::{
-    AttemptId, ClaimedJob, ClaimedWork, Job, JobClaim, JobKind, JobOp, JobOutcome, JobState, NewJob,
+    AttemptId, ClaimedJob, ClaimedWork, FOREGROUND_IMPORT_CAP, Job, JobClaim, JobKind, JobOp,
+    JobOutcome, JobState, NewJob, Prioritised,
 };
 use crate::labels::{self, LabelSet};
 use crate::outbox::{self, ActionRequest, Delivery, Intent, IntentOp, IntentState, IntentVersion};
@@ -1311,6 +1312,80 @@ impl AccountMirror {
         u32::try_from(admitted).unwrap_or(u32::MAX)
     }
 
+    /// Import jobs in the Foreground class, ready or running (what
+    /// [`FOREGROUND_IMPORT_CAP`] bounds).
+    #[must_use]
+    pub fn foreground_imports(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|job| {
+                matches!(job.kind, JobKind::Import(_))
+                    && job.priority == Priority::Foreground
+                    && matches!(job.state, JobState::Ready { .. } | JobState::Running(_))
+            })
+            .count()
+    }
+
+    /// A user opened these messages: raise their queued imports to the
+    /// Foreground class, outside any engine (like [`Self::admit_action`]).
+    /// Safe without the epoch fence because it only ever raises a class and
+    /// never creates or finishes a job; nothing else changes, so the feed
+    /// and the account's state stay where they were. Each distinct id is
+    /// reported in exactly one group of [`Prioritised`].
+    pub fn prioritise(&mut self, ids: &[MessageId], now: Timestamp) -> Prioritised {
+        let foreground = self.foreground_imports();
+        self.prioritise_counted(ids, now, foreground)
+    }
+
+    /// [`Self::prioritise`] for a mirror holding only the rows and jobs of
+    /// `ids` (a SQL store's partial load), with the account's Foreground
+    /// imports counted by the store.
+    pub fn prioritise_counted(
+        &mut self,
+        ids: &[MessageId],
+        now: Timestamp,
+        mut foreground: usize,
+    ) -> Prioritised {
+        let mut report = Prioritised::default();
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            let kind = JobKind::Import(id.clone());
+            let group = match (
+                self.messages.get(id).map(|r| &r.content),
+                self.jobs.get(&kind),
+            ) {
+                (Some(Content::Imported(_)), _) => &mut report.imported,
+                // No row (never discovered, or tombstoned); a pending row
+                // always has its import (I6), so none is created here.
+                (None, _) | (Some(Content::Pending), None) => &mut report.unknown,
+                (Some(Content::Pending), Some(job)) => match job.state {
+                    JobState::Blocked(_) => &mut report.blocked,
+                    JobState::Ready { .. } | JobState::Running(_)
+                        if job.priority == Priority::Foreground =>
+                    {
+                        &mut report.queued
+                    }
+                    JobState::Ready { .. } | JobState::Running(_)
+                        if foreground >= FOREGROUND_IMPORT_CAP =>
+                    {
+                        &mut report.over_limit
+                    }
+                    JobState::Ready { .. } | JobState::Running(_) => {
+                        let raised = crate::jobs::prioritise(job, now);
+                        self.jobs.insert(kind, raised);
+                        foreground += 1;
+                        &mut report.queued
+                    }
+                },
+            };
+            group.push(id.clone());
+        }
+        report
+    }
+
     /// When the earliest ready job is due (see [`crate::jobs::next_due`]).
     #[must_use]
     pub fn next_due(&self) -> Option<Timestamp> {
@@ -1766,5 +1841,187 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![&MessageId("c".into())]);
         assert!(!rest.has_more);
+    }
+
+    /// A mirror with `ids` discovered and their imports queued at `priority`.
+    fn pending(ids: &[&str], priority: Priority) -> AccountMirror {
+        let mut mirror = claimed();
+        let mut c = commit(&mirror);
+        c.job_plan.priority = priority;
+        c.messages = ids
+            .iter()
+            .map(|id| MessageOp::Observe(observation(id, &["INBOX"], 1)))
+            .collect();
+        let _ = mirror.apply(&c);
+        mirror
+    }
+
+    fn ids(ids: &[&str]) -> Vec<MessageId> {
+        ids.iter().map(|id| MessageId((*id).into())).collect()
+    }
+
+    fn import_of<'a>(mirror: &'a mut AccountMirror, id: &str) -> &'a mut Job {
+        mirror
+            .jobs
+            .get_mut(&JobKind::Import(MessageId(id.into())))
+            .expect("an import job")
+    }
+
+    #[test]
+    fn each_id_is_reported_in_exactly_one_group() {
+        let mut mirror = pending(
+            &["raise", "foreground", "imported", "gone", "blocked", "over"],
+            Priority::Backfill,
+        );
+        import_of(&mut mirror, "foreground").priority = Priority::Foreground;
+        import_of(&mut mirror, "blocked").state =
+            JobState::Blocked(crate::retry::BlockingFailure {
+                class: crate::retry::Blocking::Permanent,
+                detail: String::new(),
+            });
+        mirror
+            .jobs
+            .remove(&JobKind::Import(MessageId("imported".into())));
+        mirror
+            .messages
+            .get_mut(&MessageId("imported".into()))
+            .expect("row")
+            .content = Content::Imported(Box::new(StoredContent {
+            blob: BlobRef("k".into()),
+            size: 1,
+            internal_date: Timestamp(0),
+            headers: HeaderFacts::default(),
+        }));
+        let mut c = commit(&mirror);
+        c.messages = vec![MessageOp::Tombstone {
+            id: MessageId("gone".into()),
+            evidence: DeletionEvidence::History { at: HistoryId(2) },
+        }];
+        let _ = mirror.apply(&c);
+        let jobs = mirror.jobs.len();
+
+        // One Foreground slot is left: the first raise takes it.
+        let report = mirror.prioritise_counted(
+            &ids(&[
+                "raise",
+                "foreground",
+                "imported",
+                "gone",
+                "never",
+                "blocked",
+                "over",
+                "raise",
+            ]),
+            Timestamp(50),
+            FOREGROUND_IMPORT_CAP - 1,
+        );
+        assert_eq!(
+            report,
+            Prioritised {
+                queued: ids(&["raise", "foreground"]),
+                imported: ids(&["imported"]),
+                unknown: ids(&["gone", "never"]),
+                blocked: ids(&["blocked"]),
+                over_limit: ids(&["over"]),
+            }
+        );
+        assert_eq!(mirror.jobs.len(), jobs, "no job created or removed");
+        assert_eq!(
+            import_of(&mut mirror, "raise").priority,
+            Priority::Foreground
+        );
+        assert_eq!(import_of(&mut mirror, "over").priority, Priority::Backfill);
+        assert!(matches!(
+            import_of(&mut mirror, "blocked").state,
+            JobState::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn the_foreground_import_cap_counts_jobs_already_raised() {
+        let earlier: Vec<String> = (1..FOREGROUND_IMPORT_CAP)
+            .map(|n| format!("earlier-{n:02}"))
+            .collect();
+        let mut all: Vec<&str> = earlier.iter().map(String::as_str).collect();
+        all.extend(["a", "b"]);
+        let mut mirror = pending(&all, Priority::Backfill);
+        let raised = mirror.prioritise(&ids(&all[..FOREGROUND_IMPORT_CAP - 1]), Timestamp(0));
+        assert_eq!(raised.queued.len(), FOREGROUND_IMPORT_CAP - 1);
+        assert_eq!(mirror.foreground_imports(), FOREGROUND_IMPORT_CAP - 1);
+
+        let report = mirror.prioritise(&ids(&["a", "b"]), Timestamp(0));
+        assert_eq!(report.queued, ids(&["a"]));
+        assert_eq!(report.over_limit, ids(&["b"]));
+        // Asking again changes nothing.
+        assert_eq!(mirror.prioritise(&ids(&["a", "b"]), Timestamp(0)), report);
+
+        // One Foreground import finishes: its slot is free again.
+        let epoch = mirror.record.epoch;
+        let [job] = mirror
+            .claim_jobs(epoch, 1, Timestamp(0), AttemptId(1))
+            .expect("current epoch")
+            .try_into()
+            .expect("one job");
+        assert_eq!(job.priority, Priority::Foreground);
+        let mut done = commit(&mirror);
+        done.claim = Some(job.claim());
+        done.jobs = vec![JobOp::Finish {
+            claim: job.claim(),
+            outcome: JobOutcome::Done,
+        }];
+        let _ = mirror.apply(&done);
+        let report = mirror.prioritise(&ids(&["b"]), Timestamp(0));
+        assert_eq!(report.queued, ids(&["b"]));
+        assert_eq!(mirror.foreground_imports(), FOREGROUND_IMPORT_CAP);
+    }
+
+    #[test]
+    fn prioritising_writes_no_feed_entry_and_keeps_the_state() {
+        let mut mirror = pending(&["a", "b"], Priority::Backfill);
+        let before = mirror.clone();
+        let report = mirror.prioritise(&ids(&["a"]), Timestamp(0));
+        assert_eq!(report.queued, ids(&["a"]));
+        assert_eq!(mirror.log, before.log);
+        assert_eq!(mirror.seq, before.seq);
+        assert_eq!(mirror.record, before.record);
+        assert_eq!(mirror.messages, before.messages);
+        assert_eq!(mirror.intents, before.intents);
+        assert_eq!(
+            mirror.changes(StateSeq(0), 100),
+            before.changes(StateSeq(0), 100)
+        );
+        assert_ne!(mirror.jobs, before.jobs, "only the job changed");
+    }
+
+    #[test]
+    fn a_prioritised_import_is_claimed_before_live_and_backfill_work() {
+        let mut mirror = pending(&["backfill", "opened"], Priority::Backfill);
+        let mut live = commit(&mirror);
+        live.messages = vec![MessageOp::Observe(observation("live", &["INBOX"], 2))];
+        let _ = mirror.apply(&live);
+        let _ = mirror.prioritise(&ids(&["opened"]), Timestamp(0));
+        let epoch = mirror.record.epoch;
+
+        let mut any = mirror.clone();
+        let claimed = any
+            .claim_jobs(epoch, 1, Timestamp(0), AttemptId(1))
+            .expect("current epoch");
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|j| (j.kind(), j.priority))
+                .collect::<Vec<_>>(),
+            vec![(
+                JobKind::Import(MessageId("opened".into())),
+                Priority::Foreground
+            )]
+        );
+        let claimed = mirror
+            .claim_jobs_from(epoch, 4, Timestamp(0), AttemptId(1), Priority::Foreground)
+            .expect("current epoch");
+        assert_eq!(
+            claimed.iter().map(ClaimedJob::kind).collect::<Vec<_>>(),
+            vec![JobKind::Import(MessageId("opened".into()))]
+        );
     }
 }
