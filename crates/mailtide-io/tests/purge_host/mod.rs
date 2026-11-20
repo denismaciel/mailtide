@@ -380,6 +380,8 @@ impl Mailbox {
         let parts: Vec<&str> = path.split('/').collect();
         let response = match (request.method, parts.as_slice()) {
             (Method::Get, ["profile"]) => ok(&json!({"historyId": self.history_id.to_string()})),
+            // A reconciliation ends with a draft listing: there are none.
+            (Method::Get, ["drafts"]) => ok(&json!({"resultSizeEstimate": 0})),
             (Method::Get, ["labels"]) => ok(&json!({"labels": [
                 {"id": "INBOX", "name": "INBOX", "type": "system"},
                 {"id": "TRASH", "name": "TRASH", "type": "system"},

@@ -133,19 +133,29 @@ role = "Delegate the draft methods; they join the every-call-refused list of the
 [[file]]
 path = "crates/mailtide-store/src/postgres.rs"
 change = "modify"
-role = "Delegate the draft methods"
+role = "Delegate the draft methods; sends of one draft begun from separate connections have one winner"
 
 # ---------------------------------------------------------------------- driver
 
 [[file]]
 path = "crates/mailtide-io/src/drafts.rs"
 change = "new"
-role = "Runner draft methods: create, update, delete, send, drafts, draft, read_draft; DraftError"
+role = "Runner draft methods: create, update, delete, send, drafts, draft, read_draft; DraftError; a send's issue deadline and LATE_APPLY_MARGIN"
 
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "Perform and decode draft requests; refuse draft writes in read-only mode; RunnerConfig.writes (WriteSettings: max_message_bytes, shared with send, and the request timeout a send retry waits out). Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first"
+role = "Perform and decode draft requests; refuse draft writes in read-only mode; RunnerConfig.writes (WriteSettings: max_message_bytes, shared with send, and the request timeout a send retry waits out). Shared groundwork: the unfenced driver-call pattern (one Gmail request through the quota gate outside the engine, with a command id of epoch 0 as drift does, and the caller's 400 or 403 kept away from the account-level block) is added by whichever of drafts, identities, label-edit, purge, search lands first. The draft calls use the crate's direct_call (label-edit made the public call_gmail read-only), and a send purge's direct_call_before, which never issues a request after its deadline and keeps the disposition whatever the lease release does. A 2xx that does not decode is an unknown outcome for a mailbox-changing request"
+
+[[file]]
+path = "crates/mailtide-io/src/write_call_tests.rs"
+change = "new"
+role = "Mailbox-changing direct calls, which only the crate can make: an undecodable write answer is unknown; a send answered 200 is sent though the gate's release fails; a send's issue deadline at the gate"
+
+[[file]]
+path = "crates/mailtide-io/tests/direct_calls.rs"
+change = "modify"
+role = "The public call_gmail refuses the draft writes and send too"
 
 [[file]]
 path = "crates/mailtide-io/src/transport.rs"
@@ -254,7 +264,7 @@ role = "The two provider-neutral draft tests of Zero's IMAP driver suite"
 [[file]]
 path = "crates/mailtide-io/tests/fake_gmail/mod.rs"
 change = "new"
-role = "The fake Gmail with drafts the driver tests share: saves get Gmail's own Message-ID, X- headers kept, history for every save, delete and send; faults (a lost answer, a status, an answer without ids or raw content, a request held for interleaving); a second account"
+role = "The fake Gmail with drafts the driver tests share: saves get Gmail's own Message-ID, X- headers kept, history for every save, delete and send; faults (a lost answer, a status, an answer without ids or raw content, a request held for interleaving, a request that never connected, a success that does not decode); a second account"
 
 [[file]]
 path = "crates/mailtide-io/tests/drafts.rs"
@@ -656,7 +666,7 @@ covers = "The added message is the one the row already points at and the deleted
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
 name = "a_listing_naming_a_tombstoned_message_is_not_applied"
-covers = "drafts.list is not a snapshot: a row pointing at a message the mirror knows is deleted proves the listing stale, so the refresh retries"
+covers = "drafts.list is not a snapshot: a draft listed at a message the mirror knows is deleted keeps its row (that entry says nothing) while the rest of the listing applies; a listing fenced out by the generation lists again, at the periodic interval after three stale listings in a row"
 
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
@@ -932,6 +942,133 @@ covers = "Gmail assigns its own Message-ID on every save: DraftView.rfc822_messa
 target = "tests/test_drafts.py"
 name = "test_draft_bytes_need_a_tracking_id"
 covers = "create_draft raises ValueError for bytes without X-Mailtide-Id; the DraftView carries the tracking id of the bytes saved"
+
+# Review fixes
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_removal_leaves_a_row_whose_send_is_unsettled"
+covers = "A 404 to an update or delete (Removed) leaves a row whose send is unsettled alone: the send's record settles it"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "an_update_answer_after_the_send_settled_does_not_recreate_the_row"
+covers = "An update's Saved recorded after EndSend::Sent re-creates no row and logs no DraftSaved after DraftSent"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "the_rows_token_follows_its_current_messages_import"
+covers = "A listing re-point clears the row's token; the first import of its current message sets it from the tracking_id fact, or clears it when Gmail's copy has none"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_row_repointed_at_an_imported_message_takes_its_token"
+covers = "A listing re-pointing a row at a message imported before it sets the row's token from that import's tracking_id fact (no later import would)"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "two_rows_with_one_token_settle_nothing"
+covers = "A SENT import whose token two rows hold settles neither: settle only on a unique match"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_reimported_older_sent_message_settles_nothing"
+covers = "Only a message's first import settles: an older SENT message imported again leaves a later send unsettled"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_listing_lists_again_once_an_unsettled_send_has_certainly_ended"
+covers = "A listing that leaves a send unsettled asks for the next at its retry_at; an earlier ask brings a waiting listing forward, a later one never postpones it"
+
+[[test]]
+target = "crates/mailtide/src/engine.rs"
+name = "a_refused_draft_listing_never_blocks_the_account"
+covers = "A drafts.list refused with 403 (an account-class refusal), 400 or 404 drops the job and waits for the periodic listing; the account stays live"
+
+[[test]]
+target = "crates/mailtide-store/src/conformance.rs"
+name = "racing_sends"
+covers = "Two BeginSend of one draft in flight at once on one store (separate pool connections where it has them): one Started, one InProgress"
+
+[[test]]
+target = "crates/mailtide-store/src/postgres.rs"
+name = "racing_sends_from_separate_connections_have_one_winner"
+covers = "Four BeginSend of one draft from four Postgres connections: exactly one winner, five rounds"
+
+[[test]]
+target = "crates/mailtide-io/tests/direct_calls.rs"
+name = "the_public_call_refuses_every_write_before_any_token_or_quota"
+covers = "Runner::call_gmail refuses CreateDraft, UpdateDraft, DeleteDraft and SendDraft (beside label-edit's writes) before any token or quota, read-write and read-only"
+
+[[test]]
+target = "crates/mailtide-io/src/write_call_tests.rs"
+name = "an_undecodable_write_answer_is_unknown"
+covers = "A 2xx that does not decode is OutcomeUnknown for a write (a read is refused)"
+
+[[test]]
+target = "crates/mailtide-io/src/write_call_tests.rs"
+name = "a_send_answered_200_is_sent_though_the_gate_release_fails"
+covers = "A drafts.send answered 200 whose quota-lease release then fails is reported as sent and the row settles: no cleanup failure turns a send that reached Gmail into an unsent one"
+
+[[test]]
+target = "crates/mailtide-io/src/write_call_tests.rs"
+name = "a_send_the_gate_defers_past_its_issue_time_sends_nothing"
+covers = "A gate deferral past the send's issue deadline (inside the budget) sends nothing and returns the row to saved"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_held_before_its_request_is_fenced_until_it_has_certainly_ended"
+covers = "A send held before its request: a second caller after the old request-timeout fence is refused until retry_at, a listing in that window leaves the row sending, and the held send is not issued after its deadline (row back to saved)"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_answered_with_an_undecodable_success_is_an_unknown_outcome"
+covers = "A drafts.send 2xx that does not decode is OutcomeUnknown, the row stays sending and the sync settles it; never resent"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_answered_5xx_or_not_at_all_stays_sending"
+covers = "A 500, a 503 or a lost answer on send: OutcomeUnknown, the row stays sending, a second send is refused"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_rate_limited_or_deferred_returns_to_saved"
+covers = "A 429 on send, then the gate's deferral: each returns the row to saved, nothing sent"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_send_that_never_connected_returns_to_saved"
+covers = "A send whose request never connected (certainly not sent) is Retryable and the row is saved; the next send goes out"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "after_an_unknown_send_the_draft_can_be_edited_or_deleted_once_its_request_ended"
+covers = "After an unknown send: update and delete are SendInProgress before retry_at; then they read the draft: present, the row is saved and the update goes on; gone, SendUnconfirmed"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_stale_row_is_read_before_it_is_sent"
+covers = "A stale row's send reads the draft first: another message is Conflict{current} once, then sendable; a 404 is NotFound and the row leaves"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_token_another_draft_holds_is_refused"
+covers = "A create or update carrying a token another row holds is Invalid before any call"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_empty_thread_id_counts_as_absent"
+covers = "An empty thread id is none: create sends no threadId, update sends the index's"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_update_naming_gmails_message_is_not_refused_by_an_index_behind"
+covers = "if_message_id naming Gmail's current message succeeds though the index still shows the older one"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "late_ends_of_an_attempt_a_retry_took_over_are_ignored"
+covers = "Changed, Unconfirmed and Unsent recorded for an attempt a retry took over are Superseded; the retry's attempt holds and sends"
 
 # ------------------------------------------------------------------- unknowns
 # Gmail behaviour the design assumes without proof. Paths are relative to

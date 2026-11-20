@@ -1,7 +1,7 @@
 //! Draft calls: create, update, delete, send and read a Gmail draft, and the
 //! mirror's draft index (SPEC §7a).
 //!
-//! Each write is one direct call ([`Runner::call_gmail`]) through the quota
+//! Each write is one direct call (the crate's `Runner::direct_call`) through the quota
 //! gate, with Gmail's answer recorded in the index by an unfenced store
 //! write ([`Store::record_draft`]). mailtide never retries a draft write on
 //! its own. A send is at most once: the row is marked `sending` (a
@@ -161,9 +161,25 @@ fn refused(detail: &str) -> DraftError {
     })
 }
 
+/// One send attempt, as its answer is recorded.
+#[derive(Clone, Copy)]
+struct SendCall<'a> {
+    draft: &'a DraftId,
+    started: Timestamp,
+    retry: bool,
+    retry_at: Timestamp,
+}
+
+/// How long after its connection closed a send may still be applied:
+/// `send`'s live test `send-late-apply` saw a request closed unread applied
+/// within about a second, never later. A retry also waits this out.
+pub const LATE_APPLY_MARGIN: Duration = Duration::from_secs(5);
+
 /// Whether a failed send certainly sent nothing: a rate limit answers
 /// before Gmail acts. Anything else retryable (a 5xx, an expired token, a
-/// connection that broke) may have been applied.
+/// connection that broke after it opened) may have been applied; a
+/// request that never got a connection is reported as not sent by the
+/// direct call itself.
 fn certainly_unsent(failure: &RetryableFailure) -> bool {
     match failure.class {
         Retryable::AccountRateLimited
@@ -232,6 +248,101 @@ where
         }
     }
 
+    /// Whether another draft of the index holds `token`: one token per
+    /// draft, so a sent message settles exactly one send.
+    async fn token_taken(
+        &self,
+        account: &AccountId,
+        token: &str,
+        draft: Option<&DraftId>,
+    ) -> Result<bool, DraftError> {
+        let mut after: Option<DraftId> = None;
+        loop {
+            let page = self
+                .drafts(account, after.as_ref(), 500)
+                .await
+                .map_err(DraftError::Run)?;
+            if page.iter().any(|row| {
+                Some(&row.draft_id) != draft && row.tracking_id.as_deref() == Some(token)
+            }) {
+                return Ok(true);
+            }
+            match page.last() {
+                Some(last) if page.len() == 500 => after = Some(last.draft_id.clone()),
+                Some(_) | None => return Ok(false),
+            }
+        }
+    }
+
+    /// A row being sent may be updated or deleted only once its send has
+    /// certainly ended (`retry_at`): then the draft is read from Gmail. Still
+    /// there: nothing was sent, the row returns to `saved` (at the message
+    /// Gmail holds) and the call goes on. Gone: the send may have happened,
+    /// [`DraftError::SendUnconfirmed`].
+    async fn settle_finished_send(
+        &self,
+        account: &AccountId,
+        row: &DraftView,
+        deadline: Instant,
+    ) -> Result<(), DraftError> {
+        let (started, retry_at) = match row.state {
+            DraftStatus::Saved | DraftStatus::Stale => return Ok(()),
+            DraftStatus::SendUnconfirmed => return Err(DraftError::SendUnconfirmed),
+            DraftStatus::Sending { started, retry_at } => (started, retry_at),
+        };
+        if self.clock.now() < retry_at {
+            return Err(DraftError::SendInProgress {
+                retry_after: retry_at,
+            });
+        }
+        let end = |end: SendEnd| DraftWrite::EndSend {
+            draft: row.draft_id.clone(),
+            started,
+            end,
+        };
+        match self.get_draft(account, &row.draft_id, deadline).await? {
+            Some(current) if current.message == row.message_id => {
+                self.record_write(account, &end(SendEnd::Unsent)).await?;
+                Ok(())
+            }
+            Some(current) => {
+                let changed = SendEnd::Changed {
+                    message: current.message,
+                    thread_id: current.thread_id,
+                };
+                self.record_write(account, &end(changed)).await?;
+                Ok(())
+            }
+            None => {
+                self.record_answer(account, &end(SendEnd::Unconfirmed))
+                    .await;
+                Err(DraftError::SendUnconfirmed)
+            }
+        }
+    }
+
+    /// A draft write through the gate. Gmail's answer stands whatever
+    /// happens to the quota lease after it: a failure there is logged, never
+    /// returned in place of the answer (a saved or deleted draft must not
+    /// read as a failed call).
+    async fn draft_write(
+        &self,
+        account: &AccountId,
+        request: GmailRequest,
+        deadline: Instant,
+    ) -> Result<EventKind, CallError> {
+        let response = self
+            .direct_call_with_cleanup(account, request, Priority::Foreground, deadline)
+            .await?;
+        if let Some(cleanup) = &response.cleanup {
+            tracing::warn!(
+                error = cleanup.code(),
+                "quota gate failed after a draft write"
+            );
+        }
+        response.outcome
+    }
+
     /// When a listing asked for now becomes due.
     fn refresh_at(&self) -> Timestamp {
         self.clock
@@ -252,7 +363,7 @@ where
             format: DraftFormat::Minimal,
         };
         match self
-            .call_gmail(account, request, Priority::Foreground, deadline)
+            .direct_call(account, request, Priority::Foreground, deadline)
             .await?
         {
             EventKind::DraftFetched { draft, .. } => Ok(Some(draft.draft)),
@@ -300,13 +411,15 @@ where
     ) -> Result<DraftRef, DraftError> {
         let tracking_id = self.draft_bytes(&raw)?;
         let deadline = Instant::now() + budget;
+        if self.token_taken(account, &tracking_id, None).await? {
+            return Err(token_taken());
+        }
         let request = GmailRequest::CreateDraft {
             raw: Rfc822(raw),
-            thread_id,
+            // An empty thread id is no thread id.
+            thread_id: thread_id.filter(|t| !t.0.is_empty()),
         };
-        let answer = self
-            .call_gmail(account, request, Priority::Foreground, deadline)
-            .await;
+        let answer = self.draft_write(account, request, deadline).await;
         let saved = match answer {
             Ok(EventKind::DraftSaved { draft, .. }) => {
                 self.written(account, &draft, deadline).await
@@ -323,6 +436,7 @@ where
                 let write = DraftWrite::Saved {
                     draft: draft.clone(),
                     tracking_id,
+                    created: true,
                 };
                 self.record_answer(account, &write).await;
                 Ok(draft)
@@ -341,12 +455,14 @@ where
     /// Replace a draft's message (Gmail gives it a new message id; the
     /// draft id stays). The thread id is always sent: the caller's, else the
     /// index's, else one read with `drafts.get` (an update without one moves
-    /// a reply draft out of its thread). With `if_message_id` the update is
-    /// refused ([`DraftError::Conflict`]) if the draft holds another message:
-    /// from the index if it already shows one, else after reading the
-    /// draft. The bytes must carry the draft's `X-Mailtide-Id` (any, for a
-    /// draft mailtide never saved). A lost answer marks the row stale and
-    /// lists the drafts; retrying is safe, an update is a replace.
+    /// a reply draft out of its thread; an empty thread id counts as none).
+    /// With `if_message_id` the draft is read and the update refused
+    /// ([`DraftError::Conflict`]) if Gmail holds another message (never from
+    /// the index alone, which may be behind). The bytes must carry the
+    /// draft's `X-Mailtide-Id` (any, for a draft mailtide never saved) and
+    /// no other draft's. A draft whose send has certainly ended unknown is
+    /// read first (see `send_draft`). A lost answer marks the row stale
+    /// and lists the drafts; retrying is safe, an update is a replace.
     pub async fn update_draft(
         &self,
         account: &AccountId,
@@ -363,24 +479,24 @@ where
             .await
             .map_err(DraftError::Run)?;
         if let Some(row) = &row {
-            check_unsent(row)?;
+            self.settle_finished_send(account, row, deadline).await?;
             if row.tracking_id.as_ref().is_some_and(|t| *t != tracking_id) {
                 return Err(DraftError::Invalid(format!(
                     "the bytes carry another {} than the draft's",
                     mailtide_mime::TRACKING_HEADER
                 )));
             }
-            // A stale row may be behind Gmail: Gmail is asked below.
-            if let Some(expected) = &if_message_id
-                && row.state == DraftStatus::Saved
-                && *expected != row.message_id
-            {
-                return Err(DraftError::Conflict {
-                    current: row.message_id.clone(),
-                });
-            }
         }
-        let mut thread_id = thread_id.or_else(|| row.as_ref().map(|r| r.thread_id.clone()));
+        if self
+            .token_taken(account, &tracking_id, Some(draft_id))
+            .await?
+        {
+            return Err(token_taken());
+        }
+        let mut thread_id = thread_id
+            .filter(|t| !t.0.is_empty())
+            .or_else(|| row.as_ref().map(|r| r.thread_id.clone()))
+            .filter(|t| !t.0.is_empty());
         if if_message_id.is_some() || thread_id.is_none() {
             let Some(current) = self.get_draft(account, draft_id, deadline).await? else {
                 return Err(self.gone(account, draft_id).await);
@@ -417,10 +533,7 @@ where
             raw: Rfc822(raw),
             thread_id,
         };
-        let saved = match self
-            .call_gmail(account, request, Priority::Foreground, deadline)
-            .await
-        {
+        let saved = match self.draft_write(account, request, deadline).await {
             Ok(EventKind::DraftSaved { draft, .. }) => {
                 self.written(account, &draft, deadline).await
             }
@@ -435,6 +548,7 @@ where
                 let write = DraftWrite::Saved {
                     draft: draft.clone(),
                     tracking_id,
+                    created: false,
                 };
                 self.record_answer(account, &write).await;
                 Ok(draft)
@@ -477,15 +591,12 @@ where
             .await
             .map_err(DraftError::Run)?
         {
-            check_unsent(&row)?;
+            self.settle_finished_send(account, &row, deadline).await?;
         }
         let request = GmailRequest::DeleteDraft {
             id: draft_id.clone(),
         };
-        let deleted = match self
-            .call_gmail(account, request, Priority::Foreground, deadline)
-            .await
-        {
+        let deleted = match self.draft_write(account, request, deadline).await {
             Ok(EventKind::DraftDeleted { .. }) => Deleted::Deleted,
             Ok(EventKind::DraftNotFound { .. }) | Err(CallError::NotFound) => Deleted::AlreadyGone,
             Ok(_) => return Err(unexpected()),
@@ -499,9 +610,14 @@ where
             }
             Err(error) => return Err(error.into()),
         };
+        // A 404 means this call deleted nothing: the draft was gone.
+        let reason = match deleted {
+            Deleted::Deleted => RemovedReason::Deleted,
+            Deleted::AlreadyGone => RemovedReason::Gone,
+        };
         let write = DraftWrite::Removed {
             draft: draft_id.clone(),
-            reason: RemovedReason::Deleted,
+            reason,
         };
         self.record_answer(account, &write).await;
         Ok(deleted)
@@ -513,8 +629,12 @@ where
     /// 1. the row is marked `sending` first, a compare-and-set: a second
     ///    call, from this process or another, gets
     ///    [`DraftError::SendInProgress`] and calls nothing;
-    /// 2. once the first request has certainly ended (its timeout), a retry
-    ///    reads the draft before sending: gone is
+    /// 2. the request is issued by a hard deadline (now plus the smaller of
+    ///    `budget` and the request timeout: the gate's wait, the pre-read and
+    ///    the token all come before it) or not at all; the row's `retry_at`
+    ///    is that deadline plus the request timeout plus
+    ///    [`LATE_APPLY_MARGIN`], when the request has certainly ended. A
+    ///    retry from then on reads the draft before sending: gone is
     ///    [`DraftError::SendUnconfirmed`] (no send), another message is a
     ///    conflict, the same draft is sent;
     /// 3. a lost answer is never resent: the sync settles it (the imported
@@ -522,8 +642,8 @@ where
     ///    `DraftSent`; a listing that still shows the draft returns it to
     ///    `saved`).
     ///
-    /// With `if_message_id` the draft is read first and the send refused if
-    /// it holds another message.
+    /// With `if_message_id`, or for a row that was stale, the draft is read
+    /// first and the send refused if it holds another message.
     pub async fn send_draft(
         &self,
         account: &AccountId,
@@ -533,19 +653,30 @@ where
     ) -> Result<SentDraft, DraftError> {
         self.draft_writable()?;
         let deadline = Instant::now() + budget;
+        let timeout = self.config.writes.request_timeout;
+        let window = budget.min(timeout);
+        let issue_by = Instant::now() + window;
+        let retry_at = self
+            .clock
+            .now()
+            .plus(window)
+            .plus(timeout)
+            .plus(LATE_APPLY_MARGIN);
         let begin = DraftWrite::BeginSend {
             draft: draft_id.clone(),
-            if_message: if_message_id.clone(),
-            retry_at: self.clock.now().plus(self.config.writes.request_timeout),
+            retry_at,
         };
-        let (row, retry) = match self.record_write(account, &begin).await? {
-            DraftRecorded::Started { draft, retry } => (draft, retry),
+        let (row, retry, stale) = match self.record_write(account, &begin).await? {
+            DraftRecorded::Started {
+                draft,
+                retry,
+                stale,
+            } => (draft, retry, stale),
             DraftRecorded::InProgress { retry_at } => {
                 return Err(DraftError::SendInProgress {
                     retry_after: retry_at,
                 });
             }
-            DraftRecorded::Conflict { current } => return Err(DraftError::Conflict { current }),
             DraftRecorded::Unconfirmed => return Err(DraftError::SendUnconfirmed),
             DraftRecorded::NotIndexed | DraftRecorded::Done | DraftRecorded::Superseded => {
                 return Err(DraftError::NotFound);
@@ -556,22 +687,75 @@ where
                 "a started send without an attempt",
             )));
         };
+        if retry || stale || if_message_id.is_some() {
+            self.read_before_send(
+                account,
+                &row,
+                started,
+                retry,
+                if_message_id.as_ref(),
+                deadline,
+            )
+            .await?;
+        }
+        let request = GmailRequest::SendDraft {
+            id: draft_id.clone(),
+        };
+        // The disposition is kept whatever happens to the quota lease after
+        // the request: an answered send is never reported as unsent.
+        let (answer, not_sent) = match self
+            .direct_call_before(account, request, Priority::Foreground, issue_by, deadline)
+            .await
+        {
+            Ok(Some(response)) => {
+                if let Some(cleanup) = &response.cleanup {
+                    tracing::warn!(
+                        error = cleanup.code(),
+                        "quota gate failed after a draft send"
+                    );
+                }
+                (response.outcome, response.not_sent)
+            }
+            // Its deadline passed before it could be issued: nothing sent.
+            Ok(None) => (
+                Err(CallError::Deferred(QuotaDeferred {
+                    until: self.clock.now(),
+                })),
+                true,
+            ),
+            // Refused before the request (read-only, the gate): nothing sent.
+            Err(error) => (Err(error), true),
+        };
+        let end = SendCall {
+            draft: draft_id,
+            started,
+            retry,
+            retry_at,
+        };
+        self.send_answered(account, &end, answer, not_sent).await
+    }
+
+    /// What a send's answer means, recorded: sent, gone, unknown (the row
+    /// stays sending), or certainly not sent (back to `saved`).
+    async fn send_answered(
+        &self,
+        account: &AccountId,
+        call: &SendCall<'_>,
+        answer: Result<EventKind, CallError>,
+        not_sent: bool,
+    ) -> Result<SentDraft, DraftError> {
+        let SendCall {
+            draft: draft_id,
+            started,
+            retry,
+            retry_at,
+        } = *call;
         let end = |end: SendEnd| DraftWrite::EndSend {
             draft: draft_id.clone(),
             started,
             end,
         };
-        if retry || if_message_id.is_some() {
-            self.read_before_send(account, &row, started, retry, deadline)
-                .await?;
-        }
-        let request = GmailRequest::SendDraft {
-            id: draft_id.clone(),
-        };
-        match self
-            .call_gmail(account, request, Priority::Foreground, deadline)
-            .await
-        {
+        match answer {
             Ok(EventKind::DraftSent {
                 message, thread_id, ..
             }) => {
@@ -595,10 +779,16 @@ where
                 Err(DraftError::NotFound)
             }
             Ok(_) => Err(unexpected()),
-            Err(CallError::Retryable(failure)) if !certainly_unsent(&failure) => {
+            // It may have been sent: the row stays sending, and a listing
+            // once the request has certainly ended tells.
+            Err(CallError::Retryable(failure)) if !not_sent && !certainly_unsent(&failure) => {
+                self.unknown_send(account, retry_at).await;
                 Err(DraftError::OutcomeUnknown(failure.detail))
             }
-            Err(error @ (CallError::OutcomeUnknown(_) | CallError::Run(_))) => Err(error.into()),
+            Err(error @ (CallError::OutcomeUnknown(_) | CallError::Run(_))) => {
+                self.unknown_send(account, retry_at).await;
+                Err(error.into())
+            }
             Err(
                 error @ (CallError::ReadOnly
                 | CallError::Deferred(_)
@@ -611,16 +801,25 @@ where
         }
     }
 
-    /// Before a retry (or a send with `if_message_id`), read the draft: a
-    /// draft gone after a lost answer may have been sent, so it is not sent
-    /// again; another message is a conflict. Records how the attempt ended
-    /// unless the draft is there as the row says.
+    /// A send that may have happened: list the drafts once its request has
+    /// certainly ended (a listing earlier proves nothing).
+    async fn unknown_send(&self, account: &AccountId, retry_at: Timestamp) {
+        self.record_answer(account, &DraftWrite::Refresh { at: retry_at })
+            .await;
+    }
+
+    /// Before a retry (or a send with `if_message_id`, or of a row that was
+    /// stale), read the draft: a draft gone after a lost answer may have
+    /// been sent, so it is not sent again; another message than the row's,
+    /// or than `if_message`, is a conflict. Records how the attempt ended
+    /// unless the draft is there as expected.
     async fn read_before_send(
         &self,
         account: &AccountId,
         row: &mailtide::drafts::DraftRecord,
         started: Timestamp,
         retry: bool,
+        if_message: Option<&MessageId>,
         deadline: Instant,
     ) -> Result<(), DraftError> {
         let end = |end: SendEnd| DraftWrite::EndSend {
@@ -629,6 +828,15 @@ where
             end,
         };
         match self.get_draft(account, &row.id, deadline).await {
+            Ok(Some(current))
+                if current.message == row.message
+                    && if_message.is_some_and(|expected| *expected != current.message) =>
+            {
+                self.record_answer(account, &end(SendEnd::Unsent)).await;
+                Err(DraftError::Conflict {
+                    current: current.message,
+                })
+            }
             Ok(Some(current)) if current.message == row.message => Ok(()),
             Ok(Some(current)) => {
                 let changed = SendEnd::Changed {
@@ -712,7 +920,7 @@ where
             format: DraftFormat::Raw,
         };
         match self
-            .call_gmail(
+            .direct_call(
                 account,
                 request,
                 Priority::Foreground,
@@ -771,13 +979,9 @@ where
     }
 }
 
-/// A draft being sent is neither updated nor deleted: its send settles it.
-fn check_unsent(row: &DraftView) -> Result<(), DraftError> {
-    match row.state {
-        DraftStatus::Sending { retry_at } => Err(DraftError::SendInProgress {
-            retry_after: retry_at,
-        }),
-        DraftStatus::SendUnconfirmed => Err(DraftError::SendUnconfirmed),
-        DraftStatus::Saved | DraftStatus::Stale => Ok(()),
-    }
+fn token_taken() -> DraftError {
+    DraftError::Invalid(format!(
+        "another draft carries this {}: one token per draft",
+        mailtide_mime::TRACKING_HEADER
+    ))
 }

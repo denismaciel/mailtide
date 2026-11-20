@@ -197,9 +197,15 @@ def test_draft_changed_elsewhere_reaches_the_feed() -> None:
             ("saved", saved.draft_id, saved.message_id, "local"),
             ("saved", saved.draft_id, elsewhere, "remote"),
         ]
+        # Re-pointed at a message mailtide did not save: no token until Gmail's
+        # copy is imported (after draft_settle_s), then the one it carries.
         view = runner.draft(ACCOUNT, saved.draft_id)
         assert view is not None
-        assert (view.message_id, view.state, view.tracking_id) == (elsewhere, "saved", token)
+        assert (view.message_id, view.state, view.tracking_id) == (elsewhere, "saved", None)
+        clock.advance(121)
+        assert runner.run(ACCOUNT, budget_s=30).stop == "idle"
+        view = runner.draft(ACCOUNT, saved.draft_id)
+        assert view is not None and view.tracking_id == token
 
         gmail.delete_draft(saved.draft_id)
         assert runner.run(ACCOUNT, budget_s=30).stop == "idle"

@@ -1989,9 +1989,10 @@ impl Sim {
                 );
                 self.stats.draft_writes += 1;
                 match (saved, row) {
-                    (Some(draft), _) => Some(DraftWrite::Saved {
+                    (Some(draft), row) => Some(DraftWrite::Saved {
                         draft,
                         tracking_id: tracking,
+                        created: row.is_none(),
                     }),
                     (None, Some(row)) => Some(DraftWrite::Removed {
                         draft: row.id,
@@ -2031,10 +2032,9 @@ impl Sim {
     fn host_send(&mut self, row: &DraftRecord) {
         let begin = DraftWrite::BeginSend {
             draft: row.id.clone(),
-            if_message: None,
             retry_at: self.now.plus(Duration::from_mins(1)),
         };
-        let DraftRecorded::Started { draft, retry } = self.record_draft(&begin, false) else {
+        let DraftRecorded::Started { draft, retry, .. } = self.record_draft(&begin, false) else {
             return;
         };
         let Some(started) = draft.state.attempt().map(|a| a.started) else {

@@ -917,6 +917,7 @@ mod tests {
                 thread_id: ThreadId("t1".into()),
             },
             tracking_id: "tracking-0123456789".into(),
+            created: true,
         };
         store
             .record_draft(&account, &saved, Timestamp(5))

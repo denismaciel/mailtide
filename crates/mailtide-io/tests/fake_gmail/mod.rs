@@ -58,6 +58,10 @@ pub enum Fault {
     /// Act and compute the answer, then hold it until the test releases
     /// it: the request reached Gmail, its answer is still on the way.
     Held(Hold),
+    /// No connection was made: the request never reached Gmail.
+    NotSent,
+    /// Act, then answer 200 with a body that does not decode.
+    Undecodable,
 }
 
 /// A request held in flight by [`Fault::Held`].
@@ -529,6 +533,14 @@ impl FakeGmail {
                 )),
                 None,
             ),
+            Some(Fault::NotSent) => (
+                Err(TransportError::NotSent("connection refused".into())),
+                None,
+            ),
+            Some(Fault::Undecodable) => {
+                let _ = Self::respond(mailbox, request.method, &path, &query, &body, None);
+                (Ok(answer(200, &json!({"unexpected": true}))), None)
+            }
             Some(Fault::Held(hold)) => (
                 Ok(Self::respond(
                     mailbox,

@@ -727,14 +727,16 @@ Per-call costs [G]:
   request that changes the mailbox is refused before any credential or
   quota is spent, so a host cannot bypass the checks of the features that
   write (label edits, drafts, purges), which send their writes through the
-  same path inside `mailtide-io`. There, read-only mode refuses a write
+  same path inside `mailtide-io` (a draft send with the deadline by which
+  it must be issued, or never). There, read-only mode refuses a write
   before any credential or quota is spent. A direct
   call claims nothing, commits nothing and never moves the cursor (its
   command id has epoch 0, which no engine has). A refusal (a 400, a 403
   including a scope the token lacks, an account problem) is the caller's
   and blocks nothing; a real account problem is recorded by the account's
   next run. An answer lost after the request went out (a timeout, a dropped
-  connection) is reported as outcome unknown. A caller that
+  connection) is reported as outcome unknown; so is, for a request that
+  changes the mailbox, a 2xx whose body does not decode. A caller that
   needs the disposition of a write gets it alongside any failure to release
   its quota lease or install a cooldown. A caller that
   keeps Gmail's answer in the mirror records it afterwards with an unfenced
@@ -922,7 +924,7 @@ examined, refreshed, unreadable, next }`; `next == None` ends the pass. A
 missing blob is named in `unreadable`; a store failure rolls the batch back
 (call again from the same `after`).
 
-The conformance suite (`mailtide_store::conformance`, 64 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 65 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings

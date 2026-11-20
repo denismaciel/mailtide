@@ -311,4 +311,63 @@ mod tests {
             assert_eq!(epochs.len(), 4, "round {round}: epochs {epochs:?}");
         }
     }
+
+    /// Sends of one draft begun at once from separate connections (as from
+    /// separate processes): exactly one marks the row `sending`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_sends_from_separate_connections_have_one_winner() {
+        use mailtide::drafts::{DraftRecorded, DraftWrite, ListedDraft};
+        use mailtide::ids::{DraftId, MessageId, ThreadId, Timestamp};
+        let Ok(url) = std::env::var("MAILTIDE_TEST_POSTGRES_URL") else {
+            eprintln!("MAILTIDE_TEST_POSTGRES_URL not set; skipping");
+            return;
+        };
+        let _database = DATABASE.lock().await;
+        let setup = PostgresStore::connect(&url).await.expect("connect");
+        setup.migrate().await.expect("migrate");
+        for round in 0..5 {
+            let account = AccountId(format!("send{round}-{}@example.com", std::process::id()));
+            setup.track(&account, 1).await.expect("track");
+            let save = DraftWrite::Saved {
+                draft: ListedDraft {
+                    id: DraftId("r1".into()),
+                    message: MessageId(format!("m{round}")),
+                    thread_id: ThreadId("t1".into()),
+                },
+                tracking_id: format!("tracking-race-{round:010}"),
+                created: true,
+            };
+            setup
+                .record_draft(&account, &save, Timestamp(1))
+                .await
+                .expect("save");
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let url = url.clone();
+                let account = account.clone();
+                handles.push(tokio::spawn(async move {
+                    let store = PostgresStore::connect(&url).await.expect("connect");
+                    let begin = DraftWrite::BeginSend {
+                        draft: DraftId("r1".into()),
+                        retry_at: Timestamp(60_000),
+                    };
+                    store
+                        .record_draft(&account, &begin, Timestamp(2))
+                        .await
+                        .expect("begin")
+                }));
+            }
+            let mut winners = 0;
+            for handle in handles {
+                match handle.await.expect("join") {
+                    DraftRecorded::Started { .. } => winners += 1,
+                    DraftRecorded::InProgress { retry_at } => {
+                        assert_eq!(retry_at, Timestamp(60_000));
+                    }
+                    other => panic!("round {round}: {other:?}"),
+                }
+            }
+            assert_eq!(winners, 1, "round {round}");
+        }
+    }
 }

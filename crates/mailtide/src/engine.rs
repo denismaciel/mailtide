@@ -1234,6 +1234,7 @@ impl Engine {
             generation,
             claimed_at,
             grace: self.config.draft_send_grace,
+            every: self.config.draft_refresh_every,
         })];
         commit.account_ops = vec![AccountOp::SetDraftsRefreshedAt(now)];
         self.state.drafts_refreshed_at =
@@ -1516,6 +1517,12 @@ impl Engine {
         now: Timestamp,
     ) -> Vec<Command> {
         match (&blocking.class, waiting) {
+            // Drafts are not mail: a refused listing, even for a scope the
+            // token lacks, never blocks the account; the next periodic
+            // listing tries again (the account's own requests still tell).
+            (_, Waiting::Job(job)) if job.kind() == JobKind::RefreshDrafts => {
+                self.drafts_refused(&job, now)
+            }
             // The account itself is unusable: everything stops.
             (Blocking::Account(_), _) => self.block(blocking.clone(), now),
             (Blocking::Permanent, Waiting::Job(job)) => match job.kind() {
@@ -2005,6 +2012,77 @@ mod tests {
         ));
         assert_eq!(drafts_timer(&done), Some(due.plus(every)));
         no_periodic_listing_unless_live(now);
+    }
+
+    /// A refused listing (403 for a scope the token lacks, 400, 404) drops
+    /// the job and waits for the next periodic listing: drafts never block
+    /// the account, whatever the refusal's class.
+    #[test]
+    fn a_refused_draft_listing_never_blocks_the_account() {
+        let every = EngineConfig::default().draft_refresh_every;
+        let refusals = [
+            Failure::Blocking(BlockingFailure {
+                class: Blocking::Account(crate::retry::AccountProblem::ApiAccessDenied),
+                detail: "403".into(),
+            }),
+            Failure::Blocking(BlockingFailure {
+                class: Blocking::Permanent,
+                detail: "400".into(),
+            }),
+            Failure::NotFound,
+        ];
+        for failure in refusals {
+            let now = Timestamp(10_000_000);
+            let mut engine = live(100);
+            assert_eq!(draft_enqueues(&engine.start(now)), 1);
+            let claim = engine.claim_jobs(now);
+            let claim = claim
+                .iter()
+                .find(|c| matches!(c.kind, CommandKind::ClaimJobs { .. }))
+                .expect("a claim")
+                .id;
+            let commands = engine.handle(Event {
+                now,
+                kind: EventKind::JobsClaimed {
+                    command: claim,
+                    jobs: vec![ClaimedJob {
+                        work: ClaimedWork::RefreshDrafts {
+                            generation: 0,
+                            claimed_at: now,
+                        },
+                        priority: Priority::Live,
+                        failed_attempts: 0,
+                        attempt: AttemptId(9),
+                    }],
+                    next_due: None,
+                },
+            });
+            let list = commands
+                .iter()
+                .find(|c| matches!(c.kind, CommandKind::Gmail(_)))
+                .expect("drafts.list")
+                .id;
+            let refused = engine.handle(Event {
+                now,
+                kind: EventKind::RequestFailed {
+                    command: list,
+                    failure: failure.clone(),
+                },
+            });
+            assert_eq!(engine.state.sync, SyncState::Live, "{failure:?}");
+            let commit = first_commit(refused.clone()).expect("the job's finish");
+            assert!(
+                commit.jobs.iter().any(|op| matches!(
+                    op,
+                    JobOp::Finish {
+                        outcome: JobOutcome::Done,
+                        ..
+                    }
+                )),
+                "{failure:?}"
+            );
+            assert_eq!(drafts_timer(&refused), Some(now.plus(every)), "{failure:?}");
+        }
     }
 
     /// Not while bootstrapping or reconciling: they end with a listing of

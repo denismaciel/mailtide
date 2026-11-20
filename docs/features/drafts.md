@@ -91,8 +91,8 @@ is what Gmail's copy says after the last save, read from the import of the
 draft's current message (`None` until then): Gmail assigns its own Message-ID
 on every save and another on send, so it changes with each.
 `DraftError`: `NotFound`, `Conflict { current }`, `TooLarge { limit }`,
-`Invalid` (the bytes lack exactly one valid `X-Mailtide-Id`, or carry another
-than the draft's), `Deferred { until }`, `ReadOnly`, `Refused` (400/403),
+`Invalid` (the bytes lack exactly one valid `X-Mailtide-Id`, carry another
+than the draft's, or carry one another draft of the index holds), `Deferred { until }`, `ReadOnly`, `Refused` (400/403),
 `Retryable`, `OutcomeUnknown`, `SendInProgress { retry_after }`,
 `SendUnconfirmed`.
 
@@ -112,14 +112,22 @@ a `ValueError`. `delete_draft` answers `"deleted"` or `"already_gone"`.
   `compose` writes it) and refuse anything else before any call: mailtide
   never adds or repairs it. The row keeps the token (`tracking_id`); it is
   stable for the life of a draft, so an update carrying another token is
-  refused. A draft made elsewhere has none until mailtide saves it.
+  refused, and so is a create or update carrying a token another row holds
+  (one token per draft, so a sent message settles exactly one send). The
+  row's token follows Gmail's copy: the first import of the draft's current
+  message sets it from the import's `tracking_id` fact (or clears it, when
+  the bytes Gmail holds have none), and a listing that re-points the row
+  clears it until that import, or takes it at once from a message already
+  imported. A draft made elsewhere has none until then.
 
 - `if_message_id` is the optimistic check: the message id is Gmail's own
-  version of a draft. The call is refused from the index when it already
-  shows another message, else checked with `drafts.get?format=minimal`
-  before writing.
+  version of a draft. It is always checked against Gmail
+  (`drafts.get?format=minimal`) before writing, never against the index,
+  which may be behind (a caller who learned Gmail's message first would
+  get a false `Conflict`).
 - `update_draft` always sends a thread id: the caller's, else the index's,
-  else one read with `drafts.get`.
+  else one read with `drafts.get`. An empty thread id counts as none, in
+  `create_draft` too.
 - `read_draft` returns the blob when the current message is imported (content
   is immutable per message id: no Gmail call); otherwise, or with `fresh`,
   it asks Gmail. An answer whose message lacks `DRAFT` is `NotFound`.
@@ -145,10 +153,11 @@ before any call: Gmail stores a 40 MiB draft but delivers sends only up to
 34 MiB, and a draft that cannot be sent is of no use. At the limit the JSON
 body is about 46 MB (base64 grows the bytes by a third) and the call holds
 the bytes, their base64 and the body at once, about 140 MB; Gmail took 5 to
-7 s for 40 MiB, so the default HTTP request timeout (60 s) covers it, and
-the send fence's wait (`RunnerConfig.writes.request_timeout`) is that same
-timeout. A caller's `budget` bounds only the quota gate's deferral, not the
-request.
+7 s for 40 MiB, so the default HTTP request timeout (60 s) covers it. The
+send fence counts that same timeout (`RunnerConfig.writes.request_timeout`,
+which the Python runner sets to its HTTP timeout). A caller's `budget`
+bounds the quota gate's deferral, not the request; for a send it also
+bounds when the request may be issued (below).
 
 ### Store
 
@@ -224,10 +233,15 @@ consistency.
 
 `RefreshDrafts` pages `drafts.list` and commits one `DraftOp::Reconcile`,
 fenced by epoch, job claim and the **generation read at the claim**. If a
-local write happened since, or a listed message is one the mirror knows is
-deleted (the listing is stale, as §5.6 warns for messages), nothing applies
-and the job retries. Otherwise listed drafts are upserted and missing ones
-removed.
+local write happened since, nothing applies and the job lists again soon;
+after three such listings in a row (`STALE_LISTINGS`), at the periodic
+interval. A draft listed with a message the mirror knows is deleted (the
+listing is not a snapshot, as §5.6 warns for messages) says nothing about
+that draft, which keeps its row; the rest of the listing applies. Otherwise
+listed drafts are upserted and missing ones removed. A listing that leaves
+an unsettled send asks for the next one when that send's `retry_at`, or its
+grace period, comes. A listing asked for earlier than a waiting one brings
+it forward; a later ask never postpones it.
 
 Feed entries (`object_type` draft):
 
@@ -255,29 +269,65 @@ Gmail carries it:
 
 1. The row is marked `sending` (the compare-and-set) *before* the call. A
    second `send_draft` for it gets `SendInProgress` and calls nothing.
-2. A retry is accepted only after the first request's timeout has passed,
-   and it reads the draft first (`drafts.get`, 20 units). A 404 means the
-   draft was consumed: `SendUnconfirmed`, no send. Another message id means
-   it was edited: back to `saved`, `Conflict`. Only the same draft, still
-   there, is sent again.
+   The mark carries `retry_at`, computed from a hard deadline: the request
+   is issued by a deadline, now + min(`budget`, request timeout), or not at
+   all (the gate's wait, the pre-read and the token all come before it; a
+   gate deferral past it, or a request about to leave after it, sends
+   nothing and returns the row to `saved` with `Deferred`). `retry_at` =
+   that deadline + the request timeout + `LATE_APPLY_MARGIN` (5 s). So until
+   `retry_at` the first request may still be applied, and no second caller
+   or listing acts on the row.
+2. A retry is accepted only from `retry_at`, and it reads the draft first
+   (`drafts.get`, 20 units). A 404 means the draft was consumed:
+   `SendUnconfirmed`, no send. Another message id means it was edited: back
+   to `saved`, `Conflict`. Only the same draft, still there, is sent again.
+   A row that was `stale` (its message deleted in Gmail, the listing not run
+   yet) is read the same way before its first send: another message is
+   `Conflict { current }` once (the row moves to it, so the next send goes
+   through), a 404 is `NotFound` and the row leaves.
 3. mailtide never sends on its own. A lost answer is settled by Gmail, as I7
    does for intents: importing a `SENT` message whose `X-Mailtide-Id`
    equals the row's tracking id emits `DraftSent` (in whatever thread it
-   is); a listing claimed once the attempt's request has timed out that
-   still shows the draft returns it to `saved` (the negative proof: it was
-   not sent); a draft gone and unmatched once the cursor has moved past the
-   attempt and `draft_send_grace` (default 1 h) has passed ends as
+   is), but only when exactly one row carries that token, and only on the
+   message's first import (an older `SENT` message imported again settles
+   nothing); a listing claimed from `retry_at` on that still shows the
+   draft returns it to `saved` (the negative proof: it was not sent), and a
+   send that ends unknown asks for that listing, due at `retry_at`; a draft
+   gone and unmatched once the cursor has moved past the attempt and
+   `draft_send_grace` (default 1 h) has passed ends as
    `DraftRemoved{send_unconfirmed}`. No row lives forever. Message-IDs play
    no part: Gmail assigns a new one at send.
 
-A send answered by a 5xx or not answered at all may have been applied, so
-its row stays `sending` and the call returns `OutcomeUnknown`; only a
-refusal (400, 403), a rate limit or a quota deferral returns it to
-`saved`.
+A send answered by a 5xx, not answered at all, or answered 2xx with a body
+that does not decode may have been applied, so its row stays `sending` and
+the call returns `OutcomeUnknown` (Python `WriteOutcomeUnknown`). The last
+holds for every mailbox-changing direct call, not only drafts: `Runner`'s
+direct call reports it as an unknown outcome. A failure of the runner's own
+after the request went out (the quota gate's release, a cooldown) never
+replaces Gmail's answer: the send's disposition stands (the direct call
+returns both). Only a refusal (400, 403), a rate limit, a quota deferral, a
+request not issued by its deadline or one that certainly never reached
+Gmail (no connection was made) returns it to `saved`.
+
+A row being sent is not updated or deleted before `retry_at`
+(`SendInProgress`). From then on `update_draft` and `delete_draft` read the
+draft first: still there, nothing was sent, the row returns to `saved` and
+the call goes on; gone, `SendUnconfirmed`. A 404 to an update or delete
+leaves a row whose send is unsettled alone (the send's own record or the
+sync settles it), and an update's answer recorded after the send settled
+does not bring the row back. A delete answered 404 records `gone`, not
+`deleted`: that call deleted nothing.
 
 Read-only mode refuses the four writes before any call and keeps mirroring
 the index (`drafts.list` and `drafts.get` accept `gmail.readonly`). A 400 or
-403 from a draft call is the caller's error and does not block the account.
+403 from a draft call is the caller's error and does not block the account;
+nor does a refused `drafts.list` of the periodic or triggered listing, of
+any class (a 403 for a scope the token lacks included) or a 404: the job is
+dropped and the next periodic listing tries again.
+
+The public `Runner::call_gmail` only reads: it refuses every request that
+changes the mailbox before any token or quota, so a host cannot send a
+draft past its `BeginSend`. The draft calls use the crate's `direct_call`.
 
 ## 4. Alternatives rejected
 
@@ -319,12 +369,13 @@ the count and thread-summary suites (read projections), the suites
 `scripts/zero_tests.py` owns, and himalaya's `tests/send_outcome.rs` and
 JMAP tests (`send`).
 
-Our own 64 tests cover what no reference has: the request shapes and costs;
+Our own 89 tests cover what no reference has: the request shapes and costs;
 the index rules (stale rows, stale listings, the generation fence, the
 periodic refresh); every row of Appendix B, including a crash between
-Gmail's send and its record and the three send fences; drafts changed
-elsewhere; two writers; history expiry; read-only mode; a simulator campaign
-with the draft invariants; and the Python API.
+Gmail's send and its record and the three send fences (the issue deadline,
+the compare-and-set raced on every store, late records of a superseded
+attempt); drafts changed elsewhere; two writers; history expiry; read-only
+mode; a simulator campaign with the draft invariants; and the Python API.
 
 ## 6. Slices
 
@@ -368,7 +419,7 @@ is:
 `mailtide_jobs` row with an empty message key, `JobKind::message()` returns
 an `Option`, and its claim carries its own payload (the draft generation and
 the claim time); `identities` adds its kind beside it. The HTTP request
-timeout reaches the driver as `RunnerConfig.drafts.request_timeout`, which a
+timeout reaches the driver as `RunnerConfig.writes.request_timeout`, which a
 host sets to its transport's timeout (the Python runner passes its own).
 
 **Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
@@ -414,10 +465,12 @@ e.g. as a `RunnerConfig` field.
   never seen.
 - **D8. Send has three fences** (above) rather than trusting Gmail to refuse
   a second send. Costs 20 units on a retry and one refused call during a
-  timeout window. `send-late-apply` (a request whose connection was closed
-  unread was still applied within about a second, never later) backs the
-  second: once the first request's timeout has passed, reading the draft
-  tells whether it was consumed.
+  timeout window. `send-late-apply`, an unknown of the `send` plan
+  (confirmed: a `messages.send` whose connection was closed unread was
+  still applied within about a second, never later), backs the second:
+  the request is issued by its deadline or never, and `retry_at` adds the
+  request timeout and a 5 s margin (`LATE_APPLY_MARGIN`) to it, so once it
+  has passed, reading the draft tells whether it was consumed.
 - **D9. A periodic refresh, at most every 15 minutes while live.** The index
   heals whatever Gmail's consistency turns out to be, for 5 units. Both
   history unknowns and `drafts-list-consistent` are confirmed; it stays,
@@ -443,9 +496,10 @@ e.g. as a `RunnerConfig` field.
 - **D13. The tracking id comes from the import's facts.** `compose-mime`
   owns `mailtide_mime::tracking_id` (the first valid header) and
   `message-facts` the import's `tracking_id` fact (`MessageFacts`, on the
-  stored content). The settle rule reads that fact; an import without
-  facts (the extractor gave up) settles nothing, and its send ends
-  unconfirmed after the grace period, never resent. `tracking_headers`
+  stored content). The settle rule reads that fact, on a message's first
+  import and for a token exactly one row holds; an import without facts
+  (the extractor gave up) settles nothing and leaves the row's token as it
+  is, and its send ends unconfirmed after the grace period, never resent. `tracking_headers`
   beside the reader counts the headers, so a draft carrying two is refused.
 
 Unknowns (`scripts/features.py unknowns drafts` prints each test):
@@ -466,6 +520,20 @@ Unknowns (`scripts/features.py unknowns drafts` prints each test):
 - `drafts-write-answer-ids`: create and update answers carry the message and thread ids.
 - `drafts-no-precondition`: Gmail honours no `If-Match` on draft writes.
 
+## Known limits
+
+No review item was dropped: each was built with a test. What remains:
+
+- `BeginSend`'s compare-and-set is raced on every store through one pool,
+  and on Postgres from separate connections; SQLite is not raced from two
+  processes (its writer lock makes the loser fail with a busy error, never
+  send).
+- The send deadline is real time and `retry_at` host time: a host clock
+  that does not follow real time skews the fence by the difference.
+- A message that a reconciliation's paged `messages.list` skips is not
+  discovered (an engine gap, not a draft one); drafts only cover a listed
+  draft's message and a recorded send's message.
+
 ## Appendix A. Gmail calls and quota
 
 | Call | Units | Used by | Priority |
@@ -474,7 +542,7 @@ Unknowns (`scripts/features.py unknowns drafts` prints each test):
 | `drafts.update` | 15 | `update_draft` | foreground |
 | `drafts.delete` | 10 | `delete_draft` | foreground |
 | `drafts.send` | 100 | `send_draft` | foreground |
-| `drafts.get` minimal | 20 | `if_message_id`, `read_draft(fresh)`, a send retry, an update of an unknown draft | foreground |
+| `drafts.get` minimal | 20 | `if_message_id`, `read_draft(fresh)`, a send retry, the first send of a stale row, an update or delete after an unknown send, an update of an unknown draft | foreground |
 | `drafts.get` raw | 60 | `read_draft` without a blob | foreground |
 | `drafts.list` | 5 per page of 500 | index refresh, triggered or periodic | live |
 
@@ -484,5 +552,5 @@ Unknowns (`scripts/features.py unknowns drafts` prints each test):
 |---|---|---|
 | create | `OutcomeUnknown`, no id invented, refresh scheduled; a draft Gmail did create appears as `DraftSaved{remote}` | may leave a second draft: visible and deletable, never a second send |
 | update | `OutcomeUnknown`, row marked `stale` | safe, it is a replace; drop or re-read `if_message_id` first |
-| delete | `OutcomeUnknown` | safe; a 404 is `AlreadyGone` |
-| send | the row stays `sending` | `SendInProgress` until the first request has timed out; then the draft is read: gone is `SendUnconfirmed`, still there is sent |
+| delete | `OutcomeUnknown` | safe; a 404 is `AlreadyGone` (recorded as `gone`) |
+| send | the row stays `sending`; a listing is due at `retry_at` | `SendInProgress` until `retry_at`; then the draft is read: gone is `SendUnconfirmed`, still there is sent (or, for an update or delete, the row returns to `saved` and the call goes on) |

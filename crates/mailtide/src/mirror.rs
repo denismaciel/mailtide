@@ -1058,6 +1058,36 @@ impl AccountMirror {
         }
     }
 
+    fn apply_account_op(&mut self, op: &AccountOp) {
+        match op {
+            AccountOp::SetWatchExpiration(at) => self.record.watch_expiration = Some(*at),
+            AccountOp::SetCooldown(cooldown) => self.record.cooldown = Some(cooldown.clone()),
+            AccountOp::ClearCooldown => self.record.cooldown = None,
+            AccountOp::SetLastActivity(at) => {
+                self.record.last_activity =
+                    Some(self.record.last_activity.map_or(*at, |t| t.max(*at)));
+            }
+            AccountOp::SetLabelsRefreshedAt(at) => {
+                self.record.labels_refreshed_at =
+                    Some(self.record.labels_refreshed_at.map_or(*at, |t| t.max(*at)));
+            }
+            AccountOp::SetDraftsRefreshedAt(at) => {
+                self.record.drafts_refreshed_at =
+                    Some(self.record.drafts_refreshed_at.map_or(*at, |t| t.max(*at)));
+            }
+            AccountOp::Block(reason) => {
+                let resume = match std::mem::replace(&mut self.record.sync, SyncState::Live) {
+                    SyncState::Blocked { resume, .. } => resume,
+                    current => Box::new(current),
+                };
+                self.record.sync = SyncState::Blocked {
+                    reason: reason.clone(),
+                    resume,
+                };
+            }
+        }
+    }
+
     fn apply_unguarded(&mut self, commit: &Commit) -> u32 {
         self.seq = StateSeq(self.seq.0 + 1);
         let seq = self.seq;
@@ -1071,42 +1101,19 @@ impl AccountMirror {
             self.apply_label(op, seq);
         }
         for op in &commit.account_ops {
-            match op {
-                AccountOp::SetWatchExpiration(at) => self.record.watch_expiration = Some(*at),
-                AccountOp::SetCooldown(cooldown) => self.record.cooldown = Some(cooldown.clone()),
-                AccountOp::ClearCooldown => self.record.cooldown = None,
-                AccountOp::SetLastActivity(at) => {
-                    self.record.last_activity =
-                        Some(self.record.last_activity.map_or(*at, |t| t.max(*at)));
-                }
-                AccountOp::SetLabelsRefreshedAt(at) => {
-                    self.record.labels_refreshed_at =
-                        Some(self.record.labels_refreshed_at.map_or(*at, |t| t.max(*at)));
-                }
-                AccountOp::SetDraftsRefreshedAt(at) => {
-                    self.record.drafts_refreshed_at =
-                        Some(self.record.drafts_refreshed_at.map_or(*at, |t| t.max(*at)));
-                }
-                AccountOp::Block(reason) => {
-                    let resume = match std::mem::replace(&mut self.record.sync, SyncState::Live) {
-                        SyncState::Blocked { resume, .. } => resume,
-                        current => Box::new(current),
-                    };
-                    self.record.sync = SyncState::Blocked {
-                        reason: reason.clone(),
-                        resume,
-                    };
-                }
-            }
+            self.apply_account_op(op);
         }
         let mut skipped = 0;
         for op in &commit.messages {
-            let existed = message_op_id(op).is_some_and(|id| self.messages.contains_key(id));
+            let before = message_op_id(op).and_then(|id| self.messages.get(id));
+            let existed = before.is_some();
+            let was_imported = before.is_some_and(|r| matches!(r.content, Content::Imported(_)));
             if !self.apply_message(op, &commit.job_plan, seq) {
                 skipped += 1;
             }
             self.settle(op, commit.claim.as_ref(), seq);
-            let effects = self.draft_rules(op, existed, commit.job_plan.verify_due_at);
+            let effects =
+                self.draft_rules(op, existed, was_imported, commit.job_plan.verify_due_at);
             self.draft_effects(effects, commit.job_plan.draft_refresh_due_at, seq);
         }
         for op in &commit.intents {
@@ -1114,6 +1121,7 @@ impl AccountMirror {
                 skipped += 1;
             }
         }
+        let refresh_attempts = self.refresh_attempts(commit);
         for op in &commit.jobs {
             match op {
                 JobOp::Enqueue(new) => self.enqueue(new),
@@ -1140,7 +1148,7 @@ impl AccountMirror {
         // After the jobs: a listing that may not apply lists again, after
         // its own job finished.
         for op in &commit.drafts {
-            if !self.apply_draft(op, &commit.job_plan, seq) {
+            if !self.apply_draft(op, &commit.job_plan, refresh_attempts, seq) {
                 skipped += 1;
             }
         }
@@ -1702,7 +1710,13 @@ impl AccountMirror {
     /// What the draft rules make of one message operation, applied just
     /// before: `existed` says whether its row was there before; `now` is
     /// when a listing that needs no delay is due.
-    fn draft_rules(&mut self, op: &MessageOp, existed: bool, now: Timestamp) -> DraftEffects {
+    fn draft_rules(
+        &mut self,
+        op: &MessageOp,
+        existed: bool,
+        was_imported: bool,
+        now: Timestamp,
+    ) -> DraftEffects {
         match op {
             MessageOp::Observe(MessageObservation { id, .. })
             | MessageOp::PatchLabels { id, .. } => match self.messages.get(id) {
@@ -1719,6 +1733,11 @@ impl AccountMirror {
                 } else {
                     drafts::on_new_message(&self.drafts, &observation.id, &observation.labels)
                 };
+                // Only a first import: an older message imported again
+                // must not settle a later send.
+                if was_imported {
+                    return effects;
+                }
                 let settled = drafts::on_import(
                     &mut self.drafts,
                     &observation.id,
@@ -1727,7 +1746,7 @@ impl AccountMirror {
                     // The import's facts carry the X-Mailtide-Id; an import
                     // whose extractor gave up has none, and its send ends
                     // unconfirmed after the grace period (never resent).
-                    facts.as_ref().and_then(|f| f.tracking_id.as_deref()),
+                    facts.as_ref().map(|f| f.tracking_id.as_deref()),
                 );
                 effects.changes.extend(settled.changes);
                 effects.changed |= settled.changed;
@@ -1740,9 +1759,8 @@ impl AccountMirror {
             MessageOp::FinishReconcile { .. } => {
                 self.enqueue_draft_refresh(now);
                 DraftEffects {
-                    changes: Vec::new(),
-                    refresh: false,
                     changed: true,
+                    ..DraftEffects::default()
                 }
             }
             MessageOp::Listed { .. } => DraftEffects::default(),
@@ -1761,9 +1779,51 @@ impl AccountMirror {
         if effects.refresh {
             self.enqueue_draft_refresh(due);
         }
+        if let Some(at) = effects.refresh_at {
+            self.enqueue_draft_refresh(at);
+        }
     }
 
+    /// Stale listings in a row before this commit's listing, read before
+    /// its job finishes.
+    fn refresh_attempts(&self, commit: &Commit) -> u32 {
+        commit
+            .claim
+            .as_ref()
+            .filter(|claim| claim.kind == JobKind::RefreshDrafts)
+            .and_then(|claim| self.jobs.get(&claim.kind))
+            .map_or(0, |job| job.failed_attempts)
+    }
+
+    /// A row without a token whose current message is already imported
+    /// takes the token Gmail's copy carries (a listing re-pointed it at a
+    /// message imported before the listing, so no import will tell it).
+    fn tokens_from_imports(&mut self) {
+        for record in self.drafts.values_mut().filter(|r| r.tracking_id.is_none()) {
+            if let Some(MessageRecord {
+                content: Content::Imported(stored),
+                ..
+            }) = self.messages.get(&record.message)
+            {
+                record.tracking_id = stored.facts.as_ref().and_then(|f| f.tracking_id.clone());
+            }
+        }
+    }
+
+    /// Ask for a listing due at `due`. A waiting listing due earlier keeps
+    /// its time; one due later is brought forward (a send whose request
+    /// has certainly ended must not wait for a backed-off listing). A
+    /// running one is left alone: its listing re-asks for any send still
+    /// unsettled (`DraftEffects::refresh_at`).
     fn enqueue_draft_refresh(&mut self, due: Timestamp) {
+        if let Some(Job {
+            state: JobState::Ready { due_at },
+            ..
+        }) = self.jobs.get_mut(&JobKind::RefreshDrafts)
+        {
+            *due_at = (*due_at).min(due);
+            return;
+        }
         self.enqueue(&NewJob {
             kind: JobKind::RefreshDrafts,
             priority: Priority::Live,
@@ -1776,7 +1836,7 @@ impl AccountMirror {
     /// draft whose message the mirror has never seen gets a verification,
     /// as an unknown message in history does: listings are not snapshots,
     /// and the draft list is one more place to learn of a message.
-    fn apply_draft(&mut self, op: &DraftOp, plan: &JobPlan, seq: StateSeq) -> bool {
+    fn apply_draft(&mut self, op: &DraftOp, plan: &JobPlan, attempts: u32, seq: StateSeq) -> bool {
         let retry_at = plan.draft_refresh_due_at;
         match op {
             DraftOp::Reconcile(listing) => {
@@ -1799,6 +1859,7 @@ impl AccountMirror {
                 ) {
                     Reconciled::Applied(effects) => {
                         self.draft_effects(effects, retry_at, seq);
+                        self.tokens_from_imports();
                         for message in unknown {
                             self.enqueue(&NewJob {
                                 kind: JobKind::Verify(message),
@@ -1808,8 +1869,21 @@ impl AccountMirror {
                         }
                         true
                     }
+                    // Listed again soon, then at the periodic interval once
+                    // a few listings in a row were stale.
                     Reconciled::Stale => {
-                        self.enqueue_draft_refresh(retry_at);
+                        let attempts = attempts.saturating_add(1);
+                        let due_at = if attempts >= drafts::STALE_LISTINGS {
+                            listing.claimed_at.plus(listing.every)
+                        } else {
+                            retry_at
+                        };
+                        self.jobs.entry(JobKind::RefreshDrafts).or_insert(Job {
+                            kind: JobKind::RefreshDrafts,
+                            priority: Priority::Live,
+                            failed_attempts: attempts,
+                            state: JobState::Ready { due_at },
+                        });
                         false
                     }
                 }

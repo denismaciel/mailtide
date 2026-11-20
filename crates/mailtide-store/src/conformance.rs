@@ -285,6 +285,10 @@ fn draft_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
         ("the draft listing is one account-level job", |s| {
             Box::pin(draft_refresh_job(s))
         }),
+        (
+            "two sends of one draft begun at once have one winner",
+            |s| Box::pin(racing_sends(s)),
+        ),
     ]
 }
 
@@ -3730,6 +3734,74 @@ async fn claimed_generation<S: Store>(
     }))
 }
 
+/// Both futures, polled in turn until each is done: two callers in flight
+/// at once on one store (separate pool connections where it has them).
+async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
+    let (mut left, mut right) = (None, None);
+    std::future::poll_fn(move |cx| {
+        if left.is_none()
+            && let std::task::Poll::Ready(out) = a.as_mut().poll(cx)
+        {
+            left = Some(out);
+        }
+        if right.is_none()
+            && let std::task::Poll::Ready(out) = b.as_mut().poll(cx)
+        {
+            right = Some(out);
+        }
+        match (left.take(), right.take()) {
+            (Some(l), Some(r)) => std::task::Poll::Ready((l, r)),
+            (l, r) => {
+                left = l;
+                right = r;
+                std::task::Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// Two sends of one draft begun at once: exactly one wins.
+async fn racing_sends<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::drafts::{DraftRecorded, DraftWrite};
+    use mailtide::ids::DraftId;
+    claim(store).await?;
+    for round in 0..8 {
+        let id = format!("race{round}");
+        let save = DraftWrite::Saved {
+            draft: listed(&id, &format!("m-{id}")),
+            tracking_id: format!("tracking-race-{round:010}"),
+            created: true,
+        };
+        record(store, &save, 1).await?;
+        let begin = DraftWrite::BeginSend {
+            draft: DraftId(id),
+            retry_at: Timestamp(60_000),
+        };
+        let (a, b) = both(record(store, &begin, 2), record(store, &begin, 2)).await;
+        let outcomes = [a?, b?];
+        let winners = outcomes
+            .iter()
+            .filter(|o| matches!(o, DraftRecorded::Started { .. }))
+            .count();
+        let refused = outcomes
+            .iter()
+            .filter(|o| {
+                **o == DraftRecorded::InProgress {
+                    retry_at: Timestamp(60_000),
+                }
+            })
+            .count();
+        expect(
+            winners == 1 && refused == 1,
+            &format!("round {round}: one winner, one refused: {outcomes:?}"),
+        )?;
+    }
+    Ok(())
+}
+
 async fn draft_rows<S: Store>(store: &S) -> Result<(), String> {
     use mailtide::drafts::{DraftOp, DraftReconcile, DraftRecorded, DraftStatus, DraftWrite};
     use mailtide::ids::DraftId;
@@ -3737,6 +3809,7 @@ async fn draft_rows<S: Store>(store: &S) -> Result<(), String> {
     let save = |message: &str| DraftWrite::Saved {
         draft: listed("r1", message),
         tracking_id: TRACKING.into(),
+        created: true,
     };
     record(store, &save("m1"), 1).await?;
     record(store, &DraftWrite::Refresh { at: Timestamp(2) }, 2).await?;
@@ -3756,6 +3829,7 @@ async fn draft_rows<S: Store>(store: &S) -> Result<(), String> {
         generation,
         claimed_at: Timestamp(3),
         grace: std::time::Duration::from_hours(1),
+        every: std::time::Duration::from_mins(15),
     })];
     apply(store, &stale).await?;
     let views = draft_views(store).await?;
@@ -3769,7 +3843,15 @@ async fn draft_rows<S: Store>(store: &S) -> Result<(), String> {
     )?;
     // Gmail's copy of the current message names its Message-ID.
     let mut c = commit(&snapshot, 1);
-    c.messages = vec![import("m2", &["DRAFT"], 5)];
+    // Gmail's copy carries the token the bytes were saved with.
+    let mut draft_import = import("m2", &["DRAFT"], 5);
+    if let MessageOp::MarkImported {
+        facts: Some(facts), ..
+    } = &mut draft_import
+    {
+        facts.tracking_id = Some(TRACKING.into());
+    }
+    c.messages = vec![draft_import];
     apply(store, &c).await?;
     let view = store
         .draft(&account(), &DraftId("r1".into()))
@@ -3782,7 +3864,6 @@ async fn draft_rows<S: Store>(store: &S) -> Result<(), String> {
     // saved -> sending is a compare-and-set.
     let begin = DraftWrite::BeginSend {
         draft: DraftId("r1".into()),
-        if_message: Some(MessageId("m2".into())),
         retry_at: Timestamp(60_000),
     };
     expect(
@@ -3810,6 +3891,7 @@ async fn draft_rows_settle<S: Store>(store: &S, snapshot: &StoreSnapshot) -> Res
     let save = |message: &str| DraftWrite::Saved {
         draft: listed("r1", message),
         tracking_id: TRACKING.into(),
+        created: true,
     };
     // The sent message's import settles it by tracking id.
     let mut c = commit(snapshot, 2);
@@ -3885,8 +3967,11 @@ async fn draft_refresh_job<S: Store>(store: &S) -> Result<(), String> {
     use mailtide::drafts::{DraftOp, DraftReconcile, DraftWrite};
     let snapshot = claim(store).await?;
     record(store, &DraftWrite::Refresh { at: Timestamp(5) }, 1).await?;
-    // A history commit asks for one too: still one job, due when first asked.
+    // A history commit asks for one later: still one job, at the earlier
+    // time (a later ask never postpones a listing; an earlier one brings
+    // it forward).
     let mut c = commit(&snapshot, 0);
+    c.job_plan.draft_refresh_due_at = Timestamp(9);
     c.messages = vec![observe("m9", &["DRAFT"], 3)];
     apply(store, &c).await?;
     expect(
@@ -3911,6 +3996,7 @@ async fn draft_refresh_job<S: Store>(store: &S) -> Result<(), String> {
         generation,
         claimed_at: Timestamp(5),
         grace: std::time::Duration::from_hours(1),
+        every: std::time::Duration::from_mins(15),
     })];
     done.account_ops = vec![mailtide::commit::AccountOp::SetDraftsRefreshedAt(
         Timestamp(6),
@@ -3937,6 +4023,7 @@ async fn draft_refresh_job<S: Store>(store: &S) -> Result<(), String> {
         generation,
         claimed_at: Timestamp(20_000),
         grace: std::time::Duration::from_hours(1),
+        every: std::time::Duration::from_mins(15),
     })];
     apply(store, &done).await?;
     let views = draft_views(store).await?;

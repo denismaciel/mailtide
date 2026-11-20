@@ -2826,7 +2826,7 @@ mod _core {
             let (state, retry_after_ms) = match view.state {
                 DraftStatus::Saved => ("saved", None),
                 DraftStatus::Stale => ("stale", None),
-                DraftStatus::Sending { retry_at } => ("sending", Some(retry_at.0)),
+                DraftStatus::Sending { retry_at, .. } => ("sending", Some(retry_at.0)),
                 DraftStatus::SendUnconfirmed => ("send_unconfirmed", None),
             };
             Self {

@@ -1766,6 +1766,11 @@ where
                     "label listing without labels: {error:?}"
                 )))
             }
+            // A success whose answer does not decode may still have changed
+            // the mailbox: never report it as refused.
+            Err(error) if changes_mailbox(gmail_request) => {
+                Outcome::Unanswered(format!("undecodable answer to a write: {error:?}"))
+            }
             // A malformed body won't heal by waiting: refuse it for good
             // (a job blocks; a sync request blocks the account for an
             // operator) instead of re-fetching forever.
@@ -2131,3 +2136,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "write_call_tests.rs"]
+mod write_call_tests;

@@ -6,15 +6,23 @@ pub mod fake_gmail;
 use std::time::Duration;
 
 use fake_gmail::*;
-use mailtide::drafts::{DraftStatus, DraftView};
+use mailtide::drafts::{DraftRecorded, DraftStatus, DraftView, DraftWrite, SendEnd};
 use mailtide::ids::{DraftId, MessageId, Timestamp};
 use mailtide::quota::Budget;
-use mailtide_io::drafts::{Deleted, DraftError, DraftRef};
+use mailtide_io::drafts::{Deleted, DraftError, DraftRef, LATE_APPLY_MARGIN};
 use mailtide_io::runner::{Access, WriteSettings};
 use mailtide_store::Store as _;
 
 /// A send's request may be in flight this long (the default timeout).
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// From a send's start until its request has certainly ended: the latest
+/// time it may be issued (the budget, under the timeout), the request
+/// timeout and the late-apply margin.
+fn send_window() -> Duration {
+    BUDGET.min(REQUEST_TIMEOUT) + REQUEST_TIMEOUT + LATE_APPLY_MARGIN
+}
+
 /// A draft's message is imported this long after history shows it.
 const DRAFT_SETTLE: Duration = Duration::from_mins(2);
 
@@ -201,7 +209,8 @@ fn an_update_with_a_stale_message_id_is_refused() {
         let first = create(&runner, 1, "a").await;
         let second = update(&runner, &first, "b").await;
 
-        // The index already shows a newer message: refused without a call.
+        // The index already shows a newer message: still, Gmail is read
+        // (the index may be behind) and refuses, nothing written.
         let before = requests(&setup).len();
         let error = runner
             .update_draft(
@@ -220,9 +229,13 @@ fn an_update_with_a_stale_message_id_is_refused() {
                 current: second.message.clone()
             }
         );
-        assert_eq!(requests(&setup).len(), before);
+        assert_eq!(
+            requests(&setup)[before..],
+            [format!("GET drafts/{}?minimal", first.id.0)]
+        );
 
         // The index is behind (saved elsewhere): Gmail is read first.
+        let before = requests(&setup).len();
         let elsewhere = setup
             .gmail
             .lock()
@@ -319,7 +332,7 @@ fn a_send_with_a_stale_message_id_is_refused() {
         assert_eq!(row.state, DraftStatus::Saved, "sendable again");
         assert_eq!(row.message_id, message_id(&edited));
 
-        // Now the index shows the change: refused without a call.
+        // Now the index shows the change: Gmail is read, refused, not sent.
         let before = requests(&setup).len();
         let error = runner
             .send_draft(&account(), &draft.id, Some(draft.message.clone()), BUDGET)
@@ -331,7 +344,16 @@ fn a_send_with_a_stale_message_id_is_refused() {
                 current: message_id(&edited)
             }
         );
-        assert_eq!(requests(&setup).len(), before);
+        assert_eq!(
+            requests(&setup)[before..],
+            [format!("GET drafts/{}?minimal", draft.id.0)]
+        );
+        let row = view(&runner, &draft.id).await.expect("row");
+        assert_eq!(
+            row.state,
+            DraftStatus::Saved,
+            "the refusal ends the attempt"
+        );
         assert!(sent_messages(&setup).is_empty());
     });
 }
@@ -485,11 +507,12 @@ fn deleting_a_missing_draft_reports_already_gone() {
             .expect("retry");
         assert_eq!(retried, Deleted::AlreadyGone);
         assert!(view(&runner, &draft.id).await.is_none());
+        // This call deleted nothing: the feed says gone, not deleted.
         assert_eq!(
             draft_feed(&runner).await,
             vec![
                 entry("saved:local", &draft.id, &draft.message),
-                entry("removed:deleted", &draft.id, &draft.message),
+                entry("removed:gone", &draft.id, &draft.message),
             ]
         );
         // A draft Gmail never had.
@@ -553,7 +576,7 @@ fn a_send_that_times_out_then_finds_the_draft_gone_is_unconfirmed_and_never_rese
             DraftStatus::Sending { .. }
         ));
 
-        setup.clock.advance(REQUEST_TIMEOUT);
+        setup.clock.advance(send_window());
         let before = requests(&setup).len();
         let error = runner
             .send_draft(&account(), &draft.id, None, BUDGET)
@@ -597,7 +620,7 @@ fn a_send_retried_after_a_request_that_never_arrived_sends_once() {
         assert!(matches!(error, DraftError::OutcomeUnknown(_)), "{error:?}");
         assert!(sent_messages(&setup).is_empty());
 
-        setup.clock.advance(REQUEST_TIMEOUT);
+        setup.clock.advance(send_window());
         let sent = runner
             .send_draft(&account(), &draft.id, None, BUDGET)
             .await
@@ -1131,7 +1154,7 @@ fn a_second_send_while_one_is_in_flight_is_refused() {
         assert_eq!(
             second,
             Err(DraftError::SendInProgress {
-                retry_after: started.plus(REQUEST_TIMEOUT)
+                retry_after: started.plus(send_window())
             })
         );
         let first = first.expect("the first send");
@@ -1158,7 +1181,7 @@ fn a_send_retry_waits_out_the_first_request_and_reads_the_draft_before_sending()
         assert!(matches!(error, DraftError::OutcomeUnknown(_)), "{error:?}");
 
         // The first request may still be in flight.
-        setup.clock.advance(REQUEST_TIMEOUT / 2);
+        setup.clock.advance(send_window() / 2);
         let before = requests(&setup).len();
         let error = runner
             .send_draft(&account(), &draft.id, None, BUDGET)
@@ -1167,13 +1190,13 @@ fn a_send_retry_waits_out_the_first_request_and_reads_the_draft_before_sending()
         assert_eq!(
             error,
             DraftError::SendInProgress {
-                retry_after: started.plus(REQUEST_TIMEOUT)
+                retry_after: started.plus(send_window())
             }
         );
         assert_eq!(requests(&setup).len(), before, "no call");
 
         // It has timed out: the draft is read, then sent.
-        setup.clock.advance(REQUEST_TIMEOUT / 2);
+        setup.clock.advance(send_window() / 2);
         let sent = runner
             .send_draft(&account(), &draft.id, None, BUDGET)
             .await
@@ -1206,7 +1229,7 @@ fn a_send_retry_waits_out_the_first_request_and_reads_the_draft_before_sending()
                 Some(&changed.thread_id.0),
             )
             .expect("draft");
-        setup.clock.advance(REQUEST_TIMEOUT);
+        setup.clock.advance(send_window());
         let error = runner
             .send_draft(&account(), &changed.id, None, BUDGET)
             .await
@@ -1481,6 +1504,482 @@ fn a_drafts_message_id_is_read_from_gmails_copy() {
                 .expect("row")
                 .rfc822_message_id,
             Some(second)
+        );
+    });
+}
+
+// ------------------------------------------------------------- review fixes
+
+/// The state of a row being sent: its attempt's start.
+async fn sending_since(runner: &TestRunner, draft: &DraftId) -> Timestamp {
+    match view(runner, draft).await.expect("row").state {
+        DraftStatus::Sending { started, .. } => started,
+        other => panic!("not sending: {other:?}"),
+    }
+}
+
+#[test]
+fn a_send_held_before_its_request_is_fenced_until_it_has_certainly_ended() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        let started = setup.clock.now();
+        // A short budget: the request must be issued within 50 ms or never.
+        let budget = Duration::from_millis(50);
+        // The send's pre-read is held: its request is not issued yet.
+        let hold = Hold::default();
+        setup
+            .gmail
+            .fail_next("GET drafts/", Fault::Held(hold.clone()));
+        let account = account();
+        let (first, (second, listed)) = tokio::join!(
+            runner.send_draft(&account, &draft.id, Some(draft.message.clone()), budget),
+            async {
+                hold.reached().await;
+                // Past the time the request may be issued...
+                std::thread::sleep(Duration::from_millis(100));
+                // ...and past the request timeout counted from the start.
+                setup
+                    .clock
+                    .advance(REQUEST_TIMEOUT + Duration::from_secs(1));
+                let second = runner.send_draft(&account, &draft.id, None, BUDGET).await;
+                // A listing in that window still shows the draft: it proves
+                // nothing yet.
+                let now = setup.clock.now();
+                runner
+                    .store()
+                    .record_draft(&account, &DraftWrite::Refresh { at: now }, now)
+                    .await
+                    .expect("refresh");
+                let listings = setup.gmail.listings();
+                sync(&runner).await;
+                assert_eq!(setup.gmail.listings(), listings + 1, "listed");
+                let listed = view(&runner, &draft.id).await.expect("row").state;
+                hold.release();
+                (second, listed)
+            }
+        );
+        assert_eq!(
+            second,
+            Err(DraftError::SendInProgress {
+                retry_after: started
+                    .plus(budget)
+                    .plus(REQUEST_TIMEOUT)
+                    .plus(LATE_APPLY_MARGIN)
+            })
+        );
+        assert!(matches!(listed, DraftStatus::Sending { .. }), "{listed:?}");
+        // The first call's request would go out after its time: not issued.
+        assert!(matches!(first, Err(DraftError::Deferred(_))), "{first:?}");
+        assert!(setup.gmail.sent("POST drafts/send").is_empty());
+        assert!(sent_messages(&setup).is_empty());
+        assert_eq!(
+            view(&runner, &draft.id).await.expect("row").state,
+            DraftStatus::Saved
+        );
+    });
+}
+
+#[test]
+fn a_send_answered_with_an_undecodable_success_is_an_unknown_outcome() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Undecodable);
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("unknown");
+        assert!(matches!(error, DraftError::OutcomeUnknown(_)), "{error:?}");
+        assert_eq!(sent_messages(&setup).len(), 1, "Gmail did send it");
+        sending_since(&runner, &draft.id).await;
+        // Never resent; the sync confirms it.
+        sync(&runner).await;
+        assert!(view(&runner, &draft.id).await.is_none());
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), 1);
+    });
+}
+
+#[test]
+fn a_send_answered_5xx_or_not_at_all_stays_sending() {
+    for fault in [
+        Fault::Status(500),
+        Fault::Status(503),
+        Fault::Lost { applied: false },
+    ] {
+        block_on(async {
+            let (runner, setup) = runner();
+            synced(&runner).await;
+            let draft = create(&runner, 1, "a").await;
+            setup.gmail.fail_next("POST drafts/send", fault.clone());
+            let error = runner
+                .send_draft(&account(), &draft.id, None, BUDGET)
+                .await
+                .expect_err("failed");
+            assert!(
+                matches!(error, DraftError::OutcomeUnknown(_)),
+                "{fault:?}: {error:?}"
+            );
+            sending_since(&runner, &draft.id).await;
+            let again = runner.send_draft(&account(), &draft.id, None, BUDGET).await;
+            assert!(
+                matches!(again, Err(DraftError::SendInProgress { .. })),
+                "{fault:?}: {again:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn a_send_rate_limited_or_deferred_returns_to_saved() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Status(429));
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("rate limited");
+        assert!(matches!(error, DraftError::Retryable(_)), "{error:?}");
+        assert_eq!(
+            view(&runner, &draft.id).await.expect("row").state,
+            DraftStatus::Saved
+        );
+        // The rate limit's cool-down defers the next send at the gate.
+        let before = setup.gmail.sent("POST drafts/send").len();
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("deferred");
+        assert!(matches!(error, DraftError::Deferred(_)), "{error:?}");
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), before);
+        assert_eq!(
+            view(&runner, &draft.id).await.expect("row").state,
+            DraftStatus::Saved
+        );
+        assert!(sent_messages(&setup).is_empty());
+    });
+}
+
+#[test]
+fn a_send_that_never_connected_returns_to_saved() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        setup.gmail.fail_next("POST drafts/send", Fault::NotSent);
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("not sent");
+        assert!(matches!(error, DraftError::Retryable(_)), "{error:?}");
+        assert_eq!(
+            view(&runner, &draft.id).await.expect("row").state,
+            DraftStatus::Saved
+        );
+        let sent = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect("sent at once");
+        assert_eq!(sent_messages(&setup), vec![sent.message_id.0]);
+    });
+}
+
+#[test]
+fn after_an_unknown_send_the_draft_can_be_edited_or_deleted_once_its_request_ended() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        // Not sent after all: an update reads the draft, finds it, goes on.
+        let draft = create(&runner, 1, "a").await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Lost { applied: false });
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("lost");
+        assert!(matches!(error, DraftError::OutcomeUnknown(_)), "{error:?}");
+        let early = runner
+            .update_draft(
+                &account(),
+                &draft.id,
+                raw(&token(1), "b"),
+                None,
+                None,
+                BUDGET,
+            )
+            .await;
+        assert!(
+            matches!(early, Err(DraftError::SendInProgress { .. })),
+            "{early:?}"
+        );
+        setup.clock.advance(send_window());
+        let before = requests(&setup).len();
+        let updated = update(&runner, &draft, "b").await;
+        assert_eq!(
+            requests(&setup)[before..],
+            [
+                format!("GET drafts/{}?minimal", draft.id.0),
+                format!("PUT drafts/{}", draft.id.0)
+            ]
+        );
+        let row = view(&runner, &draft.id).await.expect("row");
+        assert_eq!(row.state, DraftStatus::Saved);
+        assert_eq!(row.message_id, updated.message);
+
+        // Sent after all: a delete reads the draft, finds it gone.
+        let other = create(&runner, 2, "c").await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Lost { applied: true });
+        let error = runner
+            .send_draft(&account(), &other.id, None, BUDGET)
+            .await
+            .expect_err("lost");
+        assert!(matches!(error, DraftError::OutcomeUnknown(_)), "{error:?}");
+        setup.clock.advance(send_window());
+        let before = requests(&setup).len();
+        let error = runner
+            .delete_draft(&account(), &other.id, BUDGET)
+            .await
+            .expect_err("unconfirmed");
+        assert_eq!(error, DraftError::SendUnconfirmed);
+        assert_eq!(
+            requests(&setup)[before..],
+            [format!("GET drafts/{}?minimal", other.id.0)]
+        );
+        assert_eq!(
+            view(&runner, &other.id).await.expect("row").state,
+            DraftStatus::SendUnconfirmed
+        );
+    });
+}
+
+#[test]
+fn a_stale_row_is_read_before_it_is_sent() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        let elsewhere = setup
+            .gmail
+            .lock()
+            .update_draft(
+                &draft.id.0,
+                &raw(&token(1), "elsewhere"),
+                Some(&draft.thread_id.0),
+            )
+            .expect("draft");
+        sync(&runner).await;
+        assert_eq!(
+            view(&runner, &draft.id).await.expect("row").state,
+            DraftStatus::Stale
+        );
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("changed");
+        assert_eq!(
+            error,
+            DraftError::Conflict {
+                current: message_id(&elsewhere)
+            }
+        );
+        assert!(setup.gmail.sent("POST drafts/send").is_empty());
+        let row = view(&runner, &draft.id).await.expect("row");
+        assert_eq!(row.state, DraftStatus::Saved);
+        assert_eq!(row.message_id, message_id(&elsewhere));
+        // Now the host has seen it: sent.
+        runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect("sent");
+
+        // Deleted elsewhere: the read's 404 is NotFound, nothing sent.
+        let gone = create(&runner, 2, "b").await;
+        assert!(setup.gmail.lock().delete_draft(&gone.id.0));
+        sync(&runner).await;
+        assert_eq!(
+            view(&runner, &gone.id).await.expect("row").state,
+            DraftStatus::Stale
+        );
+        let error = runner
+            .send_draft(&account(), &gone.id, None, BUDGET)
+            .await
+            .expect_err("gone");
+        assert_eq!(error, DraftError::NotFound);
+        assert_eq!(setup.gmail.sent("POST drafts/send").len(), 1);
+        assert!(view(&runner, &gone.id).await.is_none());
+    });
+}
+
+#[test]
+fn a_token_another_draft_holds_is_refused() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        create(&runner, 1, "a").await;
+        // A draft made elsewhere: its row has no token until its import.
+        let (made, _) = setup
+            .gmail
+            .lock()
+            .create_draft(&raw(&token(3), "elsewhere"), None);
+        sync_after_delay(&runner, &setup).await;
+        let made = draft_id(&made);
+        assert_eq!(view(&runner, &made).await.expect("row").tracking_id, None);
+        let before = requests(&setup).len();
+        let error = runner
+            .create_draft(&account(), raw(&token(1), "b"), None, BUDGET)
+            .await
+            .expect_err("taken");
+        assert!(matches!(error, DraftError::Invalid(_)), "{error:?}");
+        let error = runner
+            .update_draft(&account(), &made, raw(&token(1), "c"), None, None, BUDGET)
+            .await
+            .expect_err("taken");
+        assert!(matches!(error, DraftError::Invalid(_)), "{error:?}");
+        assert_eq!(requests(&setup).len(), before, "no call");
+        runner
+            .update_draft(&account(), &made, raw(&token(3), "d"), None, None, BUDGET)
+            .await
+            .expect("its own token");
+    });
+}
+
+#[test]
+fn an_empty_thread_id_counts_as_absent() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = runner
+            .create_draft(&account(), raw(&token(1), "a"), Some(thread_id("")), BUDGET)
+            .await
+            .expect("create");
+        assert!(!draft.thread_id.0.is_empty());
+        let updated = runner
+            .update_draft(
+                &account(),
+                &draft.id,
+                raw(&token(1), "b"),
+                Some(thread_id("")),
+                None,
+                BUDGET,
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.thread_id, draft.thread_id, "kept its thread");
+        let bodies = setup.gmail.lock().saved_bodies.clone();
+        assert_eq!(bodies[0]["message"].get("threadId"), None);
+        assert_eq!(bodies[1]["message"]["threadId"], draft.thread_id.0.as_str());
+    });
+}
+
+#[test]
+fn an_update_naming_gmails_message_is_not_refused_by_an_index_behind() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        // The host learned Gmail's message before the index did.
+        let elsewhere = setup
+            .gmail
+            .lock()
+            .update_draft(
+                &draft.id.0,
+                &raw(&token(1), "elsewhere"),
+                Some(&draft.thread_id.0),
+            )
+            .expect("draft");
+        assert_eq!(
+            view(&runner, &draft.id).await.expect("row").message_id,
+            draft.message
+        );
+        runner
+            .update_draft(
+                &account(),
+                &draft.id,
+                raw(&token(1), "b"),
+                None,
+                Some(message_id(&elsewhere)),
+                BUDGET,
+            )
+            .await
+            .expect("Gmail holds the message named");
+    });
+}
+
+#[test]
+fn late_ends_of_an_attempt_a_retry_took_over_are_ignored() {
+    block_on(async {
+        let (runner, setup) = runner();
+        synced(&runner).await;
+        let draft = create(&runner, 1, "a").await;
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Lost { applied: false });
+        let error = runner
+            .send_draft(&account(), &draft.id, None, BUDGET)
+            .await
+            .expect_err("lost");
+        assert!(matches!(error, DraftError::OutcomeUnknown(_)), "{error:?}");
+        let first = sending_since(&runner, &draft.id).await;
+        setup.clock.advance(send_window());
+        // The retry takes the row over; its request is held in flight
+        // while the first attempt's late records arrive.
+        let hold = Hold::default();
+        setup
+            .gmail
+            .fail_next("POST drafts/send", Fault::Held(hold.clone()));
+        let account = account();
+        let (sent, ()) = tokio::join!(
+            runner.send_draft(&account, &draft.id, None, BUDGET),
+            async {
+                hold.reached().await;
+                let retry = sending_since(&runner, &draft.id).await;
+                assert!(retry > first);
+                let ends = [
+                    SendEnd::Changed {
+                        message: message_id("m-other"),
+                        thread_id: draft.thread_id.clone(),
+                    },
+                    SendEnd::Unconfirmed,
+                    SendEnd::Unsent,
+                ];
+                for end in ends {
+                    let late = DraftWrite::EndSend {
+                        draft: draft.id.clone(),
+                        started: first,
+                        end: end.clone(),
+                    };
+                    let now = setup.clock.now();
+                    let recorded = runner
+                        .store()
+                        .record_draft(&account, &late, now)
+                        .await
+                        .expect("record");
+                    assert_eq!(recorded, DraftRecorded::Superseded, "{end:?}");
+                    assert_eq!(sending_since(&runner, &draft.id).await, retry, "{end:?}");
+                }
+                hold.release();
+            }
+        );
+        let sent = sent.expect("the retry sends");
+        assert_eq!(sent_messages(&setup), vec![sent.message_id.0.clone()]);
+        assert!(view(&runner, &draft.id).await.is_none());
+        assert_eq!(
+            draft_feed(&runner).await,
+            vec![
+                entry("saved:local", &draft.id, &draft.message),
+                entry("sent", &draft.id, &sent.message_id),
+            ]
         );
     });
 }
