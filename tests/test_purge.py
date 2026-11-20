@@ -94,6 +94,27 @@ def test_empty_trash_and_spam() -> None:
             runner.empty(ACCOUNT, "inbox")
 
 
+def test_purge_outcomes_expose_interruptions_and_cooldowns() -> None:
+    with FakeGmail() as gmail:
+        gmail.add("a", ["TRASH"])
+        gmail.add("b", ["TRASH"])
+        runner = runner_for(gmail, purge="trash_and_spam")
+        runner.run(ACCOUNT, budget_s=30)
+
+        gmail.mailbox.delete_failure = (408, "timeout")
+        interrupted = runner.purge(ACCOUNT, message_ids=["a", "b"])
+        assert interrupted.sent == ["a"]
+        assert interrupted.unsent == ["b"]
+        assert interrupted.interrupted == "outcome_unknown"
+        assert interrupted.retry_at_ms is None
+
+        gmail.mailbox.delete_failure = (429, "rateLimitExceeded")
+        cooled = runner.empty(ACCOUNT, "trash")
+        assert cooled.remaining == 2
+        assert isinstance(cooled.retry_at_ms, int) and cooled.retry_at_ms > 0
+        assert cooled.interrupted is None
+
+
 def test_a_modify_only_token_raises_purge_scope_required() -> None:
     with FakeGmail() as gmail:
         gmail.add("t", ["TRASH"])

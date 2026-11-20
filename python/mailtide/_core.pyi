@@ -499,7 +499,7 @@ class PrioritiseResult:
 
 @final
 class PurgeOutcome:
-    """What ``purge`` did: each distinct id in one of the four."""
+    """One disposition per id, with the quota deadline and interruption reason."""
 
     purged: list[str]
     sent: list[str]
@@ -513,7 +513,7 @@ class PurgeOutcome:
 
 @final
 class EmptyOutcome:
-    """What ``empty`` did, in counts."""
+    """Counts by disposition, with the quota deadline and interruption reason."""
 
     purged: int
     sent: int

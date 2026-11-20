@@ -32,6 +32,19 @@ pub trait QuotaGate: Send + Sync {
     /// Record that Gmail pushed back, for an account or the whole project.
     fn cool_down(&self, cooldown: Cooldown) -> impl Future<Output = Result<(), GateError>> + Send;
 
+    /// Install a cooldown and return its effective deadline. Gates that
+    /// can retain a later deadline override this method to report it.
+    fn cool_down_until(
+        &self,
+        cooldown: Cooldown,
+    ) -> impl Future<Output = Result<Timestamp, GateError>> + Send {
+        async move {
+            let until = cooldown.until;
+            self.cool_down(cooldown).await?;
+            Ok(until)
+        }
+    }
+
     /// Give back a lease whose request was abandoned (the run was cancelled
     /// or dropped mid-request), without knowing what it downloaded. Runs from
     /// `Drop`, so it is synchronous and must not block for long; gates that
@@ -90,6 +103,10 @@ impl QuotaGate for LocalGate {
     async fn cool_down(&self, cooldown: Cooldown) -> Result<(), GateError> {
         self.ledger()?.cool_down(cooldown);
         Ok(())
+    }
+
+    async fn cool_down_until(&self, cooldown: Cooldown) -> Result<Timestamp, GateError> {
+        Ok(self.ledger()?.cool_down(cooldown))
     }
 
     fn abandon(&self, lease: Lease) {

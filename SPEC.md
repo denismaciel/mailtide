@@ -561,57 +561,44 @@ only the host may call again, and each call is checked afresh).
    purge names at most 1,000 messages (`TooMany`); a thread target is the
    mirror's non-draft messages of the thread at the call, never
    `threads.delete`.
-2. **Fresh eligibility.** The account must be live with a cursor. The
-   cursor is read first, then `history.list` from the cursor to Gmail's
-   head, privately (committed nowhere, at most 20 pages; `MirrorStale`
-   otherwise, or on a 404), then the targets' rows, right before the
-   deletes (so an action admitted here during the history read is seen).
-   Each target's observed labels are folded with the records at or after
-   its checkpoint (the mirror's own rule). Actions not yet confirmed here
-   may only make a message less eligible: active removals of TRASH or SPAM
-   subtract from the folded labels, including a bin label seen only in
-   history. An anywhere call also respects an unsettled bin removal.
-   A trash or spam asked for here counts only
-   once Gmail's state shows it (observed, or in history). The view can't
-   tell a pending action from a delivered one, and a delivered trash may
-   since have been undone on another client and synced. A host that wants
-   to purge what its user just trashed waits for the action's confirmation
-   (the overlay clearing) or for history to show it. A message in trash or
-   spam (or anywhere, if asked) is eligible; drafts, unverified rows and
-   ids the mirror lacks are refused.
-3. **By id only, at once.** Fewer than 5 ids: one `messages.delete` each;
-   otherwise `messages.batchDelete` of at most 1,000 ids. Each is a direct
-   call (§8) at Foreground priority that **never waits** for the quota
-   gate: a delete the gate can't admit at once is `unsent` (with
-   `retry_at`), so no delete goes out long after its check. A 403
-   with either structured scope reason (`insufficientPermissions` or
-   `ACCESS_TOKEN_SCOPE_INSUFFICIENT`)
-   before any delete reached Gmail is `ScopeRequired`: nothing is trashed
-   instead, and the account is not blocked. A deferral, a 429 or a 401
-   stops the call with the rest `unsent`; a 5xx, a timeout or a lost answer
-   may have been applied, so those ids are `sent` and the call stops.
-4. **Evidence.** `history.list` again from the head read in step 2, also
-   after a refusal (a refused batch may have deleted some ids): a message
-   is `purged` only when a `messagesDeleted` record names it. Nothing else
-   is evidence: a 2xx, a lost answer, a 5xx or a 404 is `sent`, and the row
-   stays until a sync reads the record. Evidence is recorded with
-   `Store::record_deleted` (§10.3), unfenced; the cursor never moves.
+2. **Fresh eligibility.** The account must be live with a cursor. Before
+   each wire delete, read history from the cursor or the last complete
+   read's head, at most 20 pages, and reread the remaining target rows
+   and active intents. An expired history cursor or excess pages blocks
+   sending. Fold history at or after each row's checkpoint into its observed
+   labels, then subtract active TRASH or SPAM removals, including removals
+   of labels found only in history. Drafts, unverified rows and absent rows
+   are refused. An unsettled bin removal protects the message even under anywhere
+   or when it has another bin label.
+3. **Dispatch by id.** Use one `messages.delete` per eligible id below
+   five ids, or `messages.batchDelete` for up to 1,000. Do not wait on a
+   quota deferral. Before dispatch, an expired budget stops sending and a
+   check older than two seconds is refreshed. A 401, quota rejection or
+   deferral leaves the current and later requests `unsent`. A quota
+   deferral or a successfully installed cooldown gives `retry_at`. A 408,
+   5xx, timeout or lost answer may have applied. Those ids are `sent`
+   unless confirmed, and later ids are `unsent`. A recognized scope
+   refusal before any possible application is `ScopeRequired`. The runner
+   neither blocks the account nor moves mail to trash.
+4. **Evidence.** After a possible application or ordinary refusal, read
+   history from the last head. A 2xx, 404 or ambiguous batch refusal
+   remains `sent` unless history shows the deletion. Each id has one
+   disposition. Only a recorded `messagesDeleted` makes an id `purged`.
+   Recording is unfenced and leaves the cursor untouched (§10.3).
+   A failed confirmation or store write stops sending and sets
+   `interrupted`. A forgotten account cannot report a recorded tombstone.
 
-What remains open: a change made on another client between the history
-read and the delete (the delete never waits, so milliseconds), and a
-change Gmail shows in history late. Gmail showed another client's change
-in the first history read 78 of 78 times (`purge-history-freshness`), but
-one permanent removal (a draft's) appeared 1.6 s late, 1 of 150
-(`features/drafts.toml`).
+Gmail has no conditional delete. A restore can still happen between the
+latest history observation and the delete or appear in history late.
+`purge-history-freshness` saw all 78 test restores in the first read.
+A separate draft deletion appeared 1.6 seconds late once in 150 attempts.
 
-`empty(bin)` pages through the ids whose observed labels hold `TRASH` (or
-`SPAM`), 1,000 at a time, with one rolling history read: the read after
-each chunk confirms it and also finds messages that left the bin meanwhile,
-which later chunks skip. When that read fails, nothing further is sent. A
-message trashed elsewhere that the mirror has not seen in the bin is left.
-It stops at its budget (`remaining`). Errors (`PurgeError`) come only
-before any delete reached Gmail; a store or gate failure after that ends
-the call with what was known (`interrupted`).
+`empty(bin)` pages through the mirror's observed TRASH or SPAM ids, up to
+1,000 at a time. It uses the same fresh check and dispatch budget even
+after a page that sent nothing. `remaining` counts targets it did not
+reach. An in-flight delete can finish after the budget and still be
+confirmed. A fault after possible application returns the partial result
+with `interrupted`.
 
 ## 8. Quota and rate limiting
 
@@ -682,7 +669,7 @@ Per-call costs [G]:
 - **Purge** (§7a) is direct calls: `history.list` (2 units a page) before
   and after, then `messages.delete` (10) per id below 5 ids or
   `messages.batchDelete` (50) per 1,000. Emptying a trash of 5,000 costs
-  about 274 units. `threads.delete` and `messages.trash` are never used.
+  about 280 units under ordinary history pagination. `threads.delete` and `messages.trash` are never used.
 - **Import throughput** (raw gets): ≈ 6,000 messages/hour per account, so
   100k messages ≈ 17 h. About 200 accounts can import concurrently per
   project. 80M units/day ≈ 1.33M raw messages/day before billing.
@@ -942,7 +929,7 @@ runner per process, after forking:
   `MessageDeleted` entry is in the feed), `sent` (reached Gmail or may
   have, not shown yet; never resent), `refused` (id to `not_in_mirror`,
   `draft`, `unverified`, `not_in_trash_or_spam` or `gmail_refused`) and
-  `unsent` (never sent; call again), with `retry_at_ms` (when a deferred or
+  `unsent` (definitely not applied by the call), with `retry_at_ms` (when a deferred or
   rate-limited delete could go) and `interrupted` (why the call ended
   early after a delete may have reached Gmail); `EmptyOutcome` counts
   `purged`, `sent`, `skipped` and `remaining`, with the same two fields. Needs a token with

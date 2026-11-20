@@ -39,6 +39,7 @@ class Mailbox:
         # Whether the token holds https://mail.google.com/, the only scope
         # messages.delete and batchDelete accept; without it they answer 403.
         self.full_scope = True
+        self.delete_failure: tuple[int, str] | None = None
         self.deletes: list[list[str]] = []  # the ids of each delete call Gmail applied
 
     def add(
@@ -263,6 +264,9 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             if len(parts) == 2 and parts[0] == "messages":
                 if self.scope_refused():
                     return None
+                if mailbox.delete_failure:
+                    status, reason = mailbox.delete_failure
+                    return self.refuse(status, reason, "delete failed")
                 if parts[1] not in mailbox.messages:
                     return self.reply(404, {"error": {"code": 404, "message": "not found"}})
                 mailbox.delete(parts[1])
@@ -352,6 +356,9 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             if parts == ["messages", "batchDelete"]:
                 if self.scope_refused():
                     return None
+                if mailbox.delete_failure:
+                    status, reason = mailbox.delete_failure
+                    return self.refuse(status, reason, "delete failed")
                 # Deletes the ids that exist; the answer names none.
                 for mid in body["ids"]:
                     if mid in mailbox.messages:

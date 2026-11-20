@@ -377,6 +377,8 @@ const DIRECT_CALL: CommandId = CommandId {
 enum Outcome {
     Event(EventKind),
     Failed(Failure),
+    NotSent(Failure),
+    DispatchExpired,
     /// The request may have reached Gmail, but no answer came back (a
     /// timeout, a dropped connection): a write may have been applied.
     Unanswered(String),
@@ -399,6 +401,14 @@ enum Attempt {
 pub(crate) struct DirectCallResponse {
     pub(crate) outcome: Result<EventKind, CallError>,
     pub(crate) cleanup: Option<RunError>,
+    pub(crate) retry_at: Option<Timestamp>,
+    pub(crate) not_sent: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DirectTiming {
+    WaitUntil(Instant),
+    SendBefore(Instant),
 }
 
 #[cfg(test)]
@@ -916,9 +926,51 @@ where
         priority: Priority,
         deadline: Instant,
     ) -> Result<DirectCallResponse, CallError> {
+        self.direct_call_timed(
+            account,
+            request,
+            priority,
+            DirectTiming::WaitUntil(deadline),
+        )
+        .await?
+        .ok_or(CallError::Run(RunError::Invariant(
+            "a waiting direct call has no dispatch deadline",
+        )))
+    }
+
+    /// Send one request without waiting on quota. `None` means the dispatch
+    /// deadline elapsed before any request reached the transport.
+    pub(crate) async fn direct_call_before(
+        &self,
+        account: &AccountId,
+        request: GmailRequest,
+        priority: Priority,
+        deadline: Instant,
+    ) -> Result<Option<DirectCallResponse>, CallError> {
+        self.direct_call_timed(
+            account,
+            request,
+            priority,
+            DirectTiming::SendBefore(deadline),
+        )
+        .await
+    }
+
+    async fn direct_call_timed(
+        &self,
+        account: &AccountId,
+        request: GmailRequest,
+        priority: Priority,
+        timing: DirectTiming,
+    ) -> Result<Option<DirectCallResponse>, CallError> {
         if changes_mailbox(&request) && self.config.access == Access::ReadOnly {
             return Err(CallError::ReadOnly);
         }
+        let send_before = match timing {
+            DirectTiming::WaitUntil(_) => None,
+            DirectTiming::SendBefore(deadline) if Instant::now() >= deadline => return Ok(None),
+            DirectTiming::SendBefore(deadline) => Some(deadline),
+        };
         let call = GmailCall {
             account: account.clone(),
             cost: mailtide::quota::cost(&request),
@@ -927,31 +979,46 @@ where
         };
         let mut report = SyncReport::default();
         let (outcome, mut cleanup) = loop {
-            match self.attempt(DIRECT_CALL, &call, &mut report).await? {
+            match self
+                .attempt(DIRECT_CALL, &call, &mut report, send_before)
+                .await?
+            {
                 Attempt::Done { outcome, cleanup } => break (outcome, cleanup),
                 Attempt::Deferred(until) => {
                     let wait = Duration::from_millis(
                         u64::try_from(until.0 - self.clock.now().0).unwrap_or(0),
                     );
-                    if !self.clock.can_wait() || Instant::now() + wait >= deadline {
+                    if !matches!(timing, DirectTiming::WaitUntil(deadline)
+                        if self.clock.can_wait() && Instant::now() + wait < deadline)
+                    {
                         return Err(CallError::Deferred(QuotaDeferred { until }));
                     }
                     tokio::time::sleep(wait).await;
                 }
             }
         };
+        let mut retry_at = None;
+        let not_sent = matches!(outcome, Outcome::NotSent(_));
         let outcome = match outcome {
             Outcome::Event(event) => Ok(event),
             Outcome::Unanswered(detail) => Err(CallError::OutcomeUnknown(detail)),
-            Outcome::Failed(failure) => {
-                Err(self.direct_failure(account, failure, &mut cleanup).await)
-            }
+            Outcome::DispatchExpired => return cleanup.map_or(Ok(None), |error| Err(error.into())),
+            Outcome::Failed(failure) | Outcome::NotSent(failure) => Err(self
+                .direct_failure(account, failure, &mut cleanup, &mut retry_at)
+                .await),
             Outcome::StoreFailed(error) => match blob_failure(error) {
-                Ok(failure) => Err(self.direct_failure(account, failure, &mut cleanup).await),
+                Ok(failure) => Err(self
+                    .direct_failure(account, failure, &mut cleanup, &mut retry_at)
+                    .await),
                 Err(error) => Err(error.into()),
             },
         };
-        Ok(DirectCallResponse { outcome, cleanup })
+        Ok(Some(DirectCallResponse {
+            outcome,
+            cleanup,
+            retry_at,
+            not_sent,
+        }))
     }
 
     async fn direct_failure(
@@ -959,6 +1026,7 @@ where
         account: &AccountId,
         failure: Failure,
         cleanup: &mut Option<RunError>,
+        retry_at: &mut Option<Timestamp>,
     ) -> CallError {
         match failure {
             Failure::NotFound => CallError::NotFound,
@@ -967,10 +1035,13 @@ where
                 let now = self.clock.now();
                 let seed = mailtide::ids::stable_hash(account.as_str().as_bytes())
                     ^ u64::try_from(now.0).unwrap_or(0);
-                if let Some(cooldown) = Backoff::DEFAULT.cooldown(&failure, account, now, seed)
-                    && let Err(error) = self.quota.cool_down(cooldown).await
-                {
-                    cleanup.get_or_insert(RunError::Quota(error.0));
+                if let Some(cooldown) = Backoff::DEFAULT.cooldown(&failure, account, now, seed) {
+                    match self.quota.cool_down_until(cooldown).await {
+                        Ok(until) => *retry_at = Some(until),
+                        Err(error) => {
+                            cleanup.get_or_insert(RunError::Quota(error.0));
+                        }
+                    }
                 }
                 CallError::Retryable(failure)
             }
@@ -1351,7 +1422,7 @@ where
                 }),
             });
         }
-        let outcome = match self.attempt(command, &call, report).await? {
+        let outcome = match self.attempt(command, &call, report, None).await? {
             Attempt::Deferred(until) => return Ok(EventKind::RequestDeferred { command, until }),
             Attempt::Done {
                 cleanup: Some(error),
@@ -1364,7 +1435,10 @@ where
         };
         match outcome {
             Outcome::Event(event) => Ok(event),
-            Outcome::Failed(failure) => Ok(EventKind::RequestFailed { command, failure }),
+            Outcome::Failed(failure) | Outcome::NotSent(failure) => {
+                Ok(EventKind::RequestFailed { command, failure })
+            }
+            Outcome::DispatchExpired => Err(RunError::Invariant("engine dispatch expired")),
             // Retried after backoff, as any transient failure.
             Outcome::Unanswered(detail) => Ok(EventKind::RequestFailed {
                 command,
@@ -1385,6 +1459,7 @@ where
         command: CommandId,
         call: &GmailCall,
         report: &mut SyncReport,
+        send_before: Option<Instant>,
     ) -> Result<Attempt, RunError> {
         let topic = match (&call.request, &self.config.watch) {
             (GmailRequest::Watch, WatchMode::Disabled) => {
@@ -1429,14 +1504,7 @@ where
         };
         let sent = Instant::now();
         let outcome = self
-            .perform(
-                &call.account,
-                command,
-                &call.request,
-                &topic,
-                generation,
-                report,
-            )
+            .perform(call, command, &topic, generation, report, send_before)
             .await;
         let lease = held.lease.take().unwrap_or(lease);
         let duration_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1447,7 +1515,7 @@ where
                 duration_ms,
                 "gmail request"
             ),
-            Outcome::Failed(failure) => {
+            Outcome::Failed(failure) | Outcome::NotSent(failure) => {
                 request_failed(report, &call.request, failure_kind(failure), duration_ms);
             }
             // For retrying, an unanswered request is a transient failure.
@@ -1468,11 +1536,14 @@ where
                     "blob write failed"
                 );
             }
+            Outcome::DispatchExpired => {}
         }
         let bytes = match &outcome {
             Outcome::Event(EventKind::MessageImported { message, .. }) => message.size,
             Outcome::Event(_)
             | Outcome::Failed(_)
+            | Outcome::NotSent(_)
+            | Outcome::DispatchExpired
             | Outcome::Unanswered(_)
             | Outcome::StoreFailed(_) => 0,
         };
@@ -1487,25 +1558,36 @@ where
 
     async fn perform(
         &self,
-        account: &AccountId,
+        call: &GmailCall,
         command: CommandId,
-        gmail_request: &GmailRequest,
         topic: &str,
         generation: u64,
         report: &mut SyncReport,
+        send_before: Option<Instant>,
     ) -> Outcome {
+        let account = &call.account;
+        let gmail_request = &call.request;
+        if send_before.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Outcome::DispatchExpired;
+        }
         let token = match self.tokens.token(account).await {
             Ok(token) => token,
-            Err(error) => return Outcome::Failed(error.into_failure()),
+            Err(error) => return Outcome::NotSent(error.into_failure()),
         };
         let config = RequestConfig {
             watch_topic: topic.to_owned(),
         };
         let mut last = None;
         for http in request::build(gmail_request, &config) {
+            if last.is_none() && send_before.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Outcome::DispatchExpired;
+            }
             report.gmail_requests += 1;
             let response = match self.transport.send(http, &token).await {
                 Ok(response) => response,
+                Err(TransportError::NotSent(detail)) if last.is_none() => {
+                    return Outcome::NotSent(transient(detail));
+                }
                 Err(TransportError::NotSent(detail)) => return Outcome::Failed(transient(detail)),
                 Err(TransportError::OutcomeUnknown(detail)) => return Outcome::Unanswered(detail),
             };
@@ -1521,6 +1603,20 @@ where
         let Some(response) = last else {
             return Outcome::Failed(transient("no request built".into()));
         };
+        self.decode_response(call, command, &response, generation, report)
+            .await
+    }
+
+    async fn decode_response(
+        &self,
+        call: &GmailCall,
+        command: CommandId,
+        response: &mailtide_gmail::http::HttpResponse,
+        generation: u64,
+        report: &mut SyncReport,
+    ) -> Outcome {
+        let account = &call.account;
+        let gmail_request = &call.request;
         let body = response.body.as_slice();
         let decoded = match gmail_request {
             GmailRequest::GetProfile => {

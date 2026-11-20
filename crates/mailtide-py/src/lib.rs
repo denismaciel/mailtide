@@ -2467,19 +2467,17 @@ mod _core {
         /// Deleted for good, with Gmail's evidence: the tombstone is written
         /// and `MessageDeleted` is in the feed.
         purged: Vec<String>,
-        /// Reached Gmail, or may have (a lost answer, a 5xx, a 404), and
-        /// not yet shown by Gmail's history: the row stays until a sync sees
-        /// the deletion. Never resent.
+        /// Possibly applied or shown by history, with no recorded tombstone.
         sent: Vec<String>,
-        /// Not sent, by id: `not_in_mirror`, `draft`, `unverified`,
+        /// Definitively refused, by id: `not_in_mirror`, `draft`, `unverified`,
         /// `not_in_trash_or_spam` or `gmail_refused`.
         refused: std::collections::BTreeMap<String, &'static str>,
-        /// Never sent: the quota gate could not admit the delete at once,
-        /// Gmail limited the rate, or an earlier failure ended the call.
+        /// Definitely not applied by this call.
         unsent: Vec<String>,
         /// When a deferred or rate-limited delete could go, at the earliest.
         retry_at_ms: Option<i64>,
-        /// Why the call ended early after deletes may have reached Gmail.
+        /// Why sending stopped after an ambiguous answer, an unread
+        /// confirmation or a resource failure.
         interrupted: Option<String>,
     }
 
@@ -2506,7 +2504,7 @@ mod _core {
     struct EmptyOutcome {
         /// Deleted for good, with Gmail's evidence recorded.
         purged: u64,
-        /// Sent, not yet shown by history.
+        /// Possibly applied or shown by history, with no recorded tombstone.
         sent: u64,
         /// In the bin as the mirror held it, but not deleted (restored
         /// since, drafts, unverified, refused by Gmail).
@@ -2515,7 +2513,8 @@ mod _core {
         remaining: u64,
         /// When a deferred or rate-limited delete could go, at the earliest.
         retry_at_ms: Option<i64>,
-        /// Why the call ended early after deletes may have reached Gmail.
+        /// Why sending stopped after an ambiguous answer, an unread
+        /// confirmation or a resource failure.
         interrupted: Option<String>,
     }
 

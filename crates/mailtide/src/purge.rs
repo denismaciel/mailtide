@@ -96,7 +96,7 @@ pub enum Scope {
     Anywhere,
 }
 
-/// Why an id was not sent. Nothing reached Gmail for it.
+/// Why this call did not delete an id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// The mirror has no such message (never seen, or already deleted).
@@ -105,8 +105,7 @@ pub enum Refusal {
     Draft,
     /// Its labels await verification, so where it is can't be told.
     Unverified,
-    /// Not in trash or spam (or not in the bin being emptied), as of the
-    /// call: it may have been restored elsewhere since the last sync.
+    /// Outside the requested bin or protected by an unsettled bin removal.
     NotInTrashOrSpam,
     /// Gmail refused the delete (its message): nothing was deleted.
     GmailRefused(String),
@@ -148,21 +147,18 @@ pub struct PurgeOutcome {
     /// Gmail's history shows the deletion: the tombstone is written and
     /// `MessageDeleted` is in the feed.
     pub purged: Vec<MessageId>,
-    /// The delete reached Gmail, or may have (its answer was lost, a 5xx,
-    /// a 404), and history has not shown the deletion yet: the row stays
-    /// until a sync sees it. mailtide never sends it again on its own.
+    /// The delete may have applied, or evidence could not be recorded.
+    /// There is no recorded tombstone. Mailtide never resends the request.
     pub sent: Vec<MessageId>,
     /// Nothing was deleted for these, and why.
     pub refused: Vec<(MessageId, Refusal)>,
-    /// Never sent: the quota gate could not admit the delete at once (a
-    /// delete never waits), Gmail limited the rate (429), the token was
-    /// rejected, or an earlier failure ended the call. Call again; the
-    /// call checks them afresh.
+    /// Definitely not applied by this call, including undispatched
+    /// requests and definite rejection by the quota or authentication gate.
     pub unsent: Vec<MessageId>,
     /// When a deferred or rate-limited delete could go, at the earliest.
     pub retry_at: Option<Timestamp>,
-    /// Why the call ended early after deletes may have reached Gmail (the
-    /// store or the quota gate failed): what it reports is what was known.
+    /// Why sending stopped after an ambiguous answer, an unread
+    /// confirmation or a resource failure.
     pub interrupted: Option<String>,
 }
 
@@ -171,7 +167,7 @@ pub struct PurgeOutcome {
 pub struct EmptyOutcome {
     /// Deleted, with Gmail's evidence recorded.
     pub purged: u64,
-    /// Sent (or may have been), not yet shown by history.
+    /// Possibly applied or shown by history, with no recorded tombstone.
     pub sent: u64,
     /// Held in the bin by the mirror but not deleted: restored since,
     /// drafts, unverified, or refused by Gmail.
@@ -182,7 +178,8 @@ pub struct EmptyOutcome {
     pub remaining: u64,
     /// When a deferred or rate-limited delete could go, at the earliest.
     pub retry_at: Option<Timestamp>,
-    /// Why the call ended early after deletes may have reached Gmail.
+    /// Why sending stopped after an ambiguous answer, an unread
+    /// confirmation or a resource failure.
     pub interrupted: Option<String>,
 }
 
@@ -329,11 +326,11 @@ impl PurgeScan {
             return Verdict::Refused(Refusal::Draft);
         }
         let in_scope = match scope {
-            Scope::Anywhere => view.bin_removals.is_empty(),
+            Scope::Anywhere => true,
             Scope::TrashOrSpam => current.iter().any(is_bin),
             Scope::Bin(bin) => current.contains(&bin.label()),
         };
-        if in_scope {
+        if in_scope && view.bin_removals.is_empty() {
             Verdict::Eligible
         } else {
             Verdict::Refused(Refusal::NotInTrashOrSpam)
@@ -645,6 +642,11 @@ mod tests {
                 );
             }
         }
+        let both = scan(vec![added(11, "t", &["TRASH", "SPAM"])], 11);
+        assert_eq!(
+            verdict(&mirror, &both, "t", Scope::Bin(Bin::Spam)),
+            Verdict::Refused(Refusal::NotInTrashOrSpam),
+        );
     }
 
     #[test]

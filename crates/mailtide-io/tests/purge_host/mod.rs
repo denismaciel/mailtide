@@ -37,6 +37,7 @@ use mailtide_io::transport::{GmailTransport, TransportError};
 use mailtide_store::Store as _;
 use mailtide_store::memory::MemoryStore;
 use serde_json::json;
+use tokio::sync::Notify;
 
 /// The mirrored account.
 #[must_use]
@@ -134,6 +135,8 @@ pub struct Mailbox {
     /// What every delete call gets after it was applied (a 5xx, or a batch
     /// that deleted its ids and then answered 4xx).
     pub answer_after_applying: Option<HttpResponse>,
+    /// How many ids a batch applies before returning its answer.
+    pub batch_prefix: Option<usize>,
     /// Ids a single delete refuses as Gmail does a malformed id (400).
     pub malformed: BTreeSet<String>,
     /// Whether history reads fail (500) once a delete has been applied.
@@ -143,6 +146,8 @@ pub struct Mailbox {
     pub batch_delay: Duration,
     /// Run after each applied delete call: another client's change.
     pub after_delete: Option<Elsewhere>,
+    /// Run once after taking a history response snapshot.
+    pub after_history: Option<Elsewhere>,
     /// Every request, as `METHOD path` (a batch as `BATCH id,id,...`).
     pub requests: Vec<String>,
 }
@@ -161,11 +166,13 @@ impl Default for Mailbox {
             lose_delete_answers: false,
             refuse_deletes: None,
             answer_after_applying: None,
+            batch_prefix: None,
             malformed: BTreeSet::new(),
             history_fails_after_deletes: false,
             deletes_applied: 0,
             batch_delay: Duration::ZERO,
             after_delete: None,
+            after_history: None,
             requests: Vec::new(),
         }
     }
@@ -350,7 +357,7 @@ impl Mailbox {
         } else {
             // Ids that exist go; the answer names none
             // (`purge-batch-delete-partial`, assumed).
-            for id in ids {
+            for id in ids.iter().take(self.batch_prefix.unwrap_or(ids.len())) {
                 self.delete(id);
             }
         }
@@ -449,14 +456,35 @@ impl Mailbox {
 /// An action a user admits on this host while a history read is answered.
 type LocalAction = (std::sync::Weak<TestRunner>, ActionRequest);
 
+/// A point where a request waits while the test changes remote or local state.
+#[derive(Default)]
+pub struct Pause {
+    /// Signaled when the operation starts waiting.
+    pub entered: Notify,
+    /// Signal to let the operation continue.
+    pub resume: Notify,
+}
+
+impl Pause {
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.resume.notified().await;
+    }
+}
+
 /// Gmail, served through the transport.
 #[derive(Default)]
-pub struct FakeGmail(pub Mutex<Mailbox>, Mutex<Option<LocalAction>>);
+pub struct FakeGmail {
+    mailbox: Mutex<Mailbox>,
+    local_action: Mutex<Option<LocalAction>>,
+    before_modify: Mutex<Option<Arc<Pause>>>,
+    forget_after_delete: Mutex<Option<std::sync::Weak<TestRunner>>>,
+}
 
 impl FakeGmail {
     /// The mailbox, locked.
     pub fn mailbox(&self) -> std::sync::MutexGuard<'_, Mailbox> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.mailbox.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -468,6 +496,12 @@ impl GmailTransport for FakeGmail {
     ) -> Result<HttpResponse, TransportError> {
         assert_eq!(token.secret, "test-token");
         let batch = request.path.ends_with("/batchDelete");
+        if request.path.ends_with("/modify") {
+            let pause = self.before_modify.lock().expect("modify hook").take();
+            if let Some(pause) = pause {
+                pause.wait().await;
+            }
+        }
         let delay = self.mailbox().batch_delay;
         if batch && !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -492,13 +526,18 @@ impl GmailTransport for FakeGmail {
             ),
             (method, false) => format!("{} {}", method.as_str(), request.path),
         };
+        let history = request.path.ends_with("/history");
         let answer = {
             let mut mailbox = self.mailbox();
             mailbox.requests.push(line);
-            mailbox.answer(&request)
+            let answer = mailbox.answer(&request);
+            if history && let Some(mut elsewhere) = mailbox.after_history.take() {
+                elsewhere(&mut mailbox);
+            }
+            answer
         };
-        if request.path.ends_with("/history") {
-            let local = self.1.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if history {
+            let local = self.local_action.lock().expect("history hook").take();
             if let Some((runner, action)) = local
                 && let Some(runner) = runner.upgrade()
             {
@@ -509,6 +548,12 @@ impl GmailTransport for FakeGmail {
                     .expect("admit");
             }
         }
+        if batch || request.method == Method::Delete {
+            let forget = self.forget_after_delete.lock().expect("forget hook").take();
+            if let Some(runner) = forget.and_then(|weak| weak.upgrade()) {
+                runner.forget(&account()).await.expect("forget");
+            }
+        }
         answer
     }
 }
@@ -517,9 +562,15 @@ impl GmailTransport for FakeGmail {
 /// time.
 pub struct Gate {
     inner: LocalGate,
-    /// Deletes admitted before the rest are deferred, and by how long;
-    /// `None`: all are admitted.
-    pub deletes_admitted: Arc<Mutex<Option<(u32, Duration)>>>,
+    controls: Arc<Mutex<GateControls>>,
+}
+
+#[derive(Default)]
+struct GateControls {
+    deletes_admitted: Option<(u32, Duration)>,
+    releases_before_failure: Option<u32>,
+    delete_leases: BTreeSet<Lease>,
+    pause_admission: Option<Arc<Pause>>,
 }
 
 impl QuotaGate for Gate {
@@ -532,37 +583,77 @@ impl QuotaGate for Gate {
     ) -> Result<Admission, GateError> {
         let is_delete = cost == QuotaUnits(10) || cost == QuotaUnits(50);
         if is_delete {
-            let mut left = self
-                .deletes_admitted
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match left.as_mut() {
-                Some((0, by)) => {
-                    return Ok(Admission::Deferred {
-                        until: now.plus(*by),
-                    });
+            let pause = {
+                let mut controls = self.controls.lock().expect("gate controls");
+                match controls.deletes_admitted.as_mut() {
+                    Some((0, by)) => {
+                        return Ok(Admission::Deferred {
+                            until: now.plus(*by),
+                        });
+                    }
+                    Some((n, _)) => *n -= 1,
+                    None => {}
                 }
-                Some((n, _)) => *n -= 1,
-                None => {}
+                controls.pause_admission.take()
+            };
+            if let Some(pause) = pause {
+                pause.wait().await;
             }
         }
-        self.inner.admit(account, cost, priority, now).await
+        let admission = self.inner.admit(account, cost, priority, now).await?;
+        if is_delete && let Admission::Granted(lease) = admission {
+            self.controls
+                .lock()
+                .expect("gate controls")
+                .delete_leases
+                .insert(lease);
+        }
+        Ok(admission)
     }
 
     async fn release(&self, lease: Lease, bytes: u64, now: Timestamp) -> Result<(), GateError> {
-        self.inner.release(lease, bytes, now).await
+        self.inner.release(lease, bytes, now).await?;
+        let mut controls = self.controls.lock().expect("gate controls");
+        if controls.delete_leases.remove(&lease) {
+            match controls.releases_before_failure.as_mut() {
+                Some(0) => return Err(GateError("lease release failed".into())),
+                Some(n) => *n -= 1,
+                None => {}
+            }
+        }
+        Ok(())
     }
 
     async fn cool_down(&self, cooldown: Cooldown) -> Result<(), GateError> {
         self.inner.cool_down(cooldown).await
     }
+
+    async fn cool_down_until(&self, cooldown: Cooldown) -> Result<Timestamp, GateError> {
+        self.inner.cool_down_until(cooldown).await
+    }
 }
 
+type TokenPause = Arc<Mutex<Option<(u32, Arc<Pause>)>>>;
+
 /// A token source with one token that never expires.
-pub struct Tokens;
+pub struct Tokens(TokenPause);
 
 impl TokenSource for Tokens {
     async fn token(&self, _account: &AccountId) -> Result<AccessToken, TokenError> {
+        let pause = {
+            let mut blocked = self.0.lock().expect("token hook");
+            match blocked.as_mut() {
+                Some((0, _)) => blocked.take().map(|(_, pause)| pause),
+                Some((remaining, _)) => {
+                    *remaining -= 1;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
         Ok(AccessToken {
             secret: "test-token".into(),
             expires_at: Timestamp(i64::MAX),
@@ -582,7 +673,8 @@ pub const BUDGET: Duration = Duration::from_secs(10);
 pub struct Host {
     /// The runner.
     pub runner: Arc<TestRunner>,
-    deletes_admitted: Arc<Mutex<Option<(u32, Duration)>>>,
+    controls: Arc<Mutex<GateControls>>,
+    token_pause: TokenPause,
 }
 
 impl Host {
@@ -595,16 +687,27 @@ impl Host {
     /// A runner with purge set to `policy` and `access`.
     #[must_use]
     pub fn with(policy: PurgePolicy, access: Access) -> Self {
-        let deletes_admitted = Arc::new(Mutex::new(None));
+        Self::configured(Some(policy), access)
+    }
+
+    /// A runner constructed without setting a purge policy.
+    #[must_use]
+    pub fn without_policy() -> Self {
+        Self::configured(None, Access::ReadWrite)
+    }
+
+    fn configured(policy: Option<PurgePolicy>, access: Access) -> Self {
+        let controls = Arc::new(Mutex::new(GateControls::default()));
+        let token_pause = Arc::new(Mutex::new(None));
         let runner = Runner::new(
             MemoryStore::tracking(&[account()]),
             ObjectBlobs::memory(),
             FakeGmail::default(),
             Gate {
                 inner: LocalGate::new(Budget::GMAIL_DEFAULT),
-                deletes_admitted: Arc::clone(&deletes_admitted),
+                controls: Arc::clone(&controls),
             },
-            Tokens,
+            Tokens(token_pause.clone()),
             RunnerConfig {
                 access,
                 engine: EngineConfig {
@@ -615,11 +718,15 @@ impl Host {
                 watch: WatchMode::Disabled,
                 log_accounts: LogAccounts::default(),
             },
-        )
-        .with_purge(policy);
+        );
+        let runner = match policy {
+            Some(policy) => runner.with_purge(policy),
+            None => runner,
+        };
         Self {
             runner: Arc::new(runner),
-            deletes_admitted,
+            controls,
+            token_pause,
         }
     }
 
@@ -641,10 +748,54 @@ impl Host {
 
     /// Defer every delete after the first `n` by `by`.
     pub fn defer_deletes_after(&self, n: u32, by: Duration) {
-        *self
-            .deletes_admitted
+        self.controls
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((n, by));
+            .expect("gate controls")
+            .deletes_admitted = Some((n, by));
+    }
+
+    /// Fail delete lease release after `n` successful releases.
+    pub fn fail_delete_release_after(&self, n: u32) {
+        self.controls
+            .lock()
+            .expect("gate controls")
+            .releases_before_failure = Some(n);
+    }
+
+    /// Pause the first delete quota admission that reaches the gate.
+    pub fn pause_next_delete_admission(&self) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        self.controls.lock().expect("gate controls").pause_admission = Some(pause.clone());
+        pause
+    }
+
+    /// Pause token acquisition after `n` immediate acquisitions.
+    pub fn pause_token_after(&self, n: u32) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        *self.token_pause.lock().expect("token hook") = Some((n, pause.clone()));
+        pause
+    }
+
+    /// Keep the next action delivery in flight until the test resumes it.
+    pub fn pause_next_delivery(&self) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        *self
+            .runner
+            .transport()
+            .before_modify
+            .lock()
+            .expect("modify hook") = Some(pause.clone());
+        pause
+    }
+
+    /// Forget this account after the next delete and before its confirmation.
+    pub fn forget_after_delete(&self) {
+        *self
+            .runner
+            .transport()
+            .forget_after_delete
+            .lock()
+            .expect("forget hook") = Some(Arc::downgrade(&self.runner));
     }
 
     /// The user admits `action` on this host while Gmail answers the next
@@ -653,7 +804,7 @@ impl Host {
         *self
             .runner
             .transport()
-            .1
+            .local_action
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((Arc::downgrade(&self.runner), action));
     }

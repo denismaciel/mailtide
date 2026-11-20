@@ -41,7 +41,7 @@ role = "record_deleted: tombstones from history evidence outside an engine commi
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
 change = "modify"
-role = "Purge invariants for the simulator: a tombstone exists only for a message Gmail no longer has; a purge deletes only what was in the bin at its check (or moved there by an action not yet delivered)"
+role = "Purge invariants for the simulator: a tombstone exists only for a message Gmail no longer has; every applied purge delete is checked against the simulated bin at application"
 
 # ------------------------------------------------------------------ wire layer
 
@@ -92,7 +92,7 @@ role = "Runner::purge and Runner::empty: policy, the history read before and aft
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "The purge ceiling (Runner::with_purge, off by default); perform delete requests. Review ruling, landed with label-edit: the public Runner::call_gmail only reads; purges go through pub(crate) direct_call. HTTP DELETE was already on main, so http.rs and transport.rs need no change"
+role = "The purge ceiling (Runner::with_purge, off by default); perform delete requests. Review ruling, landed with label-edit: the public Runner::call_gmail only reads; purges go through pub(crate) direct_call. Dispatch checks the age and budget; returns the HTTP disposition alongside quota cleanup"
 
 [[file]]
 path = "crates/mailtide-io/tests/direct_calls.rs"
@@ -165,7 +165,7 @@ role = "The scoping rule of himalaya's JMAP delete, as a pure eligibility test"
 
 [[file]]
 path = "crates/mailtide-io/tests/ref_himalaya_gmail_backend.rs"
-change = "new"
+change = "modify"
 role = "Shared with label-edit and search: the three delete tests of himalaya's Gmail backend (the look-up before a delete, a 404, an unknown id)"
 
 [[file]]
@@ -192,6 +192,61 @@ role = "Driver tests against a fake Gmail: policy, the history check, lost answe
 path = "tests/test_purge.py"
 change = "new"
 role = "Python tests of purge and empty against FakeGmail"
+
+[[file]]
+path = "README.md"
+change = "modify"
+role = "User-facing purge guarantees and limits"
+
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "The engine does not issue or consume direct delete results"
+
+[[file]]
+path = "crates/mailtide/src/drift.rs"
+change = "modify"
+role = "Supply active bin removals in MessageView fixtures"
+
+[[file]]
+path = "crates/mailtide/src/thread.rs"
+change = "modify"
+role = "Supply active bin removals in MessageView fixtures"
+
+[[file]]
+path = "crates/mailtide-gmail/src/errors.rs"
+change = "modify"
+role = "Preserve either structured scope reason"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "Delegate the purge store methods"
+
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "Delegate purge store methods and verify schema checks"
+
+[[file]]
+path = "crates/mailtide-io/src/quota_gate.rs"
+change = "modify"
+role = "Return the effective cooldown deadline"
+
+[[file]]
+path = "crates/mailtide-io/src/transport.rs"
+change = "modify"
+role = "Single wire attempt contract and transport regressions"
+
+[[file]]
+path = "Cargo.lock"
+change = "modify"
+role = "Lock the HTTP/2 transport regression's test dependency"
+
+[[file]]
+path = "crates/mailtide-io/Cargo.toml"
+change = "modify"
+role = "Use h2 in the production transport regression"
 
 # ------------------------------------------------------------------ references
 
@@ -498,7 +553,7 @@ covers = "Every store: record_deleted is atomic with its feed entries and unfenc
 [[test]]
 target = "crates/mailtide-sim/src/lib.rs"
 name = "purges_never_tombstone_a_message_gmail_still_has"
-covers = "Seeded campaign: purges and empties from the driver, lost answers, crashes before the record, restores and new trash made elsewhere between the check and the delete; the purge invariant holds and the mirror converges"
+covers = "Seeded campaign: purges and empties from the driver, faults around delete and confirmation, fresh checks, the at-delete bin invariant and convergence"
 
 # Driver
 
@@ -545,7 +600,7 @@ covers = "TooMany for an explicit purge; the caller splits a larger set on purpo
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_delete_whose_answer_was_lost_is_never_sent_again"
-covers = "A timeout on the delete call: mailtide reads history, reports confirmed ids as purged and the rest as sent, and issues no second delete"
+covers = "A lost answer stops sending, confirms through history and leaves later ids unsent"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -625,7 +680,7 @@ covers = "The second call finds tombstones: every id is not_in_mirror, nothing i
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_purged_message_with_pending_actions_drops_them"
-covers = "Intents and their delivery go with the tombstone; a delivery already in flight gets a 404 and changes nothing"
+covers = "Intents and delivery claims go with the tombstone; a paused in-flight delivery cannot resurrect the row"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -689,37 +744,130 @@ target = "crates/mailtide-gmail/src/purge.rs"
 name = "the_structured_scope_reason_works_without_a_legacy_reason"
 covers = "The modern Google scope reason by itself identifies a missing-scope refusal"
 
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_thread_expanding_past_the_cap_sends_nothing"
+covers = "A thread with more than 1,000 mirrored members is refused before Gmail"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_restore_during_the_previous_single_delete_is_left_in_gmail"
+covers = "The next single rechecks Gmail in both purge and empty"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "empty_checks_again_after_a_page_without_a_delete"
+covers = "A skipped-only page cannot leave stale eligibility for the next page"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_delete_rechecks_after_admission_outlives_eligibility"
+covers = "A slow quota admission requires a fresh history read"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_delete_rechecks_after_credentials_outlive_eligibility"
+covers = "A slow token acquisition requires a fresh history read"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "an_expired_budget_sends_no_delete_even_after_admission"
+covers = "Zero and expired budgets prevent dispatch"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "release_failure_preserves_a_first_or_later_applied_delete"
+covers = "A quota release error preserves the response and interrupts later sends"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_408_may_have_applied_and_a_401_did_not"
+covers = "408 and 401 stop sending with distinct dispositions"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "retry_at_matches_the_gate_without_retry_after"
+covers = "A rate limit without Retry-After reports the installed cooldown"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_partly_applied_batch_with_late_evidence_stays_sent"
+covers = "An ambiguous batch refusal produces one disposition per id"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "forgetting_an_account_before_recording_reports_unrecorded_evidence"
+covers = "Recorded and forgotten-account outcomes are distinct"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_restore_after_confirmation_is_seen_before_the_next_delete"
+covers = "Each wire delete has its own history check even after a successful confirmation"
+
+[[test]]
+target = "tests/test_purge.py"
+name = "test_purge_outcomes_expose_interruptions_and_cooldowns"
+covers = "Python exposes the ambiguity interruption and the gate's effective retry timestamp"
+
+[[test]]
+target = "crates/mailtide-io/src/transport.rs"
+name = "redirects_do_not_issue_a_second_wire_request"
+covers = "A 307 or 308 cannot redirect a write"
+
+[[test]]
+target = "crates/mailtide-io/src/transport.rs"
+name = "an_http2_refused_stream_does_not_issue_a_second_wire_request"
+covers = "HTTP/2 NACKs are returned without transport replay"
+
+[[test]]
+target = "crates/mailtide-io/src/runner.rs"
+name = "release_failure_keeps_the_answer_or_unknown_disposition"
+covers = "A quota release failure preserves the direct call's response or unknown outcome"
+
+[[test]]
+target = "crates/mailtide-io/src/runner.rs"
+name = "cooldown_failure_keeps_the_rate_limit_disposition"
+covers = "The quota cooldown failure and 429 disposition are both available"
+
 # ------------------------------------------- Gmail behaviour assumed, to test
 
 [[unknown]]
 id = "purge-history-after-delete"
 question = "After messages.delete or messages.batchDelete answers 2xx, does history.list from a history id read just before already contain a messagesDeleted record for every deleted message?"
 assumed = "Yes: the deletion is applied before the answer, and its history records are readable at once."
-if_wrong = "Safe: a message without a record is reported as `sent`, keeps its row, and is tombstoned by the next sync when the record appears. Only the outcome is less definite. No second read is made: mailtide never waits for evidence and never re-deletes."
+if_wrong = "Safe: a message without a record is reported as `sent`, keeps its row, and is tombstoned by the next sync when the record appears. Only the outcome is less definite. Mailtide does not poll for evidence or resend a delete."
 test = "With a full-scope token: 1) messages.insert 6 small messages with labelIds [TRASH]. 2) getProfile, note historyId H. 3) messages.delete the first; at once history.list startHistoryId=H: expect a messagesDeleted record with its id. 4) messages.batchDelete the other five; at once history.list startHistoryId=H following every page: record how many of the five have a messagesDeleted record, and repeat the read after 1 s, 5 s and 30 s until all five appear. 5) messages.get each id: expect 404."
 
 [[unknown]]
 id = "purge-batch-delete-partial"
 question = "What does messages.batchDelete do when some ids no longer exist or are malformed: delete the rest and answer 2xx, or refuse the whole call?"
 assumed = "It deletes every id that exists and answers 2xx (`no guarantees that messages were not already deleted or even existed at all`)."
-if_wrong = "Safe: a refused call is followed by a history read; ids it shows deleted are purged, the rest are reported as refused with Gmail's message and nothing is tombstoned. mailtide never resends the chunk (not even as single deletes): the host may call again, checked afresh."
+if_wrong = "Safe: a refused call is followed by a history read; ids it shows deleted are purged, the rest are reported as sent and keep their rows. mailtide never resends the chunk (not even as single deletes): the host may call again, checked afresh."
 test = "1) Insert three messages A, B, C in TRASH; messages.delete B. 2) getProfile, note H. 3) messages.batchDelete {ids: [A, B, C]}: record the status. 4) history.list from H: record which ids have messagesDeleted. 5) Insert D; messages.batchDelete {ids: [D, 'not-an-id']}: record the status and whether D is gone (messages.get D)."
 
 [[unknown]]
 id = "purge-batch-delete-limit"
 question = "How many ids does one messages.batchDelete call accept?"
 assumed = "1,000, as messages.batchModify documents for itself; the reference only shows 133 working."
-if_wrong = "Safe: a call over the limit is refused whole (nothing deleted), and reported as refused. The chunk size is one constant."
+if_wrong = "An ambiguous refusal is confirmed through history. Unproven ids stay sent with their rows intact. The chunk size is one constant."
 test = "Insert 1,001 small messages in TRASH (messages.insert, 25 units each). 1) messages.batchDelete with 1,000 ids: expect 2xx and, via history.list, 1,000 messagesDeleted records. 2) Insert 1,000 more and call batchDelete with 1,001 ids: record the status and error body, and whether any of them was deleted."
 
 [[unknown]]
 id = "purge-scope-refusal"
-question = "With a token that has gmail.modify but not https://mail.google.com/, what exactly do messages.delete and messages.batchDelete answer?"
+question = "With a token that has gmail.modify but not https://mail.google.com/, what exactly does messages.delete answer?"
 assumed = "HTTP 403 with reason insufficientPermissions (status PERMISSION_DENIED, ACCESS_TOKEN_SCOPE_INSUFFICIENT), and nothing is deleted."
-if_wrong = "Safe: any 4xx to a delete call is the caller's error, never an account block and never a tombstone. If the reason differs the error is the generic Refused with Gmail's message instead of ScopeRequired."
-test = "Mint a token with only https://www.googleapis.com/auth/gmail.modify. 1) Insert a message M in TRASH with a full-scope token. 2) With the modify token call messages.delete M: record status, error.status, error.errors[].reason and error.details. 3) Same for messages.batchDelete {ids: [M]}. 4) messages.get M with either token: expect it to exist. 5) Repeat with a gmail.readonly token."
+if_wrong = "Safe: any 4xx to a delete call is the caller's error, never an account block and never a tombstone. The legacy or modern scope reason yields ScopeRequired. An unrecognized single 403 is a generic refusal."
+test = "Mint a token with only https://www.googleapis.com/auth/gmail.modify. 1) Insert a message M in TRASH with a full-scope token. 2) With the modify token call messages.delete M: record status, error.status, error.errors[].reason and error.details. 3) messages.get M with either token: expect it to exist. 4) Repeat with a gmail.readonly token."
 status = "confirmed"
 result = "2026-11-20: messages.delete on an inserted message in TRASH with a token holding only gmail.modify: HTTP 403, error.status PERMISSION_DENIED, errors[].reason insufficientPermissions, message \"Request had insufficient authentication scopes.\", details[0] = google.rpc.ErrorInfo {reason: ACCESS_TOKEN_SCOPE_INSUFFICIENT, domain: googleapis.com, metadata.method: caribou.api.proto.MailboxService.DeleteMessage, metadata.service: gmail.googleapis.com}; no WWW-Authenticate header. 3 of 3 identical; a gmail.readonly token got the same answer. messages.get afterwards: 200, still in TRASH. messages.batchDelete was not probed (this run was allowed the messages.delete probe only)."
+
+[[unknown]]
+id = "purge-batch-scope-refusal"
+question = "What does messages.batchDelete answer for a token without the full mail scope?"
+assumed = "HTTP 403 with a structured scope reason, as for messages.delete, with no application."
+if_wrong = "An unrecognized batch response is ambiguous and must be checked against history. Evidence alone is recorded, and the runner never falls back to trash."
+test = "Insert five TRASH messages with a full-scope token. Call messages.batchDelete on all five with gmail.modify, then with gmail.readonly. Record each answer's status and structured reasons and verify that every message still exists."
+status = "open"
 
 [[unknown]]
 id = "purge-delete-missing"

@@ -231,15 +231,19 @@ impl Ledger {
     }
 
     /// Pause an account or the project after Gmail pushed back. Never
-    /// shortens an existing pause.
-    pub fn cool_down(&mut self, cooldown: crate::retry::Cooldown) {
-        match self
+    /// shortens an existing pause. Returns the deadline in effect.
+    pub fn cool_down(&mut self, cooldown: crate::retry::Cooldown) -> Timestamp {
+        if let Some(existing) = self
             .cooldowns
             .iter_mut()
             .find(|c| c.target == cooldown.target)
         {
-            Some(existing) => existing.until = existing.until.max(cooldown.until),
-            None => self.cooldowns.push(cooldown),
+            existing.until = existing.until.max(cooldown.until);
+            existing.until
+        } else {
+            let until = cooldown.until;
+            self.cooldowns.push(cooldown);
+            until
         }
     }
 

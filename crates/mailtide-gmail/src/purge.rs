@@ -49,15 +49,13 @@ pub fn batch_delete(ids: &[MessageId]) -> HttpRequest {
 /// the detail of an [`AccountProblem::ApiAccessDenied`] refusal.
 #[must_use]
 pub fn missing_scope(refusal: &BlockingFailure) -> bool {
+    let mut detail = refusal.detail.split_ascii_whitespace();
     refusal.class == Blocking::Account(AccountProblem::ApiAccessDenied)
-        && (refusal.detail.starts_with("403 insufficientPermissions ")
-            || refusal
-                .detail
-                .starts_with("403 ACCESS_TOKEN_SCOPE_INSUFFICIENT ")
-            || matches!(
-                refusal.detail.as_str(),
-                "403 insufficientPermissions" | "403 ACCESS_TOKEN_SCOPE_INSUFFICIENT"
-            ))
+        && detail.next() == Some("403")
+        && matches!(
+            detail.next(),
+            Some("insufficientPermissions" | "ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+        )
 }
 
 /// Whether a transient failure of a delete came with Gmail's answer, so the

@@ -92,13 +92,13 @@ outcome.purged, outcome.sent, outcome.refused  # evidence-backed, unconfirmed, w
 await runner.empty("alice@example.com", "trash")  # what the mirror holds in the trash
 ```
 
-A purge checks Gmail's history since the mirror's cursor first (a restore
-already in Gmail's history refuses the message; one landing between that
-read and the delete, milliseconds later, is not seen), deletes by message
-id only and at once (never after a quota wait), never repeats a delete, and
-records a deletion only when Gmail's history shows it. A trash asked for on
-this host counts once Gmail shows it. It needs a token with `https://mail.google.com/`
-(`PurgeScopeRequired` otherwise; nothing is trashed instead).
+Each delete gets a new Gmail history check and mirror read. A check more
+than two seconds old at dispatch is refreshed, and a delete never waits
+out a quota deferral. Gmail can still publish a restore late or accept it
+between the check and the delete. Purge sends each id at most once per
+call and records a deletion only on a `messagesDeleted` history record.
+It needs a token with `https://mail.google.com/`. A missing scope raises
+`PurgeScopeRequired` before any possible application, and mail stays put.
 
 No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
 

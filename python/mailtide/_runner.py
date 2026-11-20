@@ -326,16 +326,15 @@ class Runner:
         ``Config.purge`` switches it on; only what is in trash or spam as of
         the call, unless ``anywhere=True`` under ``Config.purge="anywhere"``.
 
-        Gmail's history since the mirror's cursor is read first, then the
-        rows, so a restore already in Gmail's history (or asked for here)
-        refuses the message; a restore landing between that read and the
-        delete (milliseconds: a delete never waits for the quota gate) or
-        shown in history late is not seen. A trash asked for here counts once
-        Gmail shows it. Each delete is sent once and never repeated by
-        mailtide; a message counts as ``purged`` (and its ``MessageDeleted``
-        is in the feed) only once Gmail's history shows the deletion; one
-        that reached Gmail, or may have, is ``sent``; one never sent is
-        ``unsent`` (``retry_at_ms`` says when it could go). Needs a token
+        Each wire delete refreshes Gmail history and rereads the remaining
+        targets and local bin removals. Dispatch requires a check at most
+        two seconds old. A restore may still land between the latest read
+        and the delete or appear in history late. A recorded history
+        deletion is ``purged``. An unconfirmed or unrecorded possible
+        application is ``sent``. ``unsent`` means the call knows the delete
+        did not apply. ``retry_at_ms`` carries the gate deadline and
+        ``interrupted`` gives the reason sending stopped on a failure.
+        Needs a token
         with ``https://mail.google.com/``. Raises ``PurgeDisabled``,
         ``ReadOnlyMode``, ``TooManyMessages``, ``MirrorStale`` (run the
         account first), ``PurgeScopeRequired`` (nothing deleted, nothing
@@ -353,9 +352,9 @@ class Runner:
         self, account: str, bin: Literal["trash", "spam"], *, budget_s: float = 60.0
     ) -> EmptyOutcome:
         """Delete for good what the mirror holds in the trash (or spam),
-        1,000 at a time, until ``budget_s`` ends. Messages that left the bin
-        meanwhile, drafts and messages trashed elsewhere since the last sync
-        are left. ``remaining`` > 0: call again. Raises as ``purge``."""
+        1,000 at a time. Each request gets a fresh check and can start
+        only within ``budget_s``. The outcome counts messages and reports
+        interruptions and quota deadlines. Raises as ``purge``."""
         return await self._core.empty(account, bin, budget_s=budget_s)
 
     async def labels(self, account: str) -> list[Label]:
