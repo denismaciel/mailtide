@@ -18,7 +18,8 @@ pub enum TransportError {
 
 /// Executes HTTP requests against Gmail.
 pub trait GmailTransport: Send + Sync {
-    /// Send one request with `token`.
+    /// Send one request with `token`. Make at most one wire attempt, with
+    /// no automatic retry or redirect. The caller decides what to retry.
     fn send(
         &self,
         request: HttpRequest,
@@ -76,10 +77,7 @@ impl ReqwestTransport {
 
     /// A transport with every HTTP setting explicit.
     pub fn with_config(config: &HttpConfig) -> Result<Self, TransportError> {
-        let client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .connect_timeout(config.connect_timeout)
-            .user_agent(config.user_agent.as_str())
+        let client = client_builder(config)
             .build()
             .map_err(|e| TransportError::NotSent(e.to_string()))?;
         let origin = config.origin.as_str();
@@ -88,6 +86,15 @@ impl ReqwestTransport {
             origin: origin.trim_end_matches('/').to_owned(),
         })
     }
+}
+
+fn client_builder(config: &HttpConfig) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .connect_timeout(config.connect_timeout)
+        .user_agent(config.user_agent.as_str())
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
 }
 
 impl GmailTransport for ReqwestTransport {
@@ -263,6 +270,72 @@ mod tests {
         assert_eq!(response.status, 404);
         assert_eq!(response.header("Content-Type"), Some("application/json"));
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn redirects_do_not_issue_a_second_wire_request() {
+        for redirect in [
+            "HTTP/1.1 307 Temporary Redirect",
+            "HTTP/1.1 308 Permanent Redirect",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let origin = format!("http://{}", listener.local_addr().expect("addr"));
+            let expected = redirect[9..12].parse::<u16>().expect("status");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("first request");
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.expect("request") > 0);
+                let response = format!(
+                    "{redirect}\r\nlocation: /other\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+                drop(socket);
+                if let Ok(Ok((mut next, _))) =
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+                {
+                    let _ = next
+                        .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    return true;
+                }
+                false
+            });
+            let response = transport(&origin)
+                .send(request(Method::Delete, None), &token())
+                .await
+                .expect("answered");
+            assert!(!server.await.expect("server"), "follow-up request");
+            assert_eq!(response.status, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http2_refused_stream_does_not_issue_a_second_wire_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("first connection");
+            let mut h2 = h2::server::handshake(socket).await.expect("handshake");
+            let (_, mut response) = h2.accept().await.expect("stream").expect("request");
+            response.send_reset(h2::Reason::REFUSED_STREAM);
+            tokio::time::timeout(Duration::from_millis(200), async {
+                tokio::select! {
+                    stream = h2.accept() => stream.is_some(),
+                    connection = listener.accept() => connection.is_ok(),
+                }
+            })
+            .await
+            .unwrap_or(false)
+        });
+        let client = client_builder(&HttpConfig::new(Duration::from_secs(5)))
+            .http2_prior_knowledge()
+            .build()
+            .expect("HTTP/2 client");
+        let result = ReqwestTransport { client, origin }
+            .send(request(Method::Delete, None), &token())
+            .await;
+        assert!(!server.await.expect("server"), "follow-up request");
+        assert!(result.is_err(), "{result:?}");
     }
 
     /// A write Gmail received but never answered may have been applied: it

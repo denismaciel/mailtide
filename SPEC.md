@@ -642,6 +642,9 @@ Per-call costs [G]:
   so imports never starve user-facing work [Z].
 - **Concurrency leases** per account and per project, with expiry, so a dead
   worker frees its slot [Z].
+- Each transport send makes at most one wire attempt. The production HTTP
+  client disables redirects and automatic retries. Custom transports
+  follow the same contract so the calling workflow controls retries.
 - **Error classification:**
   - `userRateLimitExceeded` and unclassified 429 → account cooldown.
   - Project quota or rate errors → project cooldown.
