@@ -4,6 +4,7 @@
 //! claims the account (a new epoch), so overlapping runs fence each other.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use tracing::Instrument as _;
@@ -408,7 +409,27 @@ pub(crate) struct DirectCallResponse {
 #[derive(Clone, Copy)]
 enum DirectTiming {
     WaitUntil(Instant),
-    SendBefore(Instant),
+    SendBefore(DispatchDeadline),
+}
+
+#[derive(Clone, Copy)]
+struct DispatchDeadline {
+    fresh_until: Instant,
+    budget: Instant,
+}
+
+impl DispatchDeadline {
+    fn expired(self) -> bool {
+        Instant::now() >= self.fresh_until.min(self.budget)
+    }
+}
+
+async fn before_budget<T>(budget: Option<Instant>, work: impl Future<Output = T>) -> Option<T> {
+    match budget {
+        Some(deadline) if Instant::now() >= deadline => None,
+        Some(deadline) => tokio::time::timeout_at(deadline.into(), work).await.ok(),
+        None => Some(work.await),
+    }
 }
 
 #[cfg(test)]
@@ -899,8 +920,7 @@ where
     /// [`Self::call_gmail`] for any request, writes included: the features
     /// inside this crate send their writes through it, after their own
     /// checks. Read-only mode still refuses a write before any credential
-    /// or quota is spent. A caller that must not wait (a purge's delete)
-    /// passes `deadline` now: a deferral then comes back at once.
+    /// or quota is spent.
     pub(crate) async fn direct_call(
         &self,
         account: &AccountId,
@@ -945,13 +965,17 @@ where
         account: &AccountId,
         request: GmailRequest,
         priority: Priority,
-        deadline: Instant,
+        fresh_until: Instant,
+        budget: Instant,
     ) -> Result<Option<DirectCallResponse>, CallError> {
         self.direct_call_timed(
             account,
             request,
             priority,
-            DirectTiming::SendBefore(deadline),
+            DirectTiming::SendBefore(DispatchDeadline {
+                fresh_until,
+                budget,
+            }),
         )
         .await
     }
@@ -968,7 +992,7 @@ where
         }
         let send_before = match timing {
             DirectTiming::WaitUntil(_) => None,
-            DirectTiming::SendBefore(deadline) if Instant::now() >= deadline => return Ok(None),
+            DirectTiming::SendBefore(deadline) if deadline.expired() => return Ok(None),
             DirectTiming::SendBefore(deadline) => Some(deadline),
         };
         let call = GmailCall {
@@ -1459,7 +1483,7 @@ where
         command: CommandId,
         call: &GmailCall,
         report: &mut SyncReport,
-        send_before: Option<Instant>,
+        send_before: Option<DispatchDeadline>,
     ) -> Result<Attempt, RunError> {
         let topic = match (&call.request, &self.config.watch) {
             (GmailRequest::Watch, WatchMode::Disabled) => {
@@ -1480,12 +1504,20 @@ where
                 .map_err(RunError::Store)?,
             _ => 0,
         };
-        let lease = match self
-            .quota
-            .admit(&call.account, call.cost, call.priority, self.clock.now())
-            .await
-            .map_err(|e| RunError::Quota(e.0))?
-        {
+        let budget = send_before.map(|deadline| deadline.budget);
+        let Some(admission) = before_budget(
+            budget,
+            self.quota
+                .admit(&call.account, call.cost, call.priority, self.clock.now()),
+        )
+        .await
+        else {
+            return Ok(Attempt::Done {
+                outcome: Outcome::DispatchExpired,
+                cleanup: None,
+            });
+        };
+        let lease = match admission.map_err(|e| RunError::Quota(e.0))? {
             Admission::Granted(lease) => lease,
             Admission::Deferred { until } => {
                 tracing::debug!(
@@ -1506,7 +1538,6 @@ where
         let outcome = self
             .perform(call, command, &topic, generation, report, send_before)
             .await;
-        let lease = held.lease.take().unwrap_or(lease);
         let duration_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &outcome {
             Outcome::Event(_) => tracing::debug!(
@@ -1547,12 +1578,11 @@ where
             | Outcome::Unanswered(_)
             | Outcome::StoreFailed(_) => 0,
         };
-        let cleanup = self
-            .quota
-            .release(lease, bytes, self.clock.now())
-            .await
-            .err()
-            .map(|e| RunError::Quota(e.0));
+        // After a possible send, preserve the disposition even past the
+        // budget. Otherwise an expired budget can abandon the unused lease.
+        let release_budget =
+            budget.filter(|_| matches!(&outcome, Outcome::DispatchExpired | Outcome::NotSent(_)));
+        let cleanup = held.release(bytes, self.clock.now(), release_budget).await;
         Ok(Attempt::Done { outcome, cleanup })
     }
 
@@ -1563,23 +1593,25 @@ where
         topic: &str,
         generation: u64,
         report: &mut SyncReport,
-        send_before: Option<Instant>,
+        send_before: Option<DispatchDeadline>,
     ) -> Outcome {
         let account = &call.account;
         let gmail_request = &call.request;
-        if send_before.is_some_and(|deadline| Instant::now() >= deadline) {
+        if send_before.is_some_and(DispatchDeadline::expired) {
             return Outcome::DispatchExpired;
         }
-        let token = match self.tokens.token(account).await {
-            Ok(token) => token,
-            Err(error) => return Outcome::NotSent(error.into_failure()),
+        let budget = send_before.map(|deadline| deadline.budget);
+        let token = match before_budget(budget, self.tokens.token(account)).await {
+            Some(Ok(token)) => token,
+            Some(Err(error)) => return Outcome::NotSent(error.into_failure()),
+            None => return Outcome::DispatchExpired,
         };
         let config = RequestConfig {
             watch_topic: topic.to_owned(),
         };
         let mut last = None;
         for http in request::build(gmail_request, &config) {
-            if last.is_none() && send_before.is_some_and(|deadline| Instant::now() >= deadline) {
+            if last.is_none() && send_before.is_some_and(DispatchDeadline::expired) {
                 return Outcome::DispatchExpired;
             }
             report.gmail_requests += 1;
@@ -1744,6 +1776,20 @@ where
 struct LeaseGuard<'a, Q: QuotaGate> {
     gate: &'a Q,
     lease: Option<mailtide::quota::Lease>,
+}
+
+impl<Q: QuotaGate> LeaseGuard<'_, Q> {
+    async fn release(
+        &mut self,
+        bytes: u64,
+        now: Timestamp,
+        budget: Option<Instant>,
+    ) -> Option<RunError> {
+        let lease = self.lease?;
+        let released = before_budget(budget, self.gate.release(lease, bytes, now)).await?;
+        self.lease = None;
+        released.err().map(|error| RunError::Quota(error.0))
+    }
 }
 
 impl<Q: QuotaGate> Drop for LeaseGuard<'_, Q> {

@@ -77,21 +77,24 @@ Rust (`mailtide_io::Runner`):
 
 | Method | Returns |
 |---|---|
-| `purge(account, PurgeTarget::Messages(ids) \| Thread(id), anywhere, budget)` | `PurgeOutcome { purged, sent, refused, unsent, retry_at, interrupted }` |
+| `purge(account, PurgeTarget::Messages(ids) \| Thread(id), anywhere, budget)` | `PurgeOutcome { purged, sent, refused, not_applied, retry_at, interrupted }` |
 | `empty(account, Bin::Trash \| Bin::Spam, budget)` | `EmptyOutcome { purged, sent, skipped, remaining, retry_at, interrupted }` (counts) |
 
 - `purged`: Gmail's history shows the deletion and the store has its tombstone.
-- `sent`: Gmail may have applied the delete and there is no recorded
-  tombstone. This includes ambiguous batch refusals and evidence the
-  store could not record.
+- `sent` means deletion may have happened, with no confirmation that a
+  history-backed tombstone was recorded. This includes ambiguous batch
+  refusals, a lost store commit reply and evidence found for an
+  already-deleted target that the store could not confirm recording.
 - `refused`: the target was ineligible or Gmail definitively refused it.
   Reasons are `not_in_mirror`, `draft`, `unverified`,
   `not_in_trash_or_spam` and `gmail_refused`.
-- `unsent`: the call knows Gmail did not apply a delete. A 401 or quota
-  rejection can be returned after a request reached Gmail. `retry_at`
-  carries a quota deferral or the effective cooldown when one was installed.
-- `interrupted`: the reason sending stopped after an ambiguous outcome,
-  a failed confirmation, or an error affecting the partial result.
+- `not_applied` means eligible for another check. The call knows the
+  delete did not apply because it never left or Gmail rejected it with
+  401, 429 or a rate-limit 403. `empty` counts this disposition as
+  `remaining`. `retry_at` carries a quota deferral or the installed
+  cooldown.
+- `interrupted` explains why sending stopped, such as an expired check,
+  an ambiguous outcome or a failed confirmation.
 
 `PurgeError` (returned before a delete may have applied): `ReadOnly`,
 `Disabled`, `AnywhereNotAllowed`, `TooMany { limit, given }`,
@@ -130,15 +133,19 @@ the exceptions `PurgeDisabled`, `PurgeScopeRequired`, `MirrorStale`,
    into observed labels, then subtract any active bin removals. A pending
    restore, move to inbox or not-spam can remove a bin label seen only in
    history. An unsettled bin removal protects a target even under
-   anywhere or when it carries another bin label. A local trash or spam action counts once Gmail shows the bin
-   label. Drafts, unverified rows and missing rows are refused.
+   anywhere or when it carries another bin label. A local trash or spam
+   action counts once Gmail shows the bin label. Drafts, unverified rows
+   and missing rows are refused.
 5. **Dispatch by id.** Use single deletes below five eligible ids and a
    batch for up to 1,000 otherwise. A quota deferral ends sending with
-   `retry_at`. If the check was started more than two seconds ago when
-   the request would reach the transport, refresh it. This includes time
-   spent on history pages, store reads, admission and credentials. An
-   expired or zero budget prevents a new delete. An in-flight request can
-   finish and its evidence can still be recorded.
+   `retry_at`. The two-second bound runs from the start of the check to
+   the hand-off of the request to the transport. Connection setup inside
+   the transport happens after hand-off. Three consecutive expired
+   checks for one request stop sending with
+   `interrupted=eligibility_expired`. The pre-send check, quota admission
+   and token acquisition use the call budget. If a wait runs out of
+   budget, the call reports `interrupted=budget_elapsed`. An in-flight
+   delete can still finish and be confirmed.
 6. **Confirm.** Read history from the last head after a send that might
    have applied or an ordinary refusal. Record only `messagesDeleted`
    evidence. A failed confirmation sets `interrupted` and stops issuing
@@ -146,7 +153,7 @@ the exceptions `PurgeDisabled`, `PurgeScopeRequired`, `MirrorStale`,
 
 Gmail has no conditional delete. A restore between even the latest
 observation and the delete, or one published in history late, can escape
-the check. The two-second deadline limits the time before dispatch.
+the check.
 `purge-history-freshness` saw 78 of 78 restores in the first history read.
 A separate experiment saw a draft deletion appear 1.6 seconds late.
 
@@ -202,16 +209,17 @@ message stays deleted in Gmail.
 | What happens | Result |
 |---|---|
 | Initial history check fails | Error before sending |
-| The quota gate defers a delete | That request and the rest are `unsent`, with `retry_at` |
-| A timeout, lost answer, 408 or 5xx | That request is `sent` unless confirmed as `purged`. The rest are `unsent` |
+| A pre-send wait runs out of budget or three consecutive checks expire | `not_applied` for pending ids, with `interrupted` |
+| The quota gate defers a delete | That request and the rest are `not_applied`, with `retry_at` |
+| A timeout, lost answer, 408 or 5xx | That request is `sent` unless confirmed as `purged`. The rest are `not_applied` |
 | 404 | The request is `sent` unless confirmed as `purged` |
 | Recognized missing scope before any possible application | `ScopeRequired` with Gmail's reason. The account stays live and no mail is moved to trash |
 | Recognized missing scope after a possible application | This request is refused and the call stops |
-| 401 or a quota response | This request and the rest are `unsent`. A quota response reports the effective cooldown if installed |
+| 401, 429 or a rate-limit 403 | This request and the rest are `not_applied`. A quota response reports the effective cooldown if installed |
 | Ordinary single-delete 400 or 403 | `gmail_refused` unless history independently proves the deletion |
 | Ambiguous batch refusal | Each id is `sent` unless its deletion is confirmed |
 | Confirmation read or evidence write fails | Stop with `interrupted` and report each id once. Retain any evidence already recorded |
-| Account forgotten before recording | Stop with `interrupted=not_tracked` and report the unrecorded ids as `sent` |
+| Account forgotten before recording | Stop with `interrupted=not_tracked` and report `sent` for ids lacking confirmed recording |
 | Crash before recording | A later sync can record Gmail's history |
 | The host calls again | Already tombstoned ids are absent. The other ids are checked afresh |
 
@@ -372,7 +380,7 @@ confirmed.
     feature, not this one.
 13. **Drafts are refused**, as for actions; `delete_draft` owns them.
 14. **A delete never waits for the quota gate.** Not admitted at once is
-    `unsent` with `retry_at`; the caller calls again and is checked again.
+    `not_applied` with `retry_at`; the caller calls again and is checked again.
 15. **The public `call_gmail` only reads** (review ruling, shared with
     `drafts` and `label-edit`): writes go through `direct_call` inside the
     driver, so nothing deletes around a purge's checks.

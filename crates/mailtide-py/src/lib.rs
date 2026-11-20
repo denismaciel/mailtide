@@ -2467,17 +2467,19 @@ mod _core {
         /// Deleted for good, with Gmail's evidence: the tombstone is written
         /// and `MessageDeleted` is in the feed.
         purged: Vec<String>,
-        /// Possibly applied or shown by history, with no recorded tombstone.
+        /// Deletion may have happened, with no confirmation that a
+        /// history-backed tombstone was recorded.
         sent: Vec<String>,
         /// Definitively refused, by id: `not_in_mirror`, `draft`, `unverified`,
         /// `not_in_trash_or_spam` or `gmail_refused`.
         refused: std::collections::BTreeMap<String, &'static str>,
-        /// Definitely not applied by this call.
-        unsent: Vec<String>,
+        /// Definitely not applied by this call. Includes undispatched
+        /// deletes and 401, 429 or rate-limit 403 rejections.
+        not_applied: Vec<String>,
         /// When a deferred or rate-limited delete could go, at the earliest.
         retry_at_ms: Option<i64>,
-        /// Why sending stopped after an ambiguous answer, an unread
-        /// confirmation or a resource failure.
+        /// Why sending stopped, such as an expired check, an ambiguous
+        /// answer, an unread confirmation or a resource failure.
         interrupted: Option<String>,
     }
 
@@ -2492,7 +2494,7 @@ mod _core {
                     .into_iter()
                     .map(|(id, refusal)| (id.0, refusal.code()))
                     .collect(),
-                unsent: strings(outcome.unsent),
+                not_applied: strings(outcome.not_applied),
                 retry_at_ms: outcome.retry_at.map(|at| at.0),
                 interrupted: outcome.interrupted,
             }
@@ -2504,17 +2506,18 @@ mod _core {
     struct EmptyOutcome {
         /// Deleted for good, with Gmail's evidence recorded.
         purged: u64,
-        /// Possibly applied or shown by history, with no recorded tombstone.
+        /// Deletion may have happened, with no confirmation that a
+        /// history-backed tombstone was recorded.
         sent: u64,
         /// In the bin as the mirror held it, but not deleted (restored
         /// since, drafts, unverified, refused by Gmail).
         skipped: u64,
-        /// Not reached: call again.
+        /// Deletes known not to have applied, like `PurgeOutcome.not_applied`.
         remaining: u64,
         /// When a deferred or rate-limited delete could go, at the earliest.
         retry_at_ms: Option<i64>,
-        /// Why sending stopped after an ambiguous answer, an unread
-        /// confirmation or a resource failure.
+        /// Why sending stopped, such as an expired check, an ambiguous
+        /// answer, an unread confirmation or a resource failure.
         interrupted: Option<String>,
     }
 

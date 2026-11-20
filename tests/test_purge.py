@@ -66,7 +66,7 @@ def test_purge_reports_purged_and_refused_ids() -> None:
             "r": "not_in_trash_or_spam",
             "nope": "not_in_mirror",
         }
-        assert outcome.sent == [] and outcome.unsent == []
+        assert outcome.sent == [] and outcome.not_applied == []
         assert outcome.retry_at_ms is None and outcome.interrupted is None
         assert gmail.mailbox.deletes == [["t"], ["s"]]
         assert deleted_in_feed(runner) == ["t", "s"]
@@ -104,7 +104,7 @@ def test_purge_outcomes_expose_interruptions_and_cooldowns() -> None:
         gmail.mailbox.delete_failure = (408, "timeout")
         interrupted = runner.purge(ACCOUNT, message_ids=["a", "b"])
         assert interrupted.sent == ["a"]
-        assert interrupted.unsent == ["b"]
+        assert interrupted.not_applied == ["b"]
         assert interrupted.interrupted == "outcome_unknown"
         assert interrupted.retry_at_ms is None
 

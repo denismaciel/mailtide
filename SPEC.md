@@ -568,22 +568,29 @@ only the host may call again, and each call is checked afresh).
    sending. Fold history at or after each row's checkpoint into its observed
    labels, then subtract active TRASH or SPAM removals, including removals
    of labels found only in history. Drafts, unverified rows and absent rows
-   are refused. An unsettled bin removal protects the message even under anywhere
-   or when it has another bin label.
+   are refused. An unsettled bin removal protects the message even under
+   anywhere or when it has another bin label.
 3. **Dispatch by id.** Use one `messages.delete` per eligible id below
    five ids, or `messages.batchDelete` for up to 1,000. Do not wait on a
-   quota deferral. Before dispatch, an expired budget stops sending and a
-   check older than two seconds is refreshed. A 401, quota rejection or
-   deferral leaves the current and later requests `unsent`. A quota
-   deferral or a successfully installed cooldown gives `retry_at`. A 408,
-   5xx, timeout or lost answer may have applied. Those ids are `sent`
-   unless confirmed, and later ids are `unsent`. A recognized scope
-   refusal before any possible application is `ScopeRequired`. The runner
-   neither blocks the account nor moves mail to trash.
+   quota deferral. The two-second bound runs from the start of the check
+   to the hand-off of the request to the transport. Connection setup
+   inside the transport happens after hand-off. Three consecutive
+   expired checks for one request stop sending with
+   `interrupted=eligibility_expired`. The pre-send check, admission and
+   token waits use the call budget. The budget can stop an undispatched
+   delete, and confirmation remains available after a possible send.
+   Undispatched ids and deletes rejected with 401, 429 or a rate-limit
+   403 are `not_applied` and can be checked again on a new call. A quota
+   deferral or an installed cooldown gives `retry_at`. A 408, 5xx, timeout
+   or lost answer may have applied and stops subsequent deletes. A
+   recognized scope refusal before any possible application is
+   `ScopeRequired`. The account keeps syncing and mail stays put.
 4. **Evidence.** After a possible application or ordinary refusal, read
-   history from the last head. A 2xx, 404 or ambiguous batch refusal
-   remains `sent` unless history shows the deletion. Each id has one
-   disposition. Only a recorded `messagesDeleted` makes an id `purged`.
+   history from the last head. `sent` means deletion may have happened,
+   with no confirmation that a history-backed tombstone was recorded.
+   This includes a lost store commit reply after history proved deletion.
+   Each id has one disposition. Only a recorded `messagesDeleted` makes
+   an id `purged`.
    Recording is unfenced and leaves the cursor untouched (§10.3).
    A failed confirmation or store write stops sending and sets
    `interrupted`. A forgotten account cannot report a recorded tombstone.
@@ -595,10 +602,10 @@ A separate draft deletion appeared 1.6 seconds late once in 150 attempts.
 
 `empty(bin)` pages through the mirror's observed TRASH or SPAM ids, up to
 1,000 at a time. It uses the same fresh check and dispatch budget even
-after a page that sent nothing. `remaining` counts targets it did not
-reach. An in-flight delete can finish after the budget and still be
-confirmed. A fault after possible application returns the partial result
-with `interrupted`.
+after a page that sent nothing. `remaining` counts the same disposition
+that `purge` reports as `not_applied`. An in-flight delete can finish
+after the budget and still be confirmed. A fault after possible
+application returns the partial result with `interrupted`.
 
 ## 8. Quota and rate limiting
 
@@ -656,7 +663,7 @@ Per-call costs [G]:
   including a scope the token lacks, an account problem) is the caller's
   and blocks nothing; a real account problem is recorded by the account's
   next run. An answer lost after the request went out (a timeout, a dropped
-  connection) is reported as outcome unknown, never as unsent. A caller that
+  connection) is reported as outcome unknown. A caller that
   needs the disposition of a write gets it alongside any failure to release
   its quota lease or install a cooldown. A caller that
   keeps Gmail's answer in the mirror records it afterwards with an unfenced
@@ -925,14 +932,15 @@ runner per process, after forking:
   anywhere=False, budget_s=30.0) -> PurgeOutcome` and `await empty(account,
   "trash" | "spam", *, budget_s=60.0) -> EmptyOutcome`: permanent deletion
   (§7a), off unless `Config.purge` switches it on (§12a). `PurgeOutcome`
-  lists each distinct id once: `purged` (Gmail's history shows it; the
-  `MessageDeleted` entry is in the feed), `sent` (reached Gmail or may
-  have, not shown yet; never resent), `refused` (id to `not_in_mirror`,
-  `draft`, `unverified`, `not_in_trash_or_spam` or `gmail_refused`) and
-  `unsent` (definitely not applied by the call), with `retry_at_ms` (when a deferred or
-  rate-limited delete could go) and `interrupted` (why the call ended
-  early after a delete may have reached Gmail); `EmptyOutcome` counts
-  `purged`, `sent`, `skipped` and `remaining`, with the same two fields. Needs a token with
+  lists each distinct id once. `purged` has a history-backed tombstone
+  and a `MessageDeleted` feed entry. `sent` lacks confirmation that a
+  history-backed tombstone was recorded. `refused` maps ids to `not_in_mirror`,
+  `draft`, `unverified`, `not_in_trash_or_spam` or `gmail_refused`.
+  `not_applied` covers undispatched deletes and 401, 429 or rate-limit
+  403 rejections. `retry_at_ms` carries the gate deadline, and
+  `interrupted` explains why the call stopped early. `EmptyOutcome`
+  counts `purged`, `sent`, `skipped` and `remaining` (`not_applied`),
+  with the same two fields. Needs a token with
   `https://mail.google.com/`. Raises `PurgeDisabled`, `ReadOnlyMode`,
   `TooManyMessages` (a `ValueError`; more than 1,000 ids), `MirrorStale`
   (run the account first), `PurgeScopeRequired` (Gmail's message; nothing

@@ -58,11 +58,9 @@ pub fn missing_scope(refusal: &BlockingFailure) -> bool {
         )
 }
 
-/// Whether a transient failure of a delete came with Gmail's answer, so the
-/// delete may have been applied (a 5xx or a 408): it is `sent`, not
-/// `unsent`. A 401 (the token was refused before anything ran), a rate
-/// limit and a request that never left are not. [`crate::errors::classify`]
-/// leads the detail with the status it answered.
+/// Whether Gmail's response leaves application uncertain (a 5xx or a
+/// 408). An authentication or rate-limit rejection applies nothing.
+/// [`crate::errors::classify`] leads the detail with the response status.
 #[must_use]
 pub fn may_have_applied(failure: &RetryableFailure) -> bool {
     let status = failure

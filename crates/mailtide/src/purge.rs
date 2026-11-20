@@ -147,18 +147,19 @@ pub struct PurgeOutcome {
     /// Gmail's history shows the deletion: the tombstone is written and
     /// `MessageDeleted` is in the feed.
     pub purged: Vec<MessageId>,
-    /// The delete may have applied, or evidence could not be recorded.
-    /// There is no recorded tombstone. Mailtide never resends the request.
+    /// Deletion may have happened, with no confirmation that a
+    /// history-backed tombstone was recorded.
     pub sent: Vec<MessageId>,
-    /// Nothing was deleted for these, and why.
+    /// Why each id was ineligible or received a definitive permanent refusal.
     pub refused: Vec<(MessageId, Refusal)>,
-    /// Definitely not applied by this call, including undispatched
-    /// requests and definite rejection by the quota or authentication gate.
-    pub unsent: Vec<MessageId>,
+    /// Definitely not applied by this call. This includes undispatched
+    /// deletes and definitive Gmail rejections such as 401, 429 or a
+    /// rate-limit 403. A new call checks eligibility again.
+    pub not_applied: Vec<MessageId>,
     /// When a deferred or rate-limited delete could go, at the earliest.
     pub retry_at: Option<Timestamp>,
-    /// Why sending stopped after an ambiguous answer, an unread
-    /// confirmation or a resource failure.
+    /// Why sending stopped, such as an expired check, an ambiguous
+    /// answer, an unread confirmation or a resource failure.
     pub interrupted: Option<String>,
 }
 
@@ -167,19 +168,19 @@ pub struct PurgeOutcome {
 pub struct EmptyOutcome {
     /// Deleted, with Gmail's evidence recorded.
     pub purged: u64,
-    /// Possibly applied or shown by history, with no recorded tombstone.
+    /// Deletion may have happened, with no confirmation that a
+    /// history-backed tombstone was recorded.
     pub sent: u64,
     /// Held in the bin by the mirror but not deleted: restored since,
     /// drafts, unverified, or refused by Gmail.
     pub skipped: u64,
-    /// Not reached: the budget, the quota gate, a rate limit, a failing
-    /// Gmail or an unread confirmation ended the call first. Call again;
-    /// it reads the mirror afresh.
+    /// Deletes known not to have applied, with the same meaning as
+    /// [`PurgeOutcome::not_applied`].
     pub remaining: u64,
     /// When a deferred or rate-limited delete could go, at the earliest.
     pub retry_at: Option<Timestamp>,
-    /// Why sending stopped after an ambiguous answer, an unread
-    /// confirmation or a resource failure.
+    /// Why sending stopped, such as an expired check, an ambiguous
+    /// answer, an unread confirmation or a resource failure.
     pub interrupted: Option<String>,
 }
 

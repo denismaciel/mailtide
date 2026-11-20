@@ -61,7 +61,7 @@ async fn a_purge_applied_in_part_names_what_was_purged_and_what_was_refused() {
         outcome.refused.as_slice(),
         [(id, Refusal::GmailRefused(_))] if id.0 == "Egone"
     ));
-    assert!(outcome.sent.is_empty() && outcome.unsent.is_empty());
+    assert!(outcome.sent.is_empty() && outcome.not_applied.is_empty());
     // This fake applies none of the batch. Gmail's 400 gives the caller
     // no per-id proof of non-application.
     let host = mirrored(&[
@@ -76,7 +76,7 @@ async fn a_purge_applied_in_part_names_what_was_purged_and_what_was_refused() {
     let outcome = host.purge(&["a", "b", "c", "d", "e"]).await.expect("purge");
     assert!(outcome.purged.is_empty());
     assert_eq!(names(&outcome.sent), ["a", "b", "c", "d", "e"]);
-    assert!(outcome.refused.is_empty() && outcome.unsent.is_empty());
+    assert!(outcome.refused.is_empty() && outcome.not_applied.is_empty());
     assert_eq!(host.gmail().deletes(), ["BATCH a,b,c,d,e"]);
     assert!(host.mirrored("a"));
 }

@@ -327,15 +327,22 @@ class Runner:
         the call, unless ``anywhere=True`` under ``Config.purge="anywhere"``.
 
         Each wire delete refreshes Gmail history and rereads the remaining
-        targets and local bin removals. Dispatch requires a check at most
-        two seconds old. A restore may still land between the latest read
-        and the delete or appear in history late. A recorded history
-        deletion is ``purged``. An unconfirmed or unrecorded possible
-        application is ``sent``. ``unsent`` means the call knows the delete
-        did not apply. ``retry_at_ms`` carries the gate deadline and
-        ``interrupted`` gives the reason sending stopped on a failure.
-        Needs a token
-        with ``https://mail.google.com/``. Raises ``PurgeDisabled``,
+        targets and local bin removals. The two-second bound runs from the
+        start of the check to the hand-off of the request to the transport.
+        Connection setup inside the transport happens after hand-off.
+        Three consecutive expired checks for a request end the call.
+        The pre-send check, quota admission and token waits use ``budget_s``.
+        A restore may still land between the read and the delete or appear
+        in history late.
+
+        A recorded history deletion is ``purged``. ``sent`` means deletion may
+        have happened, with no confirmation that a history-backed tombstone
+        was recorded. ``not_applied`` covers undispatched deletes and Gmail's
+        401, 429 or rate-limit 403 responses. The caller can ask again.
+        ``retry_at_ms`` carries the gate deadline and ``interrupted`` gives
+        the reason sending stopped on a failure.
+
+        Needs a token with ``https://mail.google.com/``. Raises ``PurgeDisabled``,
         ``ReadOnlyMode``, ``TooManyMessages``, ``MirrorStale`` (run the
         account first), ``PurgeScopeRequired`` (nothing deleted, nothing
         trashed instead, the account keeps syncing), ``QuotaDeferred``,
@@ -353,7 +360,8 @@ class Runner:
     ) -> EmptyOutcome:
         """Delete for good what the mirror holds in the trash (or spam),
         1,000 at a time. Each request gets a fresh check and can start
-        only within ``budget_s``. The outcome counts messages and reports
+        only within ``budget_s``. ``remaining`` counts the same disposition
+        that ``purge`` reports as ``not_applied``. The outcome also reports
         interruptions and quota deadlines. Raises as ``purge``."""
         return await self._core.empty(account, bin, budget_s=budget_s)
 

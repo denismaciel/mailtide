@@ -88,15 +88,19 @@ is in trash or spam by default:
 ```python
 config = Config(database=..., blobs=..., purge="trash_and_spam")  # default "off"
 outcome = await runner.purge("alice@example.com", message_ids=["18c…"])
-outcome.purged, outcome.sent, outcome.refused  # evidence-backed, unconfirmed, why not
+outcome.purged, outcome.sent, outcome.refused, outcome.not_applied
 await runner.empty("alice@example.com", "trash")  # what the mirror holds in the trash
 ```
 
-Each delete gets a new Gmail history check and mirror read. A check more
-than two seconds old at dispatch is refreshed, and a delete never waits
-out a quota deferral. Gmail can still publish a restore late or accept it
-between the check and the delete. Purge sends each id at most once per
-call and records a deletion only on a `messagesDeleted` history record.
+Each delete gets a new Gmail history check and mirror read. The two-second
+bound runs from the start of the check to the hand-off of the request to
+the transport. Connection setup inside the transport happens after
+hand-off. Purge stops after three consecutive expired checks for a request.
+Gmail can still publish a restore late or accept it between the check and
+the delete. Purge sends each id at most once per call and records a deletion
+only on a `messagesDeleted` history record. `not_applied` covers undispatched
+deletes and Gmail's 401, 429 or rate-limit 403 responses. `sent` lacks
+confirmation that a history-backed tombstone was recorded.
 It needs a token with `https://mail.google.com/`. A missing scope raises
 `PurgeScopeRequired` before any possible application, and mail stays put.
 

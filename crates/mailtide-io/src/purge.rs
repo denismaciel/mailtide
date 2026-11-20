@@ -28,9 +28,10 @@ use crate::auth::TokenSource;
 use crate::blobs::BlobStore;
 use crate::quota_gate::QuotaGate;
 use crate::runner::{Access, CallError, DirectCallResponse, QuotaDeferred, RunError, Runner};
+use crate::transport::GmailTransport;
 
 const MAX_CHECK_AGE: Duration = Duration::from_secs(2);
-use crate::transport::GmailTransport;
+const MAX_EXPIRED_CHECKS: u8 = 3;
 
 /// Why the mirror can't vouch for a purge: run the account first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +118,7 @@ enum Disposition {
     Purged,
     Sent,
     Refused(Refusal),
-    Unsent,
+    NotApplied,
 }
 
 /// State shared by all requests in a purge or empty.
@@ -204,18 +205,18 @@ where
             ..PurgeOutcome::default()
         };
         for id in ids {
-            match dispositions.remove(&id).unwrap_or(Disposition::Unsent) {
+            match dispositions.remove(&id).unwrap_or(Disposition::NotApplied) {
                 Disposition::Purged => outcome.purged.push(id),
                 Disposition::Sent => outcome.sent.push(id),
                 Disposition::Refused(reason) => outcome.refused.push((id, reason)),
-                Disposition::Unsent => outcome.unsent.push(id),
+                Disposition::NotApplied => outcome.not_applied.push(id),
             }
         }
         tracing::info!(
             purged = outcome.purged.len(),
             sent = outcome.sent.len(),
             refused = outcome.refused.len(),
-            unsent = outcome.unsent.len(),
+            not_applied = outcome.not_applied.len(),
             "purge finished"
         );
         Ok(outcome)
@@ -270,7 +271,7 @@ where
                     Disposition::Purged => outcome.purged += 1,
                     Disposition::Sent => outcome.sent += 1,
                     Disposition::Refused(_) => outcome.skipped += 1,
-                    Disposition::Unsent => outcome.remaining += 1,
+                    Disposition::NotApplied => outcome.remaining += 1,
                 }
             }
         }
@@ -287,7 +288,7 @@ where
     }
 
     /// Process explicit ids or one mirror page, assigning exactly one final
-    /// disposition per id. Any targets left on a stop are unsent.
+    /// disposition per id. Any targets left on a stop are `not_applied`.
     async fn purge_round(
         &self,
         account: &AccountId,
@@ -296,12 +297,22 @@ where
     ) -> Result<BTreeMap<MessageId, Disposition>, PurgeError> {
         let mut dispositions = BTreeMap::new();
         let mut pending = ids.to_vec();
+        let mut expired_checks = 0;
         while !pending.is_empty() && !run.stopped && Instant::now() < run.deadline {
-            let send_before = run.deadline.min(Instant::now() + MAX_CHECK_AGE);
-            let views = match self.check_targets(account, &pending, run).await {
-                Ok(views) => views,
-                Err(error) => {
+            let fresh_until = Instant::now() + MAX_CHECK_AGE;
+            let views = match tokio::time::timeout_at(
+                run.deadline.into(),
+                self.check_targets(account, &pending, run),
+            )
+            .await
+            {
+                Ok(Ok(views)) => views,
+                Ok(Err(error)) => {
                     run.failed(error)?;
+                    break;
+                }
+                Err(_) => {
+                    run.interrupt("budget_elapsed");
                     break;
                 }
             };
@@ -331,14 +342,24 @@ where
             let named = mailtide::purge::request_ids(&request);
             let single = matches!(request, GmailRequest::DeleteMessage { .. });
             let response = self
-                .direct_call_before(account, request, Priority::Foreground, send_before)
+                .direct_call_before(
+                    account,
+                    request,
+                    Priority::Foreground,
+                    fresh_until,
+                    run.deadline,
+                )
                 .await;
             let Some(disposition) = delete_disposition(response, single, run)? else {
-                // Quota admission or credential acquisition can outlive the
-                // check. The request never reached the transport, so check
-                // again within the call budget.
+                expired_checks += 1;
+                if expired_checks >= MAX_EXPIRED_CHECKS {
+                    run.interrupt("eligibility_expired");
+                } else if Instant::now() >= run.deadline {
+                    run.interrupt("budget_elapsed");
+                }
                 continue;
             };
+            expired_checks = 0;
             pending.drain(..named.len());
             let confirm = matches!(disposition, Disposition::Sent | Disposition::Refused(_));
             for id in &named {
@@ -356,7 +377,7 @@ where
                     .await;
             }
         }
-        dispositions.extend(pending.into_iter().map(|id| (id, Disposition::Unsent)));
+        dispositions.extend(pending.into_iter().map(|id| (id, Disposition::NotApplied)));
         Ok(dispositions)
     }
 
@@ -461,8 +482,8 @@ where
     }
 
     /// Only recorded history evidence promotes an id to purged. If a
-    /// transaction fails or the account was forgotten, the evidence is
-    /// unrecorded and the caller still learns about possible application.
+    /// transaction fails or the account was forgotten, there is no
+    /// confirmation that the history-backed tombstone was recorded.
     async fn record_shown(
         &self,
         account: &AccountId,
@@ -504,11 +525,11 @@ fn delete_disposition(
         Err(CallError::Deferred(QuotaDeferred { until })) => {
             run.stopped = true;
             run.retry_at = Some(until);
-            return Ok(Some(Disposition::Unsent));
+            return Ok(Some(Disposition::NotApplied));
         }
         Err(error) => {
             run.failed(read_error(error))?;
-            return Ok(Some(Disposition::Unsent));
+            return Ok(Some(Disposition::NotApplied));
         }
     };
     if let Some(error) = response.cleanup {
@@ -525,6 +546,10 @@ fn delete_disposition(
             run.interrupt("outcome_unknown");
             Disposition::Sent
         }
+        Err(error) if response.not_sent => {
+            run.interrupt(error.code());
+            Disposition::NotApplied
+        }
         Err(CallError::Refused(refusal)) if mailtide_gmail::purge::missing_scope(&refusal) => {
             if !run.may_have_applied {
                 return Err(PurgeError::ScopeRequired(refusal.detail));
@@ -533,29 +558,26 @@ fn delete_disposition(
             Disposition::Refused(Refusal::GmailRefused(refusal.detail))
         }
         Err(CallError::Refused(refusal))
-            if response.not_sent
-                || (single
-                    && matches!(
-                        refusal.detail.split_ascii_whitespace().next(),
-                        Some("400" | "403")
-                    )) =>
+            if single
+                && matches!(
+                    refusal.detail.split_ascii_whitespace().next(),
+                    Some("400" | "403")
+                ) =>
         {
             Disposition::Refused(Refusal::GmailRefused(refusal.detail))
         }
         Err(CallError::Refused(_)) => Disposition::Sent,
-        Err(CallError::Retryable(failure))
-            if !response.not_sent && mailtide_gmail::purge::may_have_applied(&failure) =>
-        {
+        Err(CallError::Retryable(failure)) if mailtide_gmail::purge::may_have_applied(&failure) => {
             run.interrupt("outcome_unknown");
             Disposition::Sent
         }
         Err(CallError::Retryable(_)) => {
             run.stopped = true;
-            Disposition::Unsent
+            Disposition::NotApplied
         }
         Err(error) => {
             run.failed(read_error(error))?;
-            Disposition::Unsent
+            Disposition::NotApplied
         }
     };
     run.may_have_applied |= matches!(disposition, Disposition::Sent);
@@ -583,7 +605,7 @@ fn evidence(ids: &[MessageId], scan: &PurgeScan) -> Vec<(MessageId, DeletionEvid
         .collect()
 }
 
-/// A failed history read in a purge's terms: nothing was sent.
+/// Classify a failed history read in a purge's terms.
 fn read_error(error: CallError) -> PurgeError {
     match error {
         CallError::Deferred(deferred) => PurgeError::Deferred(deferred),
@@ -605,6 +627,25 @@ fn read_error(error: CallError) -> PurgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_before_the_delete_leaves_is_not_applied() {
+        let mut run = Purging::new(Scope::TrashOrSpam, Instant::now(), HistoryId(1));
+        let response = DirectCallResponse {
+            outcome: Err(CallError::Refused(BlockingFailure {
+                class: mailtide::retry::Blocking::Permanent,
+                detail: "token source unavailable".into(),
+            })),
+            cleanup: None,
+            retry_at: None,
+            not_sent: true,
+        };
+        assert!(matches!(
+            delete_disposition(Ok(Some(response)), false, &mut run),
+            Ok(Some(Disposition::NotApplied)),
+        ));
+        assert!(run.stopped);
+    }
 
     #[test]
     fn evidence_is_a_history_record_and_nothing_else() {

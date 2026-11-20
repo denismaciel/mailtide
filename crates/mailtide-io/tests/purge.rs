@@ -128,7 +128,9 @@ async fn a_purged_message_is_a_tombstone_before_the_next_sync() {
     let cursor = host.mirror().record.cursor;
     let outcome = host.purge(&["t", "s"]).await.expect("purge");
     assert_eq!(names(&outcome.purged), ["t", "s"]);
-    assert!(outcome.sent.is_empty() && outcome.refused.is_empty() && outcome.unsent.is_empty());
+    assert!(
+        outcome.sent.is_empty() && outcome.refused.is_empty() && outcome.not_applied.is_empty()
+    );
     assert!(!host.in_gmail("t") && !host.in_gmail("s"));
     // Recorded when purge returns, not at the next sync.
     assert!(!host.mirrored("t") && !host.mirrored("s"));
@@ -336,7 +338,7 @@ async fn a_delete_whose_answer_was_lost_is_never_sent_again() {
     }
     let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
     assert_eq!(names(&outcome.sent), ["a"]);
-    assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert_eq!(names(&outcome.not_applied), ["b", "c"]);
     assert_eq!(outcome.interrupted.as_deref(), Some("outcome_unknown"));
     assert_eq!(host.gmail().deletes(), ["DELETE a"]);
     assert!(host.mirrored("a") && host.in_gmail("b") && host.in_gmail("c"));
@@ -374,7 +376,7 @@ async fn a_crash_after_the_delete_heals_at_the_next_sync() {
     host.gmail().history_fails_after_deletes = true;
     let outcome = host.purge(&["a", "b"]).await.expect("purge");
     assert_eq!(names(&outcome.sent), ["a"]);
-    assert_eq!(names(&outcome.unsent), ["b"]);
+    assert_eq!(names(&outcome.not_applied), ["b"]);
     assert!(!host.in_gmail("a") && host.in_gmail("b"));
     assert!(host.mirrored("a") && host.mirrored("b"));
     host.gmail().history_fails_after_deletes = false;
@@ -394,7 +396,7 @@ async fn a_deferred_purge_sends_nothing_more() {
     host.admit_deletes(1);
     let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
     assert_eq!(names(&outcome.purged), ["a"], "the chunk sent is confirmed");
-    assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert_eq!(names(&outcome.not_applied), ["b", "c"]);
     assert!(outcome.retry_at.is_some(), "the time it could go");
     assert_eq!(host.gmail().deletes(), ["DELETE a"]);
     assert!(host.in_gmail("b") && host.in_gmail("c"));
@@ -402,7 +404,7 @@ async fn a_deferred_purge_sends_nothing_more() {
     let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
     host.admit_deletes(0);
     let outcome = host.purge(&["a"]).await.expect("purge");
-    assert_eq!(names(&outcome.unsent), ["a"]);
+    assert_eq!(names(&outcome.not_applied), ["a"]);
     assert!(outcome.retry_at.is_some());
     assert!(host.gmail().deletes().is_empty());
 }
@@ -414,7 +416,7 @@ async fn a_delete_never_waits_for_the_quota_gate() {
     let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
     host.defer_deletes_after(0, Duration::from_millis(50));
     let outcome = host.purge(&["a"]).await.expect("purge");
-    assert_eq!(names(&outcome.unsent), ["a"]);
+    assert_eq!(names(&outcome.not_applied), ["a"]);
     assert!(outcome.retry_at.is_some());
     assert!(host.gmail().deletes().is_empty(), "nothing waited and went");
     assert!(host.in_gmail("a"));
@@ -456,7 +458,7 @@ async fn a_429_or_a_5xx_on_a_delete_is_never_resent() {
     limited.headers.push(("retry-after".into(), "30".into()));
     host.gmail().refuse_deletes = Some(limited);
     let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
-    assert_eq!(names(&outcome.unsent), ["a", "b", "c"]);
+    assert_eq!(names(&outcome.not_applied), ["a", "b", "c"]);
     assert!(outcome.retry_at.is_some(), "Retry-After says when");
     assert_eq!(host.gmail().deletes(), ["DELETE a"]);
     // A 5xx may have been applied: sent, never resent, and the call stops.
@@ -464,7 +466,7 @@ async fn a_429_or_a_5xx_on_a_delete_is_never_resent() {
     host.gmail().refuse_deletes = Some(error(500, "backendError", "Backend Error"));
     let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
     assert_eq!(names(&outcome.sent), ["a"]);
-    assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert_eq!(names(&outcome.not_applied), ["b", "c"]);
     assert!(host.mirrored("a"), "no evidence, no tombstone");
     assert_eq!(host.gmail().deletes(), ["DELETE a"]);
     // A 5xx after Gmail applied it: history proves it.
@@ -472,7 +474,7 @@ async fn a_429_or_a_5xx_on_a_delete_is_never_resent() {
     host.gmail().answer_after_applying = Some(error(503, "backendError", "Backend Error"));
     let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
     assert_eq!(names(&outcome.purged), ["a"]);
-    assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert_eq!(names(&outcome.not_applied), ["b", "c"]);
     assert_eq!(host.gmail().deletes(), ["DELETE a"]);
 }
 
@@ -491,7 +493,7 @@ async fn a_lost_answer_on_a_batch_is_never_resent() {
     }
     let outcome = host.purge(&five).await.expect("purge");
     assert_eq!(outcome.sent.len(), 5);
-    assert!(outcome.purged.is_empty() && outcome.unsent.is_empty());
+    assert!(outcome.purged.is_empty() && outcome.not_applied.is_empty());
     assert_eq!(host.gmail().deletes(), ["BATCH a,b,c,d,e"], "sent once");
     assert!(host.mirrored("a"));
 }
@@ -538,7 +540,7 @@ async fn a_missing_scope_after_a_delete_succeeded_stops_the_call() {
     let outcome = host.purge(&["a", "b", "c"]).await.expect("an outcome");
     assert_eq!(names(&outcome.purged), ["a"]);
     assert_eq!(refusals(&outcome.refused), [("b", "gmail_refused")]);
-    assert_eq!(names(&outcome.unsent), ["c"]);
+    assert_eq!(names(&outcome.not_applied), ["c"]);
     assert_eq!(host.gmail().deletes(), ["DELETE a", "DELETE b"]);
 }
 
@@ -562,7 +564,7 @@ async fn a_refused_batch_is_checked_against_history() {
         "history proves the deletions"
     );
     assert_eq!(names(&outcome.sent), ["c", "d", "e"]);
-    assert!(outcome.refused.is_empty() && outcome.unsent.is_empty());
+    assert!(outcome.refused.is_empty() && outcome.not_applied.is_empty());
     assert_eq!(host.deleted_in_feed(), ["a", "b"]);
 }
 
@@ -910,7 +912,7 @@ async fn an_expired_budget_sends_no_delete_even_after_admission() {
         .purge(&account(), &target, false, Duration::ZERO)
         .await
         .expect("zero budget");
-    assert_eq!(names(&zero.unsent), ["a"]);
+    assert_eq!(names(&zero.not_applied), ["a"]);
     assert!(host.gmail().requests.is_empty());
     let pause = host.pause_next_delete_admission();
     let budget = Duration::from_millis(50);
@@ -928,8 +930,69 @@ async fn an_expired_budget_sends_no_delete_even_after_admission() {
     })
     .await
     .expect("test completed");
-    assert_eq!(names(&outcome.expect("purge").unsent), ["a"]);
+    assert_eq!(names(&outcome.expect("purge").not_applied), ["a"]);
     assert!(host.gmail().deletes().is_empty() && host.in_gmail("a"));
+}
+
+#[tokio::test]
+async fn three_expired_checks_stop_before_dispatch() {
+    let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
+    let expire_checks = async {
+        let mut pause = host.pause_next_delete_admission();
+        for _ in 0..3 {
+            pause.entered.notified().await;
+            tokio::time::sleep(Duration::from_millis(2_050)).await;
+            // A fourth attempt would stall here instead of reaching Gmail.
+            let next = host.pause_next_delete_admission();
+            pause.resume.notify_one();
+            pause = next;
+        }
+    };
+    let ((), outcome) = tokio::time::timeout(Duration::from_secs(9), async {
+        tokio::join!(expire_checks, host.purge(&["a"]))
+    })
+    .await
+    .expect("three checks fit within the budget");
+    let outcome = outcome.expect("purge");
+    assert_eq!(names(&outcome.not_applied), ["a"]);
+    assert_eq!(outcome.interrupted.as_deref(), Some("eligibility_expired"));
+    let gmail = host.gmail();
+    assert_eq!(gmail.requests.len(), 3, "one history read per check");
+    assert!(gmail.deletes().is_empty() && gmail.has("a"));
+}
+
+#[tokio::test]
+async fn stalled_pre_send_dependencies_end_at_the_budget() {
+    for stage in ["history token", "delete quota", "delete token"] {
+        let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
+        let pause = match stage {
+            "history token" => host.pause_token_after(0),
+            "delete quota" => host.pause_next_delete_admission(),
+            _ => host.pause_token_after(1),
+        };
+        let account = account();
+        let target = PurgeTarget::Messages(ids(&["a"]));
+        let budget = Duration::from_millis(100);
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                host.runner.purge(&account, &target, false, budget),
+                pause.entered.notified(),
+            )
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{stage} held up the purge"));
+        let outcome = outcome.expect("purge");
+        assert_eq!(names(&outcome.not_applied), ["a"], "{stage}");
+        assert_eq!(
+            outcome.interrupted.as_deref(),
+            Some("budget_elapsed"),
+            "{stage}"
+        );
+        assert!(
+            host.gmail().deletes().is_empty() && host.in_gmail("a"),
+            "{stage}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -944,7 +1007,7 @@ async fn release_failure_preserves_a_first_or_later_applied_delete() {
         let outcome = host.purge(&["a", "b", "c"]).await.expect("outcome");
         let split = usize::try_from(fails_after + 1).expect("small count");
         assert_eq!(names(&outcome.purged), ["a", "b", "c"][..split]);
-        assert_eq!(names(&outcome.unsent), ["a", "b", "c"][split..]);
+        assert_eq!(names(&outcome.not_applied), ["a", "b", "c"][split..]);
         assert_eq!(outcome.interrupted.as_deref(), Some("quota_gate"));
         assert_eq!(host.gmail().deletes().len(), split);
     }
@@ -962,10 +1025,10 @@ async fn a_408_may_have_applied_and_a_401_did_not() {
         let outcome = host.purge(&["a", "b"]).await.expect("outcome");
         if sent {
             assert_eq!(names(&outcome.sent), ["a"]);
-            assert_eq!(names(&outcome.unsent), ["b"]);
+            assert_eq!(names(&outcome.not_applied), ["b"]);
         } else {
             assert!(outcome.sent.is_empty());
-            assert_eq!(names(&outcome.unsent), ["a", "b"]);
+            assert_eq!(names(&outcome.not_applied), ["a", "b"]);
         }
         assert_eq!(host.gmail().deletes(), ["DELETE a"]);
         assert!(outcome.retry_at.is_none());
@@ -974,23 +1037,42 @@ async fn a_408_may_have_applied_and_a_401_did_not() {
 
 #[tokio::test]
 async fn retry_at_matches_the_gate_without_retry_after() {
-    let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
-    host.gmail().refuse_deletes = Some(error(429, "rateLimitExceeded", ""));
-    let outcome = host.purge(&["a"]).await.expect("outcome");
-    let Err(CallError::Deferred(QuotaDeferred { until })) = host
-        .runner
-        .call_gmail(
-            &account(),
-            GmailRequest::GetProfile,
-            Priority::Foreground,
-            Instant::now(),
+    for (status, reason) in [(429, "rateLimitExceeded"), (403, "userRateLimitExceeded")] {
+        let host = mirrored(
+            PurgePolicy::TrashAndSpam,
+            &[("a", &["TRASH"]), ("b", &["TRASH"])],
         )
-        .await
-    else {
-        panic!("the gate is cooling down");
-    };
-    assert_eq!(outcome.retry_at, Some(until));
-    assert_eq!(names(&outcome.unsent), ["a"]);
+        .await;
+        host.gmail().refuse_deletes = Some(error(status, reason, ""));
+        let outcome = host.purge(&["a", "b"]).await.expect("outcome");
+        let Err(CallError::Deferred(QuotaDeferred { until })) = host
+            .runner
+            .call_gmail(
+                &account(),
+                GmailRequest::GetProfile,
+                Priority::Foreground,
+                Instant::now(),
+            )
+            .await
+        else {
+            panic!("the gate is cooling down");
+        };
+        assert_eq!(outcome.retry_at, Some(until));
+        assert_eq!(names(&outcome.not_applied), ["a", "b"]);
+        assert!(outcome.refused.is_empty());
+        assert_eq!(host.gmail().deletes(), ["DELETE a"]);
+
+        let host = mirrored(
+            PurgePolicy::TrashAndSpam,
+            &[("a", &["TRASH"]), ("b", &["TRASH"])],
+        )
+        .await;
+        host.gmail().refuse_deletes = Some(error(status, reason, ""));
+        let outcome = host.empty(Bin::Trash, BUDGET).await.expect("outcome");
+        assert_eq!((outcome.remaining, outcome.skipped), (2, 0));
+        assert!(outcome.retry_at.is_some());
+        assert_eq!(host.gmail().deletes(), ["DELETE a"]);
+    }
 }
 
 #[tokio::test]

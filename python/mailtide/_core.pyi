@@ -499,7 +499,7 @@ class PrioritiseResult:
 
 @final
 class PurgeOutcome:
-    """One disposition per id, with the quota deadline and interruption reason."""
+    """One disposition per id. ``not_applied`` ids can be checked again."""
 
     purged: list[str]
     sent: list[str]
@@ -507,13 +507,13 @@ class PurgeOutcome:
         str,
         Literal["not_in_mirror", "draft", "unverified", "not_in_trash_or_spam", "gmail_refused"],
     ]
-    unsent: list[str]
+    not_applied: list[str]
     retry_at_ms: int | None
     interrupted: str | None
 
 @final
 class EmptyOutcome:
-    """Counts by disposition, with the quota deadline and interruption reason."""
+    """Counts by disposition. ``remaining`` corresponds to ``not_applied``."""
 
     purged: int
     sent: int

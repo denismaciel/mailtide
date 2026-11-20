@@ -601,7 +601,7 @@ covers = "TooMany for an explicit purge; the caller splits a larger set on purpo
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_delete_whose_answer_was_lost_is_never_sent_again"
-covers = "A lost answer stops sending, confirms through history and leaves later ids unsent"
+covers = "A lost answer stops sending, confirms through history and leaves later ids not_applied"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -616,12 +616,12 @@ covers = "Gmail deleted, nothing recorded: history's messagesDeleted tombstones 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_deferred_purge_sends_nothing_more"
-covers = "The quota gate defers a delete: chunks already sent are confirmed, the rest are unsent, with retry_at"
+covers = "The quota gate defers a delete: chunks already sent are confirmed, the rest are not_applied, with retry_at"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_delete_never_waits_for_the_quota_gate"
-covers = "A deferral the budget could wait out is still unsent: a delete goes right after its check or not at all (purge and every chunk of empty)"
+covers = "A deferral the budget could wait out is still not_applied: a delete goes right after its check or not at all (purge and every chunk of empty)"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -631,7 +631,7 @@ covers = "The rows are read after the history read, right before the deletes"
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_429_or_a_5xx_on_a_delete_is_never_resent"
-covers = "429: unsent with retry_at; 5xx: sent (may have been applied), the call stops; a 5xx after Gmail applied it is purged from history"
+covers = "429: not_applied with retry_at; 5xx: sent (may have been applied), the call stops; a 5xx after Gmail applied it is purged from history"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -646,7 +646,7 @@ covers = "A batch answered 404 and a single delete answered 404 without Gmail's 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_missing_scope_after_a_delete_succeeded_stops_the_call"
-covers = "A scope 403 mid-run is that chunk's gmail_refused; the rest unsent; the call returns its outcome"
+covers = "A scope 403 mid-run is that chunk's gmail_refused; the rest not_applied; the call returns its outcome"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -718,7 +718,7 @@ covers = "PurgeDisabled with the default Config; works with purge='trash_and_spa
 [[test]]
 target = "tests/test_purge.py"
 name = "test_purge_reports_purged_and_refused_ids"
-covers = "PurgeOutcome.purged, .refused with reasons, .sent and .unsent; changes() yields MessageDeleted"
+covers = "PurgeOutcome.purged, .refused with reasons, .sent and .not_applied; changes() yields MessageDeleted"
 
 [[test]]
 target = "tests/test_purge.py"
@@ -787,8 +787,23 @@ covers = "408 and 401 stop sending with distinct dispositions"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
+name = "three_expired_checks_stop_before_dispatch"
+covers = "Three consecutive expired checks stop sending and report not_applied with an interruption"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "stalled_pre_send_dependencies_end_at_the_budget"
+covers = "Stalled history credentials, delete admission or delete credentials cannot outlive the purge budget"
+
+[[test]]
+target = "crates/mailtide-io/src/purge.rs"
+name = "a_failure_before_the_delete_leaves_is_not_applied"
+covers = "A definitive pre-dispatch failure is not_applied"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
 name = "retry_at_matches_the_gate_without_retry_after"
-covers = "A rate limit without Retry-After reports the installed cooldown"
+covers = "429 and rate-limit 403 without Retry-After report the installed cooldown and count as not_applied or remaining"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
