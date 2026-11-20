@@ -326,11 +326,16 @@ class Runner:
         ``Config.purge`` switches it on; only what is in trash or spam as of
         the call, unless ``anywhere=True`` under ``Config.purge="anywhere"``.
 
-        Gmail's history since the mirror's cursor is read first, so a message
-        restored elsewhere a moment ago is refused. Each delete is sent once
-        and never repeated by mailtide; a message counts as ``purged`` (and
-        its ``MessageDeleted`` is in the feed) only once Gmail's history shows
-        the deletion; one sent but not shown yet is ``sent``. Needs a token
+        Gmail's history since the mirror's cursor is read first, then the
+        rows, so a restore already in Gmail's history (or asked for here)
+        refuses the message; a restore landing between that read and the
+        delete (milliseconds: a delete never waits for the quota gate) or
+        shown in history late is not seen. A trash asked for here counts once
+        Gmail shows it. Each delete is sent once and never repeated by
+        mailtide; a message counts as ``purged`` (and its ``MessageDeleted``
+        is in the feed) only once Gmail's history shows the deletion; one
+        that reached Gmail, or may have, is ``sent``; one never sent is
+        ``unsent`` (``retry_at_ms`` says when it could go). Needs a token
         with ``https://mail.google.com/``. Raises ``PurgeDisabled``,
         ``ReadOnlyMode``, ``TooManyMessages``, ``MirrorStale`` (run the
         account first), ``PurgeScopeRequired`` (nothing deleted, nothing

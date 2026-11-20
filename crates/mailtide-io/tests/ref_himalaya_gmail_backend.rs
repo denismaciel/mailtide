@@ -147,20 +147,22 @@ async fn a_message_restored_elsewhere_since_the_last_sync_is_not_purged() {
 }
 
 #[tokio::test]
-async fn a_single_delete_answered_404_is_already_gone() {
+async fn a_single_delete_answered_404_is_sent_and_tombstoned_only_by_history() {
     let host = purge_host(&[("gone", &["TRASH"])]).await;
     // Gmail no longer has it, and history has no record of that (yet).
     host.gmail().messages.remove("gone");
     let outcome = host.purge(&["gone"]).await.expect("purge");
-    assert_eq!(names(&outcome.purged), ["gone"], "a 404 is proof");
-    assert!(!host.mirrored("gone"));
-    let mirror = host.mirror();
+    // A 404 proves nothing on its own (a proxy can answer it too).
+    assert_eq!(names(&outcome.sent), ["gone"]);
     assert!(
-        mirror
-            .tombstones
-            .contains_key(&mailtide::ids::MessageId("gone".into())),
-        "tombstoned as a verified miss"
+        host.mirrored("gone"),
+        "no tombstone without a history record"
     );
+    assert!(host.deleted_in_feed().is_empty());
+    // The record arrives; the next sync writes the tombstone.
+    host.gmail().delete_record("gone");
+    host.sync().await;
+    assert!(!host.mirrored("gone"));
     assert_eq!(host.deleted_in_feed(), ["gone"]);
 }
 

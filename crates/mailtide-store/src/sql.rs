@@ -1382,19 +1382,10 @@ async fn carrying(
     let labels: Vec<&LabelId> = labels.iter().collect();
     let mut ids = BTreeSet::new();
     for chunk in labels.chunks(VIEW_CHUNK / 2) {
-        // Each id as the column's JSON spells it, LIKE's wildcards escaped.
-        let mut patterns = Vec::with_capacity(chunk.len());
-        for label in chunk {
-            let mut pattern = String::from("%");
-            for c in json(&label.0)?.chars() {
-                if matches!(c, '!' | '%' | '_') {
-                    pattern.push('!');
-                }
-                pattern.push(c);
-            }
-            pattern.push('%');
-            patterns.push(pattern);
-        }
+        let patterns = chunk
+            .iter()
+            .map(|label| label_pattern(label))
+            .collect::<Result<Vec<_>, _>>()?;
         let n = chunk.len();
         let likes = (2..n + 2)
             .map(|i| format!("labels LIKE ${i} ESCAPE '!'"))
@@ -2271,14 +2262,14 @@ impl crate::Store for SqlStore {
         // `labels` holds a JSON array of ids: match the label's JSON string
         // as text, then confirm on the parsed set, reading on until `limit`
         // rows hold it exactly (a text match is only a filter).
-        let pattern = format!("%{}%", like_escaped(&json(label)?));
+        let pattern = label_pattern(label)?;
         let wanted = usize::try_from(limit).unwrap_or(usize::MAX);
         let mut found = Vec::new();
         let mut from = after.map_or_else(String::new, |id| id.0.clone());
         while found.len() < wanted {
             let rows = sqlx::query(
                 "SELECT id, labels FROM mailtide_messages
-                 WHERE account = $1 AND id > $2 AND labels LIKE $3 ESCAPE '\\'
+                 WHERE account = $1 AND id > $2 AND labels LIKE $3 ESCAPE '!'
                  ORDER BY id LIMIT $4",
             )
             .bind(account.as_str())
@@ -2598,17 +2589,22 @@ impl LabelAttrs {
     }
 }
 
-/// `text` with `LIKE`'s wildcards and the escape character escaped (for
-/// `ESCAPE '\'`).
-fn like_escaped(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
+/// A `LIKE … ESCAPE '!'` pattern finding rows whose `labels` column holds
+/// `label`: the id as the column's JSON spells it, `LIKE`'s wildcards and
+/// the escape character escaped (`!`, not a backslash, whose meaning in a
+/// Postgres string literal depends on `standard_conforming_strings`). A
+/// match is only a filter (`SQLite` compares ASCII case-insensitively):
+/// callers check the parsed set.
+fn label_pattern(label: &LabelId) -> Result<String, StoreError> {
+    let mut pattern = String::from("%");
+    for c in json(&label.0)?.chars() {
+        if matches!(c, '!' | '%' | '_') {
+            pattern.push('!');
         }
-        out.push(c);
+        pattern.push(c);
     }
-    out
+    pattern.push('%');
+    Ok(pattern)
 }
 
 /// Ids per `IN (...)` query when reading views and feed content (well under

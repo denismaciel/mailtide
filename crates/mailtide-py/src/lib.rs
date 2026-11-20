@@ -636,8 +636,8 @@ mod _core {
                 }
                 Stale::TooFarBehind => "the mirror is too far behind Gmail: run the account first",
             }),
-            PurgeError::ScopeRequired => PurgeScopeRequired::new_err(format!(
-                "Gmail refused the delete: the token lacks {}; nothing was deleted",
+            PurgeError::ScopeRequired(detail) => PurgeScopeRequired::new_err(format!(
+                "Gmail refused the delete: the token lacks {}; nothing was deleted ({detail})",
                 mailtide_gmail::purge::FULL_SCOPE
             )),
             PurgeError::Deferred(deferred) => quota_deferred(deferred),
@@ -2467,15 +2467,20 @@ mod _core {
         /// Deleted for good, with Gmail's evidence: the tombstone is written
         /// and `MessageDeleted` is in the feed.
         purged: Vec<String>,
-        /// Sent, not yet shown by Gmail's history (or the answer was lost):
-        /// the row stays until a sync sees the deletion. Never resent.
+        /// Reached Gmail, or may have (a lost answer, a 5xx, a 404), and
+        /// not yet shown by Gmail's history: the row stays until a sync sees
+        /// the deletion. Never resent.
         sent: Vec<String>,
         /// Not sent, by id: `not_in_mirror`, `draft`, `unverified`,
         /// `not_in_trash_or_spam` or `gmail_refused`.
         refused: std::collections::BTreeMap<String, &'static str>,
-        /// Not reached: the budget, a quota deferral or a failing Gmail
-        /// ended the call first.
+        /// Never sent: the quota gate could not admit the delete at once,
+        /// Gmail limited the rate, or an earlier failure ended the call.
         unsent: Vec<String>,
+        /// When a deferred or rate-limited delete could go, at the earliest.
+        retry_at_ms: Option<i64>,
+        /// Why the call ended early after deletes may have reached Gmail.
+        interrupted: Option<String>,
     }
 
     impl From<mailtide::purge::PurgeOutcome> for PurgeOutcome {
@@ -2490,6 +2495,8 @@ mod _core {
                     .map(|(id, refusal)| (id.0, refusal.code()))
                     .collect(),
                 unsent: strings(outcome.unsent),
+                retry_at_ms: outcome.retry_at.map(|at| at.0),
+                interrupted: outcome.interrupted,
             }
         }
     }
@@ -2506,6 +2513,10 @@ mod _core {
         skipped: u64,
         /// Not reached: call again.
         remaining: u64,
+        /// When a deferred or rate-limited delete could go, at the earliest.
+        retry_at_ms: Option<i64>,
+        /// Why the call ended early after deletes may have reached Gmail.
+        interrupted: Option<String>,
     }
 
     impl From<mailtide::purge::EmptyOutcome> for EmptyOutcome {
@@ -2515,6 +2526,8 @@ mod _core {
                 sent: outcome.sent,
                 skipped: outcome.skipped,
                 remaining: outcome.remaining,
+                retry_at_ms: outcome.retry_at.map(|at| at.0),
+                interrupted: outcome.interrupted,
             }
         }
     }

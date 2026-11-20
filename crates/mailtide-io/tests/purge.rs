@@ -7,7 +7,7 @@ pub mod purge_host;
 use std::time::Duration;
 
 use mailtide::ids::{HistoryId, MessageId};
-use mailtide::outbox::{Action, ActionRequest, StarState};
+use mailtide::outbox::{Action, ActionRequest, RestoreDestination, StarState};
 use mailtide::purge::{Bin, PURGE_MAX_IDS, PurgePolicy, PurgeTarget, Refusal};
 use mailtide::reconcile::{ReconcileProgress, ReconcileReason};
 use mailtide::state::SyncState;
@@ -228,7 +228,11 @@ async fn a_token_without_the_full_scope_is_scope_required_and_blocks_nothing() {
     )
     .await;
     host.gmail().scope = MODIFY_SCOPE;
-    assert_eq!(host.purge(&["t"]).await, Err(PurgeError::ScopeRequired));
+    let refused = host.purge(&["t"]).await;
+    assert!(
+        matches!(&refused, Err(PurgeError::ScopeRequired(detail)) if detail.contains("insufficientPermissions")),
+        "Gmail's refusal is kept: {refused:?}"
+    );
     assert_eq!(
         mailtide_gmail::purge::FULL_SCOPE,
         "https://mail.google.com/",
@@ -257,10 +261,10 @@ async fn a_token_without_the_full_scope_is_scope_required_and_blocks_nothing() {
     assert!(host.mirrored("n"));
     assert!(matches!(host.mirror().record.sync, SyncState::Live));
     // Emptying is refused the same way.
-    assert_eq!(
+    assert!(matches!(
         host.empty(Bin::Trash, BUDGET).await,
-        Err(PurgeError::ScopeRequired)
-    );
+        Err(PurgeError::ScopeRequired(_))
+    ));
 }
 
 #[tokio::test]
@@ -397,6 +401,7 @@ async fn a_deferred_purge_sends_nothing_more() {
     let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
     assert_eq!(names(&outcome.purged), ["a"], "the chunk sent is confirmed");
     assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert!(outcome.retry_at.is_some(), "the time it could go");
     assert_eq!(host.gmail().deletes(), ["DELETE a"]);
     assert!(host.in_gmail("b") && host.in_gmail("c"));
     // Deferred before the first delete: nothing is sent at all.
@@ -404,7 +409,159 @@ async fn a_deferred_purge_sends_nothing_more() {
     host.admit_deletes(0);
     let outcome = host.purge(&["a"]).await.expect("purge");
     assert_eq!(names(&outcome.unsent), ["a"]);
+    assert!(outcome.retry_at.is_some());
     assert!(host.gmail().deletes().is_empty());
+}
+
+#[tokio::test]
+async fn a_delete_never_waits_for_the_quota_gate() {
+    // The gate would admit the delete 50 ms later, well within the budget:
+    // waiting would send it long after its check, so it is not sent.
+    let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
+    host.defer_deletes_after(0, Duration::from_millis(50));
+    let outcome = host.purge(&["a"]).await.expect("purge");
+    assert_eq!(names(&outcome.unsent), ["a"]);
+    assert!(outcome.retry_at.is_some());
+    assert!(host.gmail().deletes().is_empty(), "nothing waited and went");
+    assert!(host.in_gmail("a"));
+    // The same in every chunk of an empty.
+    let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
+    host.defer_deletes_after(0, Duration::from_millis(50));
+    let outcome = host.empty(Bin::Trash, BUDGET).await.expect("empty");
+    assert_eq!((outcome.purged, outcome.remaining), (0, 1));
+    assert!(host.gmail().deletes().is_empty());
+}
+
+#[tokio::test]
+async fn a_restore_admitted_here_during_the_history_read_refuses_the_id() {
+    let host = mirrored(
+        PurgePolicy::TrashAndSpam,
+        &[("a", &["TRASH"]), ("b", &["TRASH"])],
+    )
+    .await;
+    host.act_during_history_read(ActionRequest::Messages {
+        ids: ids(&["a"]),
+        action: Action::RestoreFromTrash(RestoreDestination::Inbox),
+    });
+    let outcome = host.purge(&["a", "b"]).await.expect("purge");
+    assert_eq!(refusals(&outcome.refused), [("a", "not_in_trash_or_spam")]);
+    assert_eq!(names(&outcome.purged), ["b"]);
+    assert_eq!(host.gmail().deletes(), ["DELETE b"]);
+}
+
+#[tokio::test]
+async fn a_429_or_a_5xx_on_a_delete_is_never_resent() {
+    let three = [
+        ("a", &["TRASH"][..]),
+        ("b", &["TRASH"][..]),
+        ("c", &["TRASH"][..]),
+    ];
+    // A rate limit: nothing was applied, and nothing more is sent.
+    let host = mirrored(PurgePolicy::TrashAndSpam, &three).await;
+    let mut limited = error(429, "rateLimitExceeded", "Rate Limit Exceeded");
+    limited.headers.push(("retry-after".into(), "30".into()));
+    host.gmail().refuse_deletes = Some(limited);
+    let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
+    assert_eq!(names(&outcome.unsent), ["a", "b", "c"]);
+    assert!(outcome.retry_at.is_some(), "Retry-After says when");
+    assert_eq!(host.gmail().deletes(), ["DELETE a"]);
+    // A 5xx may have been applied: sent, never resent, and the call stops.
+    let host = mirrored(PurgePolicy::TrashAndSpam, &three).await;
+    host.gmail().refuse_deletes = Some(error(500, "backendError", "Backend Error"));
+    let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
+    assert_eq!(names(&outcome.sent), ["a"]);
+    assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert!(host.mirrored("a"), "no evidence, no tombstone");
+    assert_eq!(host.gmail().deletes(), ["DELETE a"]);
+    // A 5xx after Gmail applied it: history proves it.
+    let host = mirrored(PurgePolicy::TrashAndSpam, &three).await;
+    host.gmail().answer_after_applying = Some(error(503, "backendError", "Backend Error"));
+    let outcome = host.purge(&["a", "b", "c"]).await.expect("purge");
+    assert_eq!(names(&outcome.purged), ["a"]);
+    assert_eq!(names(&outcome.unsent), ["b", "c"]);
+    assert_eq!(host.gmail().deletes(), ["DELETE a"]);
+}
+
+#[tokio::test]
+async fn a_lost_answer_on_a_batch_is_never_resent() {
+    let five = ["a", "b", "c", "d", "e"];
+    let host = mirrored(
+        PurgePolicy::TrashAndSpam,
+        &five.map(|id| (id, &["TRASH"][..])),
+    )
+    .await;
+    {
+        let mut gmail = host.gmail();
+        gmail.lose_delete_answers = true;
+        gmail.late_evidence = true;
+    }
+    let outcome = host.purge(&five).await.expect("purge");
+    assert_eq!(outcome.sent.len(), 5);
+    assert!(outcome.purged.is_empty() && outcome.unsent.is_empty());
+    assert_eq!(host.gmail().deletes(), ["BATCH a,b,c,d,e"], "sent once");
+    assert!(host.mirrored("a"));
+}
+
+#[tokio::test]
+async fn a_404_on_a_delete_tombstones_nothing() {
+    let five = ["a", "b", "c", "d", "e"];
+    // A batch answered 404 with Gmail's body.
+    let host = mirrored(
+        PurgePolicy::TrashAndSpam,
+        &five.map(|id| (id, &["TRASH"][..])),
+    )
+    .await;
+    host.gmail().refuse_deletes = Some(error(404, "notFound", "Requested entity was not found."));
+    let outcome = host.purge(&five).await.expect("purge");
+    assert_eq!(outcome.sent.len(), 5);
+    assert!(outcome.purged.is_empty());
+    assert!(host.mirror().tombstones.is_empty());
+    // A single delete answered 404 by something that is not Gmail (no
+    // body): the message is live, and stays mirrored.
+    let host = mirrored(PurgePolicy::TrashAndSpam, &[("a", &["TRASH"])]).await;
+    host.gmail().refuse_deletes = Some(mailtide_gmail::http::HttpResponse {
+        status: 404,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let outcome = host.purge(&["a"]).await.expect("purge");
+    assert_eq!(names(&outcome.sent), ["a"]);
+    assert!(host.mirrored("a") && host.in_gmail("a"));
+    assert!(host.mirror().tombstones.is_empty());
+    assert!(host.deleted_in_feed().is_empty());
+}
+
+#[tokio::test]
+async fn a_missing_scope_after_a_delete_succeeded_stops_the_call() {
+    let host = mirrored(
+        PurgePolicy::TrashAndSpam,
+        &[("a", &["TRASH"]), ("b", &["TRASH"]), ("c", &["TRASH"])],
+    )
+    .await;
+    host.gmail().after_delete = Some(Box::new(|gmail| {
+        gmail.scope = MODIFY_SCOPE;
+    }));
+    let outcome = host.purge(&["a", "b", "c"]).await.expect("an outcome");
+    assert_eq!(names(&outcome.purged), ["a"]);
+    assert_eq!(refusals(&outcome.refused), [("b", "gmail_refused")]);
+    assert_eq!(names(&outcome.unsent), ["c"]);
+    assert_eq!(host.gmail().deletes(), ["DELETE a", "DELETE b"]);
+}
+
+#[tokio::test]
+async fn a_refused_batch_is_checked_against_history() {
+    let five = ["a", "b", "c", "d", "e"];
+    let host = mirrored(
+        PurgePolicy::TrashAndSpam,
+        &five.map(|id| (id, &["TRASH"][..])),
+    )
+    .await;
+    // Gmail deleted the ids, then answered 400.
+    host.gmail().answer_after_applying = Some(error(400, "invalidArgument", "Invalid ids"));
+    let outcome = host.purge(&five).await.expect("purge");
+    assert_eq!(outcome.purged.len(), 5, "history proves the deletions");
+    assert!(outcome.refused.is_empty());
+    assert_eq!(host.deleted_in_feed().len(), 5);
 }
 
 #[tokio::test]
@@ -538,6 +695,49 @@ async fn empty_skips_messages_restored_while_it_runs() {
     let deletes = host.gmail().deletes();
     assert_eq!(deletes.len(), 2);
     assert_eq!(deletes[1], "DELETE m1000");
+}
+
+#[tokio::test]
+async fn empty_stops_after_a_failed_confirmation() {
+    let host = mirrored_many(PurgePolicy::TrashAndSpam, "m", 2_500, "TRASH").await;
+    {
+        let mut gmail = host.gmail();
+        // After the first chunk history answers 503; a phone restores a
+        // message of the second chunk meanwhile.
+        gmail.history_fails_after_deletes = true;
+        gmail.after_delete = Some(Box::new(|gmail| {
+            if gmail.has("m1500") {
+                gmail.restore("m1500");
+            }
+        }));
+    }
+    let outcome = host.empty(Bin::Trash, BUDGET).await.expect("empty");
+    assert_eq!(outcome.sent, 1_000, "unconfirmed");
+    assert_eq!(outcome.purged, 0);
+    assert_eq!(outcome.remaining, 1_500);
+    assert_eq!(host.gmail().deletes().len(), 1, "nothing further is sent");
+    assert!(host.in_gmail("m1500"));
+}
+
+#[tokio::test]
+async fn empty_reports_a_missing_scope_whenever_nothing_was_deleted_yet() {
+    // The first page holds only drafts: nothing to delete there.
+    let host = Host::new(PurgePolicy::TrashAndSpam);
+    {
+        let mut gmail = host.gmail();
+        for id in many("d", 1_000) {
+            gmail.add(&id, &["DRAFT", "TRASH"]);
+        }
+        gmail.add("z", &["TRASH"]);
+        gmail.scope = MODIFY_SCOPE;
+    }
+    host.mirror_gmail().await;
+    let refused = host.empty(Bin::Trash, BUDGET).await;
+    assert!(
+        matches!(refused, Err(PurgeError::ScopeRequired(_))),
+        "{refused:?}"
+    );
+    assert!(host.in_gmail("z"));
 }
 
 #[tokio::test]

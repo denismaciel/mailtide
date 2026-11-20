@@ -48,7 +48,7 @@ role = "Purge invariants for the simulator: a tombstone exists only for a messag
 [[file]]
 path = "crates/mailtide-gmail/src/purge.rs"
 change = "new"
-role = "messages.delete and messages.batchDelete requests; recognising the missing-scope refusal"
+role = "messages.delete and messages.batchDelete requests; recognising the missing-scope refusal and a transient failure that came with Gmail's answer (may have been applied)"
 
 [[file]]
 path = "crates/mailtide-gmail/src/request.rs"
@@ -92,7 +92,12 @@ role = "Runner::purge and Runner::empty: policy, the history read before and aft
 [[file]]
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
-role = "The purge ceiling (Runner::with_purge, off by default); perform delete requests (MessagesDeleted; a single delete's 404 stays NotFound). The direct-call groundwork (Runner::call_gmail) and HTTP DELETE were already on main, so http.rs and transport.rs need no change"
+role = "The purge ceiling (Runner::with_purge, off by default); perform delete requests. Review ruling, landed with label-edit: the public Runner::call_gmail only reads; purges go through pub(crate) direct_call. HTTP DELETE was already on main, so http.rs and transport.rs need no change"
+
+[[file]]
+path = "crates/mailtide-io/tests/direct_calls.rs"
+change = "modify"
+role = "The public call's write refusal also covers the two delete requests"
 
 [[file]]
 path = "crates/mailtide-io/src/lib.rs"
@@ -354,8 +359,8 @@ note = "himalaya reads each id (messages.get) and keeps those carrying the mailb
 
 [[suite.test]]
 name = "a_write_answered_404_is_not_found"
-test = "a_single_delete_answered_404_is_already_gone"
-note = "A 404 tombstones the message as a verified miss and counts it as purged."
+test = "a_single_delete_answered_404_is_sent_and_tombstoned_only_by_history"
+note = "himalaya reads a 404 as not found. Ours reports it as sent and tombstones nothing: purge-delete-missing is unsettled, a proxy can answer 404 for a live message, and a tombstone never heals. The history record makes the tombstone at the next sync."
 
 [[suite.test]]
 name = "unknown_ids_are_told_from_other_failures"
@@ -433,12 +438,22 @@ covers = "labelsAdded TRASH after the cursor counts: the fold is exact, not `any
 [[test]]
 target = "crates/mailtide/src/purge.rs"
 name = "a_pending_restore_makes_a_message_ineligible"
-covers = "An undelivered RestoreFromTrash or MoveToInbox intent overlays the folded labels: the user's newer wish wins"
+covers = "A RestoreFromTrash or MoveToInbox intent not yet confirmed takes TRASH or SPAM away from an observed-trashed message: the user's newer wish wins"
 
 [[test]]
 target = "crates/mailtide/src/purge.rs"
-name = "a_pending_trash_makes_a_message_eligible"
-covers = "The user trashed it here a moment ago and now deletes it for good, before the trash was delivered"
+name = "a_trash_asked_here_counts_only_once_gmail_shows_it"
+covers = "A pending trash does not make a message eligible (the overlay never adds a bin label); once history shows the delivered trash it does (replaces a_pending_trash_makes_a_message_eligible, by review ruling)"
+
+[[test]]
+target = "crates/mailtide/src/purge.rs"
+name = "a_delivered_trash_undone_elsewhere_and_synced_is_not_eligible"
+covers = "Trashed here and delivered, restored on a phone, both synced: the delivered intent still overlays TRASH in the view, and the message is refused"
+
+[[test]]
+target = "crates/mailtide/src/purge.rs"
+name = "a_trash_whose_answer_was_lost_and_then_undone_is_not_eligible"
+covers = "The delivery was applied and its answer lost (intent still pending), a phone restored the message, a sync applied both: refused"
 
 [[test]]
 target = "crates/mailtide/src/purge.rs"
@@ -515,7 +530,7 @@ covers = "No cursor, an account that is not live, history answering 404, or more
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_token_without_the_full_scope_is_scope_required_and_blocks_nothing"
-covers = "403 from messages.delete with gmail.modify: ScopeRequired naming https://mail.google.com/, no fallback to trash, the account keeps syncing"
+covers = "403 from messages.delete with gmail.modify: ScopeRequired with Gmail's message, naming https://mail.google.com/, no fallback to trash, the account keeps syncing"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -530,7 +545,7 @@ covers = "TooMany for an explicit purge; the caller splits a larger set on purpo
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_delete_whose_answer_was_lost_is_never_sent_again"
-covers = "A timeout on the delete call: mailtide reads history once, reports confirmed ids as purged and the rest as sent, and issues no second delete"
+covers = "A timeout on the delete call: mailtide reads history, reports confirmed ids as purged and the rest as sent, and issues no second delete"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -545,7 +560,62 @@ covers = "Gmail deleted, nothing recorded: history's messagesDeleted tombstones 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
 name = "a_deferred_purge_sends_nothing_more"
-covers = "The quota gate defers past the budget: chunks already sent are confirmed, the rest are unsent"
+covers = "The quota gate defers a delete: chunks already sent are confirmed, the rest are unsent, with retry_at"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_delete_never_waits_for_the_quota_gate"
+covers = "A deferral the budget could wait out is still unsent: a delete goes right after its check or not at all (purge and every chunk of empty)"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_restore_admitted_here_during_the_history_read_refuses_the_id"
+covers = "The rows are read after the history read, right before the deletes"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_429_or_a_5xx_on_a_delete_is_never_resent"
+covers = "429: unsent with retry_at; 5xx: sent (may have been applied), the call stops; a 5xx after Gmail applied it is purged from history"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_lost_answer_on_a_batch_is_never_resent"
+covers = "One batchDelete, answer lost, evidence late: every id sent, one request"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_404_on_a_delete_tombstones_nothing"
+covers = "A batch answered 404 and a single delete answered 404 without Gmail's body: sent, no tombstone, the row stays"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_missing_scope_after_a_delete_succeeded_stops_the_call"
+covers = "A scope 403 mid-run is that chunk's gmail_refused; the rest unsent; the call returns its outcome"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "a_refused_batch_is_checked_against_history"
+covers = "A batch that deleted its ids and answered 400 is confirmed: history makes them purged"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "empty_stops_after_a_failed_confirmation"
+covers = "Trash of 2,500; chunk 1 deleted; history answers 503; a restore meanwhile: nothing further is sent, the rest remaining"
+
+[[test]]
+target = "crates/mailtide-io/tests/purge.rs"
+name = "empty_reports_a_missing_scope_whenever_nothing_was_deleted_yet"
+covers = "A first page with nothing to delete, then the scope 403: ScopeRequired, not an outcome of skips"
+
+[[test]]
+target = "crates/mailtide-io/tests/direct_calls.rs"
+name = "the_public_call_refuses_every_write_before_any_token_or_quota"
+covers = "label-edit's test of the shared ruling, extended with DeleteMessage and BatchDeleteMessages: the public call_gmail refuses them on a default runner (purge off) before any token or quota"
+
+[[test]]
+target = "crates/mailtide-io/src/runner.rs"
+name = "read_only_mode_refuses_a_direct_write_before_any_token_or_quota"
+covers = "direct_call, the features' path, still refuses a delete in read-only mode before any token or quota"
 
 [[test]]
 target = "crates/mailtide-io/tests/purge.rs"
@@ -615,14 +685,14 @@ covers = "BlockingRunner mirrors the async purge API"
 id = "purge-history-after-delete"
 question = "After messages.delete or messages.batchDelete answers 2xx, does history.list from a history id read just before already contain a messagesDeleted record for every deleted message?"
 assumed = "Yes: the deletion is applied before the answer, and its history records are readable at once."
-if_wrong = "Safe: a message without a record is reported as `sent`, keeps its row, and is tombstoned by the next sync when the record appears. Only the outcome is less definite; if records are routinely late, purge waits for them for a bounded time (a second history read after one second) before answering."
+if_wrong = "Safe: a message without a record is reported as `sent`, keeps its row, and is tombstoned by the next sync when the record appears. Only the outcome is less definite. No second read is made: mailtide never waits for evidence and never re-deletes."
 test = "With a full-scope token: 1) messages.insert 6 small messages with labelIds [TRASH]. 2) getProfile, note historyId H. 3) messages.delete the first; at once history.list startHistoryId=H: expect a messagesDeleted record with its id. 4) messages.batchDelete the other five; at once history.list startHistoryId=H following every page: record how many of the five have a messagesDeleted record, and repeat the read after 1 s, 5 s and 30 s until all five appear. 5) messages.get each id: expect 404."
 
 [[unknown]]
 id = "purge-batch-delete-partial"
 question = "What does messages.batchDelete do when some ids no longer exist or are malformed: delete the rest and answer 2xx, or refuse the whole call?"
 assumed = "It deletes every id that exists and answers 2xx (`no guarantees that messages were not already deleted or even existed at all`)."
-if_wrong = "Safe: a refused call deletes nothing, history shows no messagesDeleted, and the chunk's ids are reported as refused with Gmail's message. The remedy is to send that chunk again as single messages.delete calls (10 units each), which answer per id."
+if_wrong = "Safe: a refused call is followed by a history read; ids it shows deleted are purged, the rest are reported as refused with Gmail's message and nothing is tombstoned. mailtide never resends the chunk (not even as single deletes): the host may call again, checked afresh."
 test = "1) Insert three messages A, B, C in TRASH; messages.delete B. 2) getProfile, note H. 3) messages.batchDelete {ids: [A, B, C]}: record the status. 4) history.list from H: record which ids have messagesDeleted. 5) Insert D; messages.batchDelete {ids: [D, 'not-an-id']}: record the status and whether D is gone (messages.get D)."
 
 [[unknown]]
@@ -645,14 +715,14 @@ result = "2026-11-20: messages.delete on an inserted message in TRASH with a tok
 id = "purge-delete-missing"
 question = "What does messages.delete answer for an id that was already permanently deleted?"
 assumed = "HTTP 404 notFound, as messages.get and messages.modify do for an unknown id (himalaya's run against Gmail saw 404 for those two)."
-if_wrong = "Safe: only a 404 is read as `gone`. A 2xx for a missing id proves nothing and tombstones nothing by itself, because tombstones come from the history read; any other answer is a refusal."
+if_wrong = "Safe either way: no answer to a delete is evidence. A 404 (or a 2xx) is reported as `sent` and tombstones nothing; the history record makes the tombstone. Review ruling: a 404 from something that is not Gmail must never tombstone live mail."
 test = "1) Insert a message M in TRASH; messages.delete M: expect 2xx (record whether 200 or 204 and the body). 2) messages.delete M again: record status and error body. 3) messages.delete with a well-formed id that never existed (16 hex digits) and with 'not-an-id': record both."
 
 [[unknown]]
 id = "purge-history-freshness"
 question = "Is a label change made by another client visible in history.list as soon as that client's call has returned?"
 assumed = "Yes: history.list read after a messages.untrash or messages.modify has completed contains its labelsRemoved or labelsAdded record."
-if_wrong = "This is the one place a wrong assumption can cost mail: a message restored elsewhere within Gmail's history lag would still look trashed and be purged. The window is that lag, not the mirror's age. If the test shows a lag of more than a second or two, the pre-check for explicit purges changes to messages.get (minimal, 20 units a message, as himalaya does) and empty reads messages.list with labelIds for the bin instead of history."
+if_wrong = "This is the one place a wrong assumption can cost mail: a message restored elsewhere within Gmail's history lag would still look trashed and be purged. The window is that lag, not the mirror's age. If the test shows a lag of more than a second or two, the pre-check for explicit purges changes to messages.get (minimal, 20 units a message, as himalaya does) and empty reads messages.list with labelIds for the bin instead of history. Side evidence beside the 78 of 78 below: a draft's permanent removal (drafts.delete) appeared in history 1.6 s late once in 150 (features/drafts.toml); the design states that window rather than closing it."
 test = "1) Insert a message M in TRASH; getProfile, note H. 2) From client A call messages.untrash M; the moment it returns, from client B call history.list startHistoryId=H: expect a labelsRemoved record naming TRASH for M. Repeat 50 times with fresh messages and record every miss and how long until the record appears. 3) Same with messages.modify removeLabelIds [TRASH] and with messages.batchModify over 100 messages."
 status = "confirmed"
 result = "2026-11-20: client A (one connection) changed the label, client B (another connection) called history.list from the historyId read before, 0.1 to 0.2 ms after A's call returned. messages.untrash: the labelsRemoved record naming TRASH for the message was in B's first read 50 of 50 times. messages.modify removeLabelIds [TRASH] (200): 25 of 25. messages.batchModify removing TRASH from 100 messages (204): all 100 records in the first read, 3 of 3 batches. No miss, so no lag to measure."

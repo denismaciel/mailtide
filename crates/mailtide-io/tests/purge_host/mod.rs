@@ -21,6 +21,7 @@ use mailtide::gmail::MessageObservation;
 use mailtide::ids::{AccountId, CommitId, HistoryId, MessageId, ThreadId, Timestamp};
 use mailtide::labels::set;
 use mailtide::mirror::AccountMirror;
+use mailtide::outbox::ActionRequest;
 use mailtide::purge::{Bin, EmptyOutcome, PurgeOutcome, PurgePolicy, PurgeTarget};
 use mailtide::quota::{Admission, Budget, Lease, Priority, QuotaUnits};
 use mailtide::retry::Cooldown;
@@ -130,6 +131,9 @@ pub struct Mailbox {
     pub lose_delete_answers: bool,
     /// What every delete call gets instead of being applied.
     pub refuse_deletes: Option<HttpResponse>,
+    /// What every delete call gets after it was applied (a 5xx, or a batch
+    /// that deleted its ids and then answered 4xx).
+    pub answer_after_applying: Option<HttpResponse>,
     /// Ids a single delete refuses as Gmail does a malformed id (400).
     pub malformed: BTreeSet<String>,
     /// Whether history reads fail (500) once a delete has been applied.
@@ -156,6 +160,7 @@ impl Default for Mailbox {
             withheld: Vec::new(),
             lose_delete_answers: false,
             refuse_deletes: None,
+            answer_after_applying: None,
             malformed: BTreeSet::new(),
             history_fails_after_deletes: false,
             deletes_applied: 0,
@@ -257,6 +262,11 @@ impl Mailbox {
         true
     }
 
+    /// Write the `messagesDeleted` record of a message already gone.
+    pub fn delete_record(&mut self, id: &str) {
+        self.record("messagesDeleted", id, None);
+    }
+
     /// The held-back `messagesDeleted` records reach history.
     pub fn release_evidence(&mut self) {
         let withheld = std::mem::take(&mut self.withheld);
@@ -282,7 +292,7 @@ impl Mailbox {
 
     fn history_page(&self, query: &BTreeMap<&str, &str>) -> HttpResponse {
         if self.history_fails_after_deletes && self.deletes_applied > 0 {
-            return error(500, "backendError", "Backend Error");
+            return error(503, "backendError", "Backend Error");
         }
         let start: u64 = query["startHistoryId"].parse().expect("start");
         if start < self.history_floor {
@@ -348,7 +358,9 @@ impl Mailbox {
             elsewhere(self);
             self.after_delete = Some(elsewhere);
         }
-        no_content()
+        self.answer_after_applying
+            .clone()
+            .unwrap_or_else(no_content)
     }
 
     fn answer(&mut self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
@@ -434,9 +446,12 @@ impl Mailbox {
     }
 }
 
+/// An action a user admits on this host while a history read is answered.
+type LocalAction = (std::sync::Weak<TestRunner>, ActionRequest);
+
 /// Gmail, served through the transport.
 #[derive(Default)]
-pub struct FakeGmail(pub Mutex<Mailbox>);
+pub struct FakeGmail(pub Mutex<Mailbox>, Mutex<Option<LocalAction>>);
 
 impl FakeGmail {
     /// The mailbox, locked.
@@ -457,7 +472,6 @@ impl GmailTransport for FakeGmail {
         if batch && !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let mut mailbox = self.mailbox();
         let line = match (request.method, batch) {
             (_, true) => {
                 let body: serde_json::Value =
@@ -478,17 +492,34 @@ impl GmailTransport for FakeGmail {
             ),
             (method, false) => format!("{} {}", method.as_str(), request.path),
         };
-        mailbox.requests.push(line);
-        mailbox.answer(&request)
+        let answer = {
+            let mut mailbox = self.mailbox();
+            mailbox.requests.push(line);
+            mailbox.answer(&request)
+        };
+        if request.path.ends_with("/history") {
+            let local = self.1.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some((runner, action)) = local
+                && let Some(runner) = runner.upgrade()
+            {
+                runner
+                    .store()
+                    .admit(&account(), &action, Timestamp(0))
+                    .await
+                    .expect("admit");
+            }
+        }
+        answer
     }
 }
 
-/// A [`LocalGate`] that defers every delete after the first
-/// `deletes_admitted` by an hour (past any test's budget).
+/// A [`LocalGate`] that defers every delete after the first `n` by a set
+/// time.
 pub struct Gate {
     inner: LocalGate,
-    /// Deletes admitted before the rest are deferred; `None`: all.
-    pub deletes_admitted: Arc<Mutex<Option<u32>>>,
+    /// Deletes admitted before the rest are deferred, and by how long;
+    /// `None`: all are admitted.
+    pub deletes_admitted: Arc<Mutex<Option<(u32, Duration)>>>,
 }
 
 impl QuotaGate for Gate {
@@ -506,12 +537,12 @@ impl QuotaGate for Gate {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             match left.as_mut() {
-                Some(0) => {
+                Some((0, by)) => {
                     return Ok(Admission::Deferred {
-                        until: now.plus(Duration::from_hours(1)),
+                        until: now.plus(*by),
                     });
                 }
-                Some(n) => *n -= 1,
+                Some((n, _)) => *n -= 1,
                 None => {}
             }
         }
@@ -551,7 +582,7 @@ pub const BUDGET: Duration = Duration::from_secs(10);
 pub struct Host {
     /// The runner.
     pub runner: Arc<TestRunner>,
-    deletes_admitted: Arc<Mutex<Option<u32>>>,
+    deletes_admitted: Arc<Mutex<Option<(u32, Duration)>>>,
 }
 
 impl Host {
@@ -605,10 +636,26 @@ impl Host {
 
     /// Defer every delete after the first `n`.
     pub fn admit_deletes(&self, n: u32) {
+        self.defer_deletes_after(n, Duration::from_hours(1));
+    }
+
+    /// Defer every delete after the first `n` by `by`.
+    pub fn defer_deletes_after(&self, n: u32, by: Duration) {
         *self
             .deletes_admitted
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(n);
+            .unwrap_or_else(PoisonError::into_inner) = Some((n, by));
+    }
+
+    /// The user admits `action` on this host while Gmail answers the next
+    /// history read (between a purge's history read and its rows).
+    pub fn act_during_history_read(&self, action: ActionRequest) {
+        *self
+            .runner
+            .transport()
+            .1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((Arc::downgrade(&self.runner), action));
     }
 
     /// Mirror Gmail as it is now, as a finished sync would (one commit:

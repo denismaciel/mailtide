@@ -306,6 +306,12 @@ async fn the_public_call_refuses_every_write_before_any_token_or_quota() {
             },
         },
         GmailRequest::DeleteLabel { id: label },
+        GmailRequest::DeleteMessage {
+            id: MessageId("m1".into()),
+        },
+        GmailRequest::BatchDeleteMessages {
+            ids: vec![MessageId("m1".into())],
+        },
     ];
     for access in [Access::ReadWrite, Access::ReadOnly] {
         let setup = Setup::new(access, Vec::new(), 0, Duration::ZERO);

@@ -508,6 +508,8 @@ class PurgeOutcome:
         Literal["not_in_mirror", "draft", "unverified", "not_in_trash_or_spam", "gmail_refused"],
     ]
     unsent: list[str]
+    retry_at_ms: int | None
+    interrupted: str | None
 
 @final
 class EmptyOutcome:
@@ -517,6 +519,8 @@ class EmptyOutcome:
     sent: int
     skipped: int
     remaining: int
+    retry_at_ms: int | None
+    interrupted: str | None
 
 @final
 class SearchHit:

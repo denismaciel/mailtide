@@ -9,7 +9,7 @@
 //! (`ACCESS_TOKEN_SCOPE_INSUFFICIENT`), and deletes nothing.
 
 use mailtide::ids::MessageId;
-use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
+use mailtide::retry::{AccountProblem, Blocking, BlockingFailure, Retryable, RetryableFailure};
 use serde_json::json;
 
 use crate::http::{HttpRequest, Method, encode};
@@ -55,6 +55,21 @@ pub fn missing_scope(refusal: &BlockingFailure) -> bool {
         && refusal.detail.starts_with("403 insufficientPermissions")
 }
 
+/// Whether a transient failure of a delete came with Gmail's answer, so the
+/// delete may have been applied (a 5xx or a 408): it is `sent`, not
+/// `unsent`. A 401 (the token was refused before anything ran), a rate
+/// limit and a request that never left are not. [`crate::errors::classify`]
+/// leads the detail with the status it answered.
+#[must_use]
+pub fn may_have_applied(failure: &RetryableFailure) -> bool {
+    let status = failure
+        .detail
+        .get(..3)
+        .filter(|_| failure.detail.as_bytes().get(3).is_none_or(|b| *b == b' '))
+        .and_then(|digits| digits.parse::<u16>().ok());
+    failure.class == Retryable::Transient && matches!(status, Some(408 | 500..=599))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,7 +77,7 @@ mod tests {
     use crate::http::HttpResponse;
     use crate::request::{RequestConfig, build};
     use mailtide::command::GmailRequest;
-    use mailtide::retry::{Failure, Retryable};
+    use mailtide::retry::Failure;
 
     fn config() -> RequestConfig {
         RequestConfig {
@@ -159,6 +174,24 @@ mod tests {
             "a rate limit stays a rate limit: {failure:?}"
         );
         assert!(refusal(&failure).is_none());
+
+        // A 5xx may have been applied; a 401 and a 429 were not.
+        let retryable = |status: u16, reason: &str| match classify(&answer(
+            status,
+            &json!({"error": {"code": status, "message": "x", "errors": [{"reason": reason}]}}),
+        )) {
+            Failure::Retryable(failure) => failure,
+            other => panic!("{other:?}"),
+        };
+        assert!(may_have_applied(&retryable(500, "backendError")));
+        assert!(may_have_applied(&retryable(503, "backendError")));
+        assert!(!may_have_applied(&retryable(401, "authError")));
+        assert!(!may_have_applied(&retryable(429, "rateLimitExceeded")));
+        assert!(!may_have_applied(&RetryableFailure {
+            class: Retryable::Transient,
+            retry_after: None,
+            detail: "connection refused".into(),
+        }));
 
         // A disabled API and a bad id are refusals, not a missing scope.
         for (status, reason) in [(403, "accessNotConfigured"), (400, "invalidArgument")] {

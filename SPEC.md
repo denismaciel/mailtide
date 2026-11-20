@@ -562,36 +562,54 @@ only the host may call again, and each call is checked afresh).
    mirror's non-draft messages of the thread at the call, never
    `threads.delete`.
 2. **Fresh eligibility.** The account must be live with a cursor. The
-   cursor is read first, then the targets' views, then `history.list` from
-   the cursor to Gmail's head, privately: committed nowhere, at most 20
-   pages (`MirrorStale` otherwise, or on a 404). Each target's observed
-   labels are folded with the records at or after its checkpoint (the
-   mirror's own rule), then the actions not yet confirmed are overlaid: an
-   overlay may remove a label, but may add `TRASH` or `SPAM` only if history
-   since the checkpoint has not moved the message in or out of that bin (a
-   trash delivered here and undone on a phone is refused although the view
-   still shows it trashed). A message in trash or spam (or anywhere, if
-   asked) is eligible; drafts, unverified rows and ids the mirror lacks are
-   refused. A restore made elsewhere a moment ago is therefore seen: Gmail
-   shows another client's change in history as soon as that call returns
-   (settled 2026-11-20, `purge-history-freshness`).
-3. **By id only.** Fewer than 5 ids: one `messages.delete` each; otherwise
-   `messages.batchDelete` of at most 1,000 ids. Each call is a direct call
-   (§8) at Foreground priority. A 403 `insufficientPermissions` (the token
-   lacks `https://mail.google.com/`) before anything was deleted is
-   `ScopeRequired`: nothing is trashed instead, and the account is not
-   blocked. A 429, 5xx or deferral stops the call: the rest is `unsent`.
-4. **Evidence.** `history.list` again from the head read in step 2: a
-   message is `purged` only when a `messagesDeleted` record names it, or a
-   single delete of it answered 404. A 2xx alone is `sent`: the row stays
-   until a sync reads the record. Evidence is recorded with
+   cursor is read first, then `history.list` from the cursor to Gmail's
+   head, privately (committed nowhere, at most 20 pages; `MirrorStale`
+   otherwise, or on a 404), then the targets' rows, right before the
+   deletes (so an action admitted here during the history read is seen).
+   Each target's observed labels are folded with the records at or after
+   its checkpoint (the mirror's own rule). Actions not yet confirmed here
+   may only make a message less eligible: a restore, move to inbox or
+   not-spam asked for here (pending, or delivered and awaiting
+   confirmation) refuses it, but a trash or spam asked for here counts only
+   once Gmail's state shows it (observed, or in history). The view can't
+   tell a pending action from a delivered one, and a delivered trash may
+   since have been undone on another client and synced. A host that wants
+   to purge what its user just trashed waits for the action's confirmation
+   (the overlay clearing) or for history to show it. A message in trash or
+   spam (or anywhere, if asked) is eligible; drafts, unverified rows and
+   ids the mirror lacks are refused.
+3. **By id only, at once.** Fewer than 5 ids: one `messages.delete` each;
+   otherwise `messages.batchDelete` of at most 1,000 ids. Each is a direct
+   call (§8) at Foreground priority that **never waits** for the quota
+   gate: a delete the gate can't admit at once is `unsent` (with
+   `retry_at`), so no delete goes out long after its check. A 403
+   `insufficientPermissions` (the token lacks `https://mail.google.com/`)
+   before any delete reached Gmail is `ScopeRequired`: nothing is trashed
+   instead, and the account is not blocked. A deferral, a 429 or a 401
+   stops the call with the rest `unsent`; a 5xx, a timeout or a lost answer
+   may have been applied, so those ids are `sent` and the call stops.
+4. **Evidence.** `history.list` again from the head read in step 2, also
+   after a refusal (a refused batch may have deleted some ids): a message
+   is `purged` only when a `messagesDeleted` record names it. Nothing else
+   is evidence: a 2xx, a lost answer, a 5xx or a 404 is `sent`, and the row
+   stays until a sync reads the record. Evidence is recorded with
    `Store::record_deleted` (§10.3), unfenced; the cursor never moves.
+
+What remains open: a change made on another client between the history
+read and the delete (the delete never waits, so milliseconds), and a
+change Gmail shows in history late. Gmail showed another client's change
+in the first history read 78 of 78 times (`purge-history-freshness`), but
+one permanent removal (a draft's) appeared 1.6 s late, 1 of 150
+(`features/drafts.toml`).
 
 `empty(bin)` pages through the ids whose observed labels hold `TRASH` (or
 `SPAM`), 1,000 at a time, with one rolling history read: the read after
 each chunk confirms it and also finds messages that left the bin meanwhile,
-which later chunks skip. A message trashed elsewhere that the mirror has
-not seen in the bin is left. It stops at its budget (`remaining`).
+which later chunks skip. When that read fails, nothing further is sent. A
+message trashed elsewhere that the mirror has not seen in the bin is left.
+It stops at its budget (`remaining`). Errors (`PurgeError`) come only
+before any delete reached Gmail; a store or gate failure after that ends
+the call with what was known (`interrupted`).
 
 ## 8. Quota and rate limiting
 
@@ -679,9 +697,9 @@ detection in production (§13).
   incremental sync.
 - **I5 Deletion is final.** A tombstoned id is never recreated by an event
   older than its tombstone. Its intents and jobs are cancelled. A tombstone
-  rests only on Gmail's evidence: a `messagesDeleted` history record or a
-  404 (never a delete's 2xx), so it exists only for a message Gmail no
-  longer has. A tombstone repeated for an id already tombstoned logs
+  rests only on Gmail's evidence: a `messagesDeleted` history record, or a
+  404 to the engine's own `get` (never a purge's delete answer, 2xx or
+  404), so it exists only for a message Gmail no longer has. A tombstone repeated for an id already tombstoned logs
   nothing.
 - **I6 No silent loss.** Every message id the engine has seen is in exactly
   one state: `pending | imported | failed | blocked | tombstoned`.
@@ -780,7 +798,7 @@ engine's epoch, so results meant for a dead engine are ignored).
   `TooManyConsumers`. `consumers` returns the cursors with the generation
   and floor (`ConsumerList`), so a caller can tell which are lost.
 - `record_deleted(account, [(id, evidence)], now)`: deletions a purge
-  proved (§7a), through the same tombstone rule as a sync's, atomically with
+  proved by a `messagesDeleted` record (§7a), through the same tombstone rule as a sync's, atomically with
   their feed entries and unfenced like `admit` (deletion is final, so a
   record ahead of the cursor is sound); `message_ids_labelled(account,
   label, after, limit)`: ids whose observed labels hold exactly `label`, in
@@ -912,15 +930,20 @@ runner per process, after forking:
   "trash" | "spam", *, budget_s=60.0) -> EmptyOutcome`: permanent deletion
   (§7a), off unless `Config.purge` switches it on (§12a). `PurgeOutcome`
   lists each distinct id once: `purged` (Gmail's history shows it; the
-  `MessageDeleted` entry is in the feed), `sent` (not shown yet; never
-  resent), `refused` (id to `not_in_mirror`, `draft`, `unverified`,
-  `not_in_trash_or_spam` or `gmail_refused`) and `unsent`; `EmptyOutcome`
-  counts `purged`, `sent`, `skipped` and `remaining`. Needs a token with
+  `MessageDeleted` entry is in the feed), `sent` (reached Gmail or may
+  have, not shown yet; never resent), `refused` (id to `not_in_mirror`,
+  `draft`, `unverified`, `not_in_trash_or_spam` or `gmail_refused`) and
+  `unsent` (never sent; call again), with `retry_at_ms` (when a deferred or
+  rate-limited delete could go) and `interrupted` (why the call ended
+  early after a delete may have reached Gmail); `EmptyOutcome` counts
+  `purged`, `sent`, `skipped` and `remaining`, with the same two fields. Needs a token with
   `https://mail.google.com/`. Raises `PurgeDisabled`, `ReadOnlyMode`,
   `TooManyMessages` (a `ValueError`; more than 1,000 ids), `MirrorStale`
-  (run the account first), `PurgeScopeRequired` (nothing deleted, nothing
-  trashed instead, the account keeps syncing), `QuotaDeferred`,
-  `GmailUnavailable`, `AccountBlocked`, `AccountNotTracked`;
+  (run the account first), `PurgeScopeRequired` (Gmail's message; nothing
+  deleted, nothing trashed instead, the account keeps syncing),
+  `QuotaDeferred` (the check's history read only), `GmailUnavailable`,
+  `AccountBlocked`, `AccountNotTracked`, each before any delete reached
+  Gmail;
 - `await labels(account) -> list[Label]`: the label definitions (`id`,
   `name`, `kind`: `system` or `user`, `list_visibility`,
   `message_visibility`, `color`: a `LabelColor(text, background)` or
@@ -1213,8 +1236,10 @@ the real `Runner` against a fake Gmail over HTTP.
   with the full scope are unproven (`docs/features/purge.md`): history shows
   a delete's records at once, `batchDelete` deletes the ids that exist, it
   takes 1,000 ids, and a delete of a missing id is a 404. Each is built to
-  fail safe: a message is never tombstoned without Gmail's evidence, and
-  mailtide never repeats a delete. Nothing new is persisted, so the switch
+  fail safe: a message is tombstoned only on a `messagesDeleted` record
+  (never on a delete's answer), and mailtide never repeats a delete. The
+  public `Runner::call_gmail` only reads, so no write reaches Gmail around
+  these checks. Nothing new is persisted, so the switch
   needs no migration and a database a purge wrote is an ordinary one to an
   older build.
 

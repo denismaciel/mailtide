@@ -7,23 +7,24 @@
 //! - **Eligibility** is judged on Gmail's state up to the moment of the
 //!   call, not on a mirror that may lag: [`PurgeScan`] folds the history
 //!   read since the mirror's cursor into each message's observed labels
-//!   with the mirror's own checkpoint rule, then overlays the actions not
-//!   yet confirmed. By default only a message in `TRASH` or `SPAM` is
-//!   eligible ([`Scope`]).
+//!   with the mirror's own checkpoint rule; the actions not yet confirmed
+//!   may only take labels away (a restore asked for here refuses), never
+//!   add `TRASH` or `SPAM`. By default only a message in `TRASH` or `SPAM`
+//!   is eligible ([`Scope`]).
 //! - **By id only**: [`delete_requests`] turns eligible ids into
 //!   `messages.delete` calls (fewer than
 //!   [`PURGE_BATCH_THRESHOLD`](crate::quota::PURGE_BATCH_THRESHOLD)) or
 //!   `messages.batchDelete` calls of at most [`BATCH_DELETE_MAX`]; never
 //!   `threads.delete`, never a query.
-//! - **Evidence**: a delete's 2xx proves nothing. Only a `messagesDeleted`
-//!   history record (or a single delete answered 404) makes a tombstone;
+//! - **Evidence**: a delete's answer proves nothing, a 2xx or a 404. Only a
+//!   `messagesDeleted` history record makes a tombstone;
 //!   [`PurgeScan::deleted`] finds the records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::command::GmailRequest;
 use crate::gmail::{HistoryPage, HistoryRecord};
-use crate::ids::{HistoryId, LabelId, MessageId};
+use crate::ids::{HistoryId, LabelId, MessageId, Timestamp};
 use crate::labels::{self, LabelSet};
 use crate::mirror::MessageView;
 use crate::quota::PURGE_BATCH_THRESHOLD;
@@ -144,33 +145,45 @@ pub enum Verdict {
 /// list).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PurgeOutcome {
-    /// Gmail's history shows the deletion (or a single delete answered
-    /// 404): the tombstone is written and `MessageDeleted` is in the feed.
+    /// Gmail's history shows the deletion: the tombstone is written and
+    /// `MessageDeleted` is in the feed.
     pub purged: Vec<MessageId>,
-    /// The delete was sent (or its answer was lost) and history has not
-    /// shown it yet: the row stays until a sync sees the deletion. mailtide
-    /// never sends it again on its own.
+    /// The delete reached Gmail, or may have (its answer was lost, a 5xx,
+    /// a 404), and history has not shown the deletion yet: the row stays
+    /// until a sync sees it. mailtide never sends it again on its own.
     pub sent: Vec<MessageId>,
-    /// Nothing was sent for these, and why.
+    /// Nothing was deleted for these, and why.
     pub refused: Vec<(MessageId, Refusal)>,
-    /// The budget, a quota deferral or a failing Gmail ended the call
-    /// before these were sent.
+    /// Never sent: the quota gate could not admit the delete at once (a
+    /// delete never waits), Gmail limited the rate (429), the token was
+    /// rejected, or an earlier failure ended the call. Call again; the
+    /// call checks them afresh.
     pub unsent: Vec<MessageId>,
+    /// When a deferred or rate-limited delete could go, at the earliest.
+    pub retry_at: Option<Timestamp>,
+    /// Why the call ended early after deletes may have reached Gmail (the
+    /// store or the quota gate failed): what it reports is what was known.
+    pub interrupted: Option<String>,
 }
 
 /// What emptying a bin did, in counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EmptyOutcome {
     /// Deleted, with Gmail's evidence recorded.
     pub purged: u64,
-    /// Sent, not yet shown by history.
+    /// Sent (or may have been), not yet shown by history.
     pub sent: u64,
     /// Held in the bin by the mirror but not deleted: restored since,
     /// drafts, unverified, or refused by Gmail.
     pub skipped: u64,
-    /// Not reached: the budget, a quota deferral or a failing Gmail ended
-    /// the call first. Call again; it reads the mirror afresh.
+    /// Not reached: the budget, the quota gate, a rate limit, a failing
+    /// Gmail or an unread confirmation ended the call first. Call again;
+    /// it reads the mirror afresh.
     pub remaining: u64,
+    /// When a deferred or rate-limited delete could go, at the earliest.
+    pub retry_at: Option<Timestamp>,
+    /// Why the call ended early after deletes may have reached Gmail.
+    pub interrupted: Option<String>,
 }
 
 /// One message's history since the cursor, as a purge reads it.
@@ -190,7 +203,6 @@ enum Delta {
 pub struct PurgeScan {
     records: BTreeMap<MessageId, Vec<(HistoryId, Delta)>>,
     head: Option<HistoryId>,
-    pages: u32,
 }
 
 impl PurgeScan {
@@ -203,7 +215,6 @@ impl PurgeScan {
     /// Fold one `history.list` page in. The last page of a read (no next
     /// page) sets [`Self::head`].
     pub fn read(&mut self, page: &HistoryPage) {
-        self.pages = self.pages.saturating_add(1);
         for record in &page.records {
             let (id, at, delta) = match record {
                 HistoryRecord::MessageAdded { id, message } => {
@@ -236,12 +247,6 @@ impl PurgeScan {
         }
     }
 
-    /// Pages read so far.
-    #[must_use]
-    pub fn pages(&self) -> u32 {
-        self.pages
-    }
-
     /// The history id Gmail reported with the last complete read: where the
     /// next read starts.
     #[must_use]
@@ -263,58 +268,38 @@ impl PurgeScan {
     /// The labels Gmail holds for the message now, as far as history shows:
     /// the row's observed labels with every record at or after its
     /// checkpoint applied, as the mirror's own rule applies them (records
-    /// older than the row's checkpoint are already in it). Also the labels
-    /// those records touched.
-    fn folded(&self, view: &MessageView) -> (LabelSet, LabelSet) {
+    /// older than the row's checkpoint are already in it).
+    fn folded(&self, view: &MessageView) -> LabelSet {
         let mut current = view.observed_labels.clone();
-        let mut touched = LabelSet::new();
         for (at, delta) in self.records.get(&view.id).into_iter().flatten() {
             if !labels::accepts(view.checkpoint, *at) {
                 continue;
             }
             match delta {
-                Delta::Added(added) => {
-                    current.extend(added.iter().cloned());
-                    touched.extend(added.iter().cloned());
-                }
-                Delta::Removed(removed) => {
-                    current.retain(|label| !removed.contains(label));
-                    touched.extend(removed.iter().cloned());
-                }
-                Delta::Observed(observed) => {
-                    touched.extend(current.symmetric_difference(observed).cloned());
-                    current.clone_from(observed);
-                }
+                Delta::Added(added) => current.extend(added.iter().cloned()),
+                Delta::Removed(removed) => current.retain(|label| !removed.contains(label)),
+                Delta::Observed(observed) => current.clone_from(observed),
                 Delta::Deleted => {}
             }
         }
-        (current, touched)
+        current
     }
 
     /// The labels the rules judge `view` by: Gmail's labels now
-    /// ([`Self::folded`]) with the actions not yet confirmed overlaid, so a
-    /// restore asked for here and not yet delivered refuses the message,
-    /// and a trash asked for here and not yet delivered allows it.
-    ///
-    /// The overlay (the view's effective labels against its observed ones)
-    /// includes delivered actions waiting for confirmation, which Gmail has
-    /// already applied and history may have overridden since. So an overlay
-    /// may remove a label (refusing is always safe), but may add `TRASH` or
-    /// `SPAM` only where history since the row's checkpoint has not moved
-    /// the message in or out of that bin: a message trashed here, delivered,
-    /// then restored on a phone is refused.
+    /// ([`Self::folded`]), less what the actions not yet confirmed here
+    /// remove. The overlay only ever makes a message *less* eligible: a
+    /// restore, a move to the inbox or a not-spam asked for here (pending,
+    /// or delivered and awaiting confirmation) refuses it. It never adds a
+    /// label: a trash or spam asked for here counts once Gmail's state
+    /// shows it (the observed labels, or history since the checkpoint).
+    /// The view cannot tell a pending action from a delivered one, and a
+    /// delivered trash may since have been undone elsewhere and synced, so
+    /// adding the overlay's `TRASH` would purge a message the user restored.
     #[must_use]
     pub fn current_labels(&self, view: &MessageView) -> LabelSet {
-        let (mut current, touched) = self.folded(view);
-        // What the overlay removes stays removed.
+        let mut current = self.folded(view);
         current
             .retain(|label| !view.observed_labels.contains(label) || view.labels.contains(label));
-        for label in view.labels.difference(&view.observed_labels) {
-            if is_bin(label) && touched.contains(label) {
-                continue;
-            }
-            current.insert(label.clone());
-        }
         current
     }
 
@@ -521,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_restore_seen_in_history_makes_a_message_ineligible() {
-        let mut mirror = mirror(&[("m", &["TRASH"], 10), ("d", &["INBOX"], 10)]);
+        let mirror = mirror(&[("m", &["TRASH"], 10)]);
         // Restored on a phone after the mirror last saw the message.
         let restored = scan(
             vec![removed(12, "m", &["TRASH"]), added(12, "m", &["INBOX"])],
@@ -531,17 +516,40 @@ mod tests {
             verdict(&mirror, &restored, "m", Scope::TrashOrSpam),
             Verdict::Refused(Refusal::NotInTrashOrSpam)
         );
-        // Trashed here and delivered (history shows the delivery), then
-        // restored on a phone while the delivery awaits confirmation: the
-        // unconfirmed trash in the overlay must not bring it back.
-        act(&mut mirror, "d", Action::MoveToTrash);
+    }
+
+    /// Every intent of the mirror delivered (awaiting its confirmation).
+    fn deliver_all(mirror: &mut AccountMirror) {
         for intent in mirror.intents.values_mut() {
             intent.state = crate::outbox::IntentState::Delivered {
                 at: Timestamp(0),
                 attempt: crate::jobs::AttemptId(1),
             };
         }
-        let delivered_then_restored = scan(
+    }
+
+    #[test]
+    fn a_delivered_trash_undone_elsewhere_and_synced_is_not_eligible() {
+        // Trashed here and delivered (history 11), restored on a phone
+        // (history 13), both synced: the row is observed in the inbox at 13
+        // while the delivered trash still overlays until its confirmation.
+        let mut synced = mirror(&[("d", &["INBOX"], 13)]);
+        act(&mut synced, "d", Action::MoveToTrash);
+        deliver_all(&mut synced);
+        let view = synced.view(&id("d")).expect("view");
+        assert!(
+            view.labels.contains(&LabelId("TRASH".into())),
+            "the view shows it trashed"
+        );
+        assert_eq!(
+            verdict(&synced, &scan(Vec::new(), 13), "d", Scope::TrashOrSpam),
+            Verdict::Refused(Refusal::NotInTrashOrSpam)
+        );
+        // Not yet synced either: history since the checkpoint shows both.
+        let mut unsynced = mirror(&[("d", &["INBOX"], 10)]);
+        act(&mut unsynced, "d", Action::MoveToTrash);
+        deliver_all(&mut unsynced);
+        let history = scan(
             vec![
                 added(11, "d", &["TRASH"]),
                 removed(11, "d", &["INBOX"]),
@@ -551,7 +559,19 @@ mod tests {
             13,
         );
         assert_eq!(
-            verdict(&mirror, &delivered_then_restored, "d", Scope::TrashOrSpam),
+            verdict(&unsynced, &history, "d", Scope::TrashOrSpam),
+            Verdict::Refused(Refusal::NotInTrashOrSpam)
+        );
+    }
+
+    #[test]
+    fn a_trash_whose_answer_was_lost_and_then_undone_is_not_eligible() {
+        // The delivery was applied and its answer lost, so the intent is
+        // still pending; a phone restored the message; a sync applied both.
+        let mut mirror = mirror(&[("m", &["INBOX"], 13)]);
+        act(&mut mirror, "m", Action::MoveToTrash);
+        assert_eq!(
+            verdict(&mirror, &scan(Vec::new(), 13), "m", Scope::TrashOrSpam),
             Verdict::Refused(Refusal::NotInTrashOrSpam)
         );
     }
@@ -600,16 +620,27 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_trash_makes_a_message_eligible() {
+    fn a_trash_asked_here_counts_only_once_gmail_shows_it() {
         let mut mirror = mirror(&[("m", &["INBOX", "UNREAD"], 10)]);
         act(&mut mirror, "m", Action::MoveToTrash);
-        let scan = scan(Vec::new(), 10);
+        // Not delivered yet: Gmail still has it in the inbox.
         assert_eq!(
-            verdict(&mirror, &scan, "m", Scope::TrashOrSpam),
+            verdict(&mirror, &scan(Vec::new(), 10), "m", Scope::TrashOrSpam),
+            Verdict::Refused(Refusal::NotInTrashOrSpam)
+        );
+        // Delivered: history shows the trash, and the message is eligible
+        // although the action awaits its confirmation.
+        deliver_all(&mut mirror);
+        let delivered = scan(
+            vec![added(11, "m", &["TRASH"]), removed(11, "m", &["INBOX"])],
+            11,
+        );
+        assert_eq!(
+            verdict(&mirror, &delivered, "m", Scope::TrashOrSpam),
             Verdict::Eligible
         );
         assert_eq!(
-            verdict(&mirror, &scan, "m", Scope::Bin(Bin::Trash)),
+            verdict(&mirror, &delivered, "m", Scope::Bin(Bin::Trash)),
             Verdict::Eligible
         );
     }
@@ -762,7 +793,6 @@ mod tests {
             next_page_token: None,
         });
         assert_eq!(scan.head(), Some(HistoryId(12)));
-        assert_eq!(scan.pages(), 2);
         assert_eq!(scan.deleted(&id("a")), Some(HistoryId(11)));
         assert_eq!(scan.deleted(&id("b")), None, "sent, not confirmed");
         assert_eq!(

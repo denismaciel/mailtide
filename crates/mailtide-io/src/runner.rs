@@ -731,7 +731,8 @@ where
     /// [`Self::call_gmail`] for any request, writes included: the features
     /// inside this crate send their writes through it, after their own
     /// checks. Read-only mode still refuses a write before any credential
-    /// or quota is spent.
+    /// or quota is spent. A caller that must not wait (a purge's delete)
+    /// passes `deadline` now: a deferral then comes back at once.
     pub(crate) async fn direct_call(
         &self,
         account: &AccountId,
@@ -1545,8 +1546,9 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         GmailRequest::Modify(_)
         | GmailRequest::CreateLabel(_)
         | GmailRequest::PatchLabel { .. }
-        | GmailRequest::DeleteLabel { .. } => true,
-        GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => true,
+        | GmailRequest::DeleteLabel { .. }
+        | GmailRequest::DeleteMessage { .. }
+        | GmailRequest::BatchDeleteMessages { .. } => true,
         GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }
@@ -1593,4 +1595,77 @@ fn finish(mut report: SyncReport, engine: &Engine, stop: StopReason) -> RunOutco
     report.cursor_after = status.cursor;
     report.status = Some(status);
     RunOutcome { report, stop }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AccessToken, StaticTokens};
+    use crate::blobs::ObjectBlobs;
+    use crate::quota_gate::LocalGate;
+    use mailtide::ids::LabelId;
+    use mailtide::outbox::ModifyGroup;
+    use mailtide::quota::Budget;
+    use mailtide_gmail::http::{HttpRequest, HttpResponse};
+    use mailtide_store::memory::MemoryStore;
+
+    /// A transport no test here may reach.
+    struct Unreachable;
+
+    impl GmailTransport for Unreachable {
+        async fn send(
+            &self,
+            request: HttpRequest,
+            _token: &AccessToken,
+        ) -> Result<HttpResponse, TransportError> {
+            panic!("{} {} was sent", request.method.as_str(), request.path)
+        }
+    }
+
+    fn account() -> AccountId {
+        AccountId("alice@example.com".into())
+    }
+
+    fn runner(
+        access: Access,
+    ) -> Runner<MemoryStore, ObjectBlobs, Unreachable, LocalGate, StaticTokens> {
+        Runner::new(
+            MemoryStore::tracking(&[account()]),
+            ObjectBlobs::memory(),
+            Unreachable,
+            LocalGate::new(Budget::GMAIL_DEFAULT),
+            StaticTokens::default(),
+            RunnerConfig {
+                access,
+                engine: EngineConfig::default(),
+                watch: WatchMode::Disabled,
+                log_accounts: LogAccounts::default(),
+            },
+        )
+    }
+
+    fn writes() -> Vec<GmailRequest> {
+        let m = MessageId("m1".into());
+        vec![
+            GmailRequest::Modify(ModifyGroup {
+                messages: vec![m.clone()],
+                add: Vec::new(),
+                remove: vec![LabelId("INBOX".into())],
+                versions: Vec::new(),
+            }),
+            GmailRequest::DeleteMessage { id: m.clone() },
+            GmailRequest::BatchDeleteMessages { ids: vec![m] },
+        ]
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_refuses_a_direct_write_before_any_token_or_quota() {
+        let runner = runner(Access::ReadOnly);
+        for request in writes() {
+            let answer = runner
+                .direct_call(&account(), request, Priority::Foreground, Instant::now())
+                .await;
+            assert_eq!(answer, Err(CallError::ReadOnly));
+        }
+    }
 }

@@ -8,15 +8,21 @@
 //!    read-only mode; purging outside trash and spam needs both the
 //!    [`PurgePolicy::Anywhere`] ceiling and the call's own `anywhere`;
 //! 2. it judges each message by **Gmail's state up to the call**: the
-//!    history since the mirror's cursor is read first (committed nowhere)
-//!    and folded into the mirror's rows ([`PurgeScan`]), so a message
-//!    restored elsewhere a second ago is refused;
+//!    history since the mirror's cursor is read first (committed nowhere),
+//!    then the targets' rows, and the two are folded ([`PurgeScan`]); an
+//!    action not yet confirmed here can only refuse a message, never make
+//!    it eligible. A delete **never waits** for the quota gate, so it goes
+//!    out right after its check (or not at all);
 //! 3. it deletes **by message id only** and **never repeats** a delete: a
 //!    purge is a call, not a queued intent, so nothing destructive survives
 //!    a crash or fires later, and a lost answer is never sent again;
 //! 4. a message becomes a tombstone only on **Gmail's evidence**: a
-//!    `messagesDeleted` record in the history read after the delete, or a
-//!    single delete answered 404. A 2xx alone is `sent`, never `purged`.
+//!    `messagesDeleted` record in the history read after the delete. A 2xx,
+//!    a lost answer, a 5xx or a 404 alone is `sent`, never `purged`.
+//!
+//! What it cannot close: a change made elsewhere between the history read
+//! and the delete (milliseconds, the delete never waiting), or one Gmail
+//! shows in history late.
 //!
 //! Every call goes through `Runner::direct_call` (the quota gate, epoch 0,
 //! no claim), so a refusal, a missing scope included, is the caller's and
@@ -28,7 +34,7 @@ use std::time::{Duration, Instant};
 use mailtide::command::GmailRequest;
 use mailtide::commit::DeletionEvidence;
 use mailtide::event::EventKind;
-use mailtide::ids::{AccountId, HistoryId, MessageId};
+use mailtide::ids::{AccountId, HistoryId, MessageId, Timestamp};
 use mailtide::mirror::MessageView;
 use mailtide::purge::{
     BATCH_DELETE_MAX, Bin, EmptyOutcome, PURGE_HISTORY_PAGES, PURGE_MAX_IDS, PurgeOutcome,
@@ -58,7 +64,9 @@ pub enum Stale {
     TooFarBehind,
 }
 
-/// Why a purge or an empty sent nothing (or, for `Run`, failed).
+/// Why a purge or an empty did nothing. Every error is returned before
+/// any delete reached Gmail; a failure after that is reported in the
+/// outcome (`interrupted`), with what was known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PurgeError {
     /// The runner is read-only. Wins over every other answer.
@@ -80,10 +88,11 @@ pub enum PurgeError {
     /// account, then call again.
     MirrorStale(Stale),
     /// The token lacks `https://mail.google.com/`, the only scope Gmail's
-    /// deletes accept. Nothing was deleted; mailtide never falls back to
-    /// trash, and the account keeps syncing.
-    ScopeRequired,
-    /// The quota gate would make the check wait past the budget.
+    /// deletes accept (Gmail's message). Nothing was deleted; mailtide never
+    /// falls back to trash, and the account keeps syncing.
+    ScopeRequired(String),
+    /// The quota gate would make the check's history read wait past the
+    /// budget.
     Deferred(QuotaDeferred),
     /// Gmail failed the check's history read in a way worth retrying.
     Retryable(RetryableFailure),
@@ -108,7 +117,7 @@ impl PurgeError {
             Self::AnywhereNotAllowed => "anywhere_not_allowed",
             Self::TooMany { .. } => "too_many",
             Self::MirrorStale(_) => "mirror_stale",
-            Self::ScopeRequired => "scope_required",
+            Self::ScopeRequired(_) => "scope_required",
             Self::Deferred(_) => "deferred",
             Self::Retryable(_) => "retryable",
             Self::Refused(_) => "refused",
@@ -123,27 +132,71 @@ fn store_error(error: mailtide_store::StoreError) -> PurgeError {
     PurgeError::Run(RunError::Store(error))
 }
 
-/// What the delete calls of one batch of eligible ids came to.
+/// What the delete calls of a whole purge or empty have done so far.
 #[derive(Debug, Default)]
-struct Deletes {
-    /// Answered 2xx, or the answer was lost: Gmail may have deleted them.
-    reached: Vec<MessageId>,
-    /// A single delete answered 404: Gmail has no such message.
-    missing: Vec<MessageId>,
-    /// Gmail refused the call: nothing deleted.
-    refused: Vec<(MessageId, Refusal)>,
-    /// Not sent, or answered 429/5xx.
-    unsent: Vec<MessageId>,
-    /// A deferral, a rate limit or a failure ended the sending.
+struct Sender {
+    /// A delete reached Gmail, or may have: from now on a failure is
+    /// reported in the outcome, not as an error.
+    reached_gmail: bool,
+    /// Nothing more is sent.
     stopped: bool,
+    /// When a deferred or rate-limited delete could go.
+    retry_at: Option<Timestamp>,
+    /// Why the call ended early after a delete may have reached Gmail.
+    interrupted: Option<String>,
 }
 
-impl Deletes {
-    /// Whether any call may have changed Gmail, so history is worth
-    /// reading for evidence.
-    fn worth_confirming(&self) -> bool {
-        !self.reached.is_empty() || !self.missing.is_empty() || !self.unsent.is_empty()
+impl Sender {
+    fn interrupt(&mut self, why: &str) {
+        self.stopped = true;
+        self.interrupted.get_or_insert_with(|| why.to_owned());
     }
+}
+
+/// What the delete calls for one set of eligible ids came to.
+#[derive(Debug, Default)]
+struct Chunk {
+    /// Answered 2xx, or may have been applied (a lost answer, a 5xx, a
+    /// 404): history decides.
+    reached: Vec<MessageId>,
+    /// Gmail refused the call. A batch may still have deleted some.
+    refused: Vec<(MessageId, Refusal)>,
+    /// Never sent.
+    unsent: Vec<MessageId>,
+}
+
+impl Chunk {
+    /// Whether history is worth reading for evidence: anything sent, or
+    /// refused (a refused batch may have deleted some of its ids).
+    fn worth_confirming(&self) -> bool {
+        !self.reached.is_empty() || !self.refused.is_empty()
+    }
+
+    fn refuse(&mut self, ids: Vec<MessageId>, detail: &str) {
+        self.refused.extend(
+            ids.into_iter()
+                .map(|id| (id, Refusal::GmailRefused(detail.to_owned()))),
+        );
+    }
+}
+
+/// The state of one `empty` across its chunks.
+struct Emptying {
+    bin: Bin,
+    deadline: Instant,
+    /// The rolling history read: from the cursor, then after each chunk.
+    scan: PurgeScan,
+    sender: Sender,
+    outcome: EmptyOutcome,
+}
+
+/// The targets of one round: what to send, and what history may prove.
+#[derive(Debug, Default)]
+struct Judged {
+    eligible: Vec<MessageId>,
+    /// Eligible or already deleted elsewhere: the ids evidence is read for.
+    checked: Vec<MessageId>,
+    refused: Vec<(MessageId, Refusal)>,
 }
 
 impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
@@ -162,11 +215,12 @@ where
     ///
     /// Reads history from the mirror's cursor (refusing with
     /// [`PurgeError::MirrorStale`] if that is not possible within
-    /// [`PURGE_HISTORY_PAGES`] pages), decides each id, sends one
-    /// `messages.delete` per id below five ids and `messages.batchDelete`
-    /// otherwise, reads history again and records the deletions it shows.
-    /// Quota deferrals are waited out within `budget`. mailtide never sends
-    /// a delete twice: a lost answer is reported as `sent`.
+    /// [`PURGE_HISTORY_PAGES`] pages), then the targets' rows, decides each
+    /// id, sends one `messages.delete` per id below five ids and
+    /// `messages.batchDelete` otherwise (each at once or not at all: a
+    /// delete never waits for the quota gate), reads history again and
+    /// records the deletions it shows. The check's history read waits out
+    /// deferrals within `budget`. mailtide never sends a delete twice.
     pub async fn purge(
         &self,
         account: &AccountId,
@@ -195,53 +249,50 @@ where
             }
         };
         too_many(ids.len())?;
-        let views = self.views(account, &ids).await?;
         let mut scan = PurgeScan::new();
         self.catch_up(account, cursor, &mut scan, deadline).await?;
-        let mut eligible = Vec::new();
-        let mut checked = Vec::new();
-        let mut refused = Vec::new();
-        for id in &ids {
-            match scan.verdict(id, views.get(id), scope) {
-                Verdict::Eligible => {
-                    eligible.push(id.clone());
-                    checked.push(id.clone());
-                }
-                // Recorded below, from the scan: history already shows it.
-                Verdict::Gone { .. } => checked.push(id.clone()),
-                Verdict::Refused(refusal) => refused.push((id.clone(), refusal)),
-            }
-        }
-        let mut deletes = Deletes::default();
-        self.send_deletes(account, &eligible, true, deadline, &mut deletes)
+        // The rows are read after history, right before the deletes, so an
+        // action admitted here while history was read is seen.
+        let views = self.views(account, &ids).await?;
+        let judged = judge(&ids, &views, &scan, scope);
+        let mut sender = Sender::default();
+        let mut chunk = Chunk::default();
+        self.send_deletes(account, &judged.eligible, &mut sender, &mut chunk)
             .await?;
-        if deletes.worth_confirming() {
+        if chunk.worth_confirming() {
             self.confirm(account, &mut scan, deadline).await;
         }
-        // Only for messages the mirror holds: one already tombstoned stays
-        // `not_in_mirror` although history still shows its deletion.
-        let evidence = evidence(&checked, &scan, &deletes.missing);
-        self.store()
-            .record_deleted(account, &evidence, self.now())
-            .await
-            .map_err(store_error)?;
-        let proven: BTreeSet<&MessageId> = evidence.iter().map(|(id, _)| id).collect();
+        let proven = self
+            .record_evidence(account, &judged.checked, &scan, &mut sender)
+            .await?;
         let unproven = |list: Vec<MessageId>| -> Vec<MessageId> {
             list.into_iter().filter(|id| !proven.contains(id)).collect()
         };
-        refused.extend(deletes.refused);
+        let mut refused = judged.refused;
+        refused.extend(chunk.refused);
+        // Evidence not recorded (the store failed) is still only `sent`.
+        let mut sent = unproven(chunk.reached);
+        let unrecorded: Vec<MessageId> = judged
+            .checked
+            .iter()
+            .filter(|id| scan.deleted(id).is_some() && !proven.contains(*id) && !sent.contains(id))
+            .cloned()
+            .collect();
+        sent.extend(unrecorded);
         let outcome = PurgeOutcome {
             purged: ids
                 .iter()
                 .filter(|id| proven.contains(id))
                 .cloned()
                 .collect(),
-            sent: unproven(deletes.reached),
             refused: refused
                 .into_iter()
-                .filter(|(id, _)| !proven.contains(id))
+                .filter(|(id, _)| !proven.contains(id) && !sent.contains(id))
                 .collect(),
-            unsent: unproven(deletes.unsent),
+            sent,
+            unsent: unproven(chunk.unsent),
+            retry_at: sender.retry_at,
+            interrupted: sender.interrupted,
         };
         tracing::info!(
             purged = outcome.purged.len(),
@@ -259,11 +310,12 @@ where
     ///
     /// One rolling history read from the cursor: the read after each chunk
     /// confirms it and also finds messages that left the bin meanwhile,
-    /// which the chunks still to send then skip. A message trashed
-    /// elsewhere that the mirror has not seen in the bin is left: this
-    /// host's user never saw it there. Each chunk's deletions are recorded
-    /// before the next is sent. `remaining` counts what was not reached;
-    /// calling again reads the mirror afresh.
+    /// which the chunks still to send then skip. When that read fails, no
+    /// further chunk is sent (it would be judged on stale history). A
+    /// message trashed elsewhere that the mirror has not seen in the bin is
+    /// left: this host's user never saw it there. Each chunk's deletions
+    /// are recorded before the next is sent. `remaining` counts what was
+    /// not reached; calling again reads the mirror afresh.
     pub async fn empty(
         &self,
         account: &AccountId,
@@ -273,15 +325,18 @@ where
         let deadline = Instant::now() + budget;
         self.purge_scope(false)?;
         let cursor = self.purge_cursor(account).await?;
-        let mut scan = PurgeScan::new();
-        self.catch_up(account, cursor, &mut scan, deadline).await?;
-        let mut outcome = EmptyOutcome::default();
+        let mut run = Emptying {
+            bin,
+            deadline,
+            scan: PurgeScan::new(),
+            sender: Sender::default(),
+            outcome: EmptyOutcome::default(),
+        };
+        self.catch_up(account, cursor, &mut run.scan, deadline)
+            .await?;
         let mut after: Option<MessageId> = None;
-        let mut stopped = false;
-        let mut first = true;
-        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         loop {
-            let page = self
+            let page = match self
                 .store()
                 .message_ids_labelled(
                     account,
@@ -290,56 +345,28 @@ where
                     u32::try_from(BATCH_DELETE_MAX).unwrap_or(u32::MAX),
                 )
                 .await
-                .map_err(store_error)?;
+            {
+                Ok(page) => page,
+                Err(error) if run.sender.reached_gmail => {
+                    run.sender.interrupt(RunError::Store(error).code());
+                    break;
+                }
+                Err(error) => return Err(store_error(error)),
+            };
             let Some(last) = page.last() else {
                 break;
             };
             after = Some(last.clone());
-            if stopped || Instant::now() >= deadline {
-                stopped = true;
-                outcome.remaining += count(page.len());
+            if run.sender.stopped || Instant::now() >= deadline {
+                run.sender.stopped = true;
+                run.outcome.remaining += count(page.len());
                 continue;
             }
-            let views = self.views(account, &page).await?;
-            let mut eligible = Vec::new();
-            let mut checked = Vec::new();
-            for id in &page {
-                match scan.verdict(id, views.get(id), Scope::Bin(bin)) {
-                    Verdict::Eligible => {
-                        eligible.push(id.clone());
-                        checked.push(id.clone());
-                    }
-                    Verdict::Gone { .. } => checked.push(id.clone()),
-                    Verdict::Refused(_) => outcome.skipped += 1,
-                }
-            }
-            let mut deletes = Deletes::default();
-            self.send_deletes(account, &eligible, first, deadline, &mut deletes)
-                .await?;
-            first = false;
-            if deletes.worth_confirming() {
-                self.confirm(account, &mut scan, deadline).await;
-            }
-            let evidence = evidence(&checked, &scan, &deletes.missing);
-            self.store()
-                .record_deleted(account, &evidence, self.now())
-                .await
-                .map_err(store_error)?;
-            let proven: BTreeSet<&MessageId> = evidence.iter().map(|(id, _)| id).collect();
-            let unproven =
-                |list: &[MessageId]| list.iter().filter(|id| !proven.contains(id)).count();
-            outcome.purged += count(proven.len());
-            outcome.sent += count(unproven(&deletes.reached));
-            outcome.remaining += count(unproven(&deletes.unsent));
-            outcome.skipped += count(
-                deletes
-                    .refused
-                    .iter()
-                    .filter(|(id, _)| !proven.contains(id))
-                    .count(),
-            );
-            stopped = deletes.stopped;
+            self.empty_chunk(account, &page, &mut run).await?;
         }
+        let mut outcome = run.outcome;
+        outcome.retry_at = run.sender.retry_at;
+        outcome.interrupted = run.sender.interrupted;
         tracing::info!(
             purged = outcome.purged,
             sent = outcome.sent,
@@ -348,6 +375,79 @@ where
             "empty finished"
         );
         Ok(outcome)
+    }
+
+    /// One chunk of `empty`: judge `page` against the rolling `scan`, send,
+    /// confirm, record and count.
+    async fn empty_chunk(
+        &self,
+        account: &AccountId,
+        page: &[MessageId],
+        run: &mut Emptying,
+    ) -> Result<(), PurgeError> {
+        let Emptying {
+            bin,
+            deadline,
+            scan,
+            sender,
+            outcome,
+        } = run;
+        let (bin, deadline) = (*bin, *deadline);
+        let views = match self.views(account, page).await {
+            Ok(views) => views,
+            Err(PurgeError::Run(error)) if sender.reached_gmail => {
+                sender.interrupt(error.code());
+                outcome.remaining += count(page.len());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let judged = judge(page, &views, scan, Scope::Bin(bin));
+        outcome.skipped += count(judged.refused.len());
+        let mut chunk = Chunk::default();
+        self.send_deletes(account, &judged.eligible, sender, &mut chunk)
+            .await?;
+        if chunk.worth_confirming() && !self.confirm(account, scan, deadline).await {
+            // Later chunks would be judged on history from before this
+            // one's deletes: stop.
+            sender.stopped = true;
+        }
+        let proven = self
+            .record_evidence(account, &judged.checked, scan, sender)
+            .await?;
+        let shown = |id: &&MessageId| scan.deleted(id).is_some() && !proven.contains(*id);
+        outcome.purged += count(proven.len());
+        outcome.sent += count(
+            chunk
+                .reached
+                .iter()
+                .filter(|id| !proven.contains(*id))
+                .count(),
+        );
+        // Shown by history, not recorded (the store failed): only `sent`.
+        outcome.sent += count(
+            judged
+                .checked
+                .iter()
+                .filter(shown)
+                .filter(|id| !chunk.reached.contains(id))
+                .count(),
+        );
+        outcome.remaining += count(
+            chunk
+                .unsent
+                .iter()
+                .filter(|id| !proven.contains(*id))
+                .count(),
+        );
+        outcome.skipped += count(
+            chunk
+                .refused
+                .iter()
+                .filter(|(id, _)| !proven.contains(id))
+                .count(),
+        );
+        Ok(())
     }
 
     /// The gate every purge passes before anything is read: read-only mode
@@ -401,7 +501,8 @@ where
     }
 
     /// Read history from `start` to Gmail's head into `scan`, every page,
-    /// at most [`PURGE_HISTORY_PAGES`] of them.
+    /// at most [`PURGE_HISTORY_PAGES`] of them. A read may wait out the
+    /// quota gate within `deadline`; nothing is deleted meanwhile.
     async fn catch_up(
         &self,
         account: &AccountId,
@@ -437,84 +538,134 @@ where
         Err(PurgeError::MirrorStale(Stale::TooFarBehind))
     }
 
-    /// The history read after deletes: where Gmail's evidence is. Best
-    /// effort: when it fails, what was sent stays `sent` and the next sync
-    /// finds the records.
-    async fn confirm(&self, account: &AccountId, scan: &mut PurgeScan, deadline: Instant) {
+    /// The history read after deletes: where Gmail's evidence is. `false`
+    /// when it failed: what was sent stays `sent`, the next sync finds the
+    /// records, and an `empty` sends nothing more.
+    async fn confirm(&self, account: &AccountId, scan: &mut PurgeScan, deadline: Instant) -> bool {
         let Some(head) = scan.head() else {
-            return;
+            return false;
         };
-        if let Err(error) = self.catch_up(account, head, scan, deadline).await {
-            tracing::warn!(
-                error = error.code(),
-                "purge confirmation unread; sent deletes stay unconfirmed"
-            );
+        match self.catch_up(account, head, scan, deadline).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = error.code(),
+                    "purge confirmation unread; sent deletes stay unconfirmed"
+                );
+                false
+            }
         }
     }
 
-    /// Send the deletes for `ids`, each once. `nothing_before`: no earlier
-    /// call of this purge reached Gmail, so a missing scope means nothing
-    /// was deleted and the whole call is [`PurgeError::ScopeRequired`].
+    /// Record the deletions history shows for `checked`; the ids recorded.
+    /// A store failure after a delete reached Gmail interrupts the call
+    /// (the next sync records them); before, it is the call's error.
+    async fn record_evidence(
+        &self,
+        account: &AccountId,
+        checked: &[MessageId],
+        scan: &PurgeScan,
+        sender: &mut Sender,
+    ) -> Result<BTreeSet<MessageId>, PurgeError> {
+        let evidence = evidence(checked, scan);
+        if evidence.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        match self
+            .store()
+            .record_deleted(account, &evidence, self.now())
+            .await
+        {
+            Ok(_) => Ok(evidence.into_iter().map(|(id, _)| id).collect()),
+            Err(error) if sender.reached_gmail => {
+                sender.interrupt(RunError::Store(error).code());
+                Ok(BTreeSet::new())
+            }
+            Err(error) => Err(store_error(error)),
+        }
+    }
+
+    /// Send the deletes for `ids`, each once and each at once: a delete the
+    /// quota gate cannot admit now is `unsent`, never sent later. A missing
+    /// scope before any delete reached Gmail is the call's
+    /// [`PurgeError::ScopeRequired`]; every other answer is the outcome's.
     async fn send_deletes(
         &self,
         account: &AccountId,
         ids: &[MessageId],
-        nothing_before: bool,
-        deadline: Instant,
-        out: &mut Deletes,
+        sender: &mut Sender,
+        out: &mut Chunk,
     ) -> Result<(), PurgeError> {
         for request in mailtide::purge::delete_requests(ids) {
             let named = mailtide::purge::request_ids(&request);
-            if out.stopped {
+            if sender.stopped {
                 out.unsent.extend(named);
                 continue;
             }
             let single = matches!(request, GmailRequest::DeleteMessage { .. });
-            let untouched = nothing_before && out.reached.is_empty() && out.missing.is_empty();
-            match self
-                .direct_call(account, request, Priority::Foreground, deadline)
-                .await
-            {
-                // Answered, or the answer was lost and Gmail may have
-                // applied it: never sent again either way; the
-                // confirmation read tells purged from sent.
-                Ok(EventKind::MessagesDeleted { .. }) | Err(CallError::OutcomeUnknown(_)) => {
+            // Never wait: a deadline of now turns any deferral into an
+            // answer at once.
+            let answer = self
+                .direct_call(account, request, Priority::Foreground, Instant::now())
+                .await;
+            match answer {
+                // Answered, or the answer was lost, or a 404 (which proves
+                // nothing: `purge-delete-missing` is unsettled and a proxy
+                // can answer 404): never sent again; history decides.
+                Ok(EventKind::MessagesDeleted { .. })
+                | Err(CallError::OutcomeUnknown(_) | CallError::NotFound) => {
                     out.reached.extend(named);
+                    sender.reached_gmail = true;
                 }
                 Ok(_) => {
-                    return Err(PurgeError::Run(RunError::Invariant(
-                        "unexpected answer to a delete",
-                    )));
-                }
-                // Gmail has no such message: evidence for a single delete
-                // (`purge-delete-missing`). A batch answers no id, so a 404
-                // there proves nothing.
-                Err(CallError::NotFound) if single => out.missing.extend(named),
-                Err(CallError::NotFound) => {
-                    refuse(out, named, "404 not found");
+                    out.reached.extend(named);
+                    sender.reached_gmail = true;
+                    sender.interrupt("unexpected answer to a delete");
                 }
                 Err(CallError::Refused(refusal))
                     if mailtide_gmail::purge::missing_scope(&refusal) =>
                 {
-                    if untouched {
-                        return Err(PurgeError::ScopeRequired);
+                    if !sender.reached_gmail {
+                        return Err(PurgeError::ScopeRequired(refusal.detail));
                     }
-                    refuse(out, named, &refusal.detail);
-                    out.stopped = true;
+                    out.refuse(named, &refusal.detail);
+                    sender.stopped = true;
                 }
-                Err(CallError::Refused(refusal)) => refuse(out, named, &refusal.detail),
-                Err(CallError::Retryable(_) | CallError::Deferred(_)) => {
+                Err(CallError::Refused(refusal)) => {
+                    out.refuse(named, &refusal.detail);
+                    // A refused batch may have deleted some of its ids.
+                    sender.reached_gmail |= !single;
+                }
+                Err(CallError::Retryable(failure))
+                    if mailtide_gmail::purge::may_have_applied(&failure) =>
+                {
+                    out.reached.extend(named);
+                    sender.reached_gmail = true;
+                    sender.stopped = true;
+                }
+                Err(CallError::Retryable(failure)) => {
                     out.unsent.extend(named);
-                    out.stopped = true;
+                    sender.stopped = true;
+                    if let Some(after) = failure.retry_after {
+                        sender.retry_at.get_or_insert(self.now().plus(after));
+                    }
                 }
-                Err(CallError::ReadOnly) => return Err(PurgeError::ReadOnly),
+                Err(CallError::Deferred(QuotaDeferred { until })) => {
+                    out.unsent.extend(named);
+                    sender.stopped = true;
+                    sender.retry_at.get_or_insert(until);
+                }
+                Err(CallError::ReadOnly) => {
+                    return Err(PurgeError::Run(RunError::Invariant(
+                        "a purge's delete was refused as a write",
+                    )));
+                }
                 Err(CallError::Run(error)) => {
-                    if untouched && out.refused.is_empty() {
+                    if !sender.reached_gmail {
                         return Err(PurgeError::Run(error));
                     }
-                    tracing::warn!(error = error.code(), "purge stopped: the runner failed");
                     out.unsent.extend(named);
-                    out.stopped = true;
+                    sender.interrupt(error.code());
                 }
             }
         }
@@ -522,11 +673,30 @@ where
     }
 }
 
-fn refuse(out: &mut Deletes, ids: Vec<MessageId>, detail: &str) {
-    out.refused.extend(
-        ids.into_iter()
-            .map(|id| (id, Refusal::GmailRefused(detail.to_owned()))),
-    );
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Decide each target with the pure rules.
+fn judge(
+    ids: &[MessageId],
+    views: &BTreeMap<MessageId, MessageView>,
+    scan: &PurgeScan,
+    scope: Scope,
+) -> Judged {
+    let mut judged = Judged::default();
+    for id in ids {
+        match scan.verdict(id, views.get(id), scope) {
+            Verdict::Eligible => {
+                judged.eligible.push(id.clone());
+                judged.checked.push(id.clone());
+            }
+            // History already shows it deleted: recorded, nothing sent.
+            Verdict::Gone { .. } => judged.checked.push(id.clone()),
+            Verdict::Refused(refusal) => judged.refused.push((id.clone(), refusal)),
+        }
+    }
+    judged
 }
 
 fn too_many(given: usize) -> Result<(), PurgeError> {
@@ -539,27 +709,13 @@ fn too_many(given: usize) -> Result<(), PurgeError> {
     Ok(())
 }
 
-/// Gmail's evidence for `ids`: a `messagesDeleted` record in the scan, else
-/// a single delete answered 404 (no later than the scan's head).
-fn evidence(
-    ids: &[MessageId],
-    scan: &PurgeScan,
-    missing: &[MessageId],
-) -> Vec<(MessageId, DeletionEvidence)> {
+/// Gmail's evidence for `ids`: a `messagesDeleted` record in the scan, and
+/// nothing else.
+fn evidence(ids: &[MessageId], scan: &PurgeScan) -> Vec<(MessageId, DeletionEvidence)> {
     ids.iter()
         .filter_map(|id| {
-            if let Some(at) = scan.deleted(id) {
-                return Some((id.clone(), DeletionEvidence::History { at }));
-            }
-            let head = scan.head()?;
-            missing.contains(id).then(|| {
-                (
-                    id.clone(),
-                    DeletionEvidence::VerifiedMissing {
-                        no_later_than: head,
-                    },
-                )
-            })
+            scan.deleted(id)
+                .map(|at| (id.clone(), DeletionEvidence::History { at }))
         })
         .collect()
 }
@@ -588,7 +744,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evidence_is_a_record_or_a_single_404() {
+    fn evidence_is_a_history_record_and_nothing_else() {
         let id = |s: &str| MessageId(s.into());
         let mut scan = PurgeScan::new();
         scan.read(&mailtide::gmail::HistoryPage {
@@ -599,18 +755,9 @@ mod tests {
             history_id: HistoryId(9),
             next_page_token: None,
         });
-        let found = evidence(&[id("a"), id("b"), id("c")], &scan, &[id("b")]);
         assert_eq!(
-            found,
-            vec![
-                (id("a"), DeletionEvidence::History { at: HistoryId(7) }),
-                (
-                    id("b"),
-                    DeletionEvidence::VerifiedMissing {
-                        no_later_than: HistoryId(9)
-                    }
-                ),
-            ]
+            evidence(&[id("a"), id("b")], &scan),
+            vec![(id("a"), DeletionEvidence::History { at: HistoryId(7) })]
         );
     }
 }

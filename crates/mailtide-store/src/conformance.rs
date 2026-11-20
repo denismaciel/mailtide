@@ -138,8 +138,7 @@ where
     cases.extend(consumer_cases());
     cases.extend(search_cases());
     cases.extend(message_facts_cases());
-    cases.extend(label_edit_cases());
-    cases.extend(purge_cases());
+    cases.extend(label_edit_cases().into_iter().chain(purge_cases()));
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -1810,6 +1809,7 @@ async fn ids_page_by_exact_label<S: Store>(store: &S) -> Result<(), String> {
         observe("c", &["INBOX", "Label_TRASH"], 10),
         observe("d", &["TRASHED"], 10),
         observe("e", &["SPAM", "LabelX1"], 10),
+        observe("f", &["Lab!el%"], 10),
     ];
     apply(store, &c).await?;
     expect(
@@ -1825,6 +1825,11 @@ async fn ids_page_by_exact_label<S: Store>(store: &S) -> Result<(), String> {
     expect(
         labelled(store, "Label_1", None, 10).await? == ["a"],
         "`_` matches only itself",
+    )?;
+    expect(
+        labelled(store, "Lab!el%", None, 10).await? == ["f"]
+            && labelled(store, "Lab!el", None, 10).await?.is_empty(),
+        "the escape character and `%` match only themselves",
     )?;
     expect(
         labelled(store, "SPAM", None, 10).await? == ["e"],

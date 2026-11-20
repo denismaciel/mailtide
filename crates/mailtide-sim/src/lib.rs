@@ -1987,6 +1987,26 @@ impl Sim {
         }
     }
 
+    /// A delete request: Gmail deletes the ids that exist and answers 2xx
+    /// naming none (`purge-batch-delete-partial`, assumed); a single delete
+    /// of a missing id is a 404 (`purge-delete-missing`, assumed). The
+    /// engine never sends one.
+    fn deleted(&mut self, command: CommandId, request: &GmailRequest) -> EventKind {
+        if let GmailRequest::DeleteMessage { id } = request
+            && !self.gmail.messages.contains_key(id)
+        {
+            return EventKind::MessageNotFound {
+                command,
+                message_id: id.clone(),
+            };
+        }
+        let ids = mailtide::purge::request_ids(request);
+        for id in &ids {
+            self.gmail.delete(id);
+        }
+        EventKind::MessagesDeleted { command, ids }
+    }
+
     fn gmail_result(&mut self, command: CommandId, request: &GmailRequest) -> EventKind {
         match request {
             GmailRequest::GetProfile => EventKind::ProfileFetched {
@@ -2084,21 +2104,8 @@ impl Sim {
                     detail: "the engine issues no direct call".into(),
                 }),
             },
-            // Gmail deletes the ids that exist and answers 2xx naming none
-            // (`purge-batch-delete-partial`, assumed); a single delete of a
-            // missing id is a 404 (`purge-delete-missing`, assumed).
-            GmailRequest::DeleteMessage { id } if !self.gmail.messages.contains_key(id) => {
-                EventKind::MessageNotFound {
-                    command,
-                    message_id: id.clone(),
-                }
-            }
             GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
-                let ids = mailtide::purge::request_ids(request);
-                for id in &ids {
-                    self.gmail.delete(id);
-                }
-                EventKind::MessagesDeleted { command, ids }
+                self.deleted(command, request)
             }
         }
     }

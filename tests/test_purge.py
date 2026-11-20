@@ -67,6 +67,7 @@ def test_purge_reports_purged_and_refused_ids() -> None:
             "nope": "not_in_mirror",
         }
         assert outcome.sent == [] and outcome.unsent == []
+        assert outcome.retry_at_ms is None and outcome.interrupted is None
         assert gmail.mailbox.deletes == [["t"], ["s"]]
         assert deleted_in_feed(runner) == ["t", "s"]
         assert [v.id for v in runner.messages(ACCOUNT, ["t", "s", "i"])] == ["i"]
@@ -99,8 +100,10 @@ def test_a_modify_only_token_raises_purge_scope_required() -> None:
         runner = runner_for(gmail, purge="trash_and_spam")
         runner.run(ACCOUNT, budget_s=30)
         gmail.mailbox.full_scope = False
-        with pytest.raises(mailtide.PurgeScopeRequired, match="https://mail.google.com/"):
+        with pytest.raises(mailtide.PurgeScopeRequired, match="https://mail.google.com/") as error:
             runner.purge(ACCOUNT, message_ids=["t"])
+        assert "insufficientPermissions" in str(error.value), "Gmail's own refusal is kept"
+
         assert gmail.mailbox.messages["t"]["labels"] == ["TRASH"], "not deleted, not moved"
         gmail.add("n", ["INBOX"])
         outcome = runner.run(ACCOUNT, budget_s=30)

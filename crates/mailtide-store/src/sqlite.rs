@@ -279,7 +279,6 @@ mod tests {
     /// `SchemaOutOfDate { applied, .. }` before reading or writing.
     async fn assert_every_call_refused(store: &SqliteStore, commit: &Commit, applied: u32) {
         use crate::sql::SCHEMA_VERSION;
-        use mailtide::commit::DeletionEvidence;
         use mailtide::outbox::Action;
         let account = &commit.account;
         let ids = [MessageId("m".into())];
@@ -352,13 +351,7 @@ mod tests {
             "refresh_facts",
             store.refresh_facts(account, &[update]).await.err(),
         );
-        let at = mailtide::ids::HistoryId(1);
-        let deleted = [(ids[0].clone(), DeletionEvidence::History { at })];
-        let recorded = store.record_deleted(account, &deleted, now).await;
-        refused("record_deleted", recorded.err());
-        let trash = mailtide::ids::LabelId("TRASH".into());
-        let labelled = store.message_ids_labelled(account, &trash, None, 10).await;
-        refused("message_ids_labelled", labelled.err());
+        purge_calls_refused(store, account, &refused).await;
         refused("status", store.status(account).await.err());
         refused("accounts", store.accounts().await.err());
         refused("resume", store.resume(account, now).await.err());
@@ -380,6 +373,22 @@ mod tests {
             "label_generation",
             store.label_generation(account).await.err(),
         );
+    }
+
+    /// The purge's store calls, each refused like every other call.
+    async fn purge_calls_refused(
+        store: &SqliteStore,
+        account: &AccountId,
+        refused: &impl Fn(&str, Option<StoreError>),
+    ) {
+        use mailtide::commit::DeletionEvidence;
+        let at = mailtide::ids::HistoryId(1);
+        let deleted = [(MessageId("m".into()), DeletionEvidence::History { at })];
+        let recorded = store.record_deleted(account, &deleted, Timestamp(0)).await;
+        refused("record_deleted", recorded.err());
+        let trash = mailtide::ids::LabelId("TRASH".into());
+        let labelled = store.message_ids_labelled(account, &trash, None, 10).await;
+        refused("message_ids_labelled", labelled.err());
     }
 
     /// Reads refuse a schema this build doesn't match as writes do: one
