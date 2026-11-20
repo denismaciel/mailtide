@@ -178,11 +178,11 @@ with a cursor, `ChangePage.next: FeedCursor`, `MAX_FEED_PAGE`.
 Python: no signature changes.
 
 ```python
-page = await runner.changes(account, since=state, limit=500)   # ChangePage | StateTooOld
-page.changes      # at most `limit` entries
-page.next         # opaque; may point inside a commit
+page = await runner.changes(account, since=state, limit=500)  # ChangePage | StateTooOld
+page.changes  # at most `limit` entries
+page.next  # opaque; may point inside a commit
 page.has_more
-await runner.compact(account, page.next)   # whole commits before `next`
+await runner.compact(account, page.next)  # whole commits before `next`
 ```
 
 Gmail calls: none. Engine, epochs, intents and the quota gate are untouched:
