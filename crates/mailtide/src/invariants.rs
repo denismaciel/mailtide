@@ -50,9 +50,9 @@ pub enum Violation {
         /// The message.
         message: MessageId,
     },
-    /// A purge deleted a message that was neither in trash or spam in Gmail
-    /// when it was checked, nor moved there by an action not yet
-    /// delivered (`docs/features/purge.md`).
+    /// A purge deleted a message that was not in trash or spam (or the bin
+    /// being emptied) in Gmail at the moment of the delete
+    /// (`docs/features/purge.md`).
     PurgedOutsideTrashOrSpam {
         /// The message.
         message: MessageId,
