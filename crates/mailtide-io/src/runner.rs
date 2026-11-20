@@ -389,7 +389,165 @@ enum Attempt {
     /// Not sent: the gate admits it at `until` at the earliest.
     Deferred(Timestamp),
     /// Sent (or failed before Gmail answered).
-    Done(Outcome),
+    Done {
+        outcome: Outcome,
+        cleanup: Option<RunError>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectCallResponse {
+    pub(crate) outcome: Result<EventKind, CallError>,
+    pub(crate) cleanup: Option<RunError>,
+}
+
+#[cfg(test)]
+mod direct_call_tests {
+    use super::*;
+    use crate::auth::{AccessToken, StaticTokens};
+    use crate::blobs::ObjectBlobs;
+    use crate::quota_gate::{GateError, LocalGate};
+    use mailtide::quota::{Budget, Lease, QuotaUnits};
+    use mailtide::retry::Cooldown;
+    use mailtide_gmail::http::{HttpRequest, HttpResponse};
+    use mailtide_store::memory::MemoryStore;
+
+    fn account() -> AccountId {
+        AccountId("alice@example.com".into())
+    }
+
+    struct Answer(Result<HttpResponse, TransportError>);
+
+    impl GmailTransport for Answer {
+        async fn send(
+            &self,
+            _request: HttpRequest,
+            _token: &AccessToken,
+        ) -> Result<HttpResponse, TransportError> {
+            self.0.clone()
+        }
+    }
+
+    struct FailingCleanup {
+        inner: LocalGate,
+        release: bool,
+    }
+
+    impl QuotaGate for FailingCleanup {
+        async fn admit(
+            &self,
+            account: &AccountId,
+            cost: QuotaUnits,
+            priority: Priority,
+            now: Timestamp,
+        ) -> Result<Admission, GateError> {
+            self.inner.admit(account, cost, priority, now).await
+        }
+
+        async fn release(&self, lease: Lease, bytes: u64, now: Timestamp) -> Result<(), GateError> {
+            if self.release {
+                return Err(GateError("release failed".into()));
+            }
+            self.inner.release(lease, bytes, now).await
+        }
+
+        async fn cool_down(&self, _cooldown: Cooldown) -> Result<(), GateError> {
+            Err(GateError("cooldown failed".into()))
+        }
+    }
+
+    async fn call_with_cleanup(
+        answer: Result<HttpResponse, TransportError>,
+        fail_release: bool,
+    ) -> DirectCallResponse {
+        let tokens = StaticTokens(BTreeMap::from([(
+            account(),
+            AccessToken {
+                secret: "test-token".into(),
+                expires_at: Timestamp(i64::MAX),
+            },
+        )]));
+        Runner::new(
+            MemoryStore::tracking(&[account()]),
+            ObjectBlobs::memory(),
+            Answer(answer),
+            FailingCleanup {
+                inner: LocalGate::new(Budget::GMAIL_DEFAULT),
+                release: fail_release,
+            },
+            tokens,
+            RunnerConfig {
+                access: Access::ReadWrite,
+                engine: EngineConfig::default(),
+                watch: WatchMode::Disabled,
+                log_accounts: LogAccounts::default(),
+            },
+        )
+        .direct_call_with_cleanup(
+            &account(),
+            GmailRequest::GetProfile,
+            Priority::Foreground,
+            Instant::now(),
+        )
+        .await
+        .expect("an attempted call")
+    }
+
+    #[tokio::test]
+    async fn release_failure_keeps_the_answer_or_unknown_disposition() {
+        let answer = call_with_cleanup(
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"historyId":"42"}"#.to_vec(),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            answer.outcome,
+            Ok(EventKind::ProfileFetched {
+                command: DIRECT_CALL,
+                history_id: HistoryId(42),
+            })
+        );
+        assert_eq!(
+            answer.cleanup,
+            Some(RunError::Quota("release failed".into()))
+        );
+
+        let lost =
+            call_with_cleanup(Err(TransportError::OutcomeUnknown("timeout".into())), true).await;
+        assert_eq!(
+            lost.outcome,
+            Err(CallError::OutcomeUnknown("timeout".into()))
+        );
+        assert_eq!(lost.cleanup, Some(RunError::Quota("release failed".into())));
+    }
+
+    #[tokio::test]
+    async fn cooldown_failure_keeps_the_rate_limit_disposition() {
+        let answer = call_with_cleanup(
+            Ok(HttpResponse {
+                status: 429,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            answer.outcome,
+            Err(CallError::Retryable(RetryableFailure {
+                class: Retryable::AccountRateLimited,
+                ..
+            }))
+        ));
+        assert_eq!(
+            answer.cleanup,
+            Some(RunError::Quota("cooldown failed".into()))
+        );
+    }
 }
 
 impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
@@ -740,6 +898,24 @@ where
         priority: Priority,
         deadline: Instant,
     ) -> Result<EventKind, CallError> {
+        let response = self
+            .direct_call_with_cleanup(account, request, priority, deadline)
+            .await?;
+        match response.cleanup {
+            Some(error) => Err(error.into()),
+            None => response.outcome,
+        }
+    }
+
+    /// Preserve the request disposition and any later quota error. A write
+    /// that needs to report what happened to Gmail uses both fields.
+    pub(crate) async fn direct_call_with_cleanup(
+        &self,
+        account: &AccountId,
+        request: GmailRequest,
+        priority: Priority,
+        deadline: Instant,
+    ) -> Result<DirectCallResponse, CallError> {
         if changes_mailbox(&request) && self.config.access == Access::ReadOnly {
             return Err(CallError::ReadOnly);
         }
@@ -750,9 +926,9 @@ where
             priority,
         };
         let mut report = SyncReport::default();
-        let outcome = loop {
+        let (outcome, mut cleanup) = loop {
             match self.attempt(DIRECT_CALL, &call, &mut report).await? {
-                Attempt::Done(outcome) => break outcome,
+                Attempt::Done { outcome, cleanup } => break (outcome, cleanup),
                 Attempt::Deferred(until) => {
                     let wait = Duration::from_millis(
                         u64::try_from(until.0 - self.clock.now().0).unwrap_or(0),
@@ -764,28 +940,41 @@ where
                 }
             }
         };
-        let failure = match outcome {
-            Outcome::Event(event) => return Ok(event),
-            Outcome::Unanswered(detail) => return Err(CallError::OutcomeUnknown(detail)),
-            Outcome::Failed(failure) => failure,
-            Outcome::StoreFailed(error) => blob_failure(error)?,
+        let outcome = match outcome {
+            Outcome::Event(event) => Ok(event),
+            Outcome::Unanswered(detail) => Err(CallError::OutcomeUnknown(detail)),
+            Outcome::Failed(failure) => {
+                Err(self.direct_failure(account, failure, &mut cleanup).await)
+            }
+            Outcome::StoreFailed(error) => match blob_failure(error) {
+                Ok(failure) => Err(self.direct_failure(account, failure, &mut cleanup).await),
+                Err(error) => Err(error.into()),
+            },
         };
-        Err(match failure {
+        Ok(DirectCallResponse { outcome, cleanup })
+    }
+
+    async fn direct_failure(
+        &self,
+        account: &AccountId,
+        failure: Failure,
+        cleanup: &mut Option<RunError>,
+    ) -> CallError {
+        match failure {
             Failure::NotFound => CallError::NotFound,
             Failure::Blocking(refusal) => CallError::Refused(refusal),
             Failure::Retryable(failure) => {
                 let now = self.clock.now();
                 let seed = mailtide::ids::stable_hash(account.as_str().as_bytes())
                     ^ u64::try_from(now.0).unwrap_or(0);
-                if let Some(cooldown) = Backoff::DEFAULT.cooldown(&failure, account, now, seed) {
-                    self.quota
-                        .cool_down(cooldown)
-                        .await
-                        .map_err(|e| RunError::Quota(e.0))?;
+                if let Some(cooldown) = Backoff::DEFAULT.cooldown(&failure, account, now, seed)
+                    && let Err(error) = self.quota.cool_down(cooldown).await
+                {
+                    cleanup.get_or_insert(RunError::Quota(error.0));
                 }
                 CallError::Retryable(failure)
             }
-        })
+        }
     }
 
     /// Resume a blocked account once its cause is fixed.
@@ -1162,18 +1351,26 @@ where
                 }),
             });
         }
-        match self.attempt(command, &call, report).await? {
-            Attempt::Deferred(until) => Ok(EventKind::RequestDeferred { command, until }),
-            Attempt::Done(Outcome::Event(event)) => Ok(event),
-            Attempt::Done(Outcome::Failed(failure)) => {
-                Ok(EventKind::RequestFailed { command, failure })
-            }
+        let outcome = match self.attempt(command, &call, report).await? {
+            Attempt::Deferred(until) => return Ok(EventKind::RequestDeferred { command, until }),
+            Attempt::Done {
+                cleanup: Some(error),
+                ..
+            } => return Err(error),
+            Attempt::Done {
+                outcome,
+                cleanup: None,
+            } => outcome,
+        };
+        match outcome {
+            Outcome::Event(event) => Ok(event),
+            Outcome::Failed(failure) => Ok(EventKind::RequestFailed { command, failure }),
             // Retried after backoff, as any transient failure.
-            Attempt::Done(Outcome::Unanswered(detail)) => Ok(EventKind::RequestFailed {
+            Outcome::Unanswered(detail) => Ok(EventKind::RequestFailed {
                 command,
                 failure: transient(detail),
             }),
-            Attempt::Done(Outcome::StoreFailed(error)) => Ok(EventKind::RequestFailed {
+            Outcome::StoreFailed(error) => Ok(EventKind::RequestFailed {
                 command,
                 failure: blob_failure(error)?,
             }),
@@ -1279,11 +1476,13 @@ where
             | Outcome::Unanswered(_)
             | Outcome::StoreFailed(_) => 0,
         };
-        self.quota
+        let cleanup = self
+            .quota
             .release(lease, bytes, self.clock.now())
             .await
-            .map_err(|e| RunError::Quota(e.0))?;
-        Ok(Attempt::Done(outcome))
+            .err()
+            .map(|e| RunError::Quota(e.0));
+        Ok(Attempt::Done { outcome, cleanup })
     }
 
     async fn perform(

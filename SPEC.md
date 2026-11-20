@@ -668,6 +668,8 @@ Per-call costs [G]:
   and blocks nothing; a real account problem is recorded by the account's
   next run. An answer lost after the request went out (a timeout, a dropped
   connection) is reported as outcome unknown, never as unsent. A caller that
+  needs the disposition of a write gets it alongside any failure to release
+  its quota lease or install a cooldown. A caller that
   keeps Gmail's answer in the mirror records it afterwards with an unfenced
   store method, as `admit` is: the answer only, never the cursor.
 - **Search** (`search`, `search_threads`) is a direct call: one
