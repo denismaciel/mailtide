@@ -1,8 +1,8 @@
 id = "compose-mime"
 title = "Compose: RFC 5322 messages from structured input"
-summary = "A pure `compose` in mailtide-mime that validates a flat, JMAP-shaped message (addresses, subject, text and HTML, inline images, attachments, threading ids, custom headers) and writes deterministic RFC 5322 bytes through Stalwart's mail-builder, returning the bytes, the Message-ID and the recipients; no Gmail call, no store change."
+summary = "A pure `compose` in mailtide-mime that validates a flat, JMAP-shaped message (addresses, subject, text and HTML, inline images, attachments, threading ids, the private X-Mailtide-Id tracking id, custom headers) and writes deterministic RFC 5322 bytes through Stalwart's mail-builder, returning the bytes, the ids written and the recipients; a pure reader finds the tracking id in raw bytes; no Gmail call, no store change."
 roadmap = ["C1"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/compose-mime.md"
 # Nothing here depends on another feature. `drafts` and `send` take the bytes
 # and the Message-ID this returns; `identities` decides which From is allowed.
@@ -13,12 +13,12 @@ depends_on = []
 [[file]]
 path = "crates/mailtide-mime/Cargo.toml"
 change = "modify"
-role = "Depend on mail-builder 2 without default features (no hostname lookup); dev-depend on mailtide-gmail for the header-facts test; description covers composition"
+role = "Depend on mail-builder 2 without default features (no hostname lookup) and on encodify (already locked through mail-parser) for the base64 compose writes itself; dev-depend on mailtide-gmail for the header-facts test; description covers composition"
 
 [[file]]
 path = "crates/mailtide-mime/src/lib.rs"
 change = "modify"
-role = "Crate docs; export compose, address and message_id; `Attachment` (unchanged) is shared by parse and compose"
+role = "Crate docs; export compose, address, message_id and tracking; `Attachment` (unchanged) is shared by parse and compose"
 
 [[file]]
 path = "crates/mailtide-mime/src/compose.rs"
@@ -28,12 +28,19 @@ role = "OutgoingMessage, ComposeOptions, Purpose, Composed, ComposeError; valida
 [[file]]
 path = "crates/mailtide-mime/src/address.rs"
 change = "new"
-role = "Address { name, email }, its syntax rules, and Address::parse_list (a header value from the mirror -> addresses, through mail-parser)"
+role = "Address { name, email }, its syntax rules, and parse_addresses (a header value from the mirror -> addresses, through mail-parser; the same function, name and module path as message-facts plans)"
 
 [[file]]
 path = "crates/mailtide-mime/src/message_id.rs"
 change = "new"
 role = "MessageId: strict for our own, lenient for ids we echo; from_entropy on the sender's domain; parse_list"
+
+# Added when Gmail was found to replace Message-ID and Date on every send and
+# draft save (see docs/features/README.md, "identified by a private header").
+[[file]]
+path = "crates/mailtide-mime/src/tracking.rs"
+change = "new"
+role = "TRACKING_HEADER (X-Mailtide-Id), is_tracking_id (16 to 64 of A-Za-z0-9_-), new_tracking_id(entropy), and tracking_id(raw): the first valid header, read from the header block only"
 
 [[file]]
 path = "Cargo.lock"
@@ -278,7 +285,7 @@ note = "A message without recipients is refused before sending; compose does the
 impl = "mail-parser"
 path = "src/fields/address.rs"
 symbols = ["parse_address"]
-note = "The address parser behind Address::parse_list and behind every build-then-parse check."
+note = "The address parser behind parse_addresses and behind every build-then-parse check."
 
 [[reference]]
 impl = "stalwart"
@@ -378,7 +385,7 @@ test = "parse_list_splits_names_and_addresses"
 [[suite.test]]
 name = "compose_from_keeps_a_spelled_out_display_name_apart"
 test = "a_from_parsed_from_text_is_written_as_name_and_address"
-note = "himalaya takes `Name <addr>` strings; we take Address values, parse_list is the bridge, and the whole string given as an email is refused."
+note = "himalaya takes `Name <addr>` strings; we take Address values, parse_addresses is the bridge, and the whole string given as an email is refused."
 
 [[suite.test]]
 name = "compose_to_keeps_a_spelled_out_display_name_apart"
@@ -631,15 +638,15 @@ name = "ascii_display_name_with_quotes_is_escaped"
 
 [[suite.test]]
 name = "nameless_groups_are_written_as_their_mailboxes"
-na = "Address groups are not an input: Address::parse_list flattens them"
+na = "Address groups are not an input: parse_addresses flattens them"
 
 [[suite.test]]
 name = "group_with_empty_nested_group_last_is_terminated"
-na = "Address groups are not an input: Address::parse_list flattens them"
+na = "Address groups are not an input: parse_addresses flattens them"
 
 [[suite.test]]
 name = "group_name_with_specials_round_trips"
-na = "Address groups are not an input: Address::parse_list flattens them"
+na = "Address groups are not an input: parse_addresses flattens them"
 
 [[suite.test]]
 name = "control_scan_matches_a_naive_scan"
@@ -716,7 +723,7 @@ na = "compose writes no raw header: custom values go through the encoding text w
 
 [[suite.test]]
 name = "groups_round_trip"
-na = "Address groups are not an input: Address::parse_list flattens them"
+na = "Address groups are not an input: parse_addresses flattens them"
 
 [[suite.test]]
 name = "nested_lists_do_not_panic"
@@ -824,7 +831,7 @@ covers = "mailtide_mime::parse of the output gives back the text, the html, and 
 [[test]]
 target = "crates/mailtide-mime/src/compose.rs"
 name = "headers_are_written_in_a_fixed_order"
-covers = "From, Sender, Reply-To, To, Cc, Bcc, Subject, Date, Message-ID, In-Reply-To, References, custom headers in the order given, MIME-Version; absent ones are skipped, a missing subject writes no Subject"
+covers = "From, Sender, Reply-To, To, Cc, Bcc, Subject, Date, Message-ID, In-Reply-To, References, X-Mailtide-Id, custom headers in the order given, MIME-Version; absent ones are skipped, a missing subject writes no Subject"
 
 [[test]]
 target = "crates/mailtide-mime/src/compose.rs"
@@ -903,7 +910,7 @@ covers = "Empty, no @, empty local part or domain, a space, a quoted local part,
 [[test]]
 target = "crates/mailtide-mime/src/address.rs"
 name = "a_name_and_address_in_one_string_is_refused_as_an_email"
-covers = "`Alice <a@x.org>` given as `email` is refused (it would be written as <Alice <a@x.org>>); parse_list is the way in"
+covers = "`Alice <a@x.org>` given as `email` is refused (it would be written as <Alice <a@x.org>>); parse_addresses is the way in"
 
 [[test]]
 target = "crates/mailtide-mime/src/address.rs"
@@ -925,6 +932,38 @@ target = "crates/mailtide-mime/src/message_id.rs"
 name = "the_same_entropy_and_sender_give_the_same_id"
 covers = "from_entropy is pure: <32 lowercase hex digits@sender domain>, 128 bits, no clock, no hostname"
 
+# Tracking id
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_tracking_id_is_written_once_and_returned"
+covers = "tracking_id given: exactly one X-Mailtide-Id after the ids compose writes and before the custom headers, returned in Composed and found by the reader; none given: no header, None returned"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_malformed_or_duplicated_tracking_id_is_refused"
+covers = "Shorter than 16, longer than 64, a character outside A-Za-z0-9_-, a line break, empty: refused as tracking_id; a custom header named X-Mailtide-Id in any letter case is refused, with or without a tracking_id"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_message_without_a_message_id_is_composed"
+covers = "message_id None: no Message-ID header, Composed.message_id None, Date still written, boundaries still derived and the bytes still a function of the input"
+
+[[test]]
+target = "crates/mailtide-mime/src/tracking.rs"
+name = "a_new_tracking_id_is_base64url_of_its_entropy"
+covers = "new_tracking_id is pure: 22 characters of base64url without padding, the same for the same entropy, always a valid token"
+
+[[test]]
+target = "crates/mailtide-mime/src/tracking.rs"
+name = "a_tracking_id_is_16_to_64_url_safe_characters"
+covers = "is_tracking_id: the length bounds and the alphabet"
+
+[[test]]
+target = "crates/mailtide-mime/src/tracking.rs"
+name = "the_reader_finds_the_first_valid_header_and_never_reads_the_body"
+covers = "tracking_id(raw): a folded header, any letter case of the name, LF line ends; a second occurrence ignored, an invalid value skipped, a header-like line in the body not read, a longer name not matched"
+
 [[test]]
 target = "crates/mailtide-mime/src/message_id.rs"
 name = "our_own_id_is_strict_and_an_echoed_id_is_lenient"
@@ -945,12 +984,12 @@ covers = "compose_message then parse_message: text, html, an inline image and an
 [[test]]
 target = "tests/test_compose.py"
 name = "test_compose_mints_a_message_id_on_the_senders_domain"
-covers = "message_id=None: ComposedMessage.message_id is new on each call, bracketed, on the From domain, and is the header in raw"
+covers = "message_id=None and tracking_id=None: ComposedMessage.message_id is new on each call, bracketed, on the From domain, and is the header in raw; tracking_id is new on each call, 22 base64url characters, and tracking_id(raw) finds it"
 
 [[test]]
 target = "tests/test_compose.py"
 name = "test_a_fixed_message_id_and_date_give_identical_bytes"
-covers = "new_message_id once, sent_at_ms fixed: two calls return the same bytes (a draft saved twice, a send retried)"
+covers = "new_message_id and new_tracking_id once, sent_at_ms fixed: two calls return the same bytes (a draft saved twice, a send retried)"
 
 [[test]]
 target = "tests/test_compose.py"

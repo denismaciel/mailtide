@@ -1,5 +1,19 @@
-//! Optional MIME parsing for stored raw messages: headers, text, HTML and
-//! attachments. Not needed for sync correctness (SPEC §5.5).
+//! MIME for stored and outgoing messages (SPEC §5.5): [`parse`] reads a
+//! raw message into headers, text, HTML and attachments; [`compose`] writes
+//! one from structured input, deterministically. Neither is needed for sync
+//! correctness, and neither does any I/O.
+
+mod address;
+mod compose;
+mod message_id;
+mod tracking;
+
+pub use address::{Address, parse_addresses};
+pub use compose::{
+    ComposeError, ComposeOptions, Composed, OutgoingMessage, Purpose, Reason, compose,
+};
+pub use message_id::MessageId;
+pub use tracking::{TRACKING_HEADER, is_tracking_id, new_tracking_id, tracking_id};
 
 use mail_parser::MessageParser;
 

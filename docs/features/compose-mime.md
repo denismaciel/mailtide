@@ -1,6 +1,6 @@
 # Compose: RFC 5322 messages from structured input
 
-Plan: `features/compose-mime.toml` (roadmap C1). Status: planned.
+Plan: `features/compose-mime.toml` (roadmap C1). Status: in progress.
 
 ## 1. Goal and scope
 
@@ -13,7 +13,12 @@ Afterwards a host can turn a structured message into the bytes Gmail takes as
   attachments, including an attached message;
 - threading headers (`Message-ID`, `In-Reply-To`, `References`) from the
   values the mirror already holds;
-- a result that carries the bytes, the Message-ID written and the recipients.
+- a private `X-Mailtide-Id` header, the identity that survives Gmail: Gmail
+  replaces a client's `Message-ID` and `Date` on every API send and draft
+  save and keeps every other header byte for byte (settled 2026-11-20; see
+  the rule in `README.md`);
+- a result that carries the bytes, the ids written and the recipients, and a
+  pure reader that finds the tracking id in raw bytes.
 
 `compose` is a pure function in `mailtide-mime`, the counterpart of `parse`.
 It makes no Gmail call, touches no store and adds no feed entry.
@@ -91,7 +96,8 @@ pub struct OutgoingMessage {
     pub to: Vec<Address>, pub cc: Vec<Address>, pub bcc: Vec<Address>,
     pub subject: Option<String>,
     pub sent_at: i64,                   // unix seconds; written as Date, in UTC
-    pub message_id: MessageId,
+    pub message_id: Option<MessageId>,  // written as given; Gmail replaces it
+    pub tracking_id: Option<String>,    // X-Mailtide-Id; Gmail keeps it
     pub in_reply_to: Option<MessageId>,
     pub references: Vec<MessageId>,
     pub headers: Vec<(String, String)>, // custom, in order
@@ -103,20 +109,32 @@ pub struct OutgoingMessage {
 pub struct Address { pub name: Option<String>, pub email: String }
 pub struct ComposeOptions { pub purpose: Purpose, pub max_bytes: Option<usize> }
 pub enum Purpose { Draft, Send }
-pub struct Composed { pub raw: Vec<u8>, pub message_id: String, pub recipients: Vec<String> }
+pub struct Composed {
+    pub raw: Vec<u8>, pub message_id: Option<String>,
+    pub tracking_id: Option<String>, pub recipients: Vec<String>,
+}
 
 pub fn compose(message: &OutgoingMessage, options: &ComposeOptions)
     -> Result<Composed, ComposeError>;
+
+pub const TRACKING_HEADER: &str = "X-Mailtide-Id";
+pub fn new_tracking_id(entropy: [u8; 16]) -> String;   // base64url, 22 chars
+pub fn is_tracking_id(token: &str) -> bool;             // 16..=64 of A-Za-z0-9_-
+pub fn tracking_id(raw: &[u8]) -> Option<String>;      // first valid header
 ```
 
 - `Attachment` is the struct `parse` already returns, so the attachments of
   a parsed message can be composed again.
-- `Address::parse_list(&str)` turns a header value as the mirror stores it
-  (`"Doe, Jane" <jane@x>`) into addresses. `MessageId::parse` accepts
+- `parse_addresses(&str)` turns a header value as the mirror stores it
+  (`"Doe, Jane" <jane@x>`) into addresses (the same function `message-facts`
+  plans, at the crate root). `MessageId::parse` accepts
   `<a@x>` and `a@x`; `MessageId::from_entropy([u8; 16], &Address)` mints
   `<32 hex digits@sender-domain>`.
-- `Composed.message_id` has angle brackets, the form the mirror records as
-  `rfc822_message_id`. `recipients` is To, Cc, Bcc in order, bare,
+- `Composed.message_id` has angle brackets. It is what the bytes say, not
+  what Gmail will store: Gmail replaces it on every send and draft save.
+  `Composed.tracking_id` is what identifies the message after Gmail has it;
+  `drafts` and `send` require it on the bytes they are given, and
+  `tracking_id(raw)` reads it back (headers only, never the body). `recipients` is To, Cc, Bcc in order, bare,
   deduplicated ignoring case.
 - `ComposeError { field, index, reason }` never contains the offending
   value, so a host can log it.
@@ -126,13 +144,16 @@ Python (`mailtide`), thin over the same function, run without the GIL:
 ```python
 compose_message(message: OutgoingMessage, *, purpose="send", max_bytes=None) -> ComposedMessage
 new_message_id(sender: str) -> str
+new_tracking_id() -> str
+tracking_id(raw: bytes) -> str | None
 parse_addresses(value: str) -> list[Address]
 ```
 
 `OutgoingMessage`, `Address` and `ComposedMessage` are frozen classes with
 the Rust field names (`from_` for `from`; `sent_at_ms`); an address may also
-be given as a bare `str`. `message_id=None` mints one and `sent_at_ms=None`
-is now: the two impure defaults live in the binding. `Attachment` gains a
+be given as a bare `str`. `message_id=None` and `tracking_id=None` mint one
+each (128 random bits) and `sent_at_ms=None` is now: the impure defaults live
+in the binding. `Attachment` gains a
 constructor. `ComposeError` is a `ValueError`.
 
 A reply needs no helper for its ids:
@@ -142,7 +163,10 @@ A reply needs no helper for its ids:
 ### What compose writes
 
 Headers, in this order: From, Sender, Reply-To, To, Cc, Bcc, Subject, Date,
-Message-ID, In-Reply-To, References, custom headers, MIME-Version. Then one
+Message-ID, In-Reply-To, References, X-Mailtide-Id, custom headers,
+MIME-Version. compose writes them itself through mail-builder's header
+writers, since `MessageBuilder::serialize` makes up a Message-ID when none is
+given. Then one
 fixed tree, each level present only when it has more than one child:
 
 ```
@@ -166,8 +190,9 @@ specified message to the recipients in the To, Cc, and Bcc headers", and a
 draft must keep its Bcc until it is sent.
 
 **Determinism.** `compose` reads no clock, hostname or random source. The
-date and the id are inputs, and each boundary is derived from the Message-ID
-and the part's position; a candidate that occurs in a body is skipped. Same
+date and the ids are inputs, and each boundary is derived from them (the
+Message-ID, the tracking id, the date and the author) and the part's level; a
+candidate that occurs in a body written unencoded is skipped. Same
 input, same bytes: a retried send re-sends exactly what was first sent, and
 tests compare bytes.
 
@@ -179,8 +204,9 @@ tests compare bytes.
 | address | `local@domain`, ASCII, dot-atom local part, LDH domain, length limits; `Name <a@x>` as an email is refused |
 | From | exactly one, always, also for a draft |
 | recipients | at least one across To, Cc, Bcc for `Purpose::Send` |
-| `message_id` | `left@right`, dot-atom; `in_reply_to` and `references` only need to be one token (other senders' ids are often malformed) |
-| custom header | printable ASCII name without `:`; not a header compose writes, not `Content-*` |
+| `message_id` | optional; `left@right`, dot-atom; `in_reply_to` and `references` only need to be one token (other senders' ids are often malformed) |
+| `tracking_id` | optional; 16 to 64 characters of `A-Za-z0-9_-` |
+| custom header | printable ASCII name without `:`; not a header compose writes (`X-Mailtide-Id` included), not `Content-*` |
 | inline part | HTML present; content id given and unique |
 | attachment | `type/subtype`, not `multipart/*` |
 | size | `max_bytes`, checked before encoding and on the result |
@@ -190,8 +216,9 @@ tests compare bytes.
 None. No Gmail call (0 units), no migration, no feed entry, no engine or
 simulator change. `mailtide-io` does not depend on `mailtide-mime`: `drafts`
 and `send` take bytes. They need two things from here: bytes that are stable
-across retries, and `Composed.message_id`, which the host keeps with its
-draft or send so a lost answer can be matched to the message Gmail imported.
+across retries, and the tracking id, which they read from those bytes with
+`tracking_id(raw)` and store on their row, so a lost answer can be matched to
+the `SENT` message the import records with the same `X-Mailtide-Id`.
 
 ### Failure and retry
 
@@ -260,7 +287,7 @@ reading back the ids compose wrote; and the Python API.
 
 ## 6. Slices
 
-1. **Types and rules.** `Address` with `parse_list`, `MessageId`,
+1. **Types and rules.** `Address` with `parse_addresses`, `MessageId`,
    `OutgoingMessage`, `ComposeError`, every validation; no bytes yet.
 2. **Text and HTML.** The mail-builder dependency, header order, text, HTML
    and alternative, `Purpose`, boundaries; the Zero, pimalaya, himalaya and
@@ -283,13 +310,16 @@ reading back the ids compose wrote; and the Python API.
    naming the field. *Would change:* nothing foreseen.
 4. **Flat JMAP-shaped input, one tree.** *Would change:* a need for calendar
    invitations or signed mail, which want a part tree.
-5. **The Message-ID is an input, minted once, kept for the life of a draft
-   and its send.** Random 128 bits on the sender's domain; returned in the
-   form the mirror stores. Exactly-once in `send` and send confirmation in
-   `drafts` compare it. *Would change:* `drafts-message-id-kept` or
-   `send-message-id-kept` refuted (the unknowns live with the two plans that
-   depend on the answer); then the id is advisory on that path and they
-   correlate another way.
+5. **The identity is `X-Mailtide-Id`, not the Message-ID.** Gmail replaces
+   a client's Message-ID on every send and every draft save
+   (`drafts-message-id-kept` and `send-message-id-kept`, refuted
+   2026-11-20) and keeps other client headers byte for byte. So `tracking_id`
+   (128 random bits, base64url) is minted by the caller, written as a
+   private header, and read back by `tracking_id(raw)`; exactly-once in
+   `send` and send confirmation in `drafts` compare it. The Message-ID stays
+   an optional input written as given (RFC 5322 asks for one; other
+   transports and tests keep it), and `new_message_id` still mints one on the
+   sender's domain. *Would change:* Gmail stripping unknown `X-` headers.
 6. **The crate stays pure; entropy and time come from the caller.** The
    binding supplies both by default. *Would change:* Rust hosts asking for a
    convenience, which would be a separate impure helper.
@@ -324,23 +354,26 @@ reading back the ids compose wrote; and the Python API.
 15. **No built-in size limit.** `max_bytes` is the caller's; Gmail's limits
     belong to `drafts` and `send`.
 16. **Date is always written, in UTC.** RFC 5322 requires it; a local offset
-    would disclose the user's time zone. A host should save a draft once
-    more before sending it, so the date is fresh.
+    would disclose the user's time zone. Gmail rewrites it with the time of
+    each draft save and of the send (`compose-mime-date-kept`, refuted
+    2026-11-20, harmless), so what compose writes is what other transports
+    see.
+
+Settled about Gmail:
+
+- `compose-mime-date-kept` (refuted): Gmail rewrites Date at every save and
+  send; compose keeps writing it.
 
 Assumed about Gmail, to be tested before work starts:
 
-- `compose-mime-date-kept`: Gmail sends the Date as written.
 - `compose-mime-rfc2231-filename`: Gmail reads RFC 2231 file names.
 - `compose-mime-inline-related`: Gmail shows a `related` image under the HTML alternative inline.
 
-Relied on, owned elsewhere (one Gmail fact, one unknown):
+Relied on, owned elsewhere:
 
-- `drafts-message-id-kept` (`drafts`) and `send-message-id-kept` (`send`):
-  Gmail keeps the client's Message-ID, and a custom header, through the
-  draft calls and through `messages.send`. If either is refuted,
-  `Composed.message_id` is not the id the mirror records on that path;
-  compose keeps writing one (RFC 5322 asks for it) and documents it as
-  advisory.
+- `drafts-message-id-kept` (`drafts`) and `send-message-id-kept` (`send`),
+  both refuted: Gmail replaces the client's Message-ID and keeps a custom
+  header through the draft calls and `messages.send`. Hence decision 5.
 - `send-bcc-stripped` (`send`): Gmail removes Bcc from delivered copies and
   keeps it in a stored draft and in the sender's `SENT` copy. If a draft
   loses its Bcc, the host must keep Bcc beside the draft.
