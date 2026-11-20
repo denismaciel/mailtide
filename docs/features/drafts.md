@@ -1,12 +1,13 @@
 # Drafts: create, update, delete, list, read and send
 
-Plan: `features/drafts.toml` (roadmap C2). Status: planned.
+Plan: `features/drafts.toml` (roadmap C2). Status: in progress.
 
 ## 1. Goal and scope
 
 Afterwards a host can, per account:
 
-- save a draft from RFC 5322 bytes and get Gmail's draft id back in the same call;
+- save a draft from RFC 5322 bytes carrying one `X-Mailtide-Id` and get
+  Gmail's draft id back in the same call;
 - replace it (autosave), delete it, and send it;
 - list drafts and read one from the mirror, keyed by the **stable draft id**,
   although Gmail gives a draft a new message id on every save;
@@ -83,18 +84,33 @@ Rust (`mailtide_io::Runner`); every method that calls Gmail takes a `budget`:
 | `draft(account, draft_id)` | `Option<DraftView>`, from the store |
 | `read_draft(account, draft_id, fresh)` | `DraftContent { draft_id, message_id, thread_id, raw }` |
 
-`DraftView { draft_id, message_id, thread_id, rfc822_message_id, state }`;
-`state` is `saved`, `stale` (its message was deleted in Gmail and the refresh
-has not run yet), `sending` or `send_unconfirmed`.
+`DraftView { draft_id, message_id, thread_id, tracking_id, rfc822_message_id,
+state }`; `state` is `saved`, `stale` (its message was deleted in Gmail and the
+refresh has not run yet), `sending` or `send_unconfirmed`. `rfc822_message_id`
+is what Gmail's copy says after the last save, read from the import of the
+draft's current message (`None` until then): Gmail assigns its own Message-ID
+on every save and another on send, so it changes with each.
 `DraftError`: `NotFound`, `Conflict { current }`, `TooLarge { limit }`,
-`Deferred { until }`, `ReadOnly`, `Refused` (400/403), `Retryable`,
-`OutcomeUnknown`, `SendInProgress { retry_after }`, `SendUnconfirmed`.
+`Invalid` (the bytes lack exactly one valid `X-Mailtide-Id`, or carry another
+than the draft's), `Deferred { until }`, `ReadOnly`, `Refused` (400/403),
+`Retryable`, `OutcomeUnknown`, `SendInProgress { retry_after }`,
+`SendUnconfirmed`.
 
 Python `Runner` and `BlockingRunner` get the same seven methods (`raw: bytes`,
 keyword options), frozen dataclasses for the four result types, and the
 exceptions `DraftNotFound`, `DraftConflict`, `DraftTooLarge`, `QuotaDeferred` (`until_ms`),
 `WriteOutcomeUnknown`, `SendInProgress`, `SendUnconfirmed`; `ReadOnlyMode`
-exists.
+exists; `Invalid` is a `ValueError`.
+
+- **The bytes carry the identity.** Gmail replaces a client's `Message-ID`
+  and `Date` on every save and on send, and keeps an `X-` header byte for
+  byte (`drafts-message-id-kept` refuted, `compose-mime-date-kept`). So
+  `create_draft` and `update_draft` require exactly one `X-Mailtide-Id:
+  <token>` (16 to 64 characters of `A-Za-z0-9_-`, minted by the caller;
+  `compose` writes it) and refuse anything else before any call: mailtide
+  never adds or repairs it. The row keeps the token (`tracking_id`); it is
+  stable for the life of a draft, so an update carrying another token is
+  refused. A draft made elsewhere has none until mailtide saves it.
 
 - `if_message_id` is the optimistic check: the message id is Gmail's own
   version of a draft. The call is refused from the index when it already
@@ -127,8 +143,9 @@ refused with `TooLarge` before any call, until the upload endpoint that
 ### Store
 
 One migration (the next one; numbers are assigned at merge): a table
-`mailtide_drafts (account, id, message, thread_id, rfc822_message_id, state,
-since)`, unique on `(account, message)`, and two columns on
+`mailtide_drafts (account, id, message, thread_id, tracking_id, state,
+since)`, unique on `(account, message)` and indexed on `(account,
+tracking_id)`, and two columns on
 `mailtide_accounts`, `drafts_generation BIGINT NOT NULL DEFAULT 0` and
 `drafts_refreshed_at BIGINT` (`NULL`: never listed). Both are columns of
 their own, as the label refresh's `labels_refreshed_at` is; nothing is added
@@ -147,7 +164,9 @@ build from before it can decode. The migration raises `SCHEMA_VERSION`, so
 such a build sees the database as `ahead` and refuses to sync
 (`SchemaOutOfDate`) before it claims a job or writes a row. Its reads that
 check no schema (`changes()`) fail with `CorruptState` on the first draft
-entry of a page; they never skip it. Reverting:
+entry of a page; they never skip it. Imported content gains the
+`tracking_id` header fact (a JSON key an older build reads past and would
+drop on rewrite: the raised version covers it too). Reverting:
 
 ```sql
 DELETE FROM mailtide_jobs WHERE kind = <RefreshDrafts>;
@@ -229,11 +248,19 @@ Gmail carries it:
    it was edited: back to `saved`, `Conflict`. Only the same draft, still
    there, is sent again.
 3. mailtide never sends on its own. A lost answer is settled by Gmail, as I7
-   does for intents: importing a `SENT` message whose `Message-ID` equals
-   the row's emits `DraftSent` (in whatever thread it is); a listing claimed
-   after the attempt that still shows the draft returns it to `saved`; a
-   draft gone and unmatched after `draft_send_grace` (default 1 h) ends as
-   `DraftRemoved{send_unconfirmed}`. No row lives forever.
+   does for intents: importing a `SENT` message whose `X-Mailtide-Id`
+   equals the row's tracking id emits `DraftSent` (in whatever thread it
+   is); a listing claimed once the attempt's request has timed out that
+   still shows the draft returns it to `saved` (the negative proof: it was
+   not sent); a draft gone and unmatched once the cursor has moved past the
+   attempt and `draft_send_grace` (default 1 h) has passed ends as
+   `DraftRemoved{send_unconfirmed}`. No row lives forever. Message-IDs play
+   no part: Gmail assigns a new one at send.
+
+A send answered by a 5xx or not answered at all may have been applied, so
+its row stays `sending` and the call returns `OutcomeUnknown`; only a
+refusal (400, 403), a rate limit or a quota deferral returns it to
+`saved`.
 
 Read-only mode refuses the four writes before any call and keeps mirroring
 the index (`drafts.list` and `drafts.get` accept `gmail.readonly`). A 400 or
@@ -324,6 +351,13 @@ is:
   (a gate deferral that outlasted the call's budget): added by whichever of
   `drafts`, `identities`, `label-edit`, `purge`, `search` lands first.
 
+**Built here.** The account-level job kind: `JobKind::RefreshDrafts` is a
+`mailtide_jobs` row with an empty message key, `JobKind::message()` returns
+an `Option`, and its claim carries its own payload (the draft generation and
+the claim time); `identities` adds its kind beside it. The HTTP request
+timeout reaches the driver as `RunnerConfig.drafts.request_timeout`, which a
+host sets to its transport's timeout (the Python runner passes its own).
+
 **Landed.** The groundwork is on `main`: `Runner::call_gmail` with `CallError`
 and `QuotaDeferred { until }`, the Python `QuotaDeferred` (`until_ms`) and
 `WriteOutcomeUnknown` (their Rust-to-Python conversion comes with the first
@@ -353,8 +387,8 @@ e.g. as a `RunnerConfig` field.
   duplicate draft, never a duplicate send; that does not justify a durable
   `creating` row and a second state machine. *Would reopen it:* duplicate
   drafts reported from real retries, or a host that creates drafts with no
-  user watching, together with `drafts-message-id-kept` confirmed (adoption
-  needs that key).
+  user watching. The key adoption would need now exists: the
+  `X-Mailtide-Id` every create carries.
 - **D5. The API takes bytes.** No hard dependency on `compose-mime`, and a
   host may save an `.eml` it did not compose. *Would change it:* a typed
   message type from `compose-mime` that hosts prefer; it would be added
@@ -378,12 +412,24 @@ e.g. as a `RunnerConfig` field.
   Holding it back would hide a draft for `draft_settle` for no gain.
 - **D11. `draft_inline_limit` is 3 MiB** until `drafts-raw-json-limit` is
   measured: under the 5 MB Google gives as an example of a small transfer.
+- **D12. A draft is identified by `X-Mailtide-Id`, not its Message-ID.**
+  `drafts-message-id-kept` was refuted: Gmail assigns a Message-ID on every
+  create, update and send. The token is required on the bytes, stored on
+  the row, compared on update, and matched against the `tracking_id` fact
+  of imported `SENT` messages. `DraftView.rfc822_message_id` is Gmail's,
+  read from the import. *Would change it:* nothing Gmail does today; the
+  rule is the repository's (`docs/features/README.md`).
+- **D13. The tracking-id reader and fact sit behind a seam.** `compose-mime`
+  owns `mailtide_mime::tracking_id` and `message-facts` the import's
+  `tracking_id` fact; neither has landed. This plan carries the minimum
+  under their names (`crates/mailtide-mime/src/tracking.rs`,
+  `HeaderFacts.tracking_id`), and the rebase onto either replaces the copy.
 
 Unknowns (`scripts/features.py unknowns drafts` prints each test):
 
 - `drafts-send-twice`: a second send of one draft id is a 404 and sends nothing.
 - `drafts-send-concurrent`: concurrent sends of one draft send at most once.
-- `drafts-message-id-kept`: Gmail keeps our `Message-ID` through create, update and send.
+- `drafts-message-id-kept`: refuted. Gmail replaces the `Message-ID` on create, update and send and keeps `X-` headers: confirmation keys on `X-Mailtide-Id` (D12).
 - `drafts-raw-json-limit`: the largest message the JSON `raw` field accepts.
 - `drafts-upload-limit`: the largest message the upload URIs accept.
 - `drafts-sent-thread`: the sent message is in the draft's thread.

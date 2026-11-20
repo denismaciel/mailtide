@@ -1,8 +1,8 @@
 id = "drafts"
 title = "Drafts: create, update, delete, list, read and send"
-summary = "Draft writes as quota-gated calls to Gmail's drafts API that return Gmail's draft id at once, plus a mirrored draft index (draft id -> current message id) that follows drafts changed elsewhere and confirms a send whose answer was lost."
+summary = "Draft writes as quota-gated calls to Gmail's drafts API that return Gmail's draft id at once, plus a mirrored draft index (draft id -> current message id, and the X-Mailtide-Id the bytes carry) that follows drafts changed elsewhere and confirms a send whose answer was lost."
 roadmap = ["C2"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/drafts.md"
 # No hard dependency: the API takes RFC 5322 bytes.
 #   compose-mime (C1) builds those bytes; send (C3) reuses `send_draft` and owns
@@ -81,6 +81,11 @@ path = "crates/mailtide/src/invariants.rs"
 change = "modify"
 role = "Draft invariants: one row per draft, one draft per message, a quiet mirror's index equals Gmail's"
 
+[[file]]
+path = "crates/mailtide/src/gmail.rs"
+change = "modify"
+role = "HeaderFacts.tracking_id: the X-Mailtide-Id an imported message carries. The minimum of message-facts' tracking_id fact that drafts needs (a SENT import settles a lost send by it); the rebase takes message-facts' field in its place"
+
 # ------------------------------------------------------------------ wire layer
 
 [[file]]
@@ -118,12 +123,22 @@ role = "Draft methods over AccountMirror"
 [[file]]
 path = "crates/mailtide-store/src/sql.rs"
 change = "modify"
-role = "The next migration: table mailtide_drafts and, on mailtide_accounts, the columns drafts_generation and drafts_refreshed_at (nothing is added to the sync column); load and write draft rows a commit touches"
+role = "The next migration: table mailtide_drafts (account, id, message, thread_id, tracking_id, state, since) and, on mailtide_accounts, the columns drafts_generation and drafts_refreshed_at (nothing is added to the sync column); load and write draft rows a commit touches, including the rows a SENT import's tracking id names"
 
 [[file]]
 path = "crates/mailtide-store/src/conformance.rs"
 change = "modify"
 role = "Conformance cases for draft rows, the generation fence and the feed entries"
+
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "Delegate the draft methods; they join the every-call-refused list of the schema check"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "Delegate the draft methods"
 
 # ---------------------------------------------------------------------- driver
 
@@ -146,6 +161,21 @@ role = "Send PUT and DELETE. Shared groundwork: PUT, PATCH and DELETE (crates/ma
 path = "crates/mailtide-io/src/lib.rs"
 change = "modify"
 role = "Export the draft types"
+
+[[file]]
+path = "crates/mailtide-io/Cargo.toml"
+change = "modify"
+role = "Depend on mailtide-mime for the tracking id reader"
+
+[[file]]
+path = "crates/mailtide-mime/src/tracking.rs"
+change = "new"
+role = "Seam: TRACKING_HEADER (X-Mailtide-Id), the token grammar and tracking_id(raw), written to compose-mime's contract until it lands; the rebase replaces this copy with compose-mime's"
+
+[[file]]
+path = "crates/mailtide-mime/src/lib.rs"
+change = "modify"
+role = "Export the tracking seam"
 
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
@@ -193,6 +223,16 @@ role = "FakeGmail drafts endpoints and helpers to edit, delete or send a draft a
 path = "SPEC.md"
 change = "modify"
 role = "§4 draft rows; §7 replace the last sentence (\"Sending and drafts reuse the same command and confirm-by-Gmail pattern later\"): draft writes are synchronous calls, only a lost send is confirmed by Gmail; §8 costs; §10-11 interfaces; §14 phase 7"
+
+[[file]]
+path = "README.md"
+change = "modify"
+role = "Drafts in the feature list and the Python example"
+
+[[file]]
+path = "tests/test_migrations_clock.py"
+change = "modify"
+role = "The draft reads join the every-call-refused list; the migration count"
 
 # ----------------------------------------------------------------------- tests
 
@@ -544,7 +584,7 @@ covers = "POST /drafts with {message: {raw, threadId}}; raw is unpadded base64ur
 [[test]]
 target = "crates/mailtide-gmail/src/drafts.rs"
 name = "update_puts_to_the_draft_id"
-covers = "PUT /drafts/{id}; the id is percent-encoded into the path"
+covers = "PUT /drafts/{id}; the id is percent-encoded into the path and the body always carries message.threadId (the request type has no update without one)"
 
 [[test]]
 target = "crates/mailtide-gmail/src/drafts.rs"
@@ -605,8 +645,8 @@ covers = "A row marked sending is not removed by a listing; it is send_unconfirm
 
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
-name = "a_sent_import_with_the_drafts_message_id_settles_the_send"
-covers = "Confirmation by Gmail: importing a SENT message whose Message-ID is the sending draft's emits DraftSent and drops the row"
+name = "a_sent_import_carrying_the_drafts_tracking_id_settles_the_send"
+covers = "Confirmation by Gmail: importing a SENT message whose X-Mailtide-Id is the sending draft's emits DraftSent and drops the row (Gmail replaces the Message-ID on every save and on send: drafts-message-id-kept refuted)"
 
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
@@ -626,7 +666,7 @@ covers = "Invariant: draft ids are unique per account and no two rows share a me
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
 name = "draft_rows"
-covers = "Every store: rows survive a restart, a local write bumps the generation and fences an older reconcile, feed entries are written in the same transaction, forget deletes them"
+covers = "Every store: rows (with their tracking id) survive a restart, a local write bumps the generation and fences an older reconcile, saved -> sending is a compare-and-set, a SENT import settles a sending row by tracking id, feed entries are written in the same transaction, forget deletes them"
 
 [[test]]
 target = "crates/mailtide-sim/src/lib.rs"
@@ -653,7 +693,7 @@ covers = "A draft needs no To header (Zero: outgoing MIME > builds drafts withou
 [[test]]
 target = "crates/mailtide-io/tests/drafts.rs"
 name = "an_update_keeps_the_draft_in_its_thread"
-covers = "update_draft always sends a thread id: the caller's, else the index's"
+covers = "update_draft always sends a thread id: the caller's, else the index's. A rule, not an optimisation: drafts-update-keeps-thread confirmed that an update without one moves a reply draft out of its thread"
 
 [[test]]
 target = "crates/mailtide-io/tests/drafts.rs"
@@ -827,8 +867,36 @@ covers = "A reconcile whose listing equals the index writes only the refresh tim
 
 [[test]]
 target = "crates/mailtide/src/drafts.rs"
-name = "a_lost_send_is_matched_by_message_id_in_any_thread"
+name = "a_lost_send_is_matched_by_tracking_id_in_any_thread"
 covers = "Confirmation does not assume the sent message stayed in the draft's thread; DraftSent carries the imported message's own thread id"
+
+# Added when drafts-message-id-kept was refuted: a draft is identified by
+# X-Mailtide-Id, never by its Message-ID (docs/features/README.md).
+
+[[test]]
+target = "crates/mailtide-mime/src/tracking.rs"
+name = "tracking_id_needs_exactly_one_valid_header"
+covers = "The reader behind the seam: one X-Mailtide-Id header of 16 to 64 characters of A-Za-z0-9_- in the top header block gives the token; none, two, a malformed token or one in a body part give nothing"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_draft_write_without_one_valid_tracking_id_is_refused"
+covers = "create_draft and update_draft refuse bytes without exactly one valid X-Mailtide-Id before any Gmail call or record; mailtide never adds or repairs it"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "an_update_carrying_another_tracking_id_is_refused"
+covers = "A draft's tracking id is stable: an update whose bytes carry a different token than the row's is refused before any Gmail call"
+
+[[test]]
+target = "crates/mailtide-io/tests/drafts.rs"
+name = "a_drafts_message_id_is_read_from_gmails_copy"
+covers = "Gmail assigns its own Message-ID on every save: DraftView.rfc822_message_id is unknown until the draft's current message is imported, then Gmail's, never the caller's"
+
+[[test]]
+target = "tests/test_drafts.py"
+name = "test_draft_bytes_need_a_tracking_id"
+covers = "create_draft raises ValueError for bytes without X-Mailtide-Id; the DraftView carries the tracking id of the bytes saved"
 
 # ------------------------------------------------------------------- unknowns
 # Gmail behaviour the design assumes without proof. Paths are relative to
