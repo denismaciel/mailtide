@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use crate::command::GmailRequest;
+use crate::drafts::DraftFormat;
 use crate::ids::{AccountId, Timestamp};
 use crate::search::SearchScope;
 
@@ -55,6 +56,14 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
         },
         GmailRequest::DeleteMessage { .. } => 10,
         GmailRequest::BatchDeleteMessages { .. } => 50,
+        GmailRequest::ListDrafts { .. } => 5,
+        GmailRequest::GetDraft { format, .. } => match format {
+            DraftFormat::Minimal => 20,
+            DraftFormat::Raw => 60,
+        },
+        GmailRequest::CreateDraft { .. } | GmailRequest::DeleteDraft { .. } => 10,
+        GmailRequest::UpdateDraft { .. } => 15,
+        GmailRequest::SendDraft { .. } => 100,
     })
 }
 
@@ -504,6 +513,51 @@ mod tests {
         assert_eq!(total(5), 50);
         assert_eq!(total(1_000), 50);
         assert_eq!(total(1_001), 100);
+    }
+
+    #[test]
+    fn draft_costs_follow_gmails_quota_table() {
+        use crate::drafts::Rfc822;
+        use crate::ids::{DraftId, ThreadId};
+        let id = || DraftId("r1".into());
+        let raw = || Rfc822(b"X-Mailtide-Id: 0123456789abcdef\r\n\r\nhi".to_vec());
+        let costs = [
+            (
+                GmailRequest::CreateDraft {
+                    raw: raw(),
+                    thread_id: None,
+                },
+                10,
+            ),
+            (
+                GmailRequest::UpdateDraft {
+                    id: id(),
+                    raw: raw(),
+                    thread_id: ThreadId("t".into()),
+                },
+                15,
+            ),
+            (GmailRequest::DeleteDraft { id: id() }, 10),
+            (GmailRequest::SendDraft { id: id() }, 100),
+            (GmailRequest::ListDrafts { page_token: None }, 5),
+            (
+                GmailRequest::GetDraft {
+                    id: id(),
+                    format: DraftFormat::Minimal,
+                },
+                20,
+            ),
+            (
+                GmailRequest::GetDraft {
+                    id: id(),
+                    format: DraftFormat::Raw,
+                },
+                60,
+            ),
+        ];
+        for (request, units) in costs {
+            assert_eq!(cost(&request), QuotaUnits(units), "{request:?}");
+        }
     }
 
     #[test]

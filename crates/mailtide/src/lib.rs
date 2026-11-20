@@ -11,6 +11,7 @@
 
 pub mod command;
 pub mod commit;
+pub mod drafts;
 pub mod drift;
 pub mod engine;
 pub mod event;
@@ -37,4 +38,4 @@ pub mod thread;
 pub use command::Command;
 pub use engine::{Engine, EngineConfig};
 pub use event::Event;
-pub use ids::{AccountId, HistoryId, LabelId, MessageId, ThreadId, Timestamp};
+pub use ids::{AccountId, DraftId, HistoryId, LabelId, MessageId, ThreadId, Timestamp};

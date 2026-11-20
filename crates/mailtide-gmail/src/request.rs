@@ -6,6 +6,7 @@ use mailtide::reconcile::ListScope;
 use mailtide::search::{SearchRequest, SearchScope};
 use serde_json::json;
 
+use crate::drafts;
 use crate::http::{HttpRequest, Method, encode};
 
 pub(crate) const USER: &str = "/gmail/v1/users/me";
@@ -78,6 +79,16 @@ pub fn build(request: &GmailRequest, config: &RequestConfig) -> Vec<HttpRequest>
         GmailRequest::DeleteLabel { id } => vec![crate::labels::delete(id)],
         GmailRequest::DeleteMessage { id } => vec![crate::purge::delete(id)],
         GmailRequest::BatchDeleteMessages { ids } => vec![crate::purge::batch_delete(ids)],
+        GmailRequest::ListDrafts { page_token } => vec![drafts::list(page_token.as_ref())],
+        GmailRequest::GetDraft { id, format } => vec![drafts::get(id, *format)],
+        GmailRequest::CreateDraft { raw, thread_id } => {
+            vec![drafts::create(raw, thread_id.as_ref())]
+        }
+        GmailRequest::UpdateDraft { id, raw, thread_id } => {
+            vec![drafts::update(id, raw, thread_id)]
+        }
+        GmailRequest::DeleteDraft { id } => vec![drafts::delete(id)],
+        GmailRequest::SendDraft { id } => vec![drafts::send(id)],
     }
 }
 

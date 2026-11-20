@@ -399,7 +399,13 @@ pub fn request_ids(request: &GmailRequest) -> Vec<MessageId> {
         | GmailRequest::GetLabel { .. }
         | GmailRequest::CreateLabel(_)
         | GmailRequest::PatchLabel { .. }
-        | GmailRequest::DeleteLabel { .. } => Vec::new(),
+        | GmailRequest::DeleteLabel { .. }
+        | GmailRequest::ListDrafts { .. }
+        | GmailRequest::GetDraft { .. }
+        | GmailRequest::CreateDraft { .. }
+        | GmailRequest::UpdateDraft { .. }
+        | GmailRequest::DeleteDraft { .. }
+        | GmailRequest::SendDraft { .. } => Vec::new(),
     }
 }
 

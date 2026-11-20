@@ -374,6 +374,14 @@ impl Engine {
             | EventKind::LabelNameTaken { .. }
             | EventKind::LabelDeleted { .. }
             | EventKind::MessagesDeleted { .. } => Vec::new(),
+            // Answers to direct calls (the driver's draft methods): no
+            // engine command asks for these.
+            EventKind::DraftsListed { .. }
+            | EventKind::DraftFetched { .. }
+            | EventKind::DraftSaved { .. }
+            | EventKind::DraftDeleted { .. }
+            | EventKind::DraftSent { .. }
+            | EventKind::DraftNotFound { .. } => Vec::new(),
         }
     }
 

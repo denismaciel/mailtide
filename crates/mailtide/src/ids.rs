@@ -43,6 +43,13 @@ impl AccountId {
 )]
 pub struct MessageId(pub String);
 
+/// A Gmail draft id: stable for the life of a draft, while the message it
+/// holds gets a new id on every save. Not a message id (SPEC §4).
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct DraftId(pub String);
+
 /// A Gmail thread id. Gmail's threading is authoritative.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,

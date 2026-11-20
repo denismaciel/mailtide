@@ -36,6 +36,22 @@ pub fn new_tracking_id(entropy: [u8; 16]) -> String {
 /// a tracking id. Reads the header block only, never the body.
 #[must_use]
 pub fn tracking_id(raw: &[u8]) -> Option<String> {
+    tracking_fields(raw).find_map(|value| {
+        let value = std::str::from_utf8(&value).ok()?.trim_ascii();
+        is_tracking_id(value).then(|| value.to_owned())
+    })
+}
+
+/// How many `X-Mailtide-Id` headers a raw message's header block carries,
+/// valid or not. A draft must carry exactly one: two would leave its sent
+/// message's identity to a reader's choice.
+#[must_use]
+pub fn tracking_headers(raw: &[u8]) -> usize {
+    tracking_fields(raw).count()
+}
+
+/// The values of the `X-Mailtide-Id` fields of the header block, unfolded.
+fn tracking_fields(raw: &[u8]) -> impl Iterator<Item = Vec<u8>> {
     let mut fields: Vec<Vec<u8>> = Vec::new();
     for line in raw.split(|&byte| byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -47,17 +63,12 @@ pub fn tracking_id(raw: &[u8]) -> Option<String> {
             _ => fields.push(line.to_vec()),
         }
     }
-    fields.iter().find_map(|field| {
+    fields.into_iter().filter_map(|field| {
         let colon = field.iter().position(|&byte| byte == b':')?;
         let (name, value) = field.split_at(colon);
-        if !name
-            .trim_ascii()
+        name.trim_ascii()
             .eq_ignore_ascii_case(TRACKING_HEADER.as_bytes())
-        {
-            return None;
-        }
-        let value = std::str::from_utf8(value.get(1..)?).ok()?.trim_ascii();
-        is_tracking_id(value).then(|| value.to_owned())
+            .then(|| value.get(1..).unwrap_or_default().to_vec())
     })
 }
 
@@ -134,5 +145,24 @@ mod tests {
         assert_eq!(read(&format!("X-Mailtide-Ids: {TOKEN}\r\n\r\n")), None);
         assert_eq!(tracking_id(b""), None);
         assert_eq!(tracking_id(b"\xff\xfe: \xff\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn tracking_headers_are_counted_valid_or_not() {
+        let count = |raw: &str| tracking_headers(raw.as_bytes());
+        assert_eq!(count(&format!("X-Mailtide-Id: {TOKEN}\r\n\r\nb")), 1);
+        assert_eq!(count("From: a@x\r\n\r\nb"), 0);
+        assert_eq!(
+            count(&format!(
+                "x-mailtide-id: {TOKEN}\r\nX-Mailtide-Id: short\r\n\r\nb"
+            )),
+            2,
+            "an invalid one counts"
+        );
+        assert_eq!(
+            count(&format!("From: a@x\r\n\r\nX-Mailtide-Id: {TOKEN}\r\n")),
+            0,
+            "not in the body"
+        );
     }
 }

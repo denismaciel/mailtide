@@ -21,7 +21,9 @@ pub use decode::PartDecoder;
 pub use facts::facts;
 pub use message_id::MessageId;
 pub use parts::{PartInfo, PartRole, parts};
-pub use tracking::{TRACKING_HEADER, is_tracking_id, new_tracking_id, tracking_id};
+pub use tracking::{
+    TRACKING_HEADER, is_tracking_id, new_tracking_id, tracking_headers, tracking_id,
+};
 
 use mail_parser::{HeaderForm, MessageParser};
 use mailtide::gmail::PartRef;

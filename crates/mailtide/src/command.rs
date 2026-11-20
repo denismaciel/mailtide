@@ -1,8 +1,11 @@
 //! Requests the engine returns for the host to perform (SPEC §10.2).
 
 use crate::commit::Commit;
+use crate::drafts::{DraftFormat, Rfc822};
 use crate::gmail::{LabelPatch, NewLabel};
-use crate::ids::{AccountId, CommandId, HistoryId, LabelId, MessageId, PageToken, Timestamp};
+use crate::ids::{
+    AccountId, CommandId, DraftId, HistoryId, LabelId, MessageId, PageToken, ThreadId, Timestamp,
+};
 use crate::outbox::ModifyGroup;
 use crate::quota::{Priority, QuotaUnits};
 use crate::schedule::TimerKind;
@@ -150,5 +153,45 @@ pub enum GmailRequest {
     BatchDeleteMessages {
         /// At most [`crate::purge::BATCH_DELETE_MAX`] ids.
         ids: Vec<MessageId>,
+    },
+    /// `drafts.list`, including spam and trash: the draft index refresh.
+    ListDrafts {
+        /// The page to read.
+        page_token: Option<PageToken>,
+    },
+    /// `drafts.get` (a direct call).
+    GetDraft {
+        /// The draft.
+        id: DraftId,
+        /// How much of its message to return.
+        format: DraftFormat,
+    },
+    /// `drafts.create` from raw bytes (a direct call).
+    CreateDraft {
+        /// The message.
+        raw: Rfc822,
+        /// The thread to put it in, for a reply.
+        thread_id: Option<ThreadId>,
+    },
+    /// `drafts.update`: replace the draft's message (a direct call). The
+    /// thread id is never left out: Gmail moves a reply draft updated
+    /// without one out of its thread.
+    UpdateDraft {
+        /// The draft.
+        id: DraftId,
+        /// The new message.
+        raw: Rfc822,
+        /// The draft's thread.
+        thread_id: ThreadId,
+    },
+    /// `drafts.delete`: permanent, not to trash (a direct call).
+    DeleteDraft {
+        /// The draft.
+        id: DraftId,
+    },
+    /// `drafts.send`: send the stored draft as is (a direct call).
+    SendDraft {
+        /// The draft.
+        id: DraftId,
     },
 }

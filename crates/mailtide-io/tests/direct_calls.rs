@@ -288,8 +288,11 @@ async fn a_call_claims_nothing_and_writes_nothing() {
 /// the features that write (they use the crate's `direct_call`).
 #[tokio::test]
 async fn the_public_call_refuses_every_write_before_any_token_or_quota() {
+    use mailtide::drafts::Rfc822;
     use mailtide::gmail::{LabelListVisibility, LabelPatch, MessageListVisibility, NewLabel};
+    use mailtide::ids::{DraftId, ThreadId};
     let label = LabelId("Label_1".into());
+    let draft = DraftId("r1".into());
     let writes = [
         archive_m1(),
         GmailRequest::CreateLabel(NewLabel {
@@ -312,6 +315,17 @@ async fn the_public_call_refuses_every_write_before_any_token_or_quota() {
         GmailRequest::BatchDeleteMessages {
             ids: vec![MessageId("m1".into())],
         },
+        GmailRequest::CreateDraft {
+            raw: Rfc822(b"Subject: x\r\n\r\nx".to_vec()),
+            thread_id: None,
+        },
+        GmailRequest::UpdateDraft {
+            id: draft.clone(),
+            raw: Rfc822(b"Subject: x\r\n\r\nx".to_vec()),
+            thread_id: ThreadId("t1".into()),
+        },
+        GmailRequest::DeleteDraft { id: draft.clone() },
+        GmailRequest::SendDraft { id: draft },
     ];
     for access in [Access::ReadWrite, Access::ReadOnly] {
         let setup = Setup::new(access, Vec::new(), 0, Duration::ZERO);

@@ -10,6 +10,7 @@
 
 pub mod batch;
 pub mod decode;
+pub mod drafts;
 pub mod errors;
 pub mod headers;
 pub mod http;

@@ -145,6 +145,12 @@ fn request_kind(request: &GmailRequest) -> &'static str {
         GmailRequest::DeleteLabel { .. } => "delete_label",
         GmailRequest::DeleteMessage { .. } => "delete_message",
         GmailRequest::BatchDeleteMessages { .. } => "batch_delete_messages",
+        GmailRequest::ListDrafts { .. } => "list_drafts",
+        GmailRequest::GetDraft { .. } => "get_draft",
+        GmailRequest::CreateDraft { .. } => "create_draft",
+        GmailRequest::UpdateDraft { .. } => "update_draft",
+        GmailRequest::DeleteDraft { .. } => "delete_draft",
+        GmailRequest::SendDraft { .. } => "send_draft",
     }
 }
 
@@ -1707,6 +1713,38 @@ where
                     ids: mailtide::purge::request_ids(gmail_request),
                 })
             }
+            GmailRequest::ListDrafts { .. } => mailtide_gmail::drafts::list_page(body)
+                .map(|page| EventKind::DraftsListed { command, page }),
+            GmailRequest::GetDraft { id, .. } => match mailtide_gmail::drafts::fetched(body) {
+                // Asked for one draft, answered with another: never take it.
+                Ok(Some(draft)) if draft.draft.id != *id => {
+                    return Outcome::Failed(transient(format!(
+                        "response for draft {} answered request for {}",
+                        draft.draft.id.0, id.0
+                    )));
+                }
+                Ok(Some(draft)) => Ok(EventKind::DraftFetched { command, draft }),
+                // Not a draft (drafts-id-namespace): as Gmail's own 404.
+                Ok(None) => Ok(EventKind::DraftNotFound {
+                    command,
+                    id: id.clone(),
+                }),
+                Err(error) => Err(error),
+            },
+            GmailRequest::CreateDraft { .. } | GmailRequest::UpdateDraft { .. } => {
+                mailtide_gmail::drafts::written(body)
+                    .map(|draft| EventKind::DraftSaved { command, draft })
+            }
+            GmailRequest::DeleteDraft { .. } => Ok(EventKind::DraftDeleted { command }),
+            GmailRequest::SendDraft { .. } => {
+                mailtide_gmail::drafts::sent(body).map(|(message, thread_id)| {
+                    EventKind::DraftSent {
+                        command,
+                        message,
+                        thread_id,
+                    }
+                })
+            }
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
@@ -1819,6 +1857,16 @@ fn refused(
             command,
             message_id: id.clone(),
         }),
+        (
+            Failure::NotFound,
+            GmailRequest::GetDraft { id, .. }
+            | GmailRequest::UpdateDraft { id, .. }
+            | GmailRequest::DeleteDraft { id }
+            | GmailRequest::SendDraft { id },
+        ) => Outcome::Event(EventKind::DraftNotFound {
+            command,
+            id: id.clone(),
+        }),
         // `Label name exists or conflicts`: the caller's to resolve, with
         // the label that holds the name.
         (Failure::Blocking(_), GmailRequest::CreateLabel(_) | GmailRequest::PatchLabel { .. })
@@ -1889,8 +1937,14 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::PatchLabel { .. }
         | GmailRequest::DeleteLabel { .. }
         | GmailRequest::DeleteMessage { .. }
-        | GmailRequest::BatchDeleteMessages { .. } => true,
-        GmailRequest::GetProfile
+        | GmailRequest::BatchDeleteMessages { .. }
+        | GmailRequest::CreateDraft { .. }
+        | GmailRequest::UpdateDraft { .. }
+        | GmailRequest::DeleteDraft { .. }
+        | GmailRequest::SendDraft { .. } => true,
+        GmailRequest::ListDrafts { .. }
+        | GmailRequest::GetDraft { .. }
+        | GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }
         | GmailRequest::GetMessage { .. }

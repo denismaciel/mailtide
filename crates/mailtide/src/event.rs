@@ -6,8 +6,9 @@
 //! Zero counterpart: the RPC and queue inputs of `routes/agent/index.ts` and
 //! `gmail-push.ts`.
 
+use crate::drafts::{DraftPage, FetchedDraft, WrittenDraft};
 use crate::gmail::{HistoryPage, ImportedMessage, Label, ListPage, MessageObservation};
-use crate::ids::{CommandId, CommitId, HistoryId, MessageId, Timestamp};
+use crate::ids::{CommandId, CommitId, DraftId, HistoryId, MessageId, ThreadId, Timestamp};
 use crate::outbox::ActionRequest;
 use crate::retry::Failure;
 use crate::schedule::TimerKind;
@@ -200,5 +201,47 @@ pub enum EventKind {
         command: CommandId,
         /// The ids the request named.
         ids: Vec<MessageId>,
+    },
+    /// A `drafts.list` page arrived.
+    DraftsListed {
+        /// The command it answers.
+        command: CommandId,
+        /// The page.
+        page: DraftPage,
+    },
+    /// `drafts.get` returned a draft.
+    DraftFetched {
+        /// The command it answers.
+        command: CommandId,
+        /// The draft.
+        draft: FetchedDraft,
+    },
+    /// `drafts.create` or `drafts.update` succeeded.
+    DraftSaved {
+        /// The command it answers.
+        command: CommandId,
+        /// Gmail's answer.
+        draft: WrittenDraft,
+    },
+    /// `drafts.delete` succeeded.
+    DraftDeleted {
+        /// The command it answers.
+        command: CommandId,
+    },
+    /// `drafts.send` succeeded: the draft is gone and a new message left.
+    DraftSent {
+        /// The command it answers.
+        command: CommandId,
+        /// The sent message (a new id, labelled `SENT`).
+        message: MessageId,
+        /// Its thread.
+        thread_id: ThreadId,
+    },
+    /// Gmail has no such draft (404), or what it returned is not a draft.
+    DraftNotFound {
+        /// The command it answers.
+        command: CommandId,
+        /// The draft asked for.
+        id: DraftId,
     },
 }

@@ -2205,6 +2205,25 @@ impl Sim {
             GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
                 self.deleted(command, request)
             }
+            GmailRequest::ListDrafts { .. } => EventKind::DraftsListed {
+                command,
+                page: mailtide::drafts::DraftPage {
+                    drafts: Vec::new(),
+                    next_page_token: None,
+                },
+            },
+            // The driver's direct calls: no engine command makes them.
+            GmailRequest::GetDraft { .. }
+            | GmailRequest::CreateDraft { .. }
+            | GmailRequest::UpdateDraft { .. }
+            | GmailRequest::DeleteDraft { .. }
+            | GmailRequest::SendDraft { .. } => EventKind::RequestFailed {
+                command,
+                failure: mailtide::retry::Failure::Blocking(mailtide::retry::BlockingFailure {
+                    class: mailtide::retry::Blocking::Permanent,
+                    detail: "not an engine request".into(),
+                }),
+            },
         }
     }
 

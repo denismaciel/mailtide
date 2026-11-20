@@ -229,7 +229,7 @@ pub struct RawMessage {
 }
 
 /// Gmail's base64url, with or without padding.
-const BASE64URL: GeneralPurpose = GeneralPurpose::new(
+pub(crate) const BASE64URL: GeneralPurpose = GeneralPurpose::new(
     &alphabet::URL_SAFE,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
