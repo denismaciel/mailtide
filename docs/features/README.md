@@ -177,8 +177,8 @@ exception says so under its Decisions.
   their own, no feed entry when nothing changed, never in the way of mail
   (labels 15 min, draft index 15 min, settings 6 h).
 - **Shared groundwork** (HTTP PUT, PATCH and DELETE, the unfenced driver-call
-  pattern, `QuotaDeferred`, schema-checked reads) lands before the features that
-  use it.
+  pattern, `QuotaDeferred`, `WriteOutcomeUnknown`, schema-checked reads) lands
+  before the features that use it.
 - **Tests carry their plan's names.** A mapped reference test and an own test
   exist under exactly the name and file the plan gives; when building shows a
   planned test is wrong, the plan changes in the same commit, with the reason.

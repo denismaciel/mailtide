@@ -98,6 +98,12 @@ mod _core {
     );
     create_exception!(
         _core,
+        WriteOutcomeUnknown,
+        MailtideError,
+        "A write reached Gmail, or may have, and its answer was lost (a timeout, a dropped connection): it may or may not have been applied."
+    );
+    create_exception!(
+        _core,
         SchemaOutOfDate,
         MailtideError,
         "The database's mailtide schema doesn't match this build: run migrations (or upgrade)."
@@ -139,6 +145,7 @@ mod _core {
         m.add("BlobUnavailable", py.get_type::<BlobUnavailable>())?;
         m.add("QuotaGateError", py.get_type::<QuotaGateError>())?;
         m.add("QuotaDeferred", py.get_type::<QuotaDeferred>())?;
+        m.add("WriteOutcomeUnknown", py.get_type::<WriteOutcomeUnknown>())?;
         m.add("Superseded", py.get_type::<Superseded>())?;
         m.add("SchemaOutOfDate", py.get_type::<SchemaOutOfDate>())?;
         m.add("ReadOnlyMode", py.get_type::<ReadOnlyMode>())?;

@@ -62,3 +62,9 @@ def test_quota_deferred_is_a_mailtide_error() -> None:
     """A direct call the quota gate would hold past its budget raises it."""
     assert issubclass(mailtide.QuotaDeferred, mailtide.MailtideError)
     assert "QuotaDeferred" in mailtide.__all__
+
+
+def test_write_outcome_unknown_is_a_mailtide_error() -> None:
+    """A direct write whose answer was lost raises it."""
+    assert issubclass(mailtide.WriteOutcomeUnknown, mailtide.MailtideError)
+    assert "WriteOutcomeUnknown" in mailtide.__all__
