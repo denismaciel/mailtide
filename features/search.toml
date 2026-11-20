@@ -92,6 +92,16 @@ change = "modify"
 role = "locate: two id-keyed reads (messages, tombstones) for at most 500 ids"
 
 [[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "locate delegates to the SQL store; it joins the calls refused on a schema out of date"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "locate delegates to the SQL store"
+
+[[file]]
 path = "crates/mailtide-store/src/conformance.rs"
 change = "modify"
 role = "Conformance case for locate"

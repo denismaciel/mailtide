@@ -4,7 +4,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::MessageView;
+use mailtide::mirror::{Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -169,6 +169,14 @@ impl Store for PostgresStore {
         ids: &[ThreadId],
     ) -> Result<Vec<ThreadView>, StoreError> {
         crate::Store::threads(&self.inner, account, ids).await
+    }
+
+    async fn locate(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Vec<(MessageId, Located)>, StoreError> {
+        crate::Store::locate(&self.inner, account, ids).await
     }
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {

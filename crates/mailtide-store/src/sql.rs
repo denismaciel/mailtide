@@ -22,7 +22,7 @@ use mailtide::jobs::{
 };
 use mailtide::labels::LabelSet;
 use mailtide::mirror::{
-    AccountMirror, AccountRecord, Content, MessageRecord, MessageView, StoredContent,
+    AccountMirror, AccountRecord, Content, Located, MessageRecord, MessageView, StoredContent,
 };
 use mailtide::outbox::{ActionRequest, Intent, IntentOp, plan_delivery};
 use mailtide::quota::Priority;
@@ -2082,6 +2082,71 @@ impl crate::Store for SqlStore {
             })
             .collect();
         Ok(ids.iter().filter_map(|id| views.get(id).cloned()).collect())
+    }
+
+    async fn locate(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Vec<(MessageId, Located)>, StoreError> {
+        self.ensure_schema().await?;
+        // Two primary-key reads per chunk, rows first: a message deleted
+        // between them has a tombstone by the second, which wins, so it is
+        // never reported absent while it has a row.
+        let mut found: BTreeMap<MessageId, Located> = BTreeMap::new();
+        for chunk in ids.chunks(VIEW_CHUNK) {
+            let placeholders = (2..chunk.len() + 2)
+                .map(|n| format!("${n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Only numbered placeholders are interpolated; ids are bound.
+            let sql = format!(
+                "SELECT id, CAST(CASE WHEN content IS NULL THEN 0 ELSE 1 END AS BIGINT) AS imported
+                 FROM mailtide_messages WHERE account = $1 AND id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?
+            {
+                let id: String = row.try_get("id").map_err(|e| corrupt("id", e))?;
+                let imported: i64 = row
+                    .try_get("imported")
+                    .map_err(|e| corrupt("imported", e))?;
+                found.insert(
+                    MessageId(id),
+                    Located::Row {
+                        imported: imported != 0,
+                    },
+                );
+            }
+            let sql = format!(
+                "SELECT id FROM mailtide_tombstones WHERE account = $1 AND id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(account.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?
+            {
+                let id: String = row.try_get("id").map_err(|e| corrupt("id", e))?;
+                found.insert(MessageId(id), Located::Tombstone);
+            }
+        }
+        Ok(ids
+            .iter()
+            .map(|id| {
+                let located = found.get(id).copied().unwrap_or(Located::Absent);
+                (id.clone(), located)
+            })
+            .collect())
     }
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {

@@ -4,7 +4,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::MessageView;
+use mailtide::mirror::{Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -171,6 +171,14 @@ impl Store for SqliteStore {
         crate::Store::threads(&self.inner, account, ids).await
     }
 
+    async fn locate(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Vec<(MessageId, Located)>, StoreError> {
+        crate::Store::locate(&self.inner, account, ids).await
+    }
+
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         crate::Store::labels(&self.inner, account).await
     }
@@ -304,6 +312,7 @@ mod tests {
         refused("messages", store.messages(account, &ids).await.err());
         let threads = [ThreadId("t".into())];
         refused("threads", store.threads(account, &threads).await.err());
+        refused("locate", store.locate(account, &ids).await.err());
         refused("labels", store.labels(account).await.err());
     }
 

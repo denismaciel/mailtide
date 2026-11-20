@@ -15,7 +15,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::MessageView;
+use mailtide::mirror::{Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -223,6 +223,16 @@ pub trait Store: Send + Sync {
         account: &AccountId,
         ids: &[ThreadId],
     ) -> impl Future<Output = Result<Vec<ThreadView>, StoreError>> + Send;
+
+    /// What the mirror holds for each of `ids` (at most 500), in the order
+    /// given: a row with or without its content, a tombstone, or nothing
+    /// (see [`mailtide::mirror::AccountMirror::locate`]). A read that claims
+    /// nothing, by primary key; an untracked account holds nothing.
+    fn locate(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> impl Future<Output = Result<Vec<(MessageId, Located)>, StoreError>> + Send;
 
     /// The account's label definitions as the mirror last synced them, in id
     /// order: empty before the first label sync, and for an unknown account.

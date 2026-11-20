@@ -604,6 +604,9 @@ engine's epoch, so results meant for a dead engine are ignored).
   of an untracked account, are left out; no ids read nothing. The SQL store
   reads each chunk of ids with one statement joining rows and intents, so a
   view never mixes rows from before a commit with intents from after it.
+- `locate(account, ids)`: per id (at most 500), a row with or without its
+  content, a tombstone, or nothing; a read by primary key that claims
+  nothing (what a search marks its hits with).
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
   last synced, in id order; empty before the first label sync.
 - The SQL store refuses every one of these with
@@ -612,7 +615,7 @@ engine's epoch, so results meant for a dead engine are ignored).
   missing) or ahead of it (a newer mailtide migrated it). It asks once: after
   it has seen the schema current, it and its clones do not ask again.
 
-The conformance suite (`mailtide_store::conformance`, 53 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 54 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings

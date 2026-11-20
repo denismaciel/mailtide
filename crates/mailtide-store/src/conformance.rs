@@ -16,7 +16,7 @@ use mailtide::ids::{
 };
 use mailtide::jobs::{AttemptId, FOREGROUND_IMPORT_CAP, JobKind, JobOp, JobOutcome, Prioritised};
 use mailtide::labels::{LabelSet, set};
-use mailtide::mirror::MessageView;
+use mailtide::mirror::{Located, MessageView};
 use mailtide::outbox::{Action, ActionRequest, IntentOp, ReadState};
 use mailtide::quota::Priority;
 use mailtide::revision::{
@@ -133,6 +133,7 @@ where
     cases.extend(thread_cases());
     cases.extend(isolation_cases());
     cases.extend(consumer_cases());
+    cases.extend(search_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -228,6 +229,15 @@ fn consumer_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
         ),
         ("a consumer inside a commit keeps it", |s| {
             Box::pin(a_consumer_inside_a_commit_keeps_it(s))
+        }),
+    ]
+}
+
+/// The cases of `Store::locate`, which search reads.
+fn search_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        ("locate tells rows, tombstones and unknown ids apart", |s| {
+            Box::pin(locate(s))
         }),
     ]
 }
@@ -2829,5 +2839,69 @@ async fn a_consumer_inside_a_commit_keeps_it<S: Store>(store: &S) -> Result<(), 
     expect(
         discovered(&rest.changes) == ["b", "c"],
         "the rest of the commit is read",
+    )
+}
+
+/// `Store::locate`: a row with content, a row without, a tombstone and an
+/// unknown id are told apart, for a full page of 500 ids, by a read that
+/// claims nothing; an untracked account holds nothing.
+async fn locate<S: Store>(store: &S) -> Result<(), String> {
+    let untracked = store
+        .locate(&account(), &ids(&["a"]))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        untracked == [(MessageId("a".into()), Located::Absent)],
+        "an untracked account holds nothing",
+    )?;
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![
+        import("stored", &["INBOX"], 2),
+        observe("queued", &["INBOX"], 3),
+        observe("gone", &["INBOX"], 4),
+    ];
+    apply(store, &c).await?;
+    let mut c = commit(&snapshot, 1);
+    c.messages = vec![MessageOp::Tombstone {
+        id: MessageId("gone".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(5) },
+    }];
+    apply(store, &c).await?;
+    let before = store
+        .status(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let mut asked = ids(&["queued", "unknown", "stored", "gone"]);
+    asked.extend((0..496).map(|n| MessageId(format!("other-{n}"))));
+    let located = store
+        .locate(&account(), &asked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(located.len() == 500, "one answer per id")?;
+    expect(
+        located[..4]
+            == [
+                (MessageId("queued".into()), Located::Row { imported: false }),
+                (MessageId("unknown".into()), Located::Absent),
+                (MessageId("stored".into()), Located::Row { imported: true }),
+                (MessageId("gone".into()), Located::Tombstone),
+            ],
+        &format!("rows, tombstones and absent ids are told apart: {located:?}"),
+    )?;
+    expect(
+        located[4..].iter().all(|(_, at)| *at == Located::Absent),
+        "every other id is absent",
+    )?;
+    let after = store
+        .status(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(before == after, "locate claims and writes nothing")?;
+    let mut later = commit(&snapshot, 2);
+    later.messages = vec![observe("later", &["INBOX"], 6)];
+    expect(
+        matches!(apply(store, &later).await?, CommitOutcome::Applied { .. }),
+        "the engine keeps its claim",
     )
 }

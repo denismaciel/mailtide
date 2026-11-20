@@ -8,7 +8,7 @@ use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
 use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
-use mailtide::mirror::{AccountMirror, MessageView};
+use mailtide::mirror::{AccountMirror, Located, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{
     AckOutcome, ChangeFeed, ConsumerList, ConsumerName, FeedCursor, FeedPosition, Retention,
@@ -267,6 +267,15 @@ impl Store for MemoryStore {
         self.on_account(account, Vec::new(), |mirror| {
             ids.iter().filter_map(|id| mirror.thread(id)).collect()
         })
+    }
+
+    async fn locate(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Vec<(MessageId, Located)>, StoreError> {
+        let absent = ids.iter().map(|id| (id.clone(), Located::Absent)).collect();
+        self.on_account(account, absent, |mirror| mirror.locate(ids))
     }
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
