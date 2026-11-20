@@ -768,6 +768,8 @@ question = "Does labels.list always reflect label creates and deletes that compl
 assumed = "Yes: one unpaginated answer that includes every existing label and no deleted one. A listing without a stored id is treated as proof that the label was deleted."
 if_wrong = "A listing that wrongly omits a live label would strip it from mirrored rows and nothing would put it back until those messages are fetched again (drift reports them as differs). The safe variant is local to one pure rule: remove a label only when two listings a refresh apart both lack it (a `missing` flag on the stored definition, no engine change), at the cost of up to one more refresh interval."
 test = "1) labels.create a probe label, then labels.list at once: expect the new id. Repeat 20 times with fresh names and count misses. 2) labels.delete each probe, then labels.list at once: expect the id gone; count the listings that still show it. 3) While creating 20 labels from one client in a loop, call labels.list from a second client 50 times: every listing must contain every label created before that request was sent and no label deleted before it. Run together with drafts-list-consistent and identities-read-after-write (the same loop: write, then list at once; a different endpoint each, so a separate answer each)."
+status = "confirmed"
+result = "2026-11-20: 20 probe labels: labels.list sent 1 to 300 ms after each labels.create returned always held the new id (0 misses of 20); labels.list right after each labels.delete (204) never held the deleted id (0 of 20). Two clients: one created then deleted 20 labels in a loop while a second connection called labels.list 50 times, all 50 overlapping the writes; no listing lacked a label whose create had returned before the listing was sent, and none showed a label whose delete had returned before it (0 violations). Every answer was one page (no nextPageToken; 23 to 45 labels)."
 
 [[unknown]]
 id = "label-edit-duplicate-name"
@@ -775,6 +777,8 @@ question = "What does labels.create answer for a name another label already hold
 assumed = "HTTP 409 with the message `Label name exists or conflicts`, for create and for patch; names that differ only in case conflict."
 if_wrong = "Any other 4xx is reported as Refused with Gmail's message and nothing is recorded, so the mirror stays right. Only the error type is less precise (no NameTaken with the existing label), and a host retrying a create after a timeout must list labels itself."
 test = "1) labels.create {name: 'mt-dup'}; 2) labels.create {name: 'mt-dup'} again: record status and error body. 3) labels.create {name: 'MT-DUP'}: record whether it is refused. 4) labels.create {name: 'mt-dup2'} then labels.patch it with {name: 'mt-dup'}: record status and body. 5) labels.create {name: 'INBOX'} and {name: 'inbox'}: record status and body. 6) Delete the probes."
+status = "confirmed"
+result = "2026-11-20: labels.create with a name another label holds: HTTP 409, error.status ABORTED, reason aborted, message \"Label name exists or conflicts\" (3 of 3). The same 409 for a name differing only in case and for the name with a trailing space. labels.patch renaming another label to the taken name, or to a case variant of it: the same 409 (4 of 4); labels.update (PUT) too. A label may be patched to its own name (200) and to a case variant of its own name (200, the new case is stored). Not run: creating `INBOX`/`inbox` (step 5), because this run only created labels under its own test prefix."
 
 [[unknown]]
 id = "label-edit-rename-parent"
@@ -782,6 +786,8 @@ question = "Does renaming a label through labels.patch rename its sublabels (lab
 assumed = "No: the API changes one label; Gmail's web interface renames sublabels itself. mailtide renames each sublabel, sublabels first."
 if_wrong = "Harmless: the sublabels are renamed first, so by the time the parent is patched nothing is left under the old prefix for Gmail to rename, and a patch to a name a label already has changes nothing."
 test = "1) labels.create 'mt-p', 'mt-p/a' and 'mt-p/a/b'. 2) labels.patch the first with {name: 'mt-q'}. 3) labels.list: record the names of the other two (unchanged, or 'mt-q/a' and 'mt-q/a/b'). 4) Open Gmail's web interface and note how the two sublabels are shown. 5) Delete the probes."
+status = "confirmed"
+result = "2026-11-20, 3 rounds: with labels `p`, `p/a`, `p/a/b`, labels.patch {name: `q`} on the first answered 200 and renamed only that label; labels.list at once and 20 s later still showed `p/a` and `p/a/b` under their old names. How Gmail's web interface then shows the orphaned sublabels was not looked at."
 
 [[unknown]]
 id = "label-edit-delete-parent"
@@ -789,6 +795,8 @@ question = "Does labels.delete on a label delete its sublabels too?"
 assumed = "No: only the named label goes; sublabels keep their names. mailtide refuses to delete a label that has sublabels unless asked to delete them, and then deletes each, deepest first."
 if_wrong = "Safe: with sublabels = delete they are already gone when the parent is deleted. With the default the call is refused while the mirror shows sublabels; a sublabel created elsewhere seconds ago could then be deleted by Gmail along with its parent, and the next listing removes it from the mirror like any label deleted elsewhere."
 test = "1) labels.create 'mt-d' and 'mt-d/child'; apply 'mt-d/child' to one inserted message. 2) labels.delete 'mt-d'. 3) labels.list: record whether 'mt-d/child' still exists. 4) messages.get the message: record whether it still carries the child's id. 5) Delete the probes."
+status = "confirmed"
+result = "2026-11-20, 3 rounds: with labels `d`, `d/child`, `d/child/grand` and `d/child` applied to one message, labels.delete on `d` answered 204 and removed only that label: labels.list at once and 20 s later still held the child and the grandchild with unchanged names, and messages.get still showed the child's id on the message."
 
 [[unknown]]
 id = "label-edit-color-rules"
@@ -796,6 +804,8 @@ question = "Does Gmail accept any textColor and backgroundColor pair taken from 
 assumed = "Any pair from the palette is accepted; a patch with a null color removes the colour and leaves name and visibility alone."
 if_wrong = "A refused pair is a 400 that mailtide reports as Refused, recording nothing. If null does not clear, clearing a colour is refused the same way until it is implemented as labels.get plus labels.update with every other field copied; no other call uses the PUT."
 test = "1) labels.create a probe with color {textColor: '#ffffff', backgroundColor: '#16a766'}: expect 200. 2) labels.patch it with a pair that Gmail's own picker does not offer together, e.g. {textColor: '#fb4c2f', backgroundColor: '#16a766'}: record status. 3) labels.patch with {textColor: '#123456', backgroundColor: '#16a766'}: expect 400. 4) labels.patch with {color: null}, then labels.get: record whether color is absent and whether name, labelListVisibility and messageListVisibility are unchanged. 5) Delete the probe."
+status = "confirmed"
+result = "2026-11-20: labels.create with {textColor #ffffff, backgroundColor #16a766}: 200. labels.patch with a pair the picker does not offer together (#fb4c2f on #16a766): 200; 40 random text/background pairs drawn from the documented palette: 40 of 40 accepted. A colour off the palette as text or as background: 400 INVALID_ARGUMENT \"Label color #123456 is not on the allowed color palette\". Palette values are matched case-sensitively: #FFFFFF / #16A766 got the same 400, so colours must be sent in lower case. A patch with only backgroundColor keeps the stored textColor. labels.patch {color: null}: 200, the answer and a following labels.get have no color field, and name, labelListVisibility (labelShowIfUnread) and messageListVisibility (hide) were unchanged."
 
 [[unknown]]
 id = "label-edit-modify-deleted-label"

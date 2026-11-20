@@ -873,6 +873,8 @@ question = "Does rfc822msgid: match exactly one Message-ID when given without an
 assumed = "A bare id of letters, digits and @ . _ + matches exactly that message; any other id matches when double-quoted."
 if_wrong = "by_message_id() returns None for every id outside the set proven to match, instead of a term that may match nothing or another message. A caller (send, confirming by Message-ID) then treats the lookup as unavailable, never as 'not found'."
 test = "messages.insert four messages with Message-ID <plain.1@x.test>, <a+b-c@x.test>, <a=b/c$d!e%f@x.test> and <plain.1@x.test.extra>. For each id run q=rfc822msgid:ID, q=rfc822msgid:<ID> and q=rfc822msgid:\"ID\" with includeSpamTrash=true. Expect exactly its own message each time; record every spelling that returns nothing or returns the .extra message."
+status = "confirmed"
+result = "2026-11-20, 4 inserted messages: q=rfc822msgid: returned exactly the message with that Message-ID for every spelling tried: bare, in angle brackets, double-quoted, and quoted with brackets, for <...plain.1@x.test>, <...a+b-c@x.test>, <...a=b/c$d!e%f@x.test> and <...plain.1@x.test.extra> (16 of 16; the id that is a prefix of another never returned the longer one). So the characters - = / $ ! % also match bare, not only quoted. Matching ignores case (the id in upper case found the message); the local part alone finds nothing. Each message was listed 0.2 s after messages.insert. This holds for ids Gmail stored as written (insert); a message sent through the API gets a Message-ID chosen by Gmail (send-message-id-kept)."
 
 [[unknown]]
 id = "search-label-terms"
@@ -880,6 +882,8 @@ question = "What does the label: operator in q accept: label names only or also 
 assumed = "Names only, case-insensitive, with spaces and slashes written as hyphens; an id is not accepted. The labelIds parameter takes ids only."
 if_wrong = "Nothing in mailtide depends on it: q is never rewritten and label_ids is the exact filter either way. Only the guidance changes ('filter by label with label_ids, not with label:')."
 test = "labels.create 'Proj X/Sub a' (keep its id L) and add it to one message. List with q=label:proj-x-sub-a, q=label:\"Proj X/Sub a\", q=label:Proj-X/Sub-a, q=label:L, and with labelIds=L and no q; record which return the message. labels.patch the name and repeat the name forms and labelIds=L."
+status = "confirmed"
+result = "2026-11-20, label `<prefix>/Proj X/Sub a` on one message: label: matched it by name in every spelling tried: all lower case with spaces and slashes as hyphens, original case with hyphens, spaces as hyphens with slashes kept, and the exact name in double quotes (any case). label:<label id> (Label_NN, either case) matched nothing. The labelIds parameter matched by id; given the name it answered 400 INVALID_ARGUMENT \"Invalid label: <name>\". After labels.patch renamed the label, every spelling of the new name matched within 0.2 s, the old name matched nothing, and labelIds=<id> still matched."
 
 [[unknown]]
 id = "search-unknown-label-id"
@@ -896,6 +900,8 @@ question = "With includeSpamTrash unset, do the q terms in:trash, in:spam and in
 assumed = "in:trash and in:spam do (Zero lists its bin with in:trash and no flag); in:anywhere needs includeSpamTrash=true."
 if_wrong = "Hosts pass include_spam_trash=true for those searches. mailtide passes the flag through unchanged and its default (false) stays; only the guidance changes."
 test = "messages.trash one message and add SPAM to another, both with a unique subject token. Run q='subject:<token> in:trash', '... in:spam', '... in:anywhere' and 'subject:<token>' alone, each with includeSpamTrash absent, false and true; record the ids returned."
+status = "refuted"
+result = "2026-11-20, three messages with one subject token (one normal, one in TRASH, one given SPAM by messages.modify): with includeSpamTrash absent or false, `in:trash` returned the trashed one and `in:spam` the spam one, as assumed; but `in:anywhere` returned all three with the flag absent, false or true, so it does not need includeSpamTrash. Only a q without any of those terms depends on the flag (normal only when absent/false, all three when true). Also: `label:trash`, `is:spam`, `(in:trash OR in:spam)` and labelIds=TRASH / labelIds=SPAM without q all return Trash/Spam messages with the flag absent."
 
 [[unknown]]
 id = "search-thread-history-id"
@@ -903,6 +909,8 @@ question = "Does every thread in a threads.list page carry historyId, and is it 
 assumed = "Yes: Zero and himalaya both read it from the list, and the Thread resource describes historyId as the last history record that modified the thread."
 if_wrong = "ThreadHit.history_id is optional. Without it a host cannot tell that the mirror trails Gmail for that thread and runs a sync before hydrating thread hits."
 test = "threads.list?q=subject:<token> for a thread of two messages; record whether historyId is present. messages.modify one of its messages, read history.list from the earlier historyId, list again: expect the thread's historyId to be the id of that history record or a later one."
+status = "confirmed"
+result = "2026-11-20: every entry of a threads.list page of 500 threads (includeSpamTrash=true) carried historyId; entry keys are id, snippet, historyId. For 3 two-message probe threads: after messages.modify on one message, history.list from the id read before showed the labelsAdded record with id R; threads.list then gave the thread historyId R+1, equal to threads.get's historyId and to that message's own historyId (the other message kept its older one). So the thread's historyId is the largest historyId among its messages, and is at or after the history record of the last change."
 
 [[unknown]]
 id = "search-drafts-in-results"
