@@ -139,4 +139,16 @@ pub enum GmailRequest {
         /// The label.
         id: LabelId,
     },
+    /// `messages.delete`: removes one message for good. Issued by the
+    /// driver's purge ([`crate::purge`]), never by the engine.
+    DeleteMessage {
+        /// The message.
+        id: MessageId,
+    },
+    /// `messages.batchDelete`: removes these messages for good, by id only
+    /// (never a query). Issued by the driver's purge, never by the engine.
+    BatchDeleteMessages {
+        /// At most [`crate::purge::BATCH_DELETE_MAX`] ids.
+        ids: Vec<MessageId>,
+    },
 }

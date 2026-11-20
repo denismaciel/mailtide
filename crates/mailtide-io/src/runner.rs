@@ -141,6 +141,8 @@ fn request_kind(request: &GmailRequest) -> &'static str {
         GmailRequest::CreateLabel(_) => "create_label",
         GmailRequest::PatchLabel { .. } => "patch_label",
         GmailRequest::DeleteLabel { .. } => "delete_label",
+        GmailRequest::DeleteMessage { .. } => "delete_message",
+        GmailRequest::BatchDeleteMessages { .. } => "batch_delete_messages",
     }
 }
 
@@ -1348,6 +1350,12 @@ where
                     .map(|label| EventKind::LabelSaved { command, label })
             }
             GmailRequest::DeleteLabel { .. } => Ok(EventKind::LabelDeleted { command }),
+            GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => {
+                Ok(EventKind::MessagesDeleted {
+                    command,
+                    ids: mailtide::purge::request_ids(gmail_request),
+                })
+            }
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
@@ -1515,6 +1523,7 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::CreateLabel(_)
         | GmailRequest::PatchLabel { .. }
         | GmailRequest::DeleteLabel { .. } => true,
+        GmailRequest::DeleteMessage { .. } | GmailRequest::BatchDeleteMessages { .. } => true,
         GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }

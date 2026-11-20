@@ -372,7 +372,8 @@ impl Engine {
             | EventKind::LabelFetched { .. }
             | EventKind::LabelSaved { .. }
             | EventKind::LabelNameTaken { .. }
-            | EventKind::LabelDeleted { .. } => Vec::new(),
+            | EventKind::LabelDeleted { .. }
+            | EventKind::MessagesDeleted { .. } => Vec::new(),
         }
     }
 

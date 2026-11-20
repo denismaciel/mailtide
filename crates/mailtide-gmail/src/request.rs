@@ -76,6 +76,8 @@ pub fn build(request: &GmailRequest, config: &RequestConfig) -> Vec<HttpRequest>
         GmailRequest::CreateLabel(label) => vec![crate::labels::create(label)],
         GmailRequest::PatchLabel { id, patch } => vec![crate::labels::patch(id, patch)],
         GmailRequest::DeleteLabel { id } => vec![crate::labels::delete(id)],
+        GmailRequest::DeleteMessage { id } => vec![crate::purge::delete(id)],
+        GmailRequest::BatchDeleteMessages { ids } => vec![crate::purge::batch_delete(ids)],
     }
 }
 

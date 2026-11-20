@@ -14,6 +14,7 @@ pub mod errors;
 pub mod headers;
 pub mod http;
 pub mod labels;
+pub mod purge;
 pub mod push;
 pub mod request;
 pub mod search;

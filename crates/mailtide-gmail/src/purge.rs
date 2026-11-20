@@ -1,0 +1,174 @@
+//! Permanent deletion on the wire: `messages.delete` and
+//! `messages.batchDelete`, by message id only, and telling Gmail's
+//! missing-scope refusal from its other answers.
+//!
+//! Both calls list [`FULL_SCOPE`] as their only scope: `gmail.modify` is not
+//! enough. Settled against Gmail 2026-11-20 (`purge-scope-refusal`): with a
+//! `gmail.modify` or `gmail.readonly` token `messages.delete` answers 403,
+//! `PERMISSION_DENIED`, reason `insufficientPermissions`
+//! (`ACCESS_TOKEN_SCOPE_INSUFFICIENT`), and deletes nothing.
+
+use mailtide::ids::MessageId;
+use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
+use serde_json::json;
+
+use crate::http::{HttpRequest, Method, encode};
+
+const USER: &str = "/gmail/v1/users/me";
+
+/// The OAuth scope permanent deletion needs.
+pub const FULL_SCOPE: &str = "https://mail.google.com/";
+
+/// `DELETE /messages/{id}`: no body; Gmail answers 204.
+#[must_use]
+pub fn delete(id: &MessageId) -> HttpRequest {
+    HttpRequest {
+        method: Method::Delete,
+        path: format!("{USER}/messages/{}", encode(&id.0)),
+        query: Vec::new(),
+        body: None,
+    }
+}
+
+/// `POST /messages/batchDelete` with `{ids}` and nothing else: never a
+/// query, never a label. Gmail's answer is empty and names no id.
+#[must_use]
+pub fn batch_delete(ids: &[MessageId]) -> HttpRequest {
+    let ids: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+    HttpRequest {
+        method: Method::Post,
+        path: format!("{USER}/messages/batchDelete"),
+        query: Vec::new(),
+        body: Some(json!({ "ids": ids }).to_string().into_bytes()),
+    }
+}
+
+/// Whether Gmail refused a delete because the token lacks [`FULL_SCOPE`].
+///
+/// [`crate::errors::classify`] makes every 403 `insufficientPermissions` an
+/// [`AccountProblem::ApiAccessDenied`] refusal whose detail leads with the
+/// status and that reason. Any other refusal (a disabled API, a bad id, a
+/// rate limit, which is not a refusal at all) is not a missing scope.
+#[must_use]
+pub fn missing_scope(refusal: &BlockingFailure) -> bool {
+    refusal.class == Blocking::Account(AccountProblem::ApiAccessDenied)
+        && refusal.detail.starts_with("403 insufficientPermissions")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::classify;
+    use crate::http::HttpResponse;
+    use crate::request::{RequestConfig, build};
+    use mailtide::command::GmailRequest;
+    use mailtide::retry::{Failure, Retryable};
+
+    fn config() -> RequestConfig {
+        RequestConfig {
+            watch_topic: String::new(),
+        }
+    }
+
+    #[test]
+    fn delete_sends_delete_to_the_message_id() {
+        let [request] = build(
+            &GmailRequest::DeleteMessage {
+                id: MessageId("18c/2a b".into()),
+            },
+            &config(),
+        )
+        .try_into()
+        .expect("one request");
+        assert_eq!(request.method, Method::Delete);
+        assert_eq!(
+            request.path_and_query(),
+            "/gmail/v1/users/me/messages/18c%2F2a%20b"
+        );
+        assert_eq!(request.body, None);
+    }
+
+    #[test]
+    fn batch_delete_posts_the_ids_and_nothing_else() {
+        let ids = vec![MessageId("a".into()), MessageId("b".into())];
+        let [request] = build(&GmailRequest::BatchDeleteMessages { ids }, &config())
+            .try_into()
+            .expect("one request");
+        assert_eq!(request.method, Method::Post);
+        assert_eq!(
+            request.path_and_query(),
+            "/gmail/v1/users/me/messages/batchDelete"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body.as_deref().unwrap_or_default()).expect("json");
+        assert_eq!(body, json!({ "ids": ["a", "b"] }));
+    }
+
+    fn answer(status: u16, body: &serde_json::Value) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        }
+    }
+
+    fn refusal(failure: &Failure) -> Option<&BlockingFailure> {
+        match failure {
+            Failure::Blocking(refusal) => Some(refusal),
+            Failure::NotFound | Failure::Retryable(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_missing_scope_refusal_is_told_from_a_rate_limit() {
+        // Gmail's answer to messages.delete with a gmail.modify token, as
+        // recorded 2026-11-20.
+        let scope = answer(
+            403,
+            &json!({"error": {
+                "code": 403,
+                "message": "Request had insufficient authentication scopes.",
+                "errors": [{
+                    "message": "Insufficient Permission",
+                    "domain": "global",
+                    "reason": "insufficientPermissions",
+                }],
+                "status": "PERMISSION_DENIED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+                    "domain": "googleapis.com",
+                    "metadata": {
+                        "method": "caribou.api.proto.MailboxService.DeleteMessage",
+                        "service": "gmail.googleapis.com",
+                    },
+                }],
+            }}),
+        );
+        let failure = classify(&scope);
+        assert!(refusal(&failure).is_some_and(missing_scope), "{failure:?}");
+
+        let throttled = answer(
+            403,
+            &json!({"error": {"code": 403, "message": "User-rate limit exceeded.",
+                "errors": [{"reason": "userRateLimitExceeded"}]}}),
+        );
+        let failure = classify(&throttled);
+        assert!(
+            matches!(&failure, Failure::Retryable(r) if r.class == Retryable::AccountRateLimited),
+            "a rate limit stays a rate limit: {failure:?}"
+        );
+        assert!(refusal(&failure).is_none());
+
+        // A disabled API and a bad id are refusals, not a missing scope.
+        for (status, reason) in [(403, "accessNotConfigured"), (400, "invalidArgument")] {
+            let failure = classify(&answer(
+                status,
+                &json!({"error": {"code": status, "message": "Invalid id value",
+                    "errors": [{"reason": reason}]}}),
+            ));
+            let refused = refusal(&failure).expect("a refusal");
+            assert!(!missing_scope(refused), "{status} {reason}");
+        }
+    }
+}

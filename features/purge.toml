@@ -2,7 +2,7 @@ id = "purge"
 title = "Purge: permanent delete, empty trash and empty spam"
 summary = "A switched-off-by-default call that permanently deletes named messages, a thread's messages, or everything the mirror holds in trash or spam: checked against Gmail's history since the mirror's cursor, sent by id only, never repeated by mailtide, and tombstoned only on Gmail's own evidence."
 roadmap = ["W1"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/purge.md"
 depends_on = []
 

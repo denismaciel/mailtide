@@ -191,4 +191,14 @@ pub enum EventKind {
         /// The command it answers.
         command: CommandId,
     },
+    /// `messages.delete` or `messages.batchDelete` answered 2xx. Gmail's
+    /// answer names no id and proves nothing: only a history record is
+    /// evidence of the deletion ([`crate::purge`]). Answers the driver's
+    /// purge, never an engine command.
+    MessagesDeleted {
+        /// The command it answers.
+        command: CommandId,
+        /// The ids the request named.
+        ids: Vec<MessageId>,
+    },
 }

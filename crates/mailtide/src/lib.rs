@@ -23,6 +23,7 @@ pub mod label_names;
 pub mod labels;
 pub mod mirror;
 pub mod outbox;
+pub mod purge;
 pub mod quota;
 pub mod reconcile;
 pub mod retry;

@@ -53,11 +53,17 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
             SearchScope::Messages => 5,
             SearchScope::Threads => 10,
         },
+        GmailRequest::DeleteMessage { .. } => 10,
+        GmailRequest::BatchDeleteMessages { .. } => 50,
     })
 }
 
 /// Groups at least this large use `batchModify`.
 pub const BATCH_MODIFY_THRESHOLD: u32 = 10;
+
+/// A purge of at least this many ids uses `messages.batchDelete` (50
+/// units); fewer use one `messages.delete` each (10 units, at most 40).
+pub const PURGE_BATCH_THRESHOLD: u32 = 5;
 
 /// Budgets the ledger enforces.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +470,36 @@ mod tests {
                 until: now.plus(Duration::from_secs(30))
             }
         );
+    }
+
+    #[test]
+    fn purge_costs_follow_gmails_quota_table() {
+        let ids =
+            |n: usize| -> Vec<MessageId> { (0..n).map(|i| MessageId(format!("m{i}"))).collect() };
+        let total = |n: usize| -> u32 {
+            crate::purge::delete_requests(&ids(n))
+                .iter()
+                .map(|request| cost(request).0)
+                .sum()
+        };
+        assert_eq!(
+            cost(&GmailRequest::DeleteMessage {
+                id: MessageId("m".into())
+            }),
+            QuotaUnits(10)
+        );
+        assert_eq!(
+            cost(&GmailRequest::BatchDeleteMessages { ids: ids(1_000) }),
+            QuotaUnits(50)
+        );
+        // Below the threshold each id is its own messages.delete.
+        assert_eq!(PURGE_BATCH_THRESHOLD, 5);
+        assert_eq!(total(1), 10);
+        assert_eq!(total(4), 40);
+        // From there on one batchDelete per 1,000 ids.
+        assert_eq!(total(5), 50);
+        assert_eq!(total(1_000), 50);
+        assert_eq!(total(1_001), 100);
     }
 
     #[test]
