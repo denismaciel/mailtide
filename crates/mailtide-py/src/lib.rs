@@ -29,7 +29,9 @@ mod _core {
         Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
     };
     use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
-    use mailtide::revision::{FeedCursor, FeedPosition, StateSeq, StateString};
+    use mailtide::revision::{
+        AckOutcome, ConsumerName, FeedCursor, FeedPosition, MAX_CONSUMERS, StateSeq, StateString,
+    };
     use mailtide::state::SyncPhase;
     use mailtide_gmail::push::{self, Jwks, PushExpectations};
     use mailtide_io::auth::CachedTokens;
@@ -321,6 +323,49 @@ mod _core {
         kind: &'static str,
         /// The oldest state the feed can still continue from.
         oldest: String,
+    }
+
+    /// A named consumer's acknowledged position in an account's feed.
+    #[pyclass(frozen, get_all)]
+    struct ConsumerCursor {
+        name: String,
+        /// The position, as `changes()` takes it.
+        state: String,
+        /// When it last acknowledged, or a compaction last found it caught
+        /// up.
+        seen_at_ms: i64,
+        /// Behind the feed's floor: its next read is `StateTooOld`; rebuild,
+        /// then `ack` the position the rebuild started from.
+        lost: bool,
+    }
+
+    fn consumer_cursor(
+        generation: u64,
+        floor: StateSeq,
+        cursor: &mailtide::revision::ConsumerCursor,
+    ) -> ConsumerCursor {
+        ConsumerCursor {
+            name: cursor.name.as_str().to_owned(),
+            state: position(generation, cursor.at),
+            seen_at_ms: cursor.seen_at.0,
+            lost: cursor.is_lost(floor),
+        }
+    }
+
+    fn consumer_name(name: &str) -> PyResult<ConsumerName> {
+        ConsumerName::parse(name).map_err(|_| {
+            PyValueError::new_err(format!(
+                "invalid consumer name {name:?}: 1 to 64 letters, digits, '.', '-' or '_'"
+            ))
+        })
+    }
+
+    fn max_idle(seconds: f64) -> PyResult<Duration> {
+        Duration::try_from_secs_f64(seconds).map_err(|_| {
+            PyValueError::new_err(format!(
+                "max_idle_s must be a non-negative number of seconds, got {seconds}"
+            ))
+        })
     }
 
     fn names(labels: &mailtide::labels::LabelSet) -> Vec<String> {
@@ -1787,29 +1832,57 @@ mod _core {
         async fn compact(
             self: Arc<Self>,
             account: AccountId,
-            through: FeedPosition,
+            through: Option<FeedPosition>,
+            max_idle: Duration,
         ) -> PyResult<u64> {
-            let status = self
-                .inner
-                .store()
-                .status(&account)
-                .await
-                .map_err(store_error)?;
-            // A position from another incarnation compacts nothing.
-            if status.is_none_or(|s| s.generation != through.generation) {
-                return Ok(0);
-            }
-            // Whole commits only: a position inside a commit keeps that
-            // commit until the reader is through it.
             self.inner
-                .store()
-                .compact(
-                    &account,
-                    &mailtide::revision::Retention::new(Timestamp(0))
-                        .through(through.at.compactable()),
-                )
+                .compact(&account, through, max_idle)
                 .await
-                .map_err(store_error)
+                .map_err(run_error)
+        }
+
+        async fn ack(
+            self: Arc<Self>,
+            account: AccountId,
+            consumer: ConsumerName,
+            at: FeedPosition,
+        ) -> PyResult<Py<PyAny>> {
+            match self
+                .inner
+                .ack(&account, &consumer, at)
+                .await
+                .map_err(run_error)?
+            {
+                AckOutcome::Acked(cursor) => Python::attach(|py| {
+                    // Just acknowledged: the position is at or after the floor.
+                    let cursor = consumer_cursor(at.generation, StateSeq(0), &cursor);
+                    Ok(Py::new(py, cursor)?.into_any())
+                }),
+                AckOutcome::TooOld { generation, oldest } => too_old(generation, oldest),
+                AckOutcome::TooManyConsumers => Err(PyValueError::new_err(format!(
+                    "an account has at most {MAX_CONSUMERS} consumers: drop_consumer one first"
+                ))),
+            }
+        }
+
+        async fn consumers(self: Arc<Self>, account: AccountId) -> PyResult<Vec<ConsumerCursor>> {
+            let list = self.inner.consumers(&account).await.map_err(run_error)?;
+            Ok(list
+                .cursors
+                .iter()
+                .map(|cursor| consumer_cursor(list.generation, list.floor, cursor))
+                .collect())
+        }
+
+        async fn drop_consumer(
+            self: Arc<Self>,
+            account: AccountId,
+            consumer: ConsumerName,
+        ) -> PyResult<bool> {
+            self.inner
+                .drop_consumer(&account, &consumer)
+                .await
+                .map_err(run_error)
         }
 
         async fn track(self: Arc<Self>, account: AccountId) -> PyResult<TrackResult> {
@@ -2140,18 +2213,63 @@ mod _core {
             )
         }
 
+        #[pyo3(signature = (account, through=None, max_idle_s=604_800.0))]
         fn compact<'py>(
             &self,
             py: Python<'py>,
             account: &str,
+            through: Option<&str>,
+            max_idle_s: f64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().compact(
+                    account_id(account)?,
+                    parse_since(through)?,
+                    max_idle(max_idle_s)?,
+                ),
+            )
+        }
+
+        fn ack<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            consumer: &str,
             through: &str,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().ack(
+                    account_id(account)?,
+                    consumer_name(consumer)?,
+                    parse_state(through)?,
+                ),
+            )
+        }
+
+        fn consumers<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().consumers(account_id(account)?),
+            )
+        }
+
+        fn drop_consumer<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            consumer: &str,
         ) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
                 &self.shared,
                 self.shared
                     .clone()
-                    .compact(account_id(account)?, parse_state(through)?),
+                    .drop_consumer(account_id(account)?, consumer_name(consumer)?),
             )
         }
 
@@ -2458,13 +2576,57 @@ mod _core {
             )
         }
 
-        /// Drop feed entries at or before state string `through`: whole
-        /// commits only, so a `through` inside a commit keeps that commit.
-        fn compact(&self, py: Python<'_>, account: &str, through: &str) -> PyResult<u64> {
+        /// Drop whole commits of the feed: no further than state string
+        /// `through` (when given; a `through` inside a commit keeps that
+        /// commit), nor past the slowest consumer heard from within
+        /// `max_idle_s`. With neither a bound nor a consumer, nothing goes.
+        #[pyo3(signature = (account, through=None, max_idle_s=604_800.0))]
+        fn compact(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            through: Option<&str>,
+            max_idle_s: f64,
+        ) -> PyResult<u64> {
+            let fut = self.shared.clone().compact(
+                account_id(account)?,
+                parse_since(through)?,
+                max_idle(max_idle_s)?,
+            );
+            block(py, &self.shared, fut)
+        }
+
+        /// Consumer `consumer` has durably processed the feed up to state
+        /// string `through`: hold the log from there. A `ConsumerCursor`, or
+        /// `StateTooOld` (nothing stored; rebuild).
+        fn ack(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            consumer: &str,
+            through: &str,
+        ) -> PyResult<Py<PyAny>> {
+            let fut = self.shared.clone().ack(
+                account_id(account)?,
+                consumer_name(consumer)?,
+                parse_state(through)?,
+            );
+            block(py, &self.shared, fut)
+        }
+
+        /// The account's registered consumers, in name order.
+        fn consumers(&self, py: Python<'_>, account: &str) -> PyResult<Vec<ConsumerCursor>> {
+            let fut = self.shared.clone().consumers(account_id(account)?);
+            block(py, &self.shared, fut)
+        }
+
+        /// Forget a consumer: it no longer holds the log. Whether it was
+        /// registered.
+        fn drop_consumer(&self, py: Python<'_>, account: &str, consumer: &str) -> PyResult<bool> {
             let fut = self
                 .shared
                 .clone()
-                .compact(account_id(account)?, parse_state(through)?);
+                .drop_consumer(account_id(account)?, consumer_name(consumer)?);
             block(py, &self.shared, fut)
         }
 

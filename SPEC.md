@@ -169,6 +169,21 @@ The store keeps, per account:
   facts and blob) instead of keeping a copy in the log: a message's content
   never changes in Gmail, so the row matches the entry, and older entries
   carry it too.
+- **consumer cursor**: `(account, name, position, seen_at)`, at most 16 per
+  account, names of 1 to 64 `[A-Za-z0-9._-]`. A consumer `ack`s the
+  position it has durably processed (either form of state string; the
+  cursor is *set*, also backwards); `seen_at` is its last ack, or the last
+  compaction that found it at the head. Compaction removes whole commits up
+  to a target: a cursor is **live** when it is not behind the floor (nor
+  inside the floor commit) and `seen_at` is within `max_idle` (7 days by
+  default) of the compaction's time, and each live cursor holds everything
+  after the last commit wholly behind it (`FeedCursor::compactable`). An
+  explicit bound is capped by the slowest live cursor; with no bound the
+  target is that cursor's hold, the head when every registered cursor is
+  idle or lost, and nothing when none is registered. Cursors are never
+  removed by compaction: one left behind the floor is **lost** (its reads
+  are `TooOld`) until it acks a valid position again or is dropped.
+  Commits neither read nor write cursors, and `forget` deletes them.
 
 ## 5. Gmail facts the design relies on
 
@@ -570,9 +585,19 @@ engine's epoch, so results meant for a dead engine are ignored).
   floor or inside the floor commit (compaction removes whole commits).
   `content` is the stored content of a `MessageImported` entry's message,
   loaded for the page's imports in chunks of ids, `None` once it is
-  deleted. `compact(account, through)` removes whole commits; a reader
-  inside commit `S` compacts through `FeedCursor::compactable()`, `S - 1`;
+  deleted. `compact(account, retention)` removes whole commits under the
+  account row lock: `Retention { through, now, max_idle }` gives an optional
+  bound (a reader inside commit `S` passes `FeedCursor::compactable()`,
+  `S - 1`), and the target is `compaction_target` over the account's
+  consumer cursors (§4), after every cursor at the head is seen at `now`;
   `message_ids(account, after, limit)` to rebuild a consumer.
+- `ack(account, name, position, now)`, `consumers(account)` and
+  `drop_consumer(account, name)`: consumer cursors (§4), under the account
+  row lock and unfenced like `admit`. An `ack` of a position behind the
+  floor, inside the floor commit, beyond the head or of another generation
+  is `AckOutcome::TooOld` and stores nothing; a new name beyond 16 is
+  `TooManyConsumers`. `consumers` returns the cursors with the generation
+  and floor (`ConsumerList`), so a caller can tell which are lost.
 - `messages(account, ids)`: `MessageView`s for hosts.
 - `threads(account, ids)`: `ThreadView`s (§4) in the order asked, each
   member its `messages` view; ids the mirror has no message in, and every id
@@ -587,7 +612,7 @@ engine's epoch, so results meant for a dead engine are ignored).
   missing) or ahead of it (a newer mailtide migrated it). It asks once: after
   it has seen the schema current, it and its clones do not ask again.
 
-The conformance suite (`mailtide_store::conformance`, 43 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 53 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -648,8 +673,16 @@ runner per process, after forking:
   list needs no second call; `None` once the message is deleted),
   `LabelsChanged` (added/removed), `OverlayChanged`,
   `MessageDeleted` (last thread and labels), `LabelDefinitionsChanged`;
-  `await compact(account, through)` (whole commits: a `through` inside a
-  commit keeps that commit); `await message_ids(account, after)`;
+  `await compact(account, through=None, max_idle_s=604_800.0)` (whole
+  commits, no further than `through` when given, where a `through` inside a
+  commit keeps that commit, nor past the slowest registered consumer heard
+  from within `max_idle_s`; with neither a bound nor a consumer nothing
+  goes); `await ack(account, consumer, through) -> ConsumerCursor |
+  StateTooOld` (consumer cursors, §4: `ConsumerCursor { name, state,
+  seen_at_ms, lost }`; a new name beyond 16 raises `ValueError`);
+  `await consumers(account) -> list[ConsumerCursor]`;
+  `await drop_consumer(account, consumer) -> bool`;
+  `await message_ids(account, after)`;
   `await changes(account, since) -> ChangePage`;
   `await read_blob(account, id) -> bytes`;
 - `verify_push(...) -> Notification`; `parse_message(raw) -> ParsedMessage`;
@@ -690,7 +723,8 @@ advisory lock; hosts that run migrations with their own tool execute
 writes the database refuses with `SchemaOutOfDate` unless it is current:
 `run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, and the
 reads too (`changes`, `messages`, `threads`, `labels`, `message_ids`, `compact`,
-`status`, `accounts`, `resume`, `forget`), so a build that is too old
+`ack`, `consumers`, `drop_consumer`, `status`, `accounts`, `resume`,
+`forget`), so a build that is too old
 refuses instead of misreading. Only `schema`, `migrate`, `health` and
 `read_blob` (blob storage only) answer whatever the schema. The SQL store
 makes the check (§10.3), so Rust hosts get it too.
@@ -733,6 +767,21 @@ get slower):
 ```sql
 DROP INDEX mailtide_messages_thread;
 DELETE FROM mailtide_schema WHERE version = 6;
+```
+
+Migration 7 adds `mailtide_consumers (account, name, seq, idx, seen_at)`,
+the consumer cursors (§4; `idx` set is a position inside a commit). A build
+from before it sees the database as `ahead` and refuses to sync; its
+`compact` checks no schema, so a host must not call it from an older build
+while cursors are registered (it would compact past them). Reverting loses
+only the cursors: the log and its floor are untouched, each consumer still
+follows from its own stored position, the host passes `compact` a position
+itself again, and consumers register again with their next `ack` after the
+next upgrade:
+
+```sql
+DROP TABLE mailtide_consumers;
+DELETE FROM mailtide_schema WHERE version = 7;
 ```
 
 Tests: `mailtide.testing`

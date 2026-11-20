@@ -30,7 +30,7 @@ role = "Violations for the simulator: a live consumer cut off; entries every liv
 [[file]]
 path = "crates/mailtide-store/src/lib.rs"
 change = "modify"
-role = "Store::ack, ::consumers, ::drop_consumer; Store::compact takes a Retention (an explicit `through` becomes optional)"
+role = "Store::ack (a FeedPosition: the generation is checked under the account lock), ::consumers (a ConsumerList with generation and floor), ::drop_consumer; Store::compact takes a Retention (an explicit `through` becomes optional)"
 
 [[file]]
 path = "crates/mailtide-store/src/memory.rs"
@@ -53,11 +53,8 @@ role = "Conformance cases for cursors, the compaction rule, the idle cap and for
 path = "crates/mailtide-io/src/runner.rs"
 change = "modify"
 role = "Runner::ack, ::consumers, ::drop_consumer and ::compact, which supply the runner's clock"
-
-[[file]]
-path = "crates/mailtide-io/src/lib.rs"
-change = "modify"
-role = "Export the consumer types"
+# The crate re-exports no core types: Runner's methods take and return
+# mailtide::revision types, as track and status do, so its lib.rs is untouched.
 
 # -------------------------------------------------------------------- bindings
 

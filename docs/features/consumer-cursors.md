@@ -161,10 +161,10 @@ not a name, and answers `StateTooOld` by the floor alone.
 ### Store
 
 ```rust
-fn ack(&self, account: &AccountId, consumer: &ConsumerName, at: FeedCursor, now: Timestamp)
+fn ack(&self, account: &AccountId, consumer: &ConsumerName, at: FeedPosition, now: Timestamp)
     -> impl Future<Output = Result<AckOutcome, StoreError>> + Send;
-fn consumers(&self, account: &AccountId)
-    -> impl Future<Output = Result<Vec<ConsumerCursor>, StoreError>> + Send;
+fn consumers(&self, account: &AccountId)          // the cursors, with generation and floor
+    -> impl Future<Output = Result<ConsumerList, StoreError>> + Send;
 fn drop_consumer(&self, account: &AccountId, consumer: &ConsumerName)
     -> impl Future<Output = Result<bool, StoreError>> + Send;
 fn compact(&self, account: &AccountId, retention: &Retention)   // was: through: StateSeq
@@ -172,7 +172,12 @@ fn compact(&self, account: &AccountId, retention: &Retention)   // was: through:
 ```
 
 `ack`, `drop_consumer` and `compact` run under the account row lock, like
-`admit`, so a registration cannot race a compaction past it. They are
+`admit`, so a registration cannot race a compaction past it. `ack` takes the
+whole position, generation included, so the generation is checked under
+that lock too: a `forget` and `track` between a check and the write cannot
+register a position of the old log. `consumers` returns the account's
+generation and floor with the cursors (`ConsumerList`), which a listing needs
+to encode each position as a state string and to say which are lost. They are
 **unfenced**: a consumer is not an engine and must never be refused, or
 refuse an engine, because of an epoch. `forget` deletes the account's
 cursors with its other rows; a re-tracked account has a new generation and no
@@ -180,7 +185,8 @@ cursors.
 
 ### Driver and bindings
 
-`Runner` gains the four methods and supplies its clock (so `ManualClock`
+`Runner` (`crates/mailtide-io/src/runner.rs`) gains the four methods and
+supplies its clock (so `ManualClock`
 reaches the idle rule in tests). All work in read-only mode: they write
 mailtide's own tables, never Gmail.
 
@@ -193,6 +199,7 @@ class ConsumerCursor:
     lost: bool          # behind the feed's floor: must rebuild
 
 await runner.ack(account, consumer, through) -> ConsumerCursor | StateTooOld
+# an invalid name, or a new one beyond 16, raises ValueError
 await runner.consumers(account) -> list[ConsumerCursor]
 await runner.drop_consumer(account, consumer) -> bool
 await runner.compact(account, through=None, max_idle_s=604_800.0) -> int
@@ -286,9 +293,11 @@ Own tests (28):
 
 1. `ConsumerName`, `ConsumerCursor`, `Retention`, `compaction_target` and the
    core tests.
-2. Mirror methods and the memory store; conformance cases against memory.
-3. SQL: migration, the four methods, forget; conformance on SQLite and
-   Postgres.
+2. Mirror methods and their tests.
+3. The `Store` methods on every store: memory, and SQL (migration, the four
+   methods, forget); conformance on memory, SQLite and Postgres. (Planned as
+   two slices, memory then SQL; the trait changes once, and a commit that
+   changed it for memory alone would not compile the SQL store.)
 4. Runner methods, bindings, stubs, Python tests, SPEC.
 5. Simulator readers and the two violations.
 

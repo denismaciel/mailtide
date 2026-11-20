@@ -16,6 +16,7 @@ from mailtide import _core
 from mailtide._core import (
     AccountStatus,
     ChangePage,
+    ConsumerCursor,
     DriftResult,
     ForgetResult,
     Health,
@@ -258,11 +259,33 @@ class Runner:
         from ``page.next`` while ``page.has_more``."""
         return await self._core.changes(account, since, limit)
 
-    async def compact(self, account: str, through: str) -> int:
-        """Drop feed entries at or before state ``through`` once every consumer
-        processed them: whole commits only, so a ``through`` inside a commit
-        keeps that commit. Returns how many were removed."""
-        return await self._core.compact(account, through)
+    async def compact(
+        self, account: str, through: str | None = None, max_idle_s: float = 604_800.0
+    ) -> int:
+        """Drop whole commits of the feed: no further than state ``through`` (when
+        given; a ``through`` inside a commit keeps that commit), nor past the
+        slowest registered consumer heard from within ``max_idle_s`` (7 days).
+        With neither a bound nor a consumer nothing goes. Returns how many entries
+        were removed."""
+        return await self._core.compact(account, through, max_idle_s)
+
+    async def ack(self, account: str, consumer: str, through: str) -> ConsumerCursor | StateTooOld:
+        """Consumer ``consumer`` (1 to 64 letters, digits, ``.``, ``-``, ``_``) has
+        durably processed the feed up to state ``through``: ``compact`` keeps
+        everything after it. Registers the name on first use (at most 16 per
+        account) and may move it backwards. ``StateTooOld`` stores nothing: rebuild,
+        then ack the position the rebuild started from."""
+        return await self._core.ack(account, consumer, through)
+
+    async def consumers(self, account: str) -> list[ConsumerCursor]:
+        """The registered consumers, in name order: who holds the log, since when,
+        and who is lost."""
+        return await self._core.consumers(account)
+
+    async def drop_consumer(self, account: str, consumer: str) -> bool:
+        """Forget a consumer (decommissioned): it no longer holds the log. Whether it
+        was registered."""
+        return await self._core.drop_consumer(account, consumer)
 
     async def message_ids(
         self, account: str, after: str | None = None, limit: int = 1000

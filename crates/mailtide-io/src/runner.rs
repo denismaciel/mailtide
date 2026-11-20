@@ -20,6 +20,7 @@ use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
 use mailtide::outbox::ActionRequest;
 use mailtide::quota::{Admission, Priority};
 use mailtide::retry::{Backoff, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
+use mailtide::revision::{AckOutcome, ConsumerList, ConsumerName, FeedPosition, Retention};
 use mailtide::schedule::TimerKind;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status, TrackOutcome};
 use mailtide::thread::ThreadView;
@@ -488,6 +489,70 @@ where
     /// Every account the store holds.
     pub async fn accounts(&self) -> Result<Vec<AccountId>, RunError> {
         self.store.accounts().await.map_err(RunError::Store)
+    }
+
+    /// Consumer `consumer` has durably processed `account`'s feed up to
+    /// `at`: its cursor is set there, at the runner's clock, and the log is
+    /// held from there for [`Self::compact`]. Allowed read-only: it writes
+    /// mailtide's own tables, never Gmail.
+    pub async fn ack(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+        at: FeedPosition,
+    ) -> Result<AckOutcome, RunError> {
+        self.store
+            .ack(account, consumer, at, self.clock.now())
+            .await
+            .map_err(RunError::Store)
+    }
+
+    /// `account`'s registered consumers: who holds the log, since when, and
+    /// who is lost (behind the floor).
+    pub async fn consumers(&self, account: &AccountId) -> Result<ConsumerList, RunError> {
+        self.store.consumers(account).await.map_err(RunError::Store)
+    }
+
+    /// Forget consumer `consumer` (decommissioned): it no longer holds the
+    /// log. Whether it was registered.
+    pub async fn drop_consumer(
+        &self,
+        account: &AccountId,
+        consumer: &ConsumerName,
+    ) -> Result<bool, RunError> {
+        self.store
+            .drop_consumer(account, consumer)
+            .await
+            .map_err(RunError::Store)
+    }
+
+    /// Drop whole commits of `account`'s feed: no further than `through`
+    /// (when given), nor past the slowest consumer heard from within
+    /// `max_idle`, at the runner's clock (see
+    /// [`mailtide::revision::compaction_target`]). With neither a bound nor
+    /// a registered consumer nothing goes. A `through` of another
+    /// generation compacts nothing. Returns how many entries were removed.
+    pub async fn compact(
+        &self,
+        account: &AccountId,
+        through: Option<FeedPosition>,
+        max_idle: Duration,
+    ) -> Result<u64, RunError> {
+        let mut retention = Retention::new(self.clock.now());
+        retention.max_idle = max_idle;
+        if let Some(through) = through {
+            let status = self.status(account).await?;
+            if status.is_none_or(|s| s.generation != through.generation) {
+                return Ok(0);
+            }
+            // Whole commits only: a position inside a commit keeps that
+            // commit until the reader is through it.
+            retention = retention.through(through.at.compactable());
+        }
+        self.store
+            .compact(account, &retention)
+            .await
+            .map_err(RunError::Store)
     }
 
     /// `account`'s label definitions as the mirror last synced them, in id

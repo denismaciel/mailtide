@@ -6,7 +6,7 @@ from typing import assert_never
 import mailtide
 from conftest import make_config, tokens
 from fake_gmail import Mailbox
-from mailtide.testing import FakeGmail
+from mailtide.testing import FakeGmail, ManualClock
 
 ACCOUNT = "alice@example.com"
 
@@ -136,11 +136,13 @@ def entries(pages: list[mailtide.ChangePage]) -> list[mailtide.Change]:
     return [change for page in pages for change in page.changes]
 
 
-def bootstrapped(gmail: FakeGmail, messages: int) -> tuple[mailtide.BlockingRunner, int]:
+def bootstrapped(
+    gmail: FakeGmail, messages: int, clock: ManualClock | None = None
+) -> tuple[mailtide.BlockingRunner, int]:
     """A runner that synced `messages` messages, and the account's generation."""
     for n in range(messages):
         gmail.add(f"m{n:02}", ["INBOX"])
-    runner = mailtide.BlockingRunner(make_config(gmail.origin), tokens)
+    runner = mailtide.BlockingRunner(make_config(gmail.origin), tokens, clock=clock)
     runner.migrate()
     generation = runner.track(ACCOUNT).generation
     assert generation is not None
@@ -204,3 +206,74 @@ def test_compacting_through_a_mid_commit_position_keeps_the_rest() -> None:
         assert [(c.state, c.index) for c in rest] == [(c.state, c.index) for c in whole[read:]]
         too_old = runner.changes(ACCOUNT)
         assert isinstance(too_old, mailtide.StateTooOld)
+
+
+def commit_states(runner: mailtide.BlockingRunner) -> list[str]:
+    """The state of every commit in the log, oldest first."""
+    states: list[str] = []
+    for change in entries(read_to_end(runner, None, 5_000)):
+        if change.state not in states:
+            states.append(change.state)
+    return states
+
+
+def test_compaction_waits_for_a_registered_consumer() -> None:
+    with FakeGmail() as gmail:
+        runner, _ = bootstrapped(gmail, 5, ManualClock())
+        states = commit_states(runner)
+        assert len(states) >= 2
+        whole = entries(read_to_end(runner, None, 5_000))
+        slow = runner.ack(ACCOUNT, "indexer", states[0])
+        fast = runner.ack(ACCOUNT, "notifier", states[-1])
+        assert isinstance(slow, mailtide.ConsumerCursor) and slow.state == states[0]
+        assert isinstance(fast, mailtide.ConsumerCursor) and not fast.lost
+        # No position needed: up to the slower consumer, and no further.
+        assert runner.compact(ACCOUNT) == sum(1 for c in whole if c.state == states[0])
+        listed = {c.name: (c.state, c.lost) for c in runner.consumers(ACCOUNT)}
+        assert listed == {"indexer": (states[0], False), "notifier": (states[-1], False)}
+        assert isinstance(runner.changes(ACCOUNT, since=states[0]), mailtide.ChangePage)
+
+
+def test_a_silent_consumer_is_cut_off_after_max_idle() -> None:
+    clock = ManualClock()
+    with FakeGmail() as gmail:
+        runner, _ = bootstrapped(gmail, 5, clock)
+        states = commit_states(runner)
+        runner.ack(ACCOUNT, "silent", states[0])
+        clock.advance(59)
+        runner.compact(ACCOUNT, max_idle_s=60)
+        assert isinstance(runner.changes(ACCOUNT, since=states[0]), mailtide.ChangePage)
+        clock.advance(2)
+        assert runner.compact(ACCOUNT, max_idle_s=60) > 0
+        assert isinstance(runner.changes(ACCOUNT, since=states[0]), mailtide.StateTooOld)
+        [silent] = runner.consumers(ACCOUNT)
+        assert silent.name == "silent" and silent.lost
+        assert isinstance(runner.ack(ACCOUNT, "silent", states[0]), mailtide.StateTooOld)
+
+
+def test_compact_with_a_position_still_works_without_consumers() -> None:
+    with FakeGmail() as gmail:
+        runner, _ = bootstrapped(gmail, 5)
+        states = commit_states(runner)
+        whole = entries(read_to_end(runner, None, 5_000))
+        # As called before consumers existed: whole commits through the position.
+        through = states[1]
+        assert runner.compact(ACCOUNT, through) == sum(1 for c in whole if c.state in states[:2])
+        too_old = runner.changes(ACCOUNT)
+        assert isinstance(too_old, mailtide.StateTooOld) and too_old.oldest == through
+        assert runner.consumers(ACCOUNT) == []
+        assert runner.compact(ACCOUNT) == 0, "no position and no consumer: nothing"
+
+
+def test_ack_rejects_a_position_from_another_generation() -> None:
+    clock = ManualClock()
+    with FakeGmail() as gmail:
+        runner, generation = bootstrapped(gmail, 3, clock)
+        status = runner.status(ACCOUNT)
+        assert status is not None
+        runner.forget(ACCOUNT)
+        clock.advance(1)
+        assert runner.track(ACCOUNT).generation != generation
+        for old in (status.state, f"mt2-{generation:x}.0"):
+            assert isinstance(runner.ack(ACCOUNT, "indexer", old), mailtide.StateTooOld)
+        assert runner.consumers(ACCOUNT) == []
