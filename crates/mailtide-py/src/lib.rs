@@ -29,7 +29,7 @@ mod _core {
         Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
     };
     use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
-    use mailtide::revision::{FeedPosition, StateSeq, StateString};
+    use mailtide::revision::{FeedCursor, FeedPosition, StateSeq, StateString};
     use mailtide::state::SyncPhase;
     use mailtide_gmail::push::{self, Jwks, PushExpectations};
     use mailtide_io::auth::CachedTokens;
@@ -293,14 +293,16 @@ mod _core {
         status: Option<Status>,
     }
 
-    /// Changes to the mirror after a state string, whole commits only.
+    /// Changes to the mirror after a state string: at most the call's
+    /// `limit`, and a page may end inside a commit.
     #[pyclass(frozen, get_all)]
     struct ChangePage {
         /// The changes, oldest first: `MessageDiscovered`, `MessageImported`,
         /// `LabelsChanged`, `OverlayChanged`, `MessageDeleted` or
         /// `LabelDefinitionsChanged` (match on the class or on `kind`).
         changes: Vec<Py<PyAny>>,
-        /// The state string to ask from next.
+        /// The state string to ask from next (opaque; it may point inside a
+        /// commit).
         next: String,
         has_more: bool,
     }
@@ -1238,9 +1240,16 @@ mod _core {
         }
     }
 
-    /// A state string: a position in one generation of an account's feed.
-    fn position(generation: u64, seq: StateSeq) -> String {
-        FeedPosition { generation, seq }.encode().0
+    /// A state string: a position in one generation of an account's feed,
+    /// `mt2-<generation>.<seq>` for a whole commit or
+    /// `mt2-<generation>.<seq>.<entry>` inside one.
+    fn position(generation: u64, at: impl Into<FeedCursor>) -> String {
+        FeedPosition {
+            generation,
+            at: at.into(),
+        }
+        .encode()
+        .0
     }
 
     fn parse_state(state: &str) -> PyResult<FeedPosition> {
@@ -1502,11 +1511,11 @@ mod _core {
             since: Option<FeedPosition>,
             limit: u32,
         ) -> PyResult<Py<PyAny>> {
-            let seq = since.map_or(StateSeq(0), |at| at.seq);
+            let at = since.map_or(FeedCursor::from(StateSeq(0)), |since| since.at);
             let feed = self
                 .inner
                 .store()
-                .changes(&account, seq, limit)
+                .changes(&account, at, limit)
                 .await
                 .map_err(store_error)?;
             match feed {
@@ -1542,9 +1551,11 @@ mod _core {
             if status.is_none_or(|s| s.generation != through.generation) {
                 return Ok(0);
             }
+            // Whole commits only: a position inside a commit keeps that
+            // commit until the reader is through it.
             self.inner
                 .store()
-                .compact(&account, through.seq)
+                .compact(&account, through.at.compactable())
                 .await
                 .map_err(store_error)
         }
@@ -2165,7 +2176,8 @@ mod _core {
             )
         }
 
-        /// Drop feed entries at or before state string `through`.
+        /// Drop feed entries at or before state string `through`: whole
+        /// commits only, so a `through` inside a commit keeps that commit.
         fn compact(&self, py: Python<'_>, account: &str, through: &str) -> PyResult<u64> {
             let fut = self
                 .shared

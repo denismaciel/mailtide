@@ -17,7 +17,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, StateSeq};
+use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
@@ -95,11 +95,15 @@ pub trait Store: Send + Sync {
         floor: mailtide::quota::Priority,
     ) -> impl Future<Output = Result<ClaimOutcome, StoreError>> + Send;
 
-    /// The change feed after `since`, or `TooOld` if it was compacted away.
+    /// The change feed after `since`: at most `limit` entries (clamped to
+    /// `1..=MAX_FEED_PAGE`, see [`mailtide::revision`]), in `(state, index)`
+    /// order, a page ending inside a commit when the commit is larger; or
+    /// `TooOld` if entries after `since` were compacted away (it is behind
+    /// the floor, or inside the floor commit).
     fn changes(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> impl Future<Output = Result<ChangeFeed, StoreError>> + Send;
 

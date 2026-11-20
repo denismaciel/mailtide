@@ -19,7 +19,7 @@ use mailtide::labels::{LabelSet, set};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::{Action, ActionRequest, IntentOp, ReadState};
 use mailtide::quota::Priority;
-use mailtide::revision::{Change, StateSeq};
+use mailtide::revision::{Change, ChangeEntry, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 
 use crate::{Store, StoreError};
@@ -85,9 +85,6 @@ where
             "compaction makes older states too old; ids enumerate the mirror",
             |s| Box::pin(compaction(s)),
         ),
-        ("change pages never split a commit", |s| {
-            Box::pin(whole_commit_pages(s))
-        }),
         ("admitted actions survive a newer engine's claim", |s| {
             Box::pin(admission_is_unfenced(s))
         }),
@@ -126,11 +123,9 @@ where
         ("imported entries carry the stored envelope", |s| {
             Box::pin(imports_carry_envelopes(s))
         }),
-        ("a commit of many imports is hydrated in full", |s| {
-            Box::pin(large_import_commits(s))
-        }),
     ];
     cases.extend(prioritise_cases());
+    cases.extend(feed_page_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -165,6 +160,30 @@ fn prioritise_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
         }),
         ("prioritise writes nothing to the feed", |s| {
             Box::pin(prioritise_leaves_the_feed_alone(s))
+        }),
+    ]
+}
+
+/// The cases of feed pages bounded by their limit.
+fn feed_page_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        ("change pages split inside a commit at the limit", |s| {
+            Box::pin(pages_split_inside_a_commit(s))
+        }),
+        ("commit positions read as before", |s| {
+            Box::pin(commit_positions_read_as_before(s))
+        }),
+        ("compaction keeps the commit a reader is inside", |s| {
+            Box::pin(compaction_keeps_a_commit_a_reader_is_inside(s))
+        }),
+        ("a split read survives writes between pages", |s| {
+            Box::pin(a_split_read_survives_writes_between_pages(s))
+        }),
+        ("a large commit arrives in bounded, hydrated pages", |s| {
+            Box::pin(a_large_commit_arrives_in_bounded_pages(s))
+        }),
+        ("a page hydrates only its own imports", |s| {
+            Box::pin(a_page_hydrates_only_its_own_imports(s))
         }),
     ]
 }
@@ -334,7 +353,7 @@ async fn cursor_fencing<S: Store>(store: &S) -> Result<(), String> {
         "the expected cursor must apply",
     )?;
     let page = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -493,7 +512,7 @@ async fn change_log<S: Store>(store: &S) -> Result<(), String> {
         apply(store, &c).await?;
     }
     let first = store
-        .changes(&account(), StateSeq(0), 2)
+        .changes(&account(), StateSeq(0).into(), 2)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -756,33 +775,32 @@ async fn unverified<S: Store>(store: &S) -> Result<(), String> {
     )
 }
 
-async fn whole_commit_pages<S: Store>(store: &S) -> Result<(), String> {
-    let snapshot = claim(store).await?;
-    let mut c = commit(&snapshot, 0);
-    c.messages = vec![
-        observe("a", &[], 1),
-        observe("b", &[], 2),
-        observe("c", &[], 3),
-    ];
-    apply(store, &c).await?;
-    let mut d = commit(&snapshot, 1);
-    d.messages = vec![observe("d", &[], 4)];
-    apply(store, &d).await?;
-    let mut since = StateSeq(0);
-    let mut seen = Vec::new();
-    for _ in 0..10 {
+/// Read from `since` to the end with `limit`: every entry, and each page's
+/// size.
+async fn read_all<S: Store>(
+    store: &S,
+    since: FeedCursor,
+    limit: u32,
+) -> Result<(Vec<ChangeEntry>, Vec<usize>), String> {
+    let (mut entries, mut sizes, mut since) = (Vec::new(), Vec::new(), since);
+    loop {
         let page = store
-            .changes(&account(), since, 2)
+            .changes(&account(), since, limit)
             .await
             .map_err(|e| format!("{e:?}"))
             .and_then(page)?;
-        seen.extend(page.changes);
+        sizes.push(page.changes.len());
+        entries.extend(page.changes);
         since = page.next;
         if !page.has_more {
-            break;
+            return Ok((entries, sizes));
         }
     }
-    let ids: Vec<&str> = seen
+}
+
+/// The messages discovered by `entries`, in order.
+fn discovered(entries: &[ChangeEntry]) -> Vec<&str> {
+    entries
         .iter()
         .filter_map(|entry| match &entry.change {
             Change::MessageDiscovered { id, .. } => Some(id.0.as_str()),
@@ -792,10 +810,212 @@ async fn whole_commit_pages<S: Store>(store: &S) -> Result<(), String> {
             | Change::MessageDeleted { .. }
             | Change::LabelDefinitionsChanged => None,
         })
-        .collect();
+        .collect()
+}
+
+fn identities(entries: &[ChangeEntry]) -> Vec<(StateSeq, u32)> {
+    entries.iter().map(|e| (e.state, e.index)).collect()
+}
+
+/// The account's feed position now (the last commit's state).
+async fn state<S: Store>(store: &S) -> Result<StateSeq, String> {
+    Ok(store
+        .status(&account())
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("status")?
+        .state)
+}
+
+/// Apply one commit discovering each of `ids`; its state.
+async fn discover<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    seq: u64,
+    ids: &[&str],
+) -> Result<StateSeq, String> {
+    let mut c = commit(snapshot, seq);
+    c.messages = ids.iter().map(|id| observe(id, &["INBOX"], 1)).collect();
+    apply(store, &c).await?;
+    state(store).await
+}
+
+async fn pages_split_inside_a_commit<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    discover(store, &snapshot, 0, &["a", "b", "c"]).await?;
+    discover(store, &snapshot, 1, &["d"]).await?;
+    let (entries, sizes) = read_all(store, StateSeq(0).into(), 2).await?;
     expect(
-        ids == ["a", "b", "c", "d"],
+        sizes == [2, 2],
+        "two pages of two, the first ending inside a commit",
+    )?;
+    expect(
+        discovered(&entries) == ["a", "b", "c", "d"],
         "every change arrives exactly once",
+    )?;
+    let (whole, _) = read_all(store, StateSeq(0).into(), 100).await?;
+    expect(
+        identities(&entries) == identities(&whole),
+        "identities are those of an unbounded read",
+    )
+}
+
+async fn commit_positions_read_as_before<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let first = discover(store, &snapshot, 0, &["a", "b", "c"]).await?;
+    let second = discover(store, &snapshot, 1, &["d"]).await?;
+    let third = discover(store, &snapshot, 2, &["e", "f"]).await?;
+    // From each commit position, exactly what followed that commit.
+    for (since, rest) in [
+        (StateSeq(0), &["a", "b", "c", "d", "e", "f"][..]),
+        (first, &["d", "e", "f"][..]),
+        (second, &["e", "f"][..]),
+        (third, &[][..]),
+    ] {
+        let page = store
+            .changes(&account(), since.into(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .and_then(page)?;
+        expect(
+            discovered(&page.changes) == rest && !page.has_more,
+            &format!("from {since:?}: the commits after it"),
+        )?;
+        expect(
+            page.next == FeedCursor::from(page.head),
+            "a page that reads to the head ends on its commit",
+        )?;
+    }
+    // Where the limit falls on a commit boundary, the pages and positions
+    // are the ones a whole-commit reader saw.
+    let page_one = store
+        .changes(&account(), StateSeq(0).into(), 4)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        discovered(&page_one.changes) == ["a", "b", "c", "d"]
+            && page_one.has_more
+            && page_one.next == FeedCursor::from(second),
+        "the first page ends on the second commit",
+    )?;
+    let page_two = store
+        .changes(&account(), page_one.next, 4)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        discovered(&page_two.changes) == ["e", "f"]
+            && !page_two.has_more
+            && page_two.next == FeedCursor::from(third),
+        "the second page is the third commit",
+    )
+}
+
+async fn compaction_keeps_a_commit_a_reader_is_inside<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let first = discover(store, &snapshot, 0, &["a"]).await?;
+    let second = discover(store, &snapshot, 1, &["b", "c", "d"]).await?;
+    discover(store, &snapshot, 2, &["e"]).await?;
+    let reading = store
+        .changes(&account(), StateSeq(0).into(), 2)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let inside = reading.next;
+    expect(
+        inside
+            == FeedCursor {
+                seq: second,
+                entry: Some(0),
+            },
+        "the reader is inside the second commit",
+    )?;
+    expect(
+        inside.compactable() == first,
+        "it holds the commit it is inside",
+    )?;
+    let removed = store
+        .compact(&account(), inside.compactable())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(removed == 1, "only the first commit is removed")?;
+    let (rest, _) = read_all(store, inside, 100).await?;
+    expect(
+        discovered(&rest) == ["c", "d", "e"],
+        "the reader continues where it was",
+    )?;
+    store
+        .compact(&account(), second)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        store
+            .changes(&account(), inside, 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::revision::ChangeFeed::TooOld {
+                generation: GENERATION,
+                oldest: second,
+            },
+        "compacting the commit a reader is inside makes it too old",
+    )
+}
+
+async fn a_split_read_survives_writes_between_pages<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let first = discover(store, &snapshot, 0, &["a", "b", "c", "d"]).await?;
+    let one = store
+        .changes(&account(), StateSeq(0).into(), 2)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        one.head == first && one.next.seq == first && one.has_more,
+        "the first page ends inside the commit",
+    )?;
+    // Between the pages: a commit and an admitted action.
+    discover(store, &snapshot, 1, &["e"]).await?;
+    let admitted = store
+        .admit(
+            &account(),
+            &ActionRequest::Messages {
+                ids: vec![MessageId("a".into())],
+                action: Action::Archive,
+            },
+            Timestamp(0),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(admitted == 1, "the action is admitted")?;
+    let two = store
+        .changes(&account(), one.next, 2)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        discovered(&two.changes) == ["c", "d"] && two.has_more,
+        "the rest of the commit comes first",
+    )?;
+    expect(
+        two.head > first && two.next == FeedCursor::from(first),
+        "head moves; next ends the commit and does not jump",
+    )?;
+    let (rest, _) = read_all(store, two.next, 2).await?;
+    expect(
+        discovered(&rest) == ["e"]
+            && rest
+                .iter()
+                .any(|entry| matches!(entry.change, Change::OverlayChanged { .. })),
+        "then the commit and the admission",
+    )?;
+    let mut paged = one.changes;
+    paged.extend(two.changes);
+    paged.extend(rest);
+    let (whole, _) = read_all(store, StateSeq(0).into(), 100).await?;
+    expect(
+        identities(&paged) == identities(&whole),
+        "no entry skipped or repeated",
     )
 }
 
@@ -1027,7 +1247,7 @@ async fn feed_records_changes<S: Store>(store: &S) -> Result<(), String> {
     }];
     apply(store, &deleted).await?;
     let page = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -1072,7 +1292,7 @@ async fn compaction<S: Store>(store: &S) -> Result<(), String> {
         apply(store, &c).await?;
     }
     let first = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -1084,7 +1304,7 @@ async fn compaction<S: Store>(store: &S) -> Result<(), String> {
     expect(removed == 2, "the first two commits' entries are removed")?;
     expect(
         store
-            .changes(&account(), StateSeq(0), 100)
+            .changes(&account(), StateSeq(0).into(), 100)
             .await
             .map_err(|e| format!("{e:?}"))?
             == mailtide::revision::ChangeFeed::TooOld {
@@ -1094,7 +1314,7 @@ async fn compaction<S: Store>(store: &S) -> Result<(), String> {
         "reading from before the floor is too old",
     )?;
     let rest = store
-        .changes(&account(), middle, 100)
+        .changes(&account(), middle.into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -1263,7 +1483,7 @@ async fn tracking<S: Store>(store: &S) -> Result<(), String> {
         .map_err(|e| format!("{e:?}"))?;
     let feed = page(
         store
-            .changes(&stranger, StateSeq(0), 10)
+            .changes(&stranger, StateSeq(0).into(), 10)
             .await
             .map_err(|e| format!("{e:?}"))?,
     )?;
@@ -1330,7 +1550,7 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
         "a refresh replaces the definitions: renames show, removed labels go",
     )?;
     let page = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -1390,7 +1610,7 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
     )];
     apply(store, &late).await?;
     let page = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -1414,10 +1634,8 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
 }
 
 /// The feed's import entries, by message, with their content.
-fn imports(
-    page: &mailtide::revision::ChangePage,
-) -> Vec<(&str, Option<&mailtide::mirror::StoredContent>)> {
-    page.changes
+fn imports(entries: &[ChangeEntry]) -> Vec<(&str, Option<&mailtide::mirror::StoredContent>)> {
+    entries
         .iter()
         .filter_map(|entry| match &entry.change {
             Change::MessageImported { id, .. } => Some((id.0.as_str(), entry.content.as_ref())),
@@ -1442,7 +1660,7 @@ async fn imports_carry_envelopes<S: Store>(store: &S) -> Result<(), String> {
     }];
     apply(store, &deleted).await?;
     let page = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -1456,7 +1674,7 @@ async fn imports_carry_envelopes<S: Store>(store: &S) -> Result<(), String> {
         "the import is stored with its header facts",
     )?;
     expect(
-        imports(&page) == vec![("a", stored), ("b", None)],
+        imports(&page.changes) == vec![("a", stored), ("b", None)],
         "an import carries what the mirror stores, nothing once deleted",
     )?;
     expect(
@@ -1468,24 +1686,29 @@ async fn imports_carry_envelopes<S: Store>(store: &S) -> Result<(), String> {
     )
 }
 
-async fn large_import_commits<S: Store>(store: &S) -> Result<(), String> {
-    // More imports than one chunk of ids, in one commit: a page holds it whole.
+async fn a_large_commit_arrives_in_bounded_pages<S: Store>(store: &S) -> Result<(), String> {
+    // More imports than one chunk of ids, in one commit (of imports only:
+    // the messages were discovered before).
     const COUNT: u64 = 1_200;
     let snapshot = claim(store).await?;
-    let mut c = commit(&snapshot, 0);
-    c.messages = (0..COUNT)
-        .map(|n| import(&format!("m{n:04}"), &["INBOX"], n + 1))
-        .collect();
+    let ids: Vec<String> = (0..COUNT).map(|n| format!("m{n:04}")).collect();
+    let mut seen = commit(&snapshot, 0);
+    seen.messages = ids.iter().map(|id| observe(id, &["INBOX"], 1)).collect();
+    apply(store, &seen).await?;
+    let since = state(store).await?;
+    let mut c = commit(&snapshot, 1);
+    c.messages = ids.iter().map(|id| import(id, &["INBOX"], 1)).collect();
     apply(store, &c).await?;
-    let page = store
-        .changes(&account(), StateSeq(0), 1)
-        .await
-        .map_err(|e| format!("{e:?}"))
-        .and_then(page)?;
-    let entries = imports(&page);
+    let (entries, sizes) = read_all(store, since.into(), 500).await?;
+    expect(sizes == [500, 500, 200], "pages of at most 500")?;
+    let entries = imports(&entries);
     expect(
-        u64::try_from(entries.len()) == Ok(COUNT) && !page.has_more && page.next == page.head,
-        "the whole commit arrives in one page",
+        u64::try_from(entries.len()) == Ok(COUNT)
+            && entries
+                .iter()
+                .map(|(id, _)| *id)
+                .eq(ids.iter().map(String::as_str)),
+        "every import arrives once, in order",
     )?;
     expect(
         entries.iter().all(|(id, content)| {
@@ -1785,7 +2008,7 @@ async fn prioritise_leaves_the_feed_alone<S: Store>(store: &S) -> Result<(), Str
             .map_err(|e| format!("{e:?}"))?,
     );
     let feed_before = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let report = prioritise(store, &account(), &["a"], 0).await?;
@@ -1797,9 +2020,62 @@ async fn prioritise_leaves_the_feed_alone<S: Store>(store: &S) -> Result<(), Str
             .map_err(|e| format!("{e:?}"))?,
     );
     let feed_after = store
-        .changes(&account(), StateSeq(0), 100)
+        .changes(&account(), StateSeq(0).into(), 100)
         .await
         .map_err(|e| format!("{e:?}"))?;
     expect(before == after, "the state string does not move")?;
     expect(feed_before == feed_after, "no feed entry is written")
+}
+
+/// The feed's import entries, by message, with whether they carry content.
+fn has_content(entries: &[ChangeEntry]) -> Vec<(&str, bool)> {
+    imports(entries)
+        .into_iter()
+        .map(|(id, content)| (id, content.is_some()))
+        .collect()
+}
+
+async fn a_page_hydrates_only_its_own_imports<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    // Each new import logs a discovery and an import: eight entries.
+    let mut c = commit(&snapshot, 0);
+    c.messages = ["a", "b", "c", "d"]
+        .iter()
+        .zip(1..)
+        .map(|(id, checkpoint)| import(id, &["INBOX"], checkpoint))
+        .collect();
+    apply(store, &c).await?;
+    let mut deleted = commit(&snapshot, 1);
+    deleted.messages = vec![MessageOp::Tombstone {
+        id: MessageId("c".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(9) },
+    }];
+    apply(store, &deleted).await?;
+    let first = store
+        .changes(&account(), StateSeq(0).into(), 4)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    let second = store
+        .changes(&account(), first.next, 4)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(page)?;
+    expect(
+        has_content(&first.changes) == [("a", true), ("b", true)],
+        "the first page's imports carry their content",
+    )?;
+    expect(
+        has_content(&second.changes) == [("c", false), ("d", true)],
+        "a deleted import has none; its neighbour in the page keeps its own",
+    )?;
+    expect(
+        first
+            .changes
+            .iter()
+            .chain(&second.changes)
+            .filter(|entry| !matches!(entry.change, Change::MessageImported { .. }))
+            .all(|entry| entry.content.is_none()),
+        "other kinds carry no content",
+    )
 }

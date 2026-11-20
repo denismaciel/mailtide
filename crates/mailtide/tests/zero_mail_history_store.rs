@@ -894,7 +894,7 @@ fn durable_gmail_history_checkpoints_delivers_label_notifications_independently_
         }],
     );
     // Clients learn of the label change before the body is imported…
-    let changes = mirror.changes(consumed, 100);
+    let changes = mirror.changes(consumed.into(), 100);
     assert!(matches!(
         changes.changes.as_slice(),
         [entry] if matches!(&entry.change, Change::LabelsChanged { id, .. } if *id == m("t"))
@@ -962,7 +962,7 @@ fn durable_gmail_history_checkpoints_retains_a_newer_notification_when_an_earlie
     );
     let start = mirror.seq;
     seed(&mut mirror, Priority::Live, vec![patch(12, "STARRED")]);
-    let broadcast = mirror.changes(start, 100);
+    let broadcast = mirror.changes(start.into(), 100);
     assert!(matches!(
         broadcast.changes.as_slice(),
         [entry] if matches!(&entry.change, Change::LabelsChanged { id, .. } if *id == m("t"))
@@ -976,7 +976,7 @@ fn durable_gmail_history_checkpoints_retains_a_newer_notification_when_an_earlie
     ));
     assert!(after_ack.next > broadcast.next);
     // Three commits: the import (discovered + imported) and two label changes.
-    let all = mirror.changes(StateSeq(0), 100).changes;
+    let all = mirror.changes(StateSeq(0).into(), 100).changes;
     let commits: std::collections::BTreeSet<_> = all.iter().map(|e| e.state).collect();
     assert_eq!((all.len(), commits.len()), (4, 3));
 }

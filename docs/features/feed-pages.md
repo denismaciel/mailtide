@@ -88,8 +88,11 @@ Fields are hex, as today. The decoder accepts both; anything else is
 commit boundary, so:
 
 - strings stored by consumers decode to exactly the position they named;
-- a consumer that never meets a commit larger than its `limit` never sees a
-  three-field string, and its pages are the same as before;
+- a two-field string passed back means the whole commit, as before, and a
+  page that ends on a commit boundary returns one; a page ends inside a
+  commit wherever its `limit` falls there (not only in commits larger than
+  the limit), so a consumer meets three-field strings whenever its pages and
+  commits do not line up;
 - an entry's `state` (the commit it belongs to) stays two-field, so
   `(state, index)` identities recorded for deduplication stay valid.
 
@@ -261,10 +264,12 @@ Own tests (21), in four layers:
 
 ## 6. Slices
 
-1. `FeedCursor`, the codec and its tests; `AccountMirror::changes` by cursor
-   with the core tests. Stores still convert from `StateSeq`.
-2. `Store::changes` takes a cursor: memory and SQL (the keyset query), the
-   conformance cases, clamping.
+1. and 2., in one commit: `FeedCursor`, the codec and its tests;
+   `AccountMirror::changes` by cursor with the core tests; `Store::changes`
+   takes a cursor: memory and SQL (the keyset query), the conformance cases,
+   clamping; the version-only migration. (Built apart, the first left the
+   memory store, which reads through `AccountMirror`, splitting commits
+   behind a `StateSeq` contract that cannot resume inside one.)
 3. Bindings: codec, `compact` from a mid-commit position, Python tests, SPEC.
 4. Simulator reader and `FeedPagesDiverged`.
 
@@ -284,8 +289,8 @@ Own tests (21), in four layers:
   low megabytes and under a dozen statements. A caller that asked for more
   gets `has_more`. *Would change it:* a measured need for larger pages.
 - **D4. No downgrade path for three-field strings; older builds are kept
-  out by the schema version.** The strings exist only while a consumer is
-  inside a commit larger than its limit. Writing them in a form an older
+  out by the schema version.** The strings exist only while a consumer's
+  last page ended inside a commit. Writing them in a form an older
   build could misread as a commit boundary would skip entries; a refusal at
   startup, and an error if one is decoded anyway, are the safe failures.
   *Would change it:* a host that must roll back under load; it can drain to

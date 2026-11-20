@@ -6,7 +6,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, StateSeq};
+use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
@@ -73,7 +73,7 @@ impl Store for SqliteStore {
     async fn changes(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
         self.inner.changes(account, since, limit).await
@@ -236,7 +236,7 @@ mod tests {
         refused("claim_jobs", jobs.err());
         refused(
             "changes",
-            store.changes(account, StateSeq(0), 10).await.err(),
+            store.changes(account, StateSeq(0).into(), 10).await.err(),
         );
         refused("compact", store.compact(account, StateSeq(1)).await.err());
         refused(
@@ -451,8 +451,8 @@ mod tests {
     #[tokio::test]
     async fn migration_4_is_additive_and_revertible() {
         use crate::sql::{SCHEMA_VERSION, SchemaState, migrations};
-        assert_eq!(SCHEMA_VERSION, 4);
         let all = migrations();
+        assert_eq!(all[3].version, 4);
         assert_eq!(
             all[3].statements[1..],
             [
@@ -485,7 +485,8 @@ mod tests {
                 .to_owned(),
         ])
         .await;
-        run(all[3].statements.clone()).await;
+        // Migration 4, and the later ones a current build expects.
+        run(all[3..].iter().flat_map(|m| m.statements.clone()).collect()).await;
         let account = AccountId("a@example.com".into());
         let snapshot = store
             .claim(&account, mailtide::ids::ENGINE_VERSION)
@@ -493,8 +494,10 @@ mod tests {
             .expect("claim");
         assert_eq!(snapshot.sync, mailtide::state::SyncState::Live);
         assert_eq!(snapshot.labels_refreshed_at, None);
-        // The documented downgrade.
+        // The documented downgrade, after forgetting the later
+        // (version-only) migrations.
         run(vec![
+            "DELETE FROM mailtide_schema WHERE version > 4".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at".to_owned(),
             "DELETE FROM mailtide_schema WHERE version = 4".to_owned(),
         ])
@@ -512,6 +515,44 @@ mod tests {
             .await
             .expect("claim");
         assert_eq!(snapshot.cursor, Some(mailtide::ids::HistoryId(7)));
+    }
+
+    /// Migration 5 has no statement of its own: it only keeps builds that
+    /// can't decode a position inside a commit away from the database.
+    /// Reverting it is forgetting the version.
+    #[tokio::test]
+    async fn migration_5_is_version_only_and_revertible() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState, migrations};
+        assert_eq!(SCHEMA_VERSION, 5);
+        let all = migrations();
+        assert_eq!(
+            all[4].statements[1..],
+            ["INSERT INTO mailtide_schema (version) VALUES (5)".to_owned()]
+        );
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        // The documented downgrade.
+        store
+            .inner
+            .execute_for_tests("DELETE FROM mailtide_schema WHERE version = 5")
+            .await
+            .expect("revert");
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: 4,
+                expected: SCHEMA_VERSION
+            }
+        );
+        store.migrate().await.expect("migrate again");
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Current {
+                version: SCHEMA_VERSION
+            }
+        );
     }
 
     /// A stored number out of range is corrupt, never read as another value.

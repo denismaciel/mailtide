@@ -6,7 +6,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, StateSeq};
+use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
@@ -73,7 +73,7 @@ impl Store for PostgresStore {
     async fn changes(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
         self.inner.changes(account, since, limit).await

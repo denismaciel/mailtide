@@ -27,7 +27,9 @@ use mailtide::mirror::{
 use mailtide::outbox::{ActionRequest, Intent, IntentOp, plan_delivery};
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
-use mailtide::revision::{Change, ChangeEntry, ChangeFeed, ChangePage, StateSeq};
+use mailtide::revision::{
+    Change, ChangeEntry, ChangeFeed, ChangePage, FeedCursor, MAX_FEED_PAGE, StateSeq,
+};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{
     AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome, TrackOutcome,
@@ -87,7 +89,11 @@ const MIGRATIONS: &[&[&str]] = &[&[
 &["ALTER TABLE mailtide_accounts ADD COLUMN generation BIGINT NOT NULL DEFAULT 0"],
 // 4: when the label definitions were last listed (NULL: never). Disposable:
 // dropping it only makes the next run list them again.
-&["ALTER TABLE mailtide_accounts ADD COLUMN labels_refreshed_at BIGINT"]];
+&["ALTER TABLE mailtide_accounts ADD COLUMN labels_refreshed_at BIGINT"],
+// 5: version only. State strings may name an entry inside a commit
+// (`mt2-<gen>.<seq>.<idx>`), which older builds can't decode: they must see
+// the database as ahead.
+&[]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
@@ -1049,7 +1055,7 @@ impl SqlStore {
     pub(crate) async fn changes(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
         self.ensure_schema().await?;
@@ -1075,7 +1081,7 @@ impl SqlStore {
             }
             None => (StateSeq(0), 0, StateSeq(0)),
         };
-        if since < floor {
+        if since.is_compacted(floor) {
             return Ok(ChangeFeed::TooOld {
                 generation,
                 oldest: floor,
@@ -1090,48 +1096,38 @@ impl SqlStore {
     async fn change_page(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> Result<ChangePage, StoreError> {
-        // A page ends on a whole commit: a state string names a commit, so a
-        // page cut inside one would lose the rest of it.
-        let window = sqlx::query(
-            "SELECT seq FROM mailtide_changes WHERE account = $1 AND seq > $2 ORDER BY seq, idx LIMIT $3",
+        // One keyset read on the log's key, for the page and one entry more:
+        // the extra entry says whether more are waiting and whether the
+        // page's last commit is finished (commits are written whole, so none
+        // of its entries can appear later). A commit position reads after
+        // every entry of its commit.
+        let limit = limit.clamp(1, MAX_FEED_PAGE);
+        let mut rows = sqlx::query(
+            "SELECT seq, idx, change FROM mailtide_changes
+             WHERE account = $1 AND (seq, idx) > ($2, $3) ORDER BY seq, idx LIMIT $4",
         )
         .bind(account.as_str())
-        .bind(int("since", since.0)?)
-        .bind(i64::from(limit.max(1)))
+        .bind(int("since", since.seq.0)?)
+        .bind(since.entry.map_or(i64::MAX, i64::from))
+        .bind(i64::from(limit) + 1)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| unavailable(&e))?;
-        let Some(last) = window.last() else {
-            return Ok(ChangePage {
-                generation: 0,
-                head: since,
-                changes: Vec::new(),
-                next: since,
-                has_more: false,
-            });
+        let extra = if rows.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
+            rows.pop()
+        } else {
+            None
         };
-        let cutoff: i64 = last.try_get("seq").map_err(|e| corrupt("seq", e))?;
-        let rows = sqlx::query(
-            "SELECT seq, idx, change FROM mailtide_changes WHERE account = $1 AND seq > $2 AND seq <= $3 ORDER BY seq, idx",
-        )
-        .bind(account.as_str())
-        .bind(int("since", since.0)?)
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| unavailable(&e))?;
-        let has_more =
-            sqlx::query("SELECT seq FROM mailtide_changes WHERE account = $1 AND seq > $2 LIMIT 1")
-                .bind(account.as_str())
-                .bind(cutoff)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| unavailable(&e))?
-                .is_some();
-        let mut changes = Vec::new();
+        let following = extra
+            .map(|row| {
+                let seq: i64 = row.try_get("seq").map_err(|e| corrupt("seq", e))?;
+                uint("seq", seq).map(StateSeq)
+            })
+            .transpose()?;
+        let mut changes = Vec::with_capacity(rows.len());
         for row in rows {
             let change: String = row.try_get("change").map_err(|e| corrupt("change", e))?;
             let seq: i64 = row.try_get("seq").map_err(|e| corrupt("seq", e))?;
@@ -1156,19 +1152,21 @@ impl SqlStore {
                 entry.content = contents.remove(id);
             }
         }
-        let next = StateSeq(uint("seq", cutoff)?);
+        let next = changes.last().map_or(since, |last| {
+            FeedCursor::read_through(last.state, last.index, following != Some(last.state))
+        });
         Ok(ChangePage {
             generation: 0,
-            head: next,
+            head: next.seq,
             changes,
             next,
-            has_more,
+            has_more: following.is_some(),
         })
     }
 
     /// The stored content of those of `ids` that are imported and still
-    /// held: one query per chunk of ids (a page holds whole commits, and one
-    /// commit can import tens of thousands of messages).
+    /// held: one query per chunk of ids (a page can hold up to
+    /// `MAX_FEED_PAGE` imports).
     async fn contents(
         &self,
         account: &AccountId,
@@ -1482,7 +1480,7 @@ impl crate::Store for SqlStore {
     async fn changes(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
         Self::changes(self, account, since, limit).await

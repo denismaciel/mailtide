@@ -10,7 +10,7 @@ use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
-use mailtide::revision::{ChangeFeed, StateSeq};
+use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
 
@@ -140,12 +140,12 @@ impl Store for MemoryStore {
     async fn changes(
         &self,
         account: &AccountId,
-        since: StateSeq,
+        since: FeedCursor,
         limit: u32,
     ) -> Result<ChangeFeed, StoreError> {
         let untracked = ChangeFeed::Page(mailtide::revision::ChangePage {
             generation: 0,
-            head: since,
+            head: since.seq,
             changes: Vec::new(),
             next: since,
             has_more: false,

@@ -2,7 +2,7 @@ id = "feed-pages"
 title = "Feed pages bounded by `limit`, also inside a commit"
 summary = "A feed position can name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`), so `changes(account, since, limit)` never returns more than `limit` entries; state strings already persisted keep their meaning, and no schema changes."
 roadmap = ["R6"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/feed-pages.md"
 depends_on = []
 
@@ -34,6 +34,16 @@ role = "Compile fix only: the ported tests pass `page.next` back to `changes`"
 path = "crates/mailtide-store/src/lib.rs"
 change = "modify"
 role = "Store::changes takes a FeedCursor; its contract says at most `limit` entries (clamped to MAX_FEED_PAGE)"
+
+[[file]]
+path = "crates/mailtide-store/src/sqlite.rs"
+change = "modify"
+role = "Store::changes takes a FeedCursor; the version-only migration's test, beside migration 4's"
+
+[[file]]
+path = "crates/mailtide-store/src/postgres.rs"
+change = "modify"
+role = "Store::changes takes a FeedCursor"
 
 [[file]]
 path = "crates/mailtide-store/src/memory.rs"
@@ -68,6 +78,11 @@ role = "ChangePage and changes() docstrings: `limit` is a bound, `next` may poin
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
 role = "A feed reader that pages with random limits between steps and is compared with the mirror's log"
+
+[[file]]
+path = "tests/test_migrations_clock.py"
+change = "modify"
+role = "SCHEMA_VERSION is one higher (the version-only migration)"
 
 [[file]]
 path = "tests/test_feed.py"
@@ -190,7 +205,7 @@ covers = "An import whose message was deleted before the page was read has conte
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
 name = "commit_positions_read_as_before"
-covers = "A consumer that only ever passes commit positions (the old state strings) and a limit above every commit's size sees the pages it saw before the change"
+covers = "A consumer that only ever passes commit positions (the old state strings) gets from each exactly the commits after it, as before; where its limit falls on a commit boundary its pages and `next` are the ones it saw before the change (elsewhere a page now ends inside a commit)"
 
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
