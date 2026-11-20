@@ -259,7 +259,9 @@ Suites were found with `grep -ri` for delete, destroy, purge, expunge, trash
 and spam over every checkout's test files, then read.
 
 - himalaya `src/jmap/backend.rs`: the scoping tests of its JMAP delete map
-  onto our eligibility rule and partial outcome (3 mapped; 1 `na`: a JMAP
+  onto our eligibility rule and partial outcome. The port distinguishes
+  definite single-delete refusals from ambiguous batch results
+  (3 mapped; 1 `na`: a JMAP
   email in two mailboxes only leaves the trash, a Gmail message with `TRASH`
   is in the trash). `send` and `threads` declare the suite too.
 - himalaya `src/gmail/backend.rs`: the three tests of its permanent delete,

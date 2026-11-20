@@ -750,7 +750,7 @@ impl Host {
     pub fn defer_deletes_after(&self, n: u32, by: Duration) {
         self.controls
             .lock()
-            .expect("gate controls")
+            .unwrap_or_else(PoisonError::into_inner)
             .deletes_admitted = Some((n, by));
     }
 
@@ -758,25 +758,34 @@ impl Host {
     pub fn fail_delete_release_after(&self, n: u32) {
         self.controls
             .lock()
-            .expect("gate controls")
+            .unwrap_or_else(PoisonError::into_inner)
             .releases_before_failure = Some(n);
     }
 
     /// Pause the first delete quota admission that reaches the gate.
+    #[must_use]
     pub fn pause_next_delete_admission(&self) -> Arc<Pause> {
         let pause = Arc::new(Pause::default());
-        self.controls.lock().expect("gate controls").pause_admission = Some(pause.clone());
+        self.controls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pause_admission = Some(pause.clone());
         pause
     }
 
     /// Pause token acquisition after `n` immediate acquisitions.
+    #[must_use]
     pub fn pause_token_after(&self, n: u32) -> Arc<Pause> {
         let pause = Arc::new(Pause::default());
-        *self.token_pause.lock().expect("token hook") = Some((n, pause.clone()));
+        *self
+            .token_pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((n, pause.clone()));
         pause
     }
 
     /// Keep the next action delivery in flight until the test resumes it.
+    #[must_use]
     pub fn pause_next_delivery(&self) -> Arc<Pause> {
         let pause = Arc::new(Pause::default());
         *self
@@ -784,7 +793,7 @@ impl Host {
             .transport()
             .before_modify
             .lock()
-            .expect("modify hook") = Some(pause.clone());
+            .unwrap_or_else(PoisonError::into_inner) = Some(pause.clone());
         pause
     }
 
@@ -795,7 +804,7 @@ impl Host {
             .transport()
             .forget_after_delete
             .lock()
-            .expect("forget hook") = Some(Arc::downgrade(&self.runner));
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(&self.runner));
     }
 
     /// The user admits `action` on this host while Gmail answers the next
