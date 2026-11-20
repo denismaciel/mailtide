@@ -25,6 +25,8 @@ pub enum TimerKind {
     Labels,
     /// Enqueue the periodic draft listing (SPEC §7a).
     Drafts,
+    /// Run the next mailbox completeness audit step (SPEC §6.3).
+    Audit,
 }
 
 /// How soon after a listing a label id the definitions lack may list them

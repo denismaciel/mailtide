@@ -130,7 +130,8 @@ The store keeps, per account:
 - **account**: `account_id`, `email`, `cursor` (nullable), `watch_expiration`,
   `sync_phase` (`bootstrapping | reconciling | live | blocked`),
   `notification_revision`, `processed_revision`, poll timestamps, retry and
-  backoff state, and the reconciliation progress record (§6.3).
+  backoff state, reconciliation progress, and the mailbox audit time and
+  continuation (§6.3).
 - **label**: `label_id`, `name`, `type` (system/user), list and message
   visibility, `color` (a text and background pair from Gmail's palette);
   the last three are unknown when Gmail omits them (most system labels) and
@@ -352,16 +353,52 @@ when an operator asks for it. Repeated expiries back off.
    state, so a restart resumes.
 3. **Finish** with one commit that also moves the cursor to the baseline and
    sets the state to Live:
-   - Listings are not snapshots: a concurrent change can make a page skip a
-     message, and labels changed while history was unavailable are lost.
-     So **every message whose checkpoint is older than the baseline gets a
-     verification fetch** (`format=minimal`) and becomes *unverified*
+   - Listings do not give a snapshot of labels changed while history was
+     unavailable. **Every message whose checkpoint is older than the
+     baseline gets a verification fetch** (`format=minimal`) and becomes *unverified*
      (§6.5). A first bootstrap pays nothing extra: every message is new.
    - Only a confirmed 404 tombstones a message. Absence from a listing never
      does [Z].
 4. Incremental sync resumes from the baseline, replaying every change made
    during the enumeration (I4). Imports and verifications needn't finish
    first: they are durable jobs [Z].
+
+**Paging assumption.** The simulator uses position tokens. A continuation
+starts after the last id returned even if that message was removed. The
+live `search-page-token-lifetime` check walked a labelled listing with
+`maxResults=2` across an insertion and a trash without repeats or skipped
+survivors. The engine's unfiltered, 500-result listing across permanent
+deletion remains unmeasured. A paging omission can hide a message whose
+creation predates the baseline and is absent from every listing scope.
+
+**Periodic completeness audit.** A live account's audit is due
+`audit_interval` after the previous audit completed (default 24 h, due
+on the first live run if the time is unset). The audit has its own timer.
+One claim does one Gmail page or one bounded store step. A partial audit
+hands the next step to a new claim. Hosts using the raw engine can read
+that time with `Engine::audit_next_run()`. Backfill work waits for active
+history and job work to drain first.
+
+- Request `messages.list` with `includeSpamTrash=true`, `maxResults=500`
+  and `fields=messages(id),nextPageToken` (5 quota units). Each page records
+  its membership and next token atomically. Every id seen for the first
+  time in the audit with neither a row nor a tombstone queues an ordinary
+  Backfill verification. A rejected continuation clears the partial seen
+  set in batches and restarts the listing.
+- After the last page, sweep mirror ids in primary key order, at most 500
+  per claim. A row missing from the seen set also queues a verification.
+  An arrival during the listing can be verified by the sweep. A listing
+  alone never removes a row. The verification uses normal checkpoint and
+  tombstone rules.
+- A claim can queue at most 500 verification jobs. There is no audit feed
+  entry and no history cursor change. Later verification can discover or
+  tombstone a message as usual. A run reports `audit.found_missing` and
+  `audit.found_unlisted` in its engine status (Python uses
+  `audit_found_missing` and `audit_found_unlisted`). These counts are for
+  the committed step in that run.
+- After the sweep, bounded cleanup of the temporary ids completes the
+  audit and records `audited_at`. Both the completion time and the
+  in-progress continuation survive a restart.
 
 ### 6.4 Body import jobs
 
@@ -801,18 +838,18 @@ engine's epoch, so results meant for a dead engine are ignored).
 - Triggers: `PushReceived{history_id}`, `TimerFired{timer}`,
   `ActionRequested{action}`.
 - Gmail results: `ProfileFetched`, `HistoryFetched{page}`, `HistoryExpired`,
-  `MessagesListed{page}`, `MessageFetched{observation}`,
+  `MessagesListed{page}`, `AuditListed{ids, next}`, `MessageFetched{observation}`,
   `MessageImported{message}` (after the blob is stored), `MessageNotFound`,
-  `LabelsListed{labels, generation}` (the label generation the host read
-  before sending it), `WatchRenewed{expiration}`, `LabelsModified`,
-  `DraftsListed{page}`, and `Searched{listing}` and `MessagesDeleted{ids}`,
-  which answer the driver's own search and delete requests and which the
-  engine ignores. The driver's own label requests answer
+  `LabelsListed{labels, generation, stored_user_labels}` (the generation and
+  stored user-label definitions read before sending it), `WatchRenewed{expiration}`, `LabelsModified`,
+  `DraftsListed{page}`, and
+  `Searched{listing}` and `MessagesDeleted{ids}`, which answer the driver's
+  own search and delete requests and which the engine ignores. The driver's own label requests answer
   `LabelFetched{label}`, `LabelSaved{label}`, `LabelNameTaken` (a 409) and
   `LabelDeleted`, and its draft calls `DraftFetched`, `DraftSaved`,
   `DraftDeleted`, `DraftSent` and `DraftNotFound`; the engine issues none.
 - Store results: `CommitApplied`, `CommitRejected{reason}`,
-  `JobsClaimed{jobs}`, `BlobDeleted`.
+  `AuditAdvanced{outcome}`, `JobsClaimed{jobs}`, `BlobDeleted`.
 - Failures: `RequestFailed{failure}` (retryable with class and
   `Retry-After` / not found / blocking), `RequestDeferred{until}` (the quota
   gate said not yet; not a failure).
@@ -824,7 +861,8 @@ engine's epoch, so results meant for a dead engine are ignored).
   the driver's direct calls do.
 - `Commit(commit)`: atomic, guarded (epoch, engine version, expected cursor,
   job claim).
-- `ClaimJobs{epoch, limit, now, attempt}`, `DeleteBlob{message}`.
+- `AdvanceAudit(request)`, `ClaimJobs{epoch, limit, now, attempt}`,
+  `DeleteBlob{message}`.
 - `Schedule{timer, at}`, `ReportStatus(status)`.
 
 ### 10.3 Store contract and conformance
@@ -844,6 +882,9 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `record_label(account, op)` (an `Upsert` or a `Remove`): the unfenced
   record of a local label write, bumping the label generation;
   `label_generation(account)` reads it (0 for an untracked account) (§6.6).
+- `advance_audit(request)` checks the account epoch and continuation,
+  then records a bounded audit page and its verification jobs atomically
+  (§6.3).
 - `changes(account, since: FeedCursor, limit)`: the change feed
   (`ChangeFeed::Page` of `ChangeEntry { state, index, change, content }`, or
   `TooOld` after compaction). The store reads the first `limit + 1` entries
@@ -931,7 +972,7 @@ token_source)` is async (every method is a coroutine); `mailtide.BlockingRunner`
 has the same methods, blocking, for code without an event loop. `config` is a
 `mailtide.config.Config` of plain frozen dataclasses (database URL and pool
 limits, blob URL, watch mode, HTTP, engine tunables such as
-`label_refresh_s`, quota budget); the Rust core parses and validates it once
+`label_refresh_s`, `audit_interval_s`, quota budget); the Rust core parses and validates it once
 and raises `ValueError` naming the first invalid field. Postgres pools
 default to 2 connections opened lazily; a run uses one at a time. Build one
 runner per process, after forking:
@@ -1268,6 +1309,20 @@ DROP TABLE mailtide_drafts;
 ALTER TABLE mailtide_accounts DROP COLUMN drafts_generation;  -- SQLite ≥ 3.35
 ALTER TABLE mailtide_accounts DROP COLUMN drafts_refreshed_at;
 DELETE FROM mailtide_schema WHERE version = 10;
+```
+
+Migration 11 adds nullable `audited_at` and `audit_progress` to
+`mailtide_accounts` and the temporary `mailtide_audit_seen` table (§6.3).
+The audit uses existing verification jobs and produces no new feed entry
+types. Older builds refuse the newer schema. Rollback discards the audit
+schedule and unfinished listing. Already queued verifications can still
+run, and the first audit after upgrading starts at page one.
+
+```sql
+DROP TABLE mailtide_audit_seen;
+ALTER TABLE mailtide_accounts DROP COLUMN audit_progress;
+ALTER TABLE mailtide_accounts DROP COLUMN audited_at;
+DELETE FROM mailtide_schema WHERE version = 11;
 ```
 
 Tests: `mailtide.testing`

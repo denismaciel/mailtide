@@ -76,6 +76,7 @@ class Engine:
     draft_refresh_delay_s: float = 10.0
     draft_refresh_every_s: float = 900.0
     draft_send_grace_s: float = 3600.0
+    audit_interval_s: float = 86_400.0
 
 
 @dataclass(frozen=True, slots=True)

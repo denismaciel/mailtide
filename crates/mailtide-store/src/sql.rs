@@ -45,6 +45,8 @@ use sqlx::any::AnyRow;
 use sqlx::pool::PoolOptions;
 use sqlx::{Any, AssertSqlSafe, Pool, Row, Transaction};
 
+mod audit;
+
 type AnyPool = Pool<Any>;
 
 use crate::StoreError;
@@ -137,6 +139,13 @@ const MIGRATIONS: &[&[&str]] = &[&[
     "CREATE INDEX IF NOT EXISTS mailtide_drafts_tracking ON mailtide_drafts (account, tracking_id)",
     "ALTER TABLE mailtide_accounts ADD COLUMN drafts_generation BIGINT NOT NULL DEFAULT 0",
     "ALTER TABLE mailtide_accounts ADD COLUMN drafts_refreshed_at BIGINT",
+],
+// 11: audit completion time, durable continuation and temporary membership.
+&[
+    "ALTER TABLE mailtide_accounts ADD COLUMN audited_at BIGINT",
+    "ALTER TABLE mailtide_accounts ADD COLUMN audit_progress TEXT",
+    "CREATE TABLE mailtide_audit_seen (
+        account TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (account, id))",
 ]];
 
 /// The schema version this build expects.
@@ -502,6 +511,7 @@ impl SqlStore {
             "mailtide_tombstones",
             "mailtide_jobs",
             "mailtide_seen",
+            "mailtide_audit_seen",
             "mailtide_labels",
             "mailtide_intents",
             "mailtide_changes",
@@ -570,7 +580,7 @@ impl SqlStore {
     ) -> Result<Option<(AccountRecord, StateSeq)>, StoreError> {
         let sql = format!(
             "SELECT epoch, engine_version, cursor, sync, watch_expiration, last_activity, cooldown, rng_seed, seq, log_floor, generation, labels_refreshed_at,
-               label_generation, deleted_labels, drafts_generation, drafts_refreshed_at
+               label_generation, deleted_labels, drafts_generation, drafts_refreshed_at, audited_at, audit_progress
              FROM mailtide_accounts WHERE account = $1{lock}"
         );
         // Only a constant lock clause is appended.
@@ -594,6 +604,9 @@ impl SqlStore {
         let deleted_labels: Option<String> = row
             .try_get("deleted_labels")
             .map_err(|e| corrupt("deleted_labels", e))?;
+        let audit_progress: Option<String> = row
+            .try_get("audit_progress")
+            .map_err(|e| corrupt("audit_progress", e))?;
         let record = AccountRecord {
             epoch: Epoch(uint("epoch", get_i("epoch")?)?),
             engine_version: EngineVersion(
@@ -612,6 +625,11 @@ impl SqlStore {
                 .transpose()?,
             rng_seed: get_i("rng_seed")?.cast_unsigned(),
             labels_refreshed_at: get_oi("labels_refreshed_at")?.map(Timestamp),
+            audited_at: get_oi("audited_at")?.map(Timestamp),
+            audit_progress: audit_progress
+                .as_deref()
+                .map(|value| parse("audit_progress", value))
+                .transpose()?,
             log_floor: StateSeq(uint("log_floor", get_i("log_floor")?)?),
             generation: uint("generation", get_i("generation")?)?,
             label_generation: uint("label_generation", get_i("label_generation")?)?,
@@ -1132,6 +1150,8 @@ impl SqlStore {
             cooldown: record.cooldown,
             rng_seed: record.rng_seed,
             labels_refreshed_at: record.labels_refreshed_at,
+            audited_at: record.audited_at,
+            audit_progress: record.audit_progress,
             label_ids,
             drafts_refreshed_at: record.drafts_refreshed_at,
         })
@@ -2115,6 +2135,13 @@ impl crate::Store for SqlStore {
         Self::apply(self, commit).await
     }
 
+    async fn advance_audit(
+        &self,
+        request: &mailtide::audit::AuditRequest,
+    ) -> Result<mailtide::audit::AuditOutcome, StoreError> {
+        SqlStore::advance_audit(self, request).await
+    }
+
     async fn claim_jobs(
         &self,
         account: &AccountId,
@@ -2381,6 +2408,7 @@ impl crate::Store for SqlStore {
             "mailtide_tombstones",
             "mailtide_jobs",
             "mailtide_seen",
+            "mailtide_audit_seen",
             "mailtide_labels",
             "mailtide_intents",
             "mailtide_changes",

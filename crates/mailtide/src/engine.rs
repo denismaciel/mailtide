@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::audit::{AuditOutcome, AuditProgress, AuditReport, AuditRequest, AuditStep};
 use crate::command::{Command, CommandKind, GmailCall, GmailRequest};
 use crate::commit::{
     AccountOp, Commit, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
@@ -66,6 +67,8 @@ pub struct EngineConfig {
     /// How long a send whose answer was lost waits for its sent message
     /// before it ends as unconfirmed.
     pub draft_send_grace: Duration,
+    /// Time between mailbox completeness audits (SPEC §6.3).
+    pub audit_interval: Duration,
 }
 
 /// Whether the engine keeps a Gmail push watch alive.
@@ -92,6 +95,7 @@ impl Default for EngineConfig {
             draft_refresh_delay: Duration::from_secs(10),
             draft_refresh_every: Duration::from_mins(15),
             draft_send_grace: Duration::from_hours(1),
+            audit_interval: Duration::from_hours(24),
         }
     }
 }
@@ -115,6 +119,10 @@ enum Waiting {
     Labels,
     /// `labels.list` to refresh the definitions (SPEC §6.6).
     LabelRefresh,
+    /// An audit's Gmail page.
+    AuditPage,
+    /// The store applying an audit step.
+    AuditStore,
     /// `getProfile` for the reconciliation baseline.
     Baseline,
     /// A `messages.list` page of the current reconciliation.
@@ -183,6 +191,14 @@ struct LabelRefresh {
     unlisted: LabelSet,
 }
 
+#[derive(Debug, Default)]
+struct Audit {
+    due: bool,
+    attempted: bool,
+    next_run: Option<Timestamp>,
+    report: AuditReport,
+}
+
 /// A pending label confirmation that can be carried between short runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelConfirmation {
@@ -219,6 +235,7 @@ pub struct Engine {
     label_ids: Vec<LabelId>,
     /// The label-refresh schedule.
     labels: LabelRefresh,
+    audit: Audit,
     /// Deliveries Gmail refused once while adding a label it may no longer
     /// have, held (their claim kept) until a label listing sent after the
     /// refusal has been applied; `true` once that listing is sent.
@@ -274,6 +291,7 @@ impl Engine {
             pass: None,
             label_ids: Vec::new(),
             labels: LabelRefresh::default(),
+            audit: Audit::default(),
             parked: Vec::new(),
             relisted: BTreeMap::new(),
             label_listing_failures: 0,
@@ -323,6 +341,12 @@ impl Engine {
         }
     }
 
+    /// When another claim should resume the audit, if this one used its step.
+    #[must_use]
+    pub fn audit_next_run(&self) -> Option<Timestamp> {
+        self.audit.next_run
+    }
+
     /// The first commands after start: schedule timers, resume any
     /// reconciliation, catch up on history.
     #[must_use]
@@ -370,6 +394,7 @@ impl Engine {
             self.config.draft_refresh_every,
         ));
         out.extend(self.pump_drafts(now));
+        out.extend(self.schedule_audit(now));
         out.push(self.status_command());
         out
     }
@@ -397,6 +422,12 @@ impl Engine {
                 self.history_expired(now)
             }
             EventKind::MessagesListed { command, page } => self.on_listed(command, page, now),
+            EventKind::AuditListed { command, ids, next } => {
+                self.on_audit_page(command, ids, next, now)
+            }
+            EventKind::AuditAdvanced { command, outcome } => {
+                self.on_audit_advanced(command, outcome, now)
+            }
             EventKind::MessageFetched { command, message } => {
                 self.on_fetched(command, message, now)
             }
@@ -476,6 +507,7 @@ impl Engine {
             cursor_advanced_at: self.cursor_advanced_at,
             cooldown: self.state.cooldown.clone(),
             label_listing_failures: self.label_listing_failures,
+            audit: self.audit.report,
             import: self.state.sync.reconcile().map(|progress| ImportProgress {
                 discovered: self.discovered,
                 imported: self.imported,
@@ -526,10 +558,19 @@ impl Engine {
                 out.extend(self.resume_sync(now));
                 out.extend(self.claim_jobs(now));
                 out.extend(self.pump_labels(now));
+                out.extend(self.pump_audit(now));
                 out
             }
             TimerKind::Labels => self.pump_labels(now),
             TimerKind::Drafts => self.pump_drafts(now),
+            TimerKind::Audit => {
+                let due = self.audit_due(now);
+                if due > now {
+                    return self.schedule_audit(now).into_iter().collect();
+                }
+                self.audit.due = true;
+                self.pump_audit(now)
+            }
         }
     }
 
@@ -559,7 +600,12 @@ impl Engine {
             || self.waiting.values().any(|w| match w {
                 Waiting::History | Waiting::Labels | Waiting::Baseline | Waiting::Listing => true,
                 // A label refresh never holds history back.
-                Waiting::LabelRefresh | Waiting::Watch | Waiting::Claim | Waiting::Job(_) => false,
+                Waiting::LabelRefresh
+                | Waiting::AuditPage
+                | Waiting::AuditStore
+                | Waiting::Watch
+                | Waiting::Claim
+                | Waiting::Job(_) => false,
             })
             || self.after.values().any(|a| match a {
                 AfterCommit::HistoryPage { .. }
@@ -1150,6 +1196,135 @@ impl Engine {
         vec![self.send_commit(commit, AfterCommit::ReconcileDone(to))]
     }
 
+    // ------------------------------------------------------------ mailbox audit
+
+    fn audit_due(&self, now: Timestamp) -> Timestamp {
+        if self.state.audit_progress.is_some() {
+            now
+        } else {
+            schedule::label_refresh_due(self.state.audited_at, now, self.config.audit_interval)
+        }
+    }
+
+    fn schedule_audit(&mut self, now: Timestamp) -> Option<Command> {
+        (self.state.sync == SyncState::Live && !self.audit.attempted)
+            .then(|| self.schedule(TimerKind::Audit, self.audit_due(now)))
+    }
+
+    /// Wait until the history pass and job claim have drained. Each account
+    /// claim can perform one audit step and leaves the next to a future run.
+    fn pump_audit(&mut self, now: Timestamp) -> Vec<Command> {
+        if !self.audit.due
+            || self.audit.attempted
+            || self.state.sync != SyncState::Live
+            || self.busy_syncing()
+            || self.claiming
+            || self.running_jobs != 0
+            || self.cooling_down(now)
+        {
+            return Vec::new();
+        }
+        self.audit.attempted = true;
+        match &self.state.audit_progress {
+            None | Some(AuditProgress::Listing(_)) => {
+                let page_token = match &self.state.audit_progress {
+                    Some(AuditProgress::Listing(token)) => Some(token.clone()),
+                    _ => None,
+                };
+                vec![self.gmail(
+                    GmailRequest::AuditMessages { page_token },
+                    Priority::Backfill,
+                    Waiting::AuditPage,
+                )]
+            }
+            Some(AuditProgress::Sweep(_) | AuditProgress::Cleanup { .. }) => {
+                vec![self.advance_audit(AuditStep::Continue, now)]
+            }
+        }
+    }
+
+    fn advance_audit(&mut self, step: AuditStep, now: Timestamp) -> Command {
+        let id = self.command_id();
+        self.waiting.insert(id, Waiting::AuditStore);
+        Command {
+            id,
+            kind: CommandKind::AdvanceAudit(AuditRequest {
+                account: self.state.account.clone(),
+                epoch: self.state.epoch,
+                expected: self.state.audit_progress.clone(),
+                step,
+                now,
+            }),
+        }
+    }
+
+    fn on_audit_page(
+        &mut self,
+        command: CommandId,
+        ids: Vec<MessageId>,
+        next: Option<PageToken>,
+        now: Timestamp,
+    ) -> Vec<Command> {
+        if self.waiting.remove(&command) != Some(Waiting::AuditPage)
+            || self.state.sync != SyncState::Live
+        {
+            return Vec::new();
+        }
+        let repeats = next.as_ref().is_some_and(|next| {
+            self.state.audit_progress.as_ref().is_some_and(
+                |progress| matches!(progress, AuditProgress::Listing(token) if token == next),
+            )
+        });
+        if ids.len() > crate::audit::AUDIT_PAGE_SIZE || next.is_some() && ids.is_empty() || repeats
+        {
+            return self.audit_failed(true, now);
+        }
+        vec![self.advance_audit(AuditStep::Page { ids, next }, now)]
+    }
+
+    fn on_audit_advanced(
+        &mut self,
+        command: CommandId,
+        outcome: AuditOutcome,
+        now: Timestamp,
+    ) -> Vec<Command> {
+        if self.waiting.remove(&command) != Some(Waiting::AuditStore) {
+            return Vec::new();
+        }
+        match outcome {
+            AuditOutcome::Applied {
+                completed_at,
+                report,
+            } => {
+                self.audit.report = report;
+                self.audit.next_run =
+                    Some(completed_at.map_or(now, |at| at.plus(self.config.audit_interval)));
+                if report.found_missing > 0 || report.found_unlisted > 0 {
+                    vec![self.schedule_jobs(now)]
+                } else {
+                    Vec::new()
+                }
+            }
+            AuditOutcome::Rejected(Rejection::StaleEpoch | Rejection::StaleVersion) => {
+                self.stopped = Some(Stopped::Superseded(Rejection::StaleEpoch));
+                vec![self.status_command()]
+            }
+            AuditOutcome::Rejected(_) => Vec::new(),
+        }
+    }
+
+    fn audit_failed(&mut self, restart: bool, now: Timestamp) -> Vec<Command> {
+        if restart
+            && self.state.sync == SyncState::Live
+            && matches!(self.state.audit_progress, Some(AuditProgress::Listing(_)))
+        {
+            vec![self.advance_audit(AuditStep::Restart, now)]
+        } else {
+            self.audit.next_run = Some(now.plus(Duration::from_mins(1)));
+            Vec::new()
+        }
+    }
+
     // ------------------------------------------------------------ jobs
 
     fn claim_jobs(&mut self, now: Timestamp) -> Vec<Command> {
@@ -1254,6 +1429,7 @@ impl Engine {
         if let Some(due) = next_due.filter(|due| *due > now) {
             out.push(self.schedule_jobs(due));
         }
+        out.extend(self.pump_audit(now));
         if out.is_empty() {
             return vec![self.status_command()];
         }
@@ -1533,6 +1709,7 @@ impl Engine {
                 // The reconciliation enqueued a listing of its own (the
                 // store's rule); the periodic one follows from it.
                 out.extend(self.pump_drafts(now));
+                out.extend(self.schedule_audit(now));
                 out
             }
             AfterCommit::Job => {
@@ -1638,8 +1815,12 @@ impl Engine {
                 out.extend(self.listing_ended(now));
                 out
             }
+            Some(Waiting::AuditPage) => {
+                self.audit.next_run = Some(until);
+                Vec::new()
+            }
             Some(Waiting::Watch) => vec![self.schedule(TimerKind::WatchRenewal, until)],
-            None => Vec::new(),
+            Some(Waiting::AuditStore) | None => Vec::new(),
         }
     }
 
@@ -1647,6 +1828,17 @@ impl Engine {
         let Some(waiting) = self.waiting.remove(&command) else {
             return Vec::new();
         };
+        if waiting == Waiting::AuditPage {
+            let bad_token = matches!(
+                failure,
+                Failure::NotFound
+                    | Failure::Blocking(BlockingFailure {
+                        class: Blocking::Permanent,
+                        ..
+                    })
+            );
+            return self.audit_failed(bad_token, now);
+        }
         let listing = matches!(waiting, Waiting::Labels | Waiting::LabelRefresh);
         let mut out = match failure {
             Failure::Retryable(retryable) => {
@@ -1758,7 +1950,9 @@ impl Engine {
             }
             // The watch can't be renewed: polling still finds changes; the
             // next engine tries again.
-            (Blocking::Permanent, Waiting::Watch) => Vec::new(),
+            (Blocking::Permanent, Waiting::Watch | Waiting::AuditPage | Waiting::AuditStore) => {
+                Vec::new()
+            }
         }
     }
 
@@ -1799,7 +1993,7 @@ impl Engine {
                 self.claiming = false;
                 Vec::new()
             }
-            Waiting::Watch => Vec::new(),
+            Waiting::Watch | Waiting::AuditPage | Waiting::AuditStore => Vec::new(),
         }
     }
 
@@ -1845,6 +2039,7 @@ impl Engine {
                 let at = self.backoff.next(0, failure, now, seed);
                 vec![self.schedule(TimerKind::WatchRenewal, at)]
             }
+            Waiting::AuditPage | Waiting::AuditStore => Vec::new(),
         }
     }
 
@@ -2055,6 +2250,8 @@ mod tests {
             cooldown: None,
             rng_seed: 7,
             labels_refreshed_at: None,
+            audited_at: None,
+            audit_progress: None,
             label_ids: LabelSet::new(),
             drafts_refreshed_at: None,
         };
@@ -2442,7 +2639,8 @@ mod tests {
                     }
                     CommandKind::Schedule { .. }
                     | CommandKind::DeleteBlob { .. }
-                    | CommandKind::ReportStatus(_) => None,
+                    | CommandKind::ReportStatus(_)
+                    | CommandKind::AdvanceAudit(_) => None,
                 };
                 if let Some(answer) = answer {
                     queue.extend(self.engine.handle(answer));
@@ -2854,6 +3052,8 @@ mod tests {
             cooldown: None,
             rng_seed: 7,
             labels_refreshed_at: None,
+            audited_at: None,
+            audit_progress: None,
             label_ids: LabelSet::new(),
             drafts_refreshed_at: None,
         };
@@ -2905,7 +3105,8 @@ mod tests {
                 | CommandKind::Schedule { .. }
                 | CommandKind::ClaimJobs { .. }
                 | CommandKind::DeleteBlob { .. }
-                | CommandKind::ReportStatus(_) => None,
+                | CommandKind::ReportStatus(_)
+                | CommandKind::AdvanceAudit(_) => None,
             })
             .collect()
     }
@@ -2917,7 +3118,8 @@ mod tests {
             | CommandKind::Schedule { .. }
             | CommandKind::ClaimJobs { .. }
             | CommandKind::DeleteBlob { .. }
-            | CommandKind::ReportStatus(_) => None,
+            | CommandKind::ReportStatus(_)
+            | CommandKind::AdvanceAudit(_) => None,
         })
     }
 
@@ -3170,6 +3372,148 @@ mod tests {
             applied.labels.as_slice(),
             [LabelOp::ReplaceAll { labels, .. }] if *labels == defined(&["INBOX", "UNREAD"])
         ));
+    }
+
+    #[test]
+    fn audit_due_time_survives_restart_and_uses_backfill_quota() {
+        let mut engine = live(100);
+        let completed = Timestamp(10_000);
+        engine.state.audited_at = Some(completed);
+        let due = completed.plus(engine.config.audit_interval);
+        let snapshot = engine.state.clone().validate().expect("live");
+        for now in [completed, due.minus(Duration::from_millis(1))] {
+            let mut restarted = Engine::new(snapshot.clone(), engine.config.clone());
+            let out = restarted.start(now);
+            assert!(out.iter().any(|command| command.kind
+                == CommandKind::Schedule {
+                    timer: TimerKind::Audit,
+                    at: due,
+                }));
+            assert!(
+                !out.iter()
+                    .any(|command| matches!(&command.kind, CommandKind::Gmail(call)
+                if matches!(call.request, GmailRequest::AuditMessages { .. })))
+            );
+        }
+        let mut restarted = Engine::new(snapshot, engine.config);
+        let out = restarted.on_timer(TimerKind::Audit, due);
+        assert!(
+            matches!(out.as_slice(), [Command { kind: CommandKind::Gmail(call), .. }]
+            if call.request == GmailRequest::AuditMessages { page_token: None }
+                && call.priority == Priority::Backfill && call.cost == quota::QuotaUnits(5))
+        );
+    }
+
+    #[test]
+    fn an_audit_does_one_step_per_claim_and_reports_store_counts() {
+        let mut engine = live(100);
+        let now = Timestamp(10_000);
+        let page_token = PageToken("continued".into());
+        engine.state.audit_progress = Some(AuditProgress::Listing(page_token.clone()));
+        let request = engine.on_timer(TimerKind::Audit, now).remove(0);
+        assert!(matches!(request.kind, CommandKind::Gmail(call)
+            if call.request == GmailRequest::AuditMessages { page_token: Some(page_token) }));
+        let checked = engine
+            .on_audit_page(request.id, vec![MessageId("missing".into())], None, now)
+            .remove(0);
+        assert!(
+            matches!(&checked.kind, CommandKind::AdvanceAudit(AuditRequest {
+            step: AuditStep::Page { ids, next: None }, ..
+        }) if ids == &[MessageId("missing".into())])
+        );
+        let report = AuditReport {
+            found_missing: 1,
+            found_unlisted: 0,
+        };
+        let jobs = engine.on_audit_advanced(
+            checked.id,
+            AuditOutcome::Applied {
+                completed_at: None,
+                report,
+            },
+            now,
+        );
+        assert!(matches!(
+            jobs.as_slice(),
+            [Command {
+                kind: CommandKind::Schedule {
+                    timer: TimerKind::Jobs,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert_eq!(engine.status().audit, report);
+        assert_eq!(engine.status().cursor, Some(HistoryId(100)));
+        assert_eq!(engine.audit_next_run(), Some(now));
+        assert!(engine.on_timer(TimerKind::Audit, now).is_empty());
+
+        let mut restarted = live(100);
+        restarted.state.audit_progress = Some(AuditProgress::Sweep(None));
+        let request = restarted.on_timer(TimerKind::Audit, now).remove(0);
+        assert!(matches!(
+            request.kind,
+            CommandKind::AdvanceAudit(AuditRequest {
+                step: AuditStep::Continue,
+                ..
+            })
+        ));
+        let report = AuditReport {
+            found_missing: 0,
+            found_unlisted: 1,
+        };
+        restarted.on_audit_advanced(
+            request.id,
+            AuditOutcome::Applied {
+                completed_at: None,
+                report,
+            },
+            now,
+        );
+        assert_eq!(restarted.status().audit, report);
+    }
+
+    #[test]
+    fn an_oversized_audit_page_is_never_applied() {
+        let mut engine = live(100);
+        let now = Timestamp(0);
+        let request = engine.on_timer(TimerKind::Audit, now).remove(0);
+        let ids =
+            vec![MessageId("invalid oversized page".into()); crate::audit::AUDIT_PAGE_SIZE + 1];
+        assert!(engine.on_audit_page(request.id, ids, None, now).is_empty());
+        assert!(engine.audit_next_run().is_some_and(|retry| retry > now));
+    }
+
+    #[test]
+    fn an_audit_waits_for_the_live_history_pass() {
+        let mut engine = live(100);
+        let now = Timestamp(0);
+        let history = engine.request_pass().remove(0);
+        assert!(engine.on_timer(TimerKind::Audit, now).is_empty());
+        let done = engine.on_history(
+            history.id,
+            &HistoryPage {
+                history_id: HistoryId(100),
+                records: Vec::new(),
+                next_page_token: None,
+            },
+            now,
+        );
+        assert!(done.iter().any(|cmd| matches!(
+            cmd.kind,
+            CommandKind::Schedule {
+                timer: TimerKind::Jobs,
+                ..
+            }
+        )));
+        let claim = engine.on_timer(TimerKind::Jobs, now).remove(0);
+        let commands = engine.on_claimed(claim.id, Vec::new(), None, now);
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(&cmd.kind, CommandKind::Gmail(call)
+            if matches!(call.request, GmailRequest::AuditMessages { .. })))
+        );
     }
 
     #[test]

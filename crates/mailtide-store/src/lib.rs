@@ -11,6 +11,7 @@
 
 use std::future::Future;
 
+use mailtide::audit::{AuditOutcome, AuditRequest};
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
 use mailtide::drafts::{DraftRecorded, DraftView, DraftWrite};
 use mailtide::gmail::Label;
@@ -87,6 +88,12 @@ pub trait Store: Send + Sync {
         &self,
         commit: &Commit,
     ) -> impl Future<Output = Result<CommitOutcome, StoreError>> + Send;
+
+    /// Apply one bounded audit step with its continuation and verification jobs.
+    fn advance_audit(
+        &self,
+        request: &AuditRequest,
+    ) -> impl Future<Output = Result<AuditOutcome, StoreError>> + Send;
 
     /// Claim up to `limit` jobs of at least `floor` priority due at `now`
     /// for `attempt`, highest priority first (see

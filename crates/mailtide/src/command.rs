@@ -28,6 +28,8 @@ pub enum CommandKind {
     /// Apply a commit atomically, then report `CommitApplied` or
     /// `CommitRejected`.
     Commit(Box<Commit>),
+    /// Apply a bounded mailbox audit step and report its outcome.
+    AdvanceAudit(crate::audit::AuditRequest),
     /// Fire `TimerFired` at `at`. A later schedule of the same timer replaces
     /// this one.
     Schedule {
@@ -93,6 +95,11 @@ pub enum GmailRequest {
     ListMessages {
         /// All mail, or one label (SPEC §6.3).
         scope: crate::reconcile::ListScope,
+        /// The page to read.
+        page_token: Option<PageToken>,
+    },
+    /// An all-mail audit page with just message ids and the next token.
+    AuditMessages {
         /// The page to read.
         page_token: Option<PageToken>,
     },

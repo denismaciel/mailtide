@@ -61,6 +61,22 @@ pub enum EventKind {
         /// The page.
         page: ListPage,
     },
+    /// A mailbox audit's Gmail page arrived.
+    AuditListed {
+        /// The Gmail command it answers.
+        command: CommandId,
+        /// The message ids on the page.
+        ids: Vec<MessageId>,
+        /// The next page, if any.
+        next: Option<crate::ids::PageToken>,
+    },
+    /// The store applied or rejected an audit step.
+    AuditAdvanced {
+        /// The store command it answers.
+        command: CommandId,
+        /// The outcome.
+        outcome: crate::audit::AuditOutcome,
+    },
     /// `messages.get?format=minimal` returned.
     MessageFetched {
         /// The command it answers.

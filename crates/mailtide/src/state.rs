@@ -90,6 +90,10 @@ pub struct StoreSnapshot {
     /// When the label definitions were last listed; `None` before the first
     /// listing (SPEC §6.6).
     pub labels_refreshed_at: Option<Timestamp>,
+    /// When the last mailbox completeness audit finished.
+    pub audited_at: Option<Timestamp>,
+    /// The next page of an unfinished audit.
+    pub audit_progress: Option<crate::audit::AuditProgress>,
     /// The ids of the stored label definitions, to notice ids they lack.
     pub label_ids: LabelSet,
     /// When the drafts were last listed; `None` before the first listing
@@ -160,6 +164,8 @@ mod tests {
             cooldown: None,
             rng_seed: 0,
             labels_refreshed_at: None,
+            audited_at: None,
+            audit_progress: None,
             label_ids: LabelSet::new(),
             drafts_refreshed_at: None,
         }

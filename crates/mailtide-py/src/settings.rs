@@ -50,6 +50,7 @@ pub struct RawEngine {
     pub draft_refresh_delay_s: f64,
     pub draft_refresh_every_s: f64,
     pub draft_send_grace_s: f64,
+    pub audit_interval_s: f64,
 }
 
 /// `mailtide.config.Quota`.
@@ -240,6 +241,7 @@ fn engine(raw: &RawEngine, watch: &WatchMode) -> Result<EngineConfig, Invalid> {
         draft_refresh_delay: duration("engine.draft_refresh_delay_s", raw.draft_refresh_delay_s)?,
         draft_refresh_every: positive("engine.draft_refresh_every_s", raw.draft_refresh_every_s)?,
         draft_send_grace: duration("engine.draft_send_grace_s", raw.draft_send_grace_s)?,
+        audit_interval: positive("engine.audit_interval_s", raw.audit_interval_s)?,
     };
     if engine.poll_active > engine.poll_idle {
         return Err(invalid(
@@ -407,6 +409,7 @@ mod tests {
                 draft_refresh_delay_s: 10.0,
                 draft_refresh_every_s: 900.0,
                 draft_send_grace_s: 3600.0,
+                audit_interval_s: 86_400.0,
             },
             quota: RawQuota {
                 account_per_minute: 4_800,

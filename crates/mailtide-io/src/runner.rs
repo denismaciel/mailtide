@@ -158,6 +158,7 @@ fn request_kind(request: &GmailRequest) -> &'static str {
         GmailRequest::GetProfile => "get_profile",
         GmailRequest::ListHistory { .. } => "list_history",
         GmailRequest::ListMessages { .. } => "list_messages",
+        GmailRequest::AuditMessages { .. } => "audit_messages",
         GmailRequest::GetMessage { .. } => "get_message",
         GmailRequest::ImportMessage { .. } => "import_message",
         GmailRequest::ListLabels => "list_labels",
@@ -1276,7 +1277,8 @@ where
                 TimerKind::Poll
                 | TimerKind::WatchRenewal
                 | TimerKind::Labels
-                | TimerKind::Drafts => false,
+                | TimerKind::Drafts
+                | TimerKind::Audit => false,
             })
             .map(|(_, at)| Duration::from_millis(u64::try_from(at.0 - now.0).unwrap_or(0)))
             .min()
@@ -1343,6 +1345,7 @@ where
                     CommandKind::ReportStatus(status) => report.status = Some(status),
                     kind @ (CommandKind::Gmail(_)
                     | CommandKind::Commit(_)
+                    | CommandKind::AdvanceAudit(_)
                     | CommandKind::ClaimJobs { .. }
                     | CommandKind::DeleteBlob { .. }) => {
                         if let Some(event) = self.execute(id, kind, &mut report).await? {
@@ -1374,7 +1377,11 @@ where
                         until: cooldown.until,
                     },
                     Some(_) | None => StopReason::Idle {
-                        next: timers.values().min().copied(),
+                        next: timers
+                            .values()
+                            .copied()
+                            .chain(engine.audit_next_run())
+                            .min(),
                     },
                 };
                 return Ok(self.finish(account, report, &engine, stop));
@@ -1446,6 +1453,17 @@ where
     ) -> Result<Option<EventKind>, RunError> {
         match kind {
             CommandKind::Gmail(call) => self.gmail(id, call, report).await.map(Some),
+            CommandKind::AdvanceAudit(request) => self
+                .store
+                .advance_audit(&request)
+                .await
+                .map(|outcome| {
+                    Some(EventKind::AuditAdvanced {
+                        command: id,
+                        outcome,
+                    })
+                })
+                .map_err(RunError::Store),
             CommandKind::Commit(commit) => {
                 // Gmail's push-back is shared: publish the engine's cooldowns
                 // (account or project-wide) to the gate every account uses.
@@ -1764,6 +1782,8 @@ where
             GmailRequest::ListMessages { .. } => {
                 decode::list(body).map(|page| EventKind::MessagesListed { command, page })
             }
+            GmailRequest::AuditMessages { .. } => decode::audit_page(body)
+                .map(|(ids, next)| EventKind::AuditListed { command, ids, next }),
             GmailRequest::GetMessage { id } => match decode::message_minimal(body) {
                 Ok(message) if message.id == *id => {
                     Ok(EventKind::MessageFetched { command, message })
@@ -2077,6 +2097,7 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }
+        | GmailRequest::AuditMessages { .. }
         | GmailRequest::GetMessage { .. }
         | GmailRequest::ImportMessage { .. }
         | GmailRequest::ListLabels

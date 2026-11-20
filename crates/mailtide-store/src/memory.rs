@@ -123,6 +123,17 @@ impl Store for MemoryStore {
         )
     }
 
+    async fn advance_audit(
+        &self,
+        request: &mailtide::audit::AuditRequest,
+    ) -> Result<mailtide::audit::AuditOutcome, StoreError> {
+        self.on_account(
+            &request.account,
+            mailtide::audit::AuditOutcome::Rejected(mailtide::commit::Rejection::StaleEpoch),
+            |mirror| mirror.advance_audit(request),
+        )
+    }
+
     async fn claim_jobs(
         &self,
         account: &AccountId,

@@ -182,6 +182,34 @@ pub fn list(body: &[u8]) -> Result<ListPage, DecodeError> {
     })
 }
 
+/// Decode an audit's partial `messages.list` response.
+pub fn audit_page(body: &[u8]) -> Result<(Vec<MessageId>, Option<PageToken>), DecodeError> {
+    #[derive(Deserialize)]
+    struct Id {
+        id: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Page {
+        #[serde(default)]
+        messages: Vec<Id>,
+        next_page_token: Option<String>,
+    }
+
+    let page: Page = json(body)?;
+    if page.messages.iter().any(|entry| entry.id.is_empty()) {
+        return Err(DecodeError::MissingField("id"));
+    }
+    Ok((
+        page.messages
+            .into_iter()
+            .map(|entry| MessageId(entry.id))
+            .collect(),
+        page.next_page_token.map(PageToken),
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireFullMessage {

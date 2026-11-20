@@ -759,6 +759,8 @@ mod _core {
         cursor_advanced_at_ms: Option<i64>,
         cooldown_until_ms: Option<i64>,
         label_listing_failures: u32,
+        audit_found_missing: u32,
+        audit_found_unlisted: u32,
         discovered: Option<u64>,
         imported: Option<u64>,
         discovery_complete: Option<bool>,
@@ -791,6 +793,8 @@ mod _core {
                 cursor_advanced_at_ms: status.cursor_advanced_at.map(|t| t.0),
                 cooldown_until_ms: status.cooldown.map(|c| c.until.0),
                 label_listing_failures: status.label_listing_failures,
+                audit_found_missing: status.audit.found_missing,
+                audit_found_unlisted: status.audit.found_unlisted,
                 discovered: status.import.map(|i| i.discovered),
                 imported: status.import.map(|i| i.imported),
                 discovery_complete: status.import.map(|i| i.discovery_complete),
@@ -2137,6 +2141,7 @@ mod _core {
         draft_refresh_delay_s: f64,
         draft_refresh_every_s: f64,
         draft_send_grace_s: f64,
+        audit_interval_s: f64,
     }
 
     #[derive(FromPyObject)]
@@ -2209,6 +2214,7 @@ mod _core {
                     draft_refresh_delay_s: c.engine.draft_refresh_delay_s,
                     draft_refresh_every_s: c.engine.draft_refresh_every_s,
                     draft_send_grace_s: c.engine.draft_send_grace_s,
+                    audit_interval_s: c.engine.audit_interval_s,
                 },
                 quota: crate::settings::RawQuota {
                     account_per_minute: c.quota.account_per_minute,

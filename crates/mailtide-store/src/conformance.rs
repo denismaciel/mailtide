@@ -6,6 +6,7 @@
 
 use std::future::Future;
 
+use mailtide::audit::{AuditOutcome, AuditProgress, AuditReport, AuditRequest, AuditStep};
 use mailtide::commit::{
     Commit, CommitOutcome, CursorMove, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
@@ -15,7 +16,7 @@ use mailtide::gmail::{
 };
 use mailtide::ids::{
     AccountId, BlobRef, CommitId, ENGINE_VERSION, EngineVersion, HistoryId, LabelId, MessageId,
-    ThreadId, Timestamp,
+    PageToken, ThreadId, Timestamp,
 };
 use mailtide::jobs::{AttemptId, FOREGROUND_IMPORT_CAP, JobKind, JobOp, JobOutcome, Prioritised};
 use mailtide::labels::{LabelSet, set};
@@ -124,12 +125,9 @@ where
             Box::pin(label_definitions(s))
         }),
         (
-            "label refreshes persist their time; unchanged ones log nothing",
-            |s| Box::pin(label_refreshes(s)),
+            "mailbox audits persist progress and queue bounded verification",
+            |s| Box::pin(mailbox_audit(s)),
         ),
-        ("imported entries carry the stored envelope", |s| {
-            Box::pin(imports_carry_envelopes(s))
-        }),
     ];
     cases.extend(prioritise_cases());
     cases.extend(feed_page_cases());
@@ -258,6 +256,9 @@ fn search_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
 /// The cases of message facts (SPEC §4, §10.3).
 fn message_facts_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     vec![
+        ("imported entries carry the stored envelope", |s| {
+            Box::pin(imports_carry_envelopes(s))
+        }),
         ("content written without facts reads back", |s| {
             Box::pin(content_written_without_facts_reads_back(s))
         }),
@@ -295,6 +296,10 @@ fn draft_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
 /// The cases of label attributes and local label writes.
 fn label_edit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     vec![
+        (
+            "label refreshes persist their time; unchanged ones log nothing",
+            |s| Box::pin(label_refreshes(s)),
+        ),
         (
             "label attributes round-trip; local label writes record, fence and strip",
             |s| Box::pin(label_attributes_and_writes(s)),
@@ -2323,6 +2328,170 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
     expect(
         snapshot.labels_refreshed_at == Some(Timestamp(9_000)),
         "an unchanged listing still records its time, which never moves back",
+    )
+}
+
+async fn mailbox_audit<S: Store>(store: &S) -> Result<(), String> {
+    use mailtide::audit::AUDIT_PAGE_SIZE;
+    use mailtide::state::SyncState;
+    let snapshot = claim(store).await?;
+    expect(
+        snapshot.audited_at.is_none() && snapshot.audit_progress.is_none(),
+        "new audit state is empty",
+    )?;
+    let mut live = commit(&snapshot, 0);
+    live.sync = Some(SyncState::Live);
+    live.cursor = Some(CursorMove {
+        expected: None,
+        to: HistoryId(10),
+    });
+    live.messages = vec![
+        import("kept", &["INBOX"], 10),
+        import("vanished", &["INBOX"], 10),
+        MessageOp::Tombstone {
+            id: MessageId("tombstone".into()),
+            evidence: DeletionEvidence::History { at: HistoryId(10) },
+        },
+    ];
+    let CommitOutcome::Applied { state, .. } = apply(store, &live).await? else {
+        return Err("could not seed a live account".into());
+    };
+    let snapshot = claim(store).await?;
+    let overlarge = vec!["missing"; AUDIT_PAGE_SIZE + 1];
+    expect(
+        audit_step(store, &snapshot, audit_page(&overlarge, None), 10).await?
+            == AuditOutcome::Rejected(mailtide::commit::Rejection::InvalidTransition),
+        "oversized page is refused",
+    )?;
+    expect(
+        audit_step(
+            store,
+            &snapshot,
+            audit_page(&["kept", "missing", "missing", "tombstone"], Some("page2")),
+            11,
+        )
+        .await?
+            == audit_applied(1, 0, None),
+        "verify just one newly discovered id",
+    )?;
+    let next = claim(store).await?;
+    expect(
+        next.audit_progress == Some(AuditProgress::Listing(PageToken("page2".into())))
+            && next.audited_at.is_none(),
+        "continuation survives a claim",
+    )?;
+    expect(
+        audit_step(store, &snapshot, audit_page(&[], None), 12).await?
+            == AuditOutcome::Rejected(mailtide::commit::Rejection::StaleEpoch),
+        "an old worker cannot advance the audit",
+    )?;
+    expect(
+        audit_step(store, &next, audit_page(&["missing"], None), 12).await?
+            == audit_applied(0, 0, None),
+        "repeated id is counted once",
+    )?;
+    sweep_and_complete_audit(store, state).await
+}
+
+fn audit_page(ids: &[&str], next: Option<&str>) -> AuditStep {
+    AuditStep::Page {
+        ids: ids.iter().map(|id| MessageId((*id).into())).collect(),
+        next: next.map(|token| PageToken(token.into())),
+    }
+}
+
+fn audit_applied(
+    found_missing: u32,
+    found_unlisted: u32,
+    completed_at: Option<Timestamp>,
+) -> AuditOutcome {
+    AuditOutcome::Applied {
+        completed_at,
+        report: AuditReport {
+            found_missing,
+            found_unlisted,
+        },
+    }
+}
+
+async fn audit_step<S: Store>(
+    store: &S,
+    snapshot: &StoreSnapshot,
+    step: AuditStep,
+    now: i64,
+) -> Result<AuditOutcome, String> {
+    store
+        .advance_audit(&AuditRequest {
+            account: snapshot.account.clone(),
+            epoch: snapshot.epoch,
+            expected: snapshot.audit_progress.clone(),
+            step,
+            now: Timestamp(now),
+        })
+        .await
+        .map_err(|error| format!("{error:?}"))
+}
+
+async fn sweep_and_complete_audit<S: Store>(store: &S, state: StateSeq) -> Result<(), String> {
+    use mailtide::jobs::ClaimOutcome;
+    let next = claim(store).await?;
+    expect(
+        audit_step(store, &next, AuditStep::Continue, 13).await? == audit_applied(0, 1, None),
+        "verify the row Gmail omitted",
+    )?;
+    let next = claim(store).await?;
+    expect(
+        audit_step(store, &next, AuditStep::Continue, 14).await?
+            == audit_applied(0, 0, Some(Timestamp(14))),
+        "cleanup completes the audit",
+    )?;
+    let next = claim(store).await?;
+    expect(
+        next.audited_at == Some(Timestamp(14))
+            && next.audit_progress.is_none()
+            && next.cursor == Some(HistoryId(10)),
+        "completion survives a claim and keeps the cursor",
+    )?;
+    let outcome = store
+        .claim_jobs(
+            &account(),
+            next.epoch,
+            10,
+            Timestamp(14),
+            AttemptId(1),
+            Priority::Backfill,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let ClaimOutcome::Claimed { jobs, .. } = outcome else {
+        return Err("unable to claim verification jobs".into());
+    };
+    let checks: Vec<_> = jobs
+        .iter()
+        .filter(|job| matches!(job.kind(), JobKind::Verify(_)))
+        .map(|job| (job.kind(), job.priority))
+        .collect();
+    expect(
+        checks
+            == [
+                (
+                    JobKind::Verify(MessageId("missing".into())),
+                    Priority::Backfill,
+                ),
+                (
+                    JobKind::Verify(MessageId("vanished".into())),
+                    Priority::Backfill,
+                ),
+            ],
+        "only the two verifications are queued at Backfill",
+    )?;
+    let changes = store
+        .changes(&account(), state.into(), 10)
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    expect(
+        matches!(changes, ChangeFeed::Page(page) if page.changes.is_empty()),
+        "audit bookkeeping produces no feed entries",
     )
 }
 

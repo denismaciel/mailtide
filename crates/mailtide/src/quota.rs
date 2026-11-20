@@ -41,6 +41,7 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
         // labels.patch is not in Google's table: declared as labels.update.
         GmailRequest::ListMessages { .. }
         | GmailRequest::ListDrafts { .. }
+        | GmailRequest::AuditMessages { .. }
         | GmailRequest::CreateLabel(_)
         | GmailRequest::PatchLabel { .. }
         | GmailRequest::DeleteLabel { .. } => 5,

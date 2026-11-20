@@ -62,6 +62,13 @@ impl Store for SqliteStore {
         self.inner.apply(commit).await
     }
 
+    async fn advance_audit(
+        &self,
+        request: &mailtide::audit::AuditRequest,
+    ) -> Result<mailtide::audit::AuditOutcome, StoreError> {
+        self.inner.advance_audit(request).await
+    }
+
     async fn claim_jobs(
         &self,
         account: &AccountId,
@@ -389,6 +396,27 @@ mod tests {
         let threads = [ThreadId("t".into())];
         refused("threads", store.threads(account, &threads).await.err());
         refused("locate", store.locate(account, &ids).await.err());
+        assert_maintenance_refused(store, commit, refused).await;
+    }
+
+    async fn assert_maintenance_refused(
+        store: &SqliteStore,
+        commit: &Commit,
+        refused: impl Fn(&str, Option<StoreError>),
+    ) {
+        let account = &commit.account;
+        let now = Timestamp(0);
+        let audit = mailtide::audit::AuditRequest {
+            account: account.clone(),
+            epoch: commit.epoch,
+            expected: None,
+            step: mailtide::audit::AuditStep::Page {
+                ids: Vec::new(),
+                next: None,
+            },
+            now,
+        };
+        refused("advance_audit", store.advance_audit(&audit).await.err());
         refused("labels", store.labels(account).await.err());
         let write = mailtide::commit::LabelOp::Remove {
             id: mailtide::ids::LabelId("Label_1".into()),
@@ -879,10 +907,11 @@ mod tests {
     }
 
     /// The documented rollbacks of the migrations after message facts, the
-    /// latest first: the draft index, then label editing.
+    /// latest first: the audit, the draft index, then label editing.
     fn later_rollbacks() -> Vec<String> {
-        drafts_rollback()
+        audit_rollback()
             .into_iter()
+            .chain(drafts_rollback())
             .chain(label_editing_rollback())
             .collect()
     }
@@ -928,7 +957,7 @@ mod tests {
             .record_draft(&account, &refresh, Timestamp(6))
             .await
             .expect("record");
-        for statement in drafts_rollback() {
+        for statement in audit_rollback().into_iter().chain(drafts_rollback()) {
             store
                 .inner
                 .execute_for_tests(&statement)
@@ -1167,10 +1196,7 @@ mod tests {
             .await
             .expect("claim");
         assert_eq!(snapshot.labels_refreshed_at, Some(Timestamp(5_000)));
-        for statement in drafts_rollback()
-            .into_iter()
-            .chain(label_editing_rollback())
-        {
+        for statement in later_rollbacks() {
             store
                 .inner
                 .execute_for_tests(&statement)
@@ -1186,6 +1212,76 @@ mod tests {
         );
         store.migrate().await.expect("migrate again");
         assert_eq!(store.labels(&account).await, Ok(travel));
+    }
+
+    fn audit_migration() -> (Vec<crate::sql::Migration>, crate::sql::Migration) {
+        let all = crate::sql::migrations();
+        let index = all
+            .iter()
+            .position(|m| m.statements.iter().any(|s| s.contains("COLUMN audited_at")))
+            .expect("the audit migration");
+        (all[..index].to_vec(), all[index].clone())
+    }
+
+    fn audit_rollback() -> Vec<String> {
+        let (_, migration) = audit_migration();
+        vec![
+            "DROP TABLE mailtide_audit_seen".to_owned(),
+            "ALTER TABLE mailtide_accounts DROP COLUMN audit_progress".to_owned(),
+            "ALTER TABLE mailtide_accounts DROP COLUMN audited_at".to_owned(),
+            format!(
+                "DELETE FROM mailtide_schema WHERE version = {}",
+                migration.version
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_audit_migration_is_additive_and_revertible() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState};
+        let (before, migration) = audit_migration();
+        assert!(
+            migration
+                .statements
+                .iter()
+                .any(|s| s == "ALTER TABLE mailtide_accounts ADD COLUMN audited_at BIGINT")
+        );
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        run_statements(&store, &before).await;
+        store.inner.execute_for_tests(
+            "INSERT INTO mailtide_accounts (account, epoch, engine_version, cursor, sync, rng_seed, seq)
+             VALUES ('a@example.com', 1, 1, 7, '\"Live\"', 0, 0)"
+        ).await.expect("old account");
+        store.migrate().await.expect("migrate");
+        let account = AccountId("a@example.com".into());
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.audited_at, None);
+        assert_eq!(snapshot.audit_progress, None);
+        for statement in audit_rollback() {
+            store
+                .inner
+                .execute_for_tests(&statement)
+                .await
+                .expect("rollback");
+        }
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: migration.version - 1,
+                expected: SCHEMA_VERSION,
+            }
+        );
+        store.migrate().await.expect("migrate again");
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        assert_eq!(snapshot.cursor, Some(mailtide::ids::HistoryId(7)));
     }
 
     async fn run_statements(store: &SqliteStore, migrations: &[crate::sql::Migration]) {

@@ -55,6 +55,20 @@ pub fn build(request: &GmailRequest, config: &RequestConfig) -> Vec<HttpRequest>
             }
             vec![get(format!("{USER}/messages"), query)]
         }
+        GmailRequest::AuditMessages { page_token } => {
+            let mut query = vec![
+                ("includeSpamTrash".to_owned(), "true".to_owned()),
+                (
+                    "maxResults".to_owned(),
+                    mailtide::audit::AUDIT_PAGE_SIZE.to_string(),
+                ),
+                ("fields".to_owned(), "messages(id),nextPageToken".to_owned()),
+            ];
+            if let Some(token) = page_token {
+                query.push(("pageToken".to_owned(), token.0.clone()));
+            }
+            vec![get(format!("{USER}/messages"), query)]
+        }
         GmailRequest::GetMessage { id } => vec![get(
             format!("{USER}/messages/{}", encode(&id.0)),
             vec![("format".to_owned(), "minimal".to_owned())],
@@ -198,6 +212,28 @@ mod tests {
         assert_eq!(
             request.path_and_query(),
             "/gmail/v1/users/me/messages?includeSpamTrash=true&maxResults=500&labelIds=INBOX"
+        );
+    }
+
+    #[test]
+    fn audit_requests_only_message_ids_and_the_next_token() {
+        let [request] = build(
+            &GmailRequest::AuditMessages {
+                page_token: Some(PageToken("next".into())),
+            },
+            &config(),
+        )
+        .try_into()
+        .expect("one request");
+        assert_eq!(request.path, "/gmail/v1/users/me/messages");
+        assert_eq!(
+            request.query,
+            [
+                ("includeSpamTrash".into(), "true".into()),
+                ("maxResults".into(), "500".into()),
+                ("fields".into(), "messages(id),nextPageToken".into()),
+                ("pageToken".into(), "next".into()),
+            ]
         );
     }
 

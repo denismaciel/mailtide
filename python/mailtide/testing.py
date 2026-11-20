@@ -368,6 +368,18 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             if parts[0] == "drafts":
                 return self._drafts(parts, query, {})
             if parts == ["messages"]:
+                if query.get("fields") == "messages(id),nextPageToken":
+                    limit = int(query["maxResults"])
+                    position = query.get("pageToken")
+                    ids = [
+                        mid
+                        for mid in sorted(mailbox.messages, reverse=True)
+                        if position is None or mid < position
+                    ]
+                    page: dict = {"messages": [{"id": mid} for mid in ids[:limit]]}
+                    if len(ids) > limit:
+                        page["nextPageToken"] = ids[limit - 1]
+                    return self.reply(200, page)
                 label = query.get("labelIds")
                 ids = [
                     {"id": mid, "threadId": m["thread"]}

@@ -62,6 +62,13 @@ impl Store for PostgresStore {
         self.inner.apply(commit).await
     }
 
+    async fn advance_audit(
+        &self,
+        request: &mailtide::audit::AuditRequest,
+    ) -> Result<mailtide::audit::AuditOutcome, StoreError> {
+        self.inner.advance_audit(request).await
+    }
+
     async fn claim_jobs(
         &self,
         account: &AccountId,

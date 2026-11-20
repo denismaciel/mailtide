@@ -9,6 +9,7 @@
 //! Module layout follows Zero's mailbox sync (Mail-0/Zero, MIT,
 //! `apps/server/MAILBOX_SYNC.md`), restated as a pure state machine.
 
+pub mod audit;
 pub mod command;
 pub mod commit;
 pub mod drafts;

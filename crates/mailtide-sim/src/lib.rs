@@ -159,6 +159,8 @@ pub struct Faults {
     /// A host draft call is not atomic: Gmail acts later (a send, within
     /// its request timeout) and the answer is recorded steps later.
     pub draft_late: Probability,
+    /// Use unsafe live offsets for message listings, for regression tests.
+    pub offset_paging: bool,
 }
 
 impl Faults {
@@ -178,6 +180,7 @@ impl Faults {
             bad_listing: Probability::NEVER,
             draft_record_lost: Probability::NEVER,
             draft_late: Probability::NEVER,
+            offset_paging: false,
         }
     }
 
@@ -197,6 +200,7 @@ impl Faults {
             bad_listing: rng.probability(0.2),
             draft_record_lost: rng.probability(0.3),
             draft_late: rng.probability(0.5),
+            offset_paging: false,
         }
     }
 }
@@ -943,22 +947,39 @@ impl Gmail {
         })
     }
 
-    fn list(&self, scope: &ListScope, token: Option<&PageToken>) -> ListPage {
-        let ids: Vec<(MessageId, ThreadId)> = self
+    fn list(&self, scope: &ListScope, token: Option<&PageToken>, offset_paging: bool) -> ListPage {
+        let offset = if offset_paging {
+            token.and_then(|t| t.0.parse::<usize>().ok()).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut ids: Vec<(MessageId, ThreadId)> = self
             .messages
             .iter()
             .rev()
+            .filter(|(id, _)| offset_paging || token.is_none_or(|position| id.0 < position.0))
             .filter(|(_, m)| match scope {
                 ListScope::All => true,
                 ListScope::Label(label) => m.labels.contains(label),
             })
+            .skip(offset)
+            .take(LIST_PAGE + 1)
             .map(|(id, m)| (id.clone(), m.thread.clone()))
             .collect();
-        let offset = token.and_then(|t| t.0.parse::<usize>().ok()).unwrap_or(0);
-        let more = offset + LIST_PAGE < ids.len();
+        let next_page_token = if ids.len() > LIST_PAGE {
+            ids.pop();
+            let continuation = if offset_paging {
+                (offset + LIST_PAGE).to_string()
+            } else {
+                ids.last().expect("page has a last item").0.0.clone()
+            };
+            Some(PageToken(continuation))
+        } else {
+            None
+        };
         ListPage {
-            messages: ids.into_iter().skip(offset).take(LIST_PAGE).collect(),
-            next_page_token: more.then(|| PageToken((offset + LIST_PAGE).to_string())),
+            messages: ids,
+            next_page_token,
         }
     }
 
@@ -2396,6 +2417,15 @@ impl Sim {
     }
 
     fn fire_next_timer(&mut self) {
+        if let Some(at) = self
+            .engine
+            .audit_next_run()
+            .filter(|at| self.timers.values().all(|timer| at < timer))
+        {
+            self.now = self.now.max(at);
+            self.rebuild();
+            return;
+        }
         let Some((&timer, &at)) = self.timers.iter().min_by_key(|(_, at)| **at) else {
             // Nothing scheduled: poll, as a host's safety net would.
             self.now = self.now.plus(Duration::from_mins(1));
@@ -2518,6 +2548,13 @@ impl Sim {
                 self.blobs.remove(&message);
                 self.deliver(EventKind::BlobDeleted { command: id });
             }
+            CommandKind::AdvanceAudit(request) => {
+                let outcome = self.mirror.advance_audit(&request);
+                self.deliver(EventKind::AuditAdvanced {
+                    command: id,
+                    outcome,
+                });
+            }
             CommandKind::ReportStatus(_) => {}
         }
     }
@@ -2592,6 +2629,17 @@ impl Sim {
         EventKind::MessagesDeleted { command, ids }
     }
 
+    fn audit_page(&self, command: CommandId, token: Option<&PageToken>) -> EventKind {
+        let page = self
+            .gmail
+            .list(&ListScope::All, token, self.faults.offset_paging);
+        EventKind::AuditListed {
+            command,
+            ids: page.messages.into_iter().map(|(id, _)| id).collect(),
+            next: page.next_page_token,
+        }
+    }
+
     fn gmail_result(&mut self, command: CommandId, request: &GmailRequest) -> EventKind {
         match request {
             GmailRequest::GetProfile => EventKind::ProfileFetched {
@@ -2606,8 +2654,13 @@ impl Sim {
             }
             GmailRequest::ListMessages { scope, page_token } => EventKind::MessagesListed {
                 command,
-                page: self.gmail.list(scope, page_token.as_ref()),
+                page: self
+                    .gmail
+                    .list(scope, page_token.as_ref(), self.faults.offset_paging),
             },
+            GmailRequest::AuditMessages { page_token } => {
+                self.audit_page(command, page_token.as_ref())
+            }
             GmailRequest::GetMessage { id } => match self.gmail.get(id) {
                 Some(message) => EventKind::MessageFetched { command, message },
                 None => EventKind::MessageNotFound {
@@ -2921,6 +2974,7 @@ mod tests {
     use super::*;
     use mailtide::engine::JOB_CONCURRENCY;
     use mailtide::quota::Priority;
+    use mailtide::state::SyncState;
 
     #[test]
     fn probabilities_must_be_valid() {
@@ -2939,6 +2993,92 @@ mod tests {
     fn a_quiet_mailbox_bootstraps_and_converges() {
         let result = replay(1, &[]);
         assert!(result.passed(), "{result:#?}");
+    }
+
+    #[test]
+    fn position_tokens_continue_after_a_deleted_boundary_and_skip_newer_mail() {
+        let mut gmail = Gmail::default();
+        let ids: Vec<_> = (0..7)
+            .map(|_| gmail.add(ThreadId("t1".into()), labels::set(["INBOX"])))
+            .collect();
+        let first = gmail.list(&ListScope::All, None, false);
+        assert_eq!(first.messages.last().expect("first page").0, ids[2]);
+        gmail.delete(&ids[2]);
+        gmail.add(ThreadId("t1".into()), labels::set(["INBOX"]));
+        let next = gmail.list(&ListScope::All, first.next_page_token.as_ref(), false);
+        assert_eq!(
+            next.messages
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [ids[1].clone(), ids[0].clone()]
+        );
+        assert!(next.next_page_token.is_none());
+    }
+
+    #[test]
+    fn the_audit_recovers_a_message_reconciliation_skipped_with_offset_paging() {
+        let mut sim = Sim::new(
+            Rng(34),
+            Faults {
+                offset_paging: true,
+                ..Faults::none()
+            },
+            None,
+        );
+        sim.gmail = Gmail::default();
+        let messages: Vec<_> = (0..7)
+            .map(|_| sim.gmail.add(ThreadId("t1".into()), labels::set(["INBOX"])))
+            .collect();
+        let baseline = sim.gmail.current();
+        sim.pending.extend(sim.engine.start(sim.now));
+        let mut churned = [false; 3];
+        for _ in 0..500 {
+            if sim.mirror.record.sync == SyncState::Live {
+                break;
+            }
+            for command in &sim.pending {
+                let CommandKind::Gmail(call) = &command.kind else {
+                    continue;
+                };
+                match &call.request {
+                    GmailRequest::ListMessages {
+                        scope: ListScope::All,
+                        page_token: Some(_),
+                    } if !churned[0] => {
+                        sim.gmail.delete(&messages[5]);
+                        churned[0] = true;
+                    }
+                    GmailRequest::ListMessages {
+                        scope: ListScope::Label(label),
+                        page_token: None,
+                    } if label.0 == "INBOX" && !churned[1] => {
+                        sim.gmail.add(ThreadId("t1".into()), labels::set(["INBOX"]));
+                        churned[1] = true;
+                    }
+                    GmailRequest::ListMessages {
+                        scope: ListScope::Label(label),
+                        page_token: Some(_),
+                    } if label.0 == "INBOX" && !churned[2] => {
+                        sim.gmail.delete(&messages[4]);
+                        churned[2] = true;
+                    }
+                    _ => {}
+                }
+            }
+            sim.advance();
+        }
+        assert_eq!(churned, [true; 3]);
+        assert_eq!(sim.mirror.record.sync, SyncState::Live);
+        assert_eq!(sim.mirror.record.cursor, Some(baseline));
+        let missed = &messages[1];
+        assert!(sim.gmail.messages.contains_key(missed));
+        assert!(!sim.mirror.messages.contains_key(missed));
+        assert!(matches!(sim.heal(), Convergence::Reached { .. }));
+        assert!(matches!(
+            sim.mirror.messages[missed].content,
+            Content::Imported(_)
+        ));
     }
 
     #[test]

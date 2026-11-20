@@ -21,6 +21,8 @@ pub struct Status {
     pub cooldown: Option<Cooldown>,
     /// Incomplete or inconsistent label listings that failed this run.
     pub label_listing_failures: u32,
+    /// What the mailbox completeness audit found in this run.
+    pub audit: crate::audit::AuditReport,
     /// Import progress while bootstrapping or reconciling.
     pub import: Option<ImportProgress>,
 }

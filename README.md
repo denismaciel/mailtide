@@ -7,6 +7,9 @@ carries user actions back to Gmail. Rust core with no I/O of its own
 
 Wheels for CPython ≥ 3.12 (abi3) and free-threaded 3.14t/3.15t; thread safe.
 
+A daily completeness audit verifies messages that Gmail history or a
+reconciliation missed. It runs in the background and resumes across runs.
+
 ## Install
 
 Wheels are attached to each [GitHub release](https://github.com/denismaciel/mailtide/releases)

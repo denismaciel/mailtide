@@ -8,7 +8,11 @@
 //! decision functions inside their transaction, and write the results.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
+use crate::audit::{
+    self, AUDIT_PAGE_SIZE, AuditOutcome, AuditProgress, AuditReport, AuditRequest, AuditStep,
+};
 use crate::commit::{
     AccountOp, Commit, CommitOutcome, DeletionEvidence, JobPlan, LabelOp, MessageOp, Rejection,
 };
@@ -185,6 +189,10 @@ pub struct AccountRecord {
     pub rng_seed: u64,
     /// When the label definitions were last listed.
     pub labels_refreshed_at: Option<Timestamp>,
+    /// When the last mailbox completeness audit finished.
+    pub audited_at: Option<Timestamp>,
+    /// The next page of an unfinished audit.
+    pub audit_progress: Option<crate::audit::AuditProgress>,
     /// Change-feed entries at or before this state were compacted away.
     pub log_floor: StateSeq,
     /// Which incarnation of the account this is: set when it is tracked, so
@@ -223,6 +231,8 @@ impl AccountRecord {
             cooldown: None,
             rng_seed: stable_hash(account.as_str().as_bytes()),
             labels_refreshed_at: None,
+            audited_at: None,
+            audit_progress: None,
             log_floor: StateSeq(0),
             generation,
             label_generation: 0,
@@ -895,6 +905,8 @@ pub struct AccountMirror {
     pub jobs: BTreeMap<JobKind, Job>,
     /// Reconciliation: scopes each message was listed in.
     pub seen: BTreeMap<MessageId, BTreeSet<ListScope>>,
+    /// Ids collected by the current mailbox audit.
+    pub audit_seen: BTreeSet<MessageId>,
     /// Label definitions.
     pub labels: Vec<Label>,
     /// Pending user actions, one per (message, label).
@@ -920,6 +932,7 @@ impl AccountMirror {
             tombstones: BTreeMap::new(),
             jobs: BTreeMap::new(),
             seen: BTreeMap::new(),
+            audit_seen: BTreeSet::new(),
             labels: Vec::new(),
             intents: BTreeMap::new(),
             drafts: DraftIndex::new(),
@@ -1026,8 +1039,77 @@ impl AccountMirror {
             cooldown: self.record.cooldown.clone(),
             rng_seed: self.record.rng_seed,
             labels_refreshed_at: self.record.labels_refreshed_at,
+            audited_at: self.record.audited_at,
+            audit_progress: self.record.audit_progress.clone(),
             label_ids: self.labels.iter().map(|label| label.id.clone()).collect(),
             drafts_refreshed_at: self.record.drafts_refreshed_at,
+        }
+    }
+
+    /// Apply one bounded audit step without writing a feed entry.
+    pub fn advance_audit(&mut self, request: &AuditRequest) -> AuditOutcome {
+        if let Err(reason) = request.check(
+            self.record.epoch,
+            self.record.sync == SyncState::Live,
+            self.record.audit_progress.as_ref(),
+        ) {
+            return AuditOutcome::Rejected(reason);
+        }
+        let mut report = AuditReport::default();
+        let mut completed_at = None;
+        self.record.audit_progress = match (&request.step, request.expected.as_ref()) {
+            (AuditStep::Page { ids, next }, _) => {
+                for id in ids {
+                    if self.audit_seen.insert(id.clone())
+                        && !self.messages.contains_key(id)
+                        && !self.tombstones.contains_key(id)
+                    {
+                        report.found_missing += 1;
+                        self.enqueue(&audit::verify(id.clone(), request.now));
+                    }
+                }
+                Some(audit::after_listing(next.clone()))
+            }
+            (AuditStep::Continue, Some(AuditProgress::Sweep(after))) => {
+                let lower = after.as_ref().map_or(Unbounded, Excluded);
+                let ids: Vec<_> = self
+                    .messages
+                    .range::<MessageId, _>((lower, Unbounded))
+                    .take(AUDIT_PAGE_SIZE)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in &ids {
+                    if !self.audit_seen.contains(id) {
+                        report.found_unlisted += 1;
+                        self.enqueue(&audit::verify(id.clone(), request.now));
+                    }
+                }
+                Some(audit::after_sweep(&ids))
+            }
+            (AuditStep::Continue, Some(AuditProgress::Cleanup { after, complete })) => {
+                let lower = after.as_ref().map_or(Unbounded, Excluded);
+                let ids: Vec<_> = self
+                    .audit_seen
+                    .range::<MessageId, _>((lower, Unbounded))
+                    .take(AUDIT_PAGE_SIZE)
+                    .cloned()
+                    .collect();
+                for id in &ids {
+                    self.audit_seen.remove(id);
+                }
+                let (next, finished) = audit::after_cleanup(&ids, *complete, request.now);
+                completed_at = finished;
+                next
+            }
+            (AuditStep::Restart, _) => Some(audit::cleanup(false)),
+            (AuditStep::Continue, _) => unreachable!("validated audit step"),
+        };
+        if let Some(at) = completed_at {
+            self.record.audited_at = Some(self.record.audited_at.map_or(at, |last| last.max(at)));
+        }
+        AuditOutcome::Applied {
+            completed_at,
+            report,
         }
     }
 
