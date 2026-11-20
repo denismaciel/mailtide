@@ -2,7 +2,7 @@ id = "consumer-cursors"
 title = "Consumer cursors: compaction that waits for feed consumers"
 summary = "Named consumers record how far they have processed the feed (`ack`); `compact(account)` drops only what every live consumer has acknowledged, and a consumer that has neither acknowledged nor been seen caught up for `max_idle` (7 days) stops holding the log."
 roadmap = ["S5"]
-status = "in_progress"
+status = "done"
 design = "docs/features/consumer-cursors.md"
 # The cursor a consumer acknowledges is feed-pages' FeedCursor (it may point
 # inside a commit).
