@@ -170,9 +170,16 @@ exception says so under its Decisions.
   code path exists and is tested, but needs an explicit setting until its
   `[[unknown]]` is confirmed (today: Bcc on send, and permanent delete as a
   whole). Everything else is built on the assumed behaviour and fails safe.
-- **One inline size limit.** A draft or a send whose message is at most 3 MiB goes
-  in the JSON body; a send above that uses a resumable upload; a draft above it is
-  refused until uploads exist for drafts.
+- **One size limit, and no uploads.** Drafts and sends put the message in the JSON
+  body (`raw`), whatever its size, and refuse a message above `max_message_bytes`
+  (default 35,651,584: 34 MiB) before calling Gmail. Settled 2026-11-20: the JSON
+  route accepted drafts and sends of 40 MiB (`drafts-raw-json-limit`); sends were
+  delivered up to 34 MiB, and from 35 MiB Gmail answers 200 and then bounces the
+  message (`send-size-limit`), so the limit is ours to enforce. There is no
+  resumable upload: after a session's last byte, a status query still answers
+  "nothing received" for up to 7.5 s, and uploading again on that answer sends the
+  message twice (`send-session-completed-status`). A 200 to a send is acceptance,
+  not delivery.
 - **A message mailtide writes is identified by a private header, not by its
   Message-ID.** Gmail replaces a client-supplied `Message-ID` and `Date` on every
   API send and every draft save (settled 2026-11-20: `send-message-id-kept`,
