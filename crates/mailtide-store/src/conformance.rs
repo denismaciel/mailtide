@@ -128,6 +128,7 @@ where
     cases.extend(prioritise_cases());
     cases.extend(feed_page_cases());
     cases.extend(thread_cases());
+    cases.extend(isolation_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -963,6 +964,112 @@ async fn thread_views_never_mix_accounts<S: Store>(store: &S) -> Result<(), Stri
             && members(&read[0]) == ["a", "b"]
             && read[0].labels == set(["INBOX", "STARRED", "UNREAD"]),
         "the other account's own rows",
+    )
+}
+
+/// The cases pinning that accounts share nothing (`docs/features/blob-dedupe.md`).
+fn isolation_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![(
+        "a deletion and forget in one account leave another as it was",
+        |s| Box::pin(accounts_are_kept_apart(s)),
+    )]
+}
+
+/// What a store shows of `account`: its status, these messages and its feed.
+async fn everything<S: Store>(
+    store: &S,
+    account: &AccountId,
+    ids: &[&str],
+) -> Result<
+    (
+        Option<mailtide::status::AccountStatus>,
+        Vec<MessageView>,
+        mailtide::revision::ChangeFeed,
+    ),
+    String,
+> {
+    let ids: Vec<MessageId> = ids.iter().map(|id| MessageId((*id).into())).collect();
+    let status = store.status(account).await.map_err(|e| format!("{e:?}"))?;
+    let views = store
+        .messages(account, &ids)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let feed = store
+        .changes(account, StateSeq(0).into(), 100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok((status, views, feed))
+}
+
+async fn accounts_are_kept_apart<S: Store>(store: &S) -> Result<(), String> {
+    // The other account's address extends this one's: rows are keyed by
+    // account, never matched by prefix.
+    let other = AccountId("conformance@example.com.au".into());
+    let mine = claim(store).await?;
+    store
+        .track(&other, GENERATION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let theirs = store
+        .claim(&other, ENGINE_VERSION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    // The same message in both, plus one more each: mine imported, theirs
+    // still waiting for its import job.
+    let mut c = commit(&mine, 0);
+    c.messages = vec![import("a", &["INBOX"], 1), import("c", &["INBOX"], 2)];
+    apply(store, &c).await?;
+    let mut c = commit(&theirs, 0);
+    c.messages = vec![import("a", &["INBOX"], 1), observe("b", &["INBOX"], 2)];
+    apply(store, &c).await?;
+    let before = everything(store, &other, &["a", "b"]).await?;
+    expect(
+        before.0.as_ref().is_some_and(|s| s.jobs.ready == 1) && before.1.len() == 2,
+        "the other account holds both messages and one import job",
+    )?;
+
+    // Deleting `a` here queues its cleanup here only.
+    let mut c = commit(&mine, 1);
+    c.messages = vec![MessageOp::Tombstone {
+        id: MessageId("a".into()),
+        evidence: DeletionEvidence::History { at: HistoryId(30) },
+    }];
+    apply(store, &c).await?;
+    let jobs = store
+        .claim_jobs(
+            &account(),
+            mine.epoch,
+            10,
+            Timestamp(i64::MAX),
+            AttemptId(1),
+            Priority::Backfill,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(claimed)?;
+    expect(
+        jobs.iter()
+            .map(mailtide::jobs::ClaimedJob::kind)
+            .collect::<Vec<_>>()
+            == [JobKind::BlobCleanup(MessageId("a".into()))],
+        "the cleanup is queued in the deleting account",
+    )?;
+    expect(
+        everything(store, &other, &["a", "b"]).await? == before,
+        "the other account is untouched by the deletion",
+    )?;
+
+    expect(
+        store
+            .forget(&account())
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == mailtide::status::ForgetOutcome::Forgotten { messages: 1 },
+        "forget counts only this account's rows",
+    )?;
+    expect(
+        everything(store, &other, &["a", "b"]).await? == before,
+        "the other account is untouched by forget",
     )
 }
 

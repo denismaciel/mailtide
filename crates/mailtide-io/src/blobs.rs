@@ -189,3 +189,106 @@ mod option_tests {
         assert!(!settings.contains_key("home"));
     }
 }
+
+/// Blobs are per account on purpose (SPEC §3): the same message in two
+/// mirrored mailboxes is two objects, so deleting one account's content,
+/// one message at a time or all at once, never touches another's.
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    fn account(address: &str) -> AccountId {
+        AccountId::parse(address).expect("an address")
+    }
+
+    /// A fresh directory for the local-disk backend, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mailtide-blobs-{name}-{}-{}",
+                std::process::id(),
+                crate::now().0
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            Self(dir)
+        }
+
+        fn blobs(&self) -> ObjectBlobs {
+            let url = url::Url::from_directory_path(&self.0).expect("an absolute path");
+            ObjectBlobs::from_url(url.as_str()).expect("local disk")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_same_message_id_in_two_accounts_has_two_keys() {
+        let message = MessageId("18c2f0a1b2c3d4e5".into());
+        let alice = blob_key(&account("alice@example.com"), &message);
+        let bob = blob_key(&account("bob@example.com"), &message);
+        assert_eq!(alice.0, "alice@example.com/18c2f0a1b2c3d4e5.eml");
+        assert_eq!(bob.0, "bob@example.com/18c2f0a1b2c3d4e5.eml");
+        assert_ne!(alice, bob);
+    }
+
+    async fn two_objects(blobs: &ObjectBlobs) {
+        let message = MessageId("m1".into());
+        let bytes = b"Message-ID: <same@example.com>\r\n\r\nSame bytes\r\n".to_vec();
+        let alice = blob_key(&account("alice@example.com"), &message);
+        let bob = blob_key(&account("bob@example.com"), &message);
+        blobs.put(&alice, bytes.clone()).await.expect("put");
+        blobs.put(&bob, bytes.clone()).await.expect("put");
+        blobs.delete(&alice).await.expect("delete");
+        assert_eq!(blobs.get(&alice).await, Err(BlobError::NotFound));
+        assert_eq!(blobs.get(&bob).await.expect("still there"), bytes);
+    }
+
+    #[tokio::test]
+    async fn identical_bytes_in_two_accounts_are_two_objects() {
+        two_objects(&ObjectBlobs::memory()).await;
+        let scratch = Scratch::new("two-objects");
+        two_objects(&scratch.blobs()).await;
+    }
+
+    async fn delete_one_account(blobs: &ObjectBlobs) {
+        let short = account("a@x.co");
+        let longer = account("a@x.com");
+        let deeper = account("a@x.co.uk");
+        for who in [&short, &longer, &deeper] {
+            for id in ["m1", "m2"] {
+                let key = blob_key(who, &MessageId(id.into()));
+                blobs.put(&key, b"raw".to_vec()).await.expect("put");
+            }
+        }
+        assert_eq!(blobs.delete_account(&short).await, Ok(2));
+        for id in ["m1", "m2"] {
+            let id = MessageId(id.into());
+            assert_eq!(
+                blobs.get(&blob_key(&short, &id)).await,
+                Err(BlobError::NotFound)
+            );
+            for kept in [&longer, &deeper] {
+                assert_eq!(
+                    blobs.get(&blob_key(kept, &id)).await.as_deref(),
+                    Ok(&b"raw"[..]),
+                    "{} lost {}",
+                    kept.as_str(),
+                    id.0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_account_spares_an_account_whose_name_extends_it() {
+        delete_one_account(&ObjectBlobs::memory()).await;
+        let scratch = Scratch::new("prefix");
+        delete_one_account(&scratch.blobs()).await;
+    }
+}

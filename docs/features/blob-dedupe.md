@@ -198,8 +198,13 @@ Own tests (6), all of behaviour that exists and must stay:
 - Store conformance (1), `accounts_are_kept_apart`: two tracked accounts
   hold the same message id; a tombstone queues cleanup in one only, and
   `forget` of it leaves the other's row, content reference, jobs and feed.
-  The suite has no two-account case today.
-- Python (1): `forget` of one account, then `read_blob` of the other.
+  The other account's address extends the first one's
+  (`conformance@example.com.au`), so a store matching rows by prefix fails.
+  The suite's only other two-account case (`thread views never mix
+  accounts`) is about reads. The new case sits in its own list,
+  `isolation_cases()`.
+- Python (1): `forget` of one account, then `read_blob` of the other, whose
+  address again extends the first one's.
 
 No simulator work: engine behaviour does not change, and the simulator runs
 one account.

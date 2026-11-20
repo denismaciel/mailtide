@@ -9,7 +9,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mailtide::EngineConfig;
-use mailtide::engine::JOB_CONCURRENCY;
+use mailtide::engine::{BLOB_GRACE, JOB_CONCURRENCY};
 use mailtide::ids::{AccountId, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::PRIORITISE_MAX_IDS;
 use mailtide::labels::set;
@@ -18,11 +18,12 @@ use mailtide::outbox::{Action, ActionRequest, ReadState};
 use mailtide::quota::{Admission, Budget, Lease, Priority, QuotaUnits};
 use mailtide::retry::Cooldown;
 use mailtide::state::{SyncPhase, SyncState};
+use mailtide::status::ForgetOutcome;
 use mailtide::thread::ThreadView;
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
 use mailtide_io::Clock;
 use mailtide_io::auth::{AccessToken, CachedTokens, StaticTokens, TokenError, TokenSource};
-use mailtide_io::blobs::{BlobStore, ObjectBlobs, blob_key};
+use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
 use mailtide_io::quota_gate::{GateError, LocalGate, QuotaGate};
 use mailtide_io::runner::{Access, RunError, Runner, RunnerConfig, StopReason, WatchMode};
 use mailtide_io::transport::{GmailTransport, TransportError};
@@ -112,6 +113,16 @@ impl Mailbox {
         self.history.push(json!({
             "id": self.history_id.to_string(),
             "labelsRemoved": [{"message": {"id": id, "threadId": message.thread}, "labelIds": [label]}],
+        }));
+    }
+
+    /// Delete a message for good, as emptying the trash does.
+    fn delete(&mut self, id: &str) {
+        self.history_id += 1;
+        let message = self.messages.remove(id).expect("message");
+        self.history.push(json!({
+            "id": self.history_id.to_string(),
+            "messagesDeleted": [{"message": {"id": id, "threadId": message.thread}}],
         }));
     }
 }
@@ -762,4 +773,111 @@ async fn a_401_on_a_gmail_call_drops_the_token_and_retries_without_blocking() {
             .sync,
         SyncState::Live
     );
+}
+
+/// Two mailboxes behind one transport, told apart by the token's secret
+/// (the account's local part).
+#[derive(Debug, Default)]
+struct TwoMailboxes {
+    alice: FakeGmail,
+    bob: FakeGmail,
+}
+
+impl GmailTransport for TwoMailboxes {
+    async fn send(
+        &self,
+        request: HttpRequest,
+        token: &AccessToken,
+    ) -> Result<HttpResponse, TransportError> {
+        let mailbox = match token.secret.as_str() {
+            "alice" => &self.alice,
+            "bob" => &self.bob,
+            other => panic!("unexpected token {other}"),
+        };
+        let token = AccessToken {
+            secret: "test-token".into(),
+            expires_at: token.expires_at,
+        };
+        mailbox.send(request, &token).await
+    }
+}
+
+#[tokio::test]
+async fn one_accounts_cleanup_and_forget_leave_anothers_copy() {
+    let (alice, bob) = (account(), AccountId::parse("bob@example.com").expect("bob"));
+    let gmail = TwoMailboxes::default();
+    for mailbox in [&gmail.alice, &gmail.bob] {
+        let mut mailbox = mailbox.0.lock().expect("lock");
+        mailbox.add("m1", &["INBOX"]);
+        mailbox.add("m2", &["INBOX"]);
+    }
+    let token = |secret: &str| AccessToken {
+        secret: secret.into(),
+        expires_at: Timestamp(i64::MAX),
+    };
+    let tokens = StaticTokens(BTreeMap::from([
+        (alice.clone(), token("alice")),
+        (bob.clone(), token("bob")),
+    ]));
+    let clock = HostClock::new();
+    let runner = runner_for(gmail, tokens, &[alice.clone(), bob.clone()]).with_clock(clock.clock());
+    let run = |account: AccountId| {
+        let runner = &runner;
+        async move {
+            let outcome = runner
+                .run(&account, Duration::from_secs(30))
+                .await
+                .expect("run");
+            assert!(
+                matches!(outcome.stop, StopReason::Idle { .. }),
+                "{:?}",
+                outcome.stop
+            );
+        }
+    };
+    run(alice.clone()).await;
+    run(bob.clone()).await;
+    let stored = |account: &AccountId, id: &str| {
+        let key = blob_key(account, &MessageId(id.into()));
+        let runner = &runner;
+        async move { runner.blobs().get(&key).await }
+    };
+    let raw = stored(&bob, "m1").await.expect("bob's copy");
+    assert_eq!(
+        stored(&alice, "m1").await.expect("alice's copy"),
+        raw,
+        "the same bytes"
+    );
+    let bobs = runner.store().mirror(&bob).expect("bob's mirror");
+
+    // Alice deletes m1: her copy goes once the grace period has passed.
+    runner
+        .transport()
+        .alice
+        .0
+        .lock()
+        .expect("lock")
+        .delete("m1");
+    run(alice.clone()).await;
+    assert_eq!(
+        stored(&alice, "m1").await.as_ref(),
+        Ok(&raw),
+        "kept during the grace period"
+    );
+    clock.advance(BLOB_GRACE + Duration::from_secs(60));
+    run(alice.clone()).await;
+    assert_eq!(stored(&alice, "m1").await, Err(BlobError::NotFound));
+    assert_eq!(stored(&bob, "m1").await.as_ref(), Ok(&raw));
+    assert_eq!(runner.store().mirror(&bob), Some(bobs.clone()));
+
+    // Forgetting Alice removes her rows and her one remaining blob only.
+    let forgotten = runner.forget(&alice).await.expect("forget");
+    assert_eq!(
+        (forgotten.store, forgotten.blobs),
+        (ForgetOutcome::Forgotten { messages: 1 }, 1)
+    );
+    for id in ["m1", "m2"] {
+        assert!(stored(&bob, id).await.is_ok(), "bob keeps {id}");
+    }
+    assert_eq!(runner.store().mirror(&bob), Some(bobs));
 }

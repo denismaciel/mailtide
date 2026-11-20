@@ -90,6 +90,38 @@ def test_status_admit_resume_forget(gmail: tuple[Mailbox, str]) -> None:
     assert runner.forget(ACCOUNT).outcome == "unknown"
 
 
+def test_forget_leaves_other_accounts_content(gmail: tuple[Mailbox, str]) -> None:
+    """Blobs are per account: two mailboxes holding the same message keep
+    two copies, and forgetting one account never touches the other's."""
+    mailbox, origin = gmail
+    mailbox.add("m1", ["INBOX"])
+    # Its address extends the first one's: blobs are kept by path segment.
+    other = "alice@example.com.au"
+    runner = mailtide.BlockingRunner(make_config(origin), tokens)
+    runner.migrate()
+    for account in (ACCOUNT, other):
+        runner.track(account)
+        assert runner.run(account, budget_s=30).stop == "idle"
+    raw = runner.read_blob(other, "m1")
+    assert runner.read_blob(ACCOUNT, "m1") == raw
+    [before] = runner.messages(other, ["m1"])
+    assert before.content is not None
+
+    forgotten = runner.forget(ACCOUNT)
+    assert (forgotten.outcome, forgotten.messages, forgotten.blobs) == ("forgotten", 1, 1)
+    with pytest.raises(mailtide.BlobNotFound):
+        runner.read_blob(ACCOUNT, "m1")
+    assert runner.read_blob(other, "m1") == raw
+    [after] = runner.messages(other, ["m1"])
+    assert after.content is not None
+    assert (after.labels, after.content.blob, after.content.size) == (
+        before.labels,
+        before.content.blob,
+        before.content.size,
+    )
+    assert after.content.blob.startswith(f"{other}/")
+
+
 def test_a_resumed_account_syncs_again(gmail: tuple[Mailbox, str]) -> None:
     mailbox, origin = gmail
     mailbox.add("m1", ["INBOX"])
