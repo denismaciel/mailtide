@@ -52,7 +52,11 @@ inform the design. No code is copied from them.
 
 - Other providers (Outlook/Graph, generic IMAP). The external API is
   provider-neutral (JMAP-shaped), so they can be added behind it later.
-- Full-text search. That belongs to the host.
+- Full-text search over the mirror. An index of the mirror's content belongs
+  to the host. What mailtide offers is a pass-through to Gmail's own search
+  (`search`, §11): the host's query string goes to Gmail untouched, Gmail
+  decides what matches, and the hits come back as ids marked with what the
+  mirror holds. mailtide parses no query and keeps no results.
 - Message parsing inside the sync core. Parsing is a separate optional crate
   (§5.5).
 - Sending mail, draft authoring, label creation/rename/delete. These come
@@ -455,6 +459,7 @@ Per-call costs [G]:
 | `messages.get` (minimal/metadata) | 20 |
 | `messages.get` (raw/full) | 60 |
 | `messages.list` | 5 |
+| `threads.list` | 10 |
 | `history.list` | 2 |
 | `messages.modify` | 5 |
 | `messages.batchModify` | 50 |
@@ -493,6 +498,10 @@ Per-call costs [G]:
   connection) is reported as outcome unknown, never as unsent. A caller that
   keeps Gmail's answer in the mirror records it afterwards with an unfenced
   store method, as `admit` is: the answer only, never the cursor.
+- **Search** (`search`, `search_threads`) is a direct call: one
+  `messages.list` (5 units) or `threads.list` (10) per page, at the caller's
+  priority (Foreground by default; a background job passes Backfill). It
+  writes nothing; a refusal is the caller's and blocks nothing.
 - **Import throughput** (raw gets): ≈ 6,000 messages/hour per account, so
   100k messages ≈ 17 h. About 200 accounts can import concurrently per
   project. 80M units/day ≈ 1.33M raw messages/day before billing.
@@ -543,7 +552,9 @@ engine's epoch, so results meant for a dead engine are ignored).
 - Gmail results: `ProfileFetched`, `HistoryFetched{page}`, `HistoryExpired`,
   `MessagesListed{page}`, `MessageFetched{observation}`,
   `MessageImported{message}` (after the blob is stored), `MessageNotFound`,
-  `LabelsListed`, `WatchRenewed{expiration}`, `LabelsModified`.
+  `LabelsListed`, `WatchRenewed{expiration}`, `LabelsModified`, and
+  `Searched{listing}`, which answers the driver's own search request and
+  which the engine ignores.
 - Store results: `CommitApplied`, `CommitRejected{reason}`,
   `JobsClaimed{jobs}`, `BlobDeleted`.
 - Failures: `RequestFailed{failure}` (retryable with class and
@@ -552,7 +563,8 @@ engine's epoch, so results meant for a dead engine are ignored).
 
 ### 10.2 Commands (engine → host)
 
-- `Gmail{account, request, priority, cost}`.
+- `Gmail{account, request, priority, cost}`. The engine never issues
+  `GmailRequest::Search`: only the driver's direct call does.
 - `Commit(commit)`: atomic, guarded (epoch, engine version, expected cursor,
   job claim).
 - `ClaimJobs{epoch, limit, now, attempt}`, `DeleteBlob{message}`.
@@ -658,6 +670,42 @@ runner per process, after forking:
   sorting, paging and counting them is the host's read model: collect the
   thread ids of a `changes` page, read them in one call, upsert each answer
   and delete the ids left out;
+- `await search(account, query, *, label_ids=(), include_spam_trash=False,
+  limit=100, page_token=None, priority="foreground", budget_s=10.0) ->
+  SearchPage`: one page of Gmail's own search for `query` (the search box's
+  syntax, sent untouched; `messages.list`, 5 units, through the quota gate).
+  Each `SearchHit(message_id, thread_id, state)` is `imported`,
+  `not_imported` (a row, no content yet) or `unknown` (no row yet: Gmail is
+  ahead of the mirror; the next `run` brings it), in Gmail's order; hits the
+  mirror deleted are left out and counted in `deleted`. Read hits with
+  `messages`. `label_ids` are label ids every hit carries (names go in the
+  query as `label:`); an id the mirror's label definitions lack raises
+  `UnknownLabel` before Gmail is asked, because Gmail answers an unknown
+  label id with no hits rather than an error (before the first label
+  listing every id is unknown). `include_spam_trash` reaches Spam and Trash
+  for a query that names neither (`in:trash`, `in:spam` and `in:anywhere`
+  reach them anyway). `limit` is clamped to 1..=500. `next_page_token`,
+  passed back with the same arguments, reads the next page; it is refused
+  (`InvalidPageToken`, nothing sent) for any other search, and a token Gmail
+  refuses raises `PageTokenRejected`: start again. Paging is not a snapshot:
+  ids can repeat or be skipped when the mailbox changes between pages.
+  `mirror_state` is the feed state read before Gmail was asked: feed entries
+  after it mean the page may be stale. `estimate` is Gmail's
+  `resultSizeEstimate`, a hint. A search writes nothing, never preempts a
+  sync, works read-only, and is never retried by mailtide. Refusals:
+  `SearchRefused` (Gmail's 400 or 403; the account is not blocked),
+  `QuotaDeferred`, `GmailUnavailable` (5xx, timeout, rate limit),
+  `AccountBlocked`, `AccountNotTracked`, `ValueError` for a blank query;
+- `await search_threads(...) -> ThreadSearchPage`: the same for thread ids
+  (`threads.list`, 10 units), each `ThreadHit(thread_id, history_id)` with
+  Gmail's history id for the thread (past the page's `cursor`, the mirror
+  has not caught up with it); thread hits are not marked against the mirror;
+- `search_literal(text)` renders user text as one search value that cannot
+  add operators (quotes, braces and parentheses become spaces, a standalone
+  `OR`/`AND` is lowercased, anything but one bare word is quoted;
+  `ValueError` when no word is left); `search_by_message_id(id)` is the
+  `rfc822msgid:` term for the `Message-ID` Gmail stored, which is not the one
+  a client wrote on a message sent or a draft saved through the API;
 - `await labels(account) -> list[Label]`: the label definitions (`id`,
   `name`, `kind`: `system` or `user`) as the mirror last synced them, in id
   order, to show label ids as names; empty before the first label sync.
@@ -707,6 +755,9 @@ runner per process, after forking:
   its budget; nothing was sent; `until_ms` says when it could run),
   `WriteOutcomeUnknown` (a direct call that writes reached Gmail, or may
   have, and its answer was lost: it may or may not have been applied),
+  `SearchRefused` and its subclass `UnknownLabel` (`label_id`),
+  `InvalidPageToken` and its subclass `PageTokenRejected`,
+  `GmailUnavailable`, `AccountBlocked`,
   `Superseded`, `InvalidPush`, and `DelegationRevoked` (raised by the token source
   to block an account; the block is committed, and later runs make no
   credential calls), `InvalidPush`.
@@ -724,9 +775,10 @@ advisory lock; hosts that run migrations with their own tool execute
 `mailtide.migrations()` (ordered SQL with its bookkeeping) instead.
 `schema()` reports `current`, `behind` or `ahead`. Every call that reads or
 writes the database refuses with `SchemaOutOfDate` unless it is current:
-`run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, and the
-reads too (`changes`, `messages`, `threads`, `labels`, `message_ids`, `compact`,
-`ack`, `consumers`, `drop_consumer`, `status`, `accounts`, `resume`,
+`run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, `search`,
+`search_threads`, and the reads too (`changes`, `messages`, `threads`,
+`labels`, `message_ids`, `compact`, `ack`, `consumers`, `drop_consumer`,
+`status`, `accounts`, `resume`,
 `forget`), so a build that is too old
 refuses instead of misreading. Only `schema`, `migrate`, `health` and
 `read_blob` (blob storage only) answer whatever the schema. The SQL store

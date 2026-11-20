@@ -28,10 +28,12 @@ mod _core {
     use mailtide::outbox::{
         Action, ActionRequest, Importance, LabelDelta, ReadState, RestoreDestination, StarState,
     };
+    use mailtide::quota::Priority;
     use mailtide::retry::{AccountProblem, Blocking, BlockingFailure};
     use mailtide::revision::{
         AckOutcome, ConsumerName, FeedCursor, FeedPosition, MAX_CONSUMERS, StateSeq, StateString,
     };
+    use mailtide::search::{HitState, SearchPageToken, SearchQuery};
     use mailtide::state::SyncPhase;
     use mailtide_gmail::push::{self, Jwks, PushExpectations};
     use mailtide_io::auth::CachedTokens;
@@ -39,6 +41,7 @@ mod _core {
     use mailtide_io::blobs::{BlobError, BlobStore, ObjectBlobs, blob_key};
     use mailtide_io::quota_gate::LocalGate;
     use mailtide_io::runner::{self, RunError, RunnerConfig, StopReason};
+    use mailtide_io::search::{self as runner_search, SearchError};
     use mailtide_io::transport::ReqwestTransport;
     use mailtide_store::sql::{SchemaState, SqlStore};
     use mailtide_store::{Store, StoreError};
@@ -140,6 +143,42 @@ mod _core {
         PyValueError,
         "compose_message refused its input: `field`, `index` (the entry of a list field, or None) and `reason` say where and why. The message never holds the offending value."
     );
+    create_exception!(
+        _core,
+        SearchRefused,
+        MailtideError,
+        "Gmail refused the search for good (a query or filter it rejects, a missing scope, an account problem): the caller's error; the account is not blocked by it."
+    );
+    create_exception!(
+        _core,
+        UnknownLabel,
+        SearchRefused,
+        "A search's label filter names an id the mirror's label definitions lack (deleted, never created, or newer than the last label listing); `label_id` names it. Gmail would answer it with no hits, so nothing was sent."
+    );
+    create_exception!(
+        _core,
+        InvalidPageToken,
+        MailtideError,
+        "The page token was not issued by mailtide for this very search (account, scope, query, label ids, include_spam_trash and limit); nothing was sent."
+    );
+    create_exception!(
+        _core,
+        PageTokenRejected,
+        InvalidPageToken,
+        "Gmail refused a continuation mailtide issued: start again from the first page."
+    );
+    create_exception!(
+        _core,
+        GmailUnavailable,
+        MailtideError,
+        "Gmail failed or limited the call (a 5xx, a timeout, a rate limit): retry later."
+    );
+    create_exception!(
+        _core,
+        AccountBlocked,
+        MailtideError,
+        "The account is blocked until an operator acts (see `status`); nothing was sent."
+    );
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -160,6 +199,12 @@ mod _core {
         m.add("AccountNotTracked", py.get_type::<AccountNotTracked>())?;
         m.add("BlobNotFound", py.get_type::<BlobNotFound>())?;
         m.add("ComposeError", py.get_type::<ComposeError>())?;
+        m.add("SearchRefused", py.get_type::<SearchRefused>())?;
+        m.add("UnknownLabel", py.get_type::<UnknownLabel>())?;
+        m.add("InvalidPageToken", py.get_type::<InvalidPageToken>())?;
+        m.add("PageTokenRejected", py.get_type::<PageTokenRejected>())?;
+        m.add("GmailUnavailable", py.get_type::<GmailUnavailable>())?;
+        m.add("AccountBlocked", py.get_type::<AccountBlocked>())?;
         m.add("SCHEMA_VERSION", mailtide_store::sql::SCHEMA_VERSION)?;
         Ok(())
     }
@@ -212,6 +257,56 @@ mod _core {
                 "prioritise takes at most {} message ids per call, got {given}",
                 mailtide::jobs::PRIORITISE_MAX_IDS
             )),
+        }
+    }
+
+    /// `error` with `name` set to `value` on the exception instance.
+    fn with_attribute<'py>(
+        error: PyErr,
+        name: &str,
+        value: impl IntoPyObject<'py>,
+        py: Python<'py>,
+    ) -> PyErr {
+        match error.value(py).setattr(name, value) {
+            Ok(()) => error,
+            Err(failed) => failed,
+        }
+    }
+
+    fn quota_deferred(deferred: runner::QuotaDeferred) -> PyErr {
+        Python::attach(|py| {
+            let error = QuotaDeferred::new_err(format!(
+                "the quota gate would hold this call until {} ms; nothing was sent",
+                deferred.until.0
+            ));
+            with_attribute(error, "until_ms", deferred.until.0, py)
+        })
+    }
+
+    fn search_error(error: SearchError) -> PyErr {
+        match error {
+            SearchError::EmptyQuery => PyValueError::new_err(
+                "search needs a non-blank query: a label-only listing is the mirror's to answer",
+            ),
+            SearchError::InvalidPageToken => InvalidPageToken::new_err(
+                "this page token was not issued for this search: start from the first page",
+            ),
+            SearchError::UnknownLabel(label) => Python::attach(|py| {
+                let error = UnknownLabel::new_err(format!(
+                    "the mirror holds no label {:?} (deleted, never created, or newer than the last label listing: run() first)",
+                    label.0
+                ));
+                with_attribute(error, "label_id", label.0, py)
+            }),
+            SearchError::PageTokenRejected => PageTokenRejected::new_err(
+                "Gmail refused the page token: start from the first page",
+            ),
+            SearchError::Refused(refusal) => SearchRefused::new_err(describe(&refusal)),
+            SearchError::Deferred(deferred) => quota_deferred(deferred),
+            SearchError::Retryable(failure) => GmailUnavailable::new_err(failure.detail),
+            SearchError::AccountBlocked(reason) => AccountBlocked::new_err(describe(&reason)),
+            SearchError::NotTracked => store_error(StoreError::NotTracked),
+            SearchError::Run(error) => run_error(error),
         }
     }
 
@@ -1399,6 +1494,151 @@ mod _core {
         run: Option<Py<RunOutcome>>,
     }
 
+    /// A message Gmail's search matched, with what the mirror holds for it.
+    #[pyclass(frozen, get_all)]
+    #[derive(Clone)]
+    struct SearchHit {
+        message_id: String,
+        thread_id: String,
+        /// `imported` (`messages()` has all of it), `not_imported` (its
+        /// labels, not its content yet) or `unknown` (no row yet: the next
+        /// sync brings it).
+        state: &'static str,
+    }
+
+    /// One page of a message search.
+    #[pyclass(frozen, get_all)]
+    struct SearchPage {
+        /// In Gmail's order; hits the mirror deleted are left out.
+        hits: Vec<SearchHit>,
+        /// Pass as `page_token` with the same search for the next page;
+        /// `None` ends the paging run.
+        next_page_token: Option<String>,
+        /// Gmail's `resultSizeEstimate`: a hint, not a count.
+        estimate: u64,
+        /// Hits left out because the mirror deleted them.
+        deleted: u32,
+        /// The feed state read before Gmail was asked: `changes(account,
+        /// since=mirror_state)` returning entries means the page may be
+        /// stale.
+        mirror_state: String,
+        cursor: Option<u64>,
+        phase: &'static str,
+    }
+
+    impl From<runner_search::SearchPage> for SearchPage {
+        fn from(page: runner_search::SearchPage) -> Self {
+            Self {
+                hits: page
+                    .hits
+                    .into_iter()
+                    .map(|hit| SearchHit {
+                        message_id: hit.message_id.0,
+                        thread_id: hit.thread_id.0,
+                        state: match hit.state {
+                            HitState::Imported => "imported",
+                            HitState::NotImported => "not_imported",
+                            HitState::Unknown => "unknown",
+                        },
+                    })
+                    .collect(),
+                next_page_token: page.next_page_token.map(|token| token.0),
+                estimate: page.estimate,
+                deleted: page.deleted,
+                mirror_state: page.mirror_state.encode().0,
+                cursor: page.cursor.map(|c| c.0),
+                phase: phase_name(page.phase),
+            }
+        }
+    }
+
+    /// A thread Gmail's search matched.
+    #[pyclass(frozen, get_all)]
+    #[derive(Clone)]
+    struct ThreadHit {
+        thread_id: String,
+        /// Gmail's history id for the thread: past the page's `cursor`, the
+        /// mirror has not caught up with it yet.
+        history_id: Option<u64>,
+    }
+
+    /// One page of a thread search.
+    #[pyclass(frozen, get_all)]
+    struct ThreadSearchPage {
+        hits: Vec<ThreadHit>,
+        next_page_token: Option<String>,
+        estimate: u64,
+        mirror_state: String,
+        cursor: Option<u64>,
+        phase: &'static str,
+    }
+
+    impl From<runner_search::ThreadSearchPage> for ThreadSearchPage {
+        fn from(page: runner_search::ThreadSearchPage) -> Self {
+            Self {
+                hits: page
+                    .hits
+                    .into_iter()
+                    .map(|hit| ThreadHit {
+                        thread_id: hit.thread_id.0,
+                        history_id: hit.history_id.map(|h| h.0),
+                    })
+                    .collect(),
+                next_page_token: page.next_page_token.map(|token| token.0),
+                estimate: page.estimate,
+                mirror_state: page.mirror_state.encode().0,
+                cursor: page.cursor.map(|c| c.0),
+                phase: phase_name(page.phase),
+            }
+        }
+    }
+
+    /// A search's keyword arguments (`label_ids`, `include_spam_trash`,
+    /// `limit`, `page_token`, `priority`, `budget_s`), checked: an unknown
+    /// keyword is a `TypeError`, as for a Python function.
+    fn search_args(
+        query: String,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<(SearchQuery, Duration)> {
+        let mut search = SearchQuery::new(query);
+        let mut budget = Duration::from_secs(10);
+        for (key, value) in options.into_iter().flat_map(PyDictMethods::iter) {
+            match key.extract::<String>()?.as_str() {
+                "label_ids" => {
+                    search.label_ids = value
+                        .extract::<Vec<String>>()?
+                        .into_iter()
+                        .map(LabelId)
+                        .collect();
+                }
+                "include_spam_trash" => search.include_spam_trash = value.extract()?,
+                "limit" => search.limit = value.extract()?,
+                "page_token" => {
+                    search.page_token = value.extract::<Option<String>>()?.map(SearchPageToken);
+                }
+                "priority" => {
+                    search.priority = match value.extract::<String>()?.as_str() {
+                        "foreground" => Priority::Foreground,
+                        "live" => Priority::Live,
+                        "backfill" => Priority::Backfill,
+                        other => {
+                            return Err(PyValueError::new_err(format!(
+                                "priority must be foreground, live or backfill, not {other:?}"
+                            )));
+                        }
+                    };
+                }
+                "budget_s" => budget = seconds(value.extract()?, "budget_s")?,
+                other => {
+                    return Err(PyTypeError::new_err(format!(
+                        "search got an unexpected keyword argument {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok((search, budget))
+    }
+
     /// What `resume` did.
     #[pyclass(frozen, get_all)]
     struct ResumeResult {
@@ -1764,6 +2004,32 @@ mod _core {
                     detail: Some(format!("{e:?}")),
                 },
             })
+        }
+
+        async fn search(
+            self: Arc<Self>,
+            account: AccountId,
+            query: SearchQuery,
+            budget: Duration,
+        ) -> PyResult<SearchPage> {
+            self.inner
+                .search(&account, &query, budget)
+                .await
+                .map(SearchPage::from)
+                .map_err(search_error)
+        }
+
+        async fn search_threads(
+            self: Arc<Self>,
+            account: AccountId,
+            query: SearchQuery,
+            budget: Duration,
+        ) -> PyResult<ThreadSearchPage> {
+            self.inner
+                .search_threads(&account, &query, budget)
+                .await
+                .map(ThreadSearchPage::from)
+                .map_err(search_error)
         }
 
         async fn labels(self: Arc<Self>, account: AccountId) -> PyResult<Vec<Label>> {
@@ -2160,6 +2426,42 @@ mod _core {
             future(py, &self.shared, self.shared.clone().health())
         }
 
+        #[pyo3(signature = (account, query, **options))]
+        fn search<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            query: String,
+            options: Option<&Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let (query, budget) = search_args(query, options)?;
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .search(account_id(account)?, query, budget),
+            )
+        }
+
+        #[pyo3(signature = (account, query, **options))]
+        fn search_threads<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            query: String,
+            options: Option<&Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let (query, budget) = search_args(query, options)?;
+            future(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .search_threads(account_id(account)?, query, budget),
+            )
+        }
+
         fn labels<'py>(&self, py: Python<'py>, account: &str) -> PyResult<Bound<'py, PyAny>> {
             future(
                 py,
@@ -2518,6 +2820,46 @@ mod _core {
             block(py, &self.shared, self.shared.clone().health())
         }
 
+        /// One page of Gmail's search, each hit marked against the mirror;
+        /// see `mailtide.Runner.search`.
+        #[pyo3(signature = (account, query, **options))]
+        fn search(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            query: String,
+            options: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<SearchPage> {
+            let (query, budget) = search_args(query, options)?;
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .search(account_id(account)?, query, budget),
+            )
+        }
+
+        /// One page of Gmail's thread search; see
+        /// `mailtide.Runner.search_threads`.
+        #[pyo3(signature = (account, query, **options))]
+        fn search_threads(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            query: String,
+            options: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<ThreadSearchPage> {
+            let (query, budget) = search_args(query, options)?;
+            block(
+                py,
+                &self.shared,
+                self.shared
+                    .clone()
+                    .search_threads(account_id(account)?, query, budget),
+            )
+        }
+
         /// The account's label definitions as last synced, in id order.
         fn labels(&self, py: Python<'_>, account: &str) -> PyResult<Vec<Label>> {
             block(
@@ -2664,6 +3006,28 @@ mod _core {
     }
 
     // ------------------------------------------------------------ functions
+
+    /// `text` as one Gmail search value that matches it literally and cannot
+    /// add operators or groups (for `from:`, `subject:` or a bare term).
+    /// `ValueError` when no word is left.
+    #[pyfunction]
+    fn search_literal(text: &str) -> PyResult<String> {
+        mailtide_gmail::search::literal(text)
+            .ok_or_else(|| PyValueError::new_err("the text holds no word Gmail could match"))
+    }
+
+    /// The search term finding a message by the `Message-ID` Gmail stored
+    /// (`rfc822msgid:`). Gmail replaces the one a client writes on an API
+    /// send or draft save, so it cannot find a message mailtide just sent.
+    /// `ValueError` for an id Gmail's syntax cannot carry.
+    #[pyfunction]
+    fn search_by_message_id(message_id: &str) -> PyResult<String> {
+        mailtide_gmail::search::by_message_id(message_id).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "Gmail's search cannot carry the Message-ID {message_id:?}"
+            ))
+        })
+    }
 
     /// One schema migration as SQL (see `migrations`).
     #[pyclass(frozen, get_all)]

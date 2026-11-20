@@ -9,7 +9,7 @@ transaction rolls back; every commit is atomic and fenced, so that is safe).
 import asyncio
 import contextvars
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Literal
 
 from mailtide import _core
@@ -28,7 +28,9 @@ from mailtide._core import (
     ResumeResult,
     RunOutcome,
     SchemaStatus,
+    SearchPage,
     StateTooOld,
+    ThreadSearchPage,
     ThreadView,
     TrackResult,
 )
@@ -50,6 +52,7 @@ Action = Literal[
     "not_spam",
     "change_labels",
 ]
+Priority = Literal["foreground", "live", "backfill"]
 
 
 class Runner:
@@ -231,6 +234,71 @@ class Runner:
     async def health(self) -> Health:
         """Whether the database answers within the pool's acquire timeout."""
         return await self._core.health()
+
+    async def search(
+        self,
+        account: str,
+        query: str,
+        *,
+        label_ids: Sequence[str] = (),
+        include_spam_trash: bool = False,
+        limit: int = 100,
+        page_token: str | None = None,
+        priority: Priority = "foreground",
+        budget_s: float = 10.0,
+    ) -> SearchPage:
+        """One page of Gmail's own search for ``query`` (the search box's
+        syntax, sent untouched; ``messages.list``, 5 quota units).
+
+        Each hit is ``imported``, ``not_imported`` or ``unknown`` (no row
+        yet: the next ``run`` brings it); hits the mirror deleted are left
+        out and counted in ``deleted``. Read the hits with ``messages``.
+        ``label_ids`` are label ids all hits carry (names go in the query as
+        ``label:``); an id the mirror's label definitions lack raises
+        ``UnknownLabel``, since Gmail would answer it with no hits. Pass
+        ``next_page_token`` back with the same arguments for the next page.
+        A page whose ``mirror_state`` has feed entries after it may be stale.
+        Writes nothing and never preempts a sync; allowed read-only. Raises
+        ``SearchRefused``, ``InvalidPageToken``, ``PageTokenRejected``,
+        ``QuotaDeferred``, ``GmailUnavailable``, ``AccountBlocked``,
+        ``AccountNotTracked``, or ``ValueError`` for a blank query."""
+        return await self._core.search(
+            account,
+            query,
+            label_ids=list(label_ids),
+            include_spam_trash=include_spam_trash,
+            limit=limit,
+            page_token=page_token,
+            priority=priority,
+            budget_s=budget_s,
+        )
+
+    async def search_threads(
+        self,
+        account: str,
+        query: str,
+        *,
+        label_ids: Sequence[str] = (),
+        include_spam_trash: bool = False,
+        limit: int = 100,
+        page_token: str | None = None,
+        priority: Priority = "foreground",
+        budget_s: float = 10.0,
+    ) -> ThreadSearchPage:
+        """One page of thread ids Gmail's search matches (``threads.list``,
+        10 quota units), each with Gmail's ``history_id`` for the thread:
+        past the page's ``cursor``, the mirror has not caught up with it.
+        Otherwise as ``search``."""
+        return await self._core.search_threads(
+            account,
+            query,
+            label_ids=list(label_ids),
+            include_spam_trash=include_spam_trash,
+            limit=limit,
+            page_token=page_token,
+            priority=priority,
+            budget_s=budget_s,
+        )
 
     async def labels(self, account: str) -> list[Label]:
         """``account``'s label definitions as the mirror last synced them, in id

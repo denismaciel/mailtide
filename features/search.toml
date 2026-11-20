@@ -2,12 +2,12 @@ id = "search"
 title = "Search: a Gmail query to message and thread ids"
 summary = "A read-only driver call that sends the host's query string to Gmail's own search through the quota gate and returns one page of ids, each marked with what the mirror holds for it; it parses no query, builds no index, caches nothing and writes nothing."
 roadmap = ["R9"]
-status = "in_progress"
+status = "done"
 design = "docs/features/search.md"
 # No hard dependency. Soft links, none needed to build this:
 #   threads (R7) hydrates thread hits; prioritise (S1) bumps a hit whose body is
-#   not imported yet; send (C3) can reuse the search request and `by_message_id`
-#   to confirm a send by Message-ID; drafts (C2) maps a DRAFT hit to its draft id.
+#   not imported yet; drafts (C2) maps a DRAFT hit to its draft id. send (C3)
+#   does not use `by_message_id`: Gmail replaces a sent message's Message-ID.
 depends_on = []
 
 # ---------------------------------------------------------------- core (pure)
@@ -877,6 +877,16 @@ target = "tests/test_search.py"
 name = "test_search_literal_quotes_user_text"
 covers = "mailtide.search_literal and search_by_message_id; ValueError for text with no word"
 
+[[test]]
+target = "tests/test_search.py"
+name = "test_unknown_label_raises_before_gmail"
+covers = "UnknownLabel (a SearchRefused) with label_id, before the first label listing and for an id the listing lacks, with no request reaching FakeGmail; a known id goes out as labelIds"
+
+[[test]]
+target = "tests/test_search.py"
+name = "test_a_deferred_search_raises_quota_deferred"
+covers = "A search the gate holds past budget_s raises QuotaDeferred with until_ms, nothing sent (the first binding that raises it)"
+
 # ------------------------------------------------- unproven Gmail behaviour
 
 [[unknown]]
@@ -919,7 +929,7 @@ result = "2026-11-20, six inserted subjects, each query run 3 times with the sam
 id = "search-msgid-match"
 question = "Does rfc822msgid: match exactly one Message-ID when given without angle brackets, and how must an id holding characters such as - = / $ ! % be written: bare or quoted?"
 assumed = "A bare id of letters, digits and @ . _ + matches exactly that message; any other id matches when double-quoted."
-if_wrong = "by_message_id() returns None for every id outside the set proven to match, instead of a term that may match nothing or another message. A caller (send, confirming by Message-ID) then treats the lookup as unavailable, never as 'not found'."
+if_wrong = "by_message_id() returns None for every id outside the set proven to match, instead of a term that may match nothing or another message. A caller then treats the lookup as unavailable, never as 'not found'."
 test = "messages.insert four messages with Message-ID <plain.1@x.test>, <a+b-c@x.test>, <a=b/c$d!e%f@x.test> and <plain.1@x.test.extra>. For each id run q=rfc822msgid:ID, q=rfc822msgid:<ID> and q=rfc822msgid:\"ID\" with includeSpamTrash=true. Expect exactly its own message each time; record every spelling that returns nothing or returns the .extra message."
 status = "confirmed"
 result = "2026-11-20, 4 inserted messages: q=rfc822msgid: returned exactly the message with that Message-ID for every spelling tried: bare, in angle brackets, double-quoted, and quoted with brackets, for <...plain.1@x.test>, <...a+b-c@x.test>, <...a=b/c$d!e%f@x.test> and <...plain.1@x.test.extra> (16 of 16; the id that is a prefix of another never returned the longer one). So the characters - = / $ ! % also match bare, not only quoted. Matching ignores case (the id in upper case found the message); the local part alone finds nothing. Each message was listed 0.2 s after messages.insert. This holds for ids Gmail stored as written (insert); a message sent through the API gets a Message-ID chosen by Gmail (send-message-id-kept)."

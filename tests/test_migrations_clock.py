@@ -52,6 +52,8 @@ def every_database_call(
         "admit": lambda: runner.admit(ACCOUNT, "archive", message_ids=["m1"]),
         "prioritise": lambda: runner.prioritise(ACCOUNT, ["m1"]),
         "drift": lambda: runner.drift(ACCOUNT, ["m1"]),
+        "search": lambda: runner.search(ACCOUNT, "x"),
+        "search_threads": lambda: runner.search_threads(ACCOUNT, "x"),
         "notify": lambda: runner.notify(ACCOUNT, 7),
         "status": lambda: runner.status(ACCOUNT),
         "accounts": runner.accounts,

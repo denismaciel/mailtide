@@ -28,6 +28,13 @@ class Mailbox:
         self.messages: dict[str, dict] = {}
         self.history: list[dict] = []
         self.labels: dict[str, dict] = {"INBOX": {"id": "INBOX", "name": "INBOX", "type": "system"}}
+        # Search results by query, as message ids in Gmail's order. Like
+        # Gmail's index they are not derived from the mailbox, and the fake
+        # interprets no query: a query nobody scripted matches nothing.
+        self.search_results: dict[str, list[str]] = {}
+        self.search_refusal: tuple[int, str] | None = None  # (status, reason) searches get
+        self.searches: list[dict[str, list[str]]] = []  # each search's parameters
+        self.withheld: set[str] = set()  # raw fetches of these ids answer 503
 
     def add(
         self,
@@ -65,6 +72,31 @@ class Mailbox:
     def label(self, lid: str, name: str, kind: str = "user") -> None:
         """Create a label definition, or rename it (no history record, as in Gmail)."""
         self.labels[lid] = {"id": lid, "name": name, "type": kind}
+
+    def search_page(self, query: dict[str, list[str]], threads: bool) -> tuple[int, dict]:
+        """One page of the scripted results for ``q``, paged by
+        ``maxResults`` with the offset as the page token."""
+        self.searches.append(query)
+        if self.search_refusal:
+            status, reason = self.search_refusal
+            error = {"code": status, "message": "refused", "errors": [{"reason": reason}]}
+            return status, {"error": error}
+        hits = self.search_results.get(query["q"][0], [])
+        if threads:
+            hits = list(dict.fromkeys(f"t-{mid}" for mid in hits))
+        start = int(query.get("pageToken", ["0"])[0])
+        end = start + int(query.get("maxResults", ["100"])[0])
+        body: dict = {"resultSizeEstimate": len(hits)}
+        if threads:
+            body["threads"] = [
+                {"id": tid, "snippet": "", "historyId": str(self.history_id)}
+                for tid in hits[start:end]
+            ]
+        else:
+            body["messages"] = [{"id": mid, "threadId": f"t-{mid}"} for mid in hits[start:end]]
+        if end < len(hits):
+            body["nextPageToken"] = str(end)
+        return 200, body
 
     def expire_history(self) -> None:
         """Gmail dropped the history so far: syncing from before now answers 404."""
@@ -119,8 +151,11 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
         def _get(self) -> None:
             assert self.headers["authorization"] == "Bearer test-token"
             url = urlparse(self.path)
-            query = {k: v[0] for k, v in parse_qs(url.query).items()}
+            params = parse_qs(url.query, keep_blank_values=True)
+            query = {k: v[0] for k, v in params.items()}
             parts = url.path.removeprefix(PREFIX).split("/")
+            if parts == ["threads"] or (parts == ["messages"] and "q" in query):
+                return self.reply(*mailbox.search_page(params, threads=parts == ["threads"]))
             if parts == ["profile"]:
                 return self.reply(200, {"historyId": str(mailbox.history_id)})
             if parts == ["labels"]:
@@ -150,6 +185,9 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                     "internalDate": str(m["date_ms"]),
                     "snippet": "hi",
                 }
+                if query.get("format") == "raw" and mid in mailbox.withheld:
+                    error = {"code": 503, "message": "backend error"}
+                    return self.reply(503, {"error": error})
                 if query.get("format") == "raw":
                     recipients = "".join(
                         f"{name}: {', '.join(m[key])}\r\n"
@@ -192,7 +230,9 @@ class FakeGmail:
 
     ``with FakeGmail() as gmail:`` starts it; ``gmail.origin`` is the URL to
     configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``delete``,
-    ``label``, ``expire_history``, ``refuse``, ``delay_s``, ``requests``).
+    ``label``, ``expire_history``, ``refuse``, ``delay_s``, ``requests``,
+    ``withheld``, and for searches ``search_results``, ``search_refusal``,
+    ``searches``).
     """
 
     def __init__(self) -> None:
@@ -230,6 +270,12 @@ class FakeGmail:
                 to=to,
                 cc=cc,
             )
+
+    def script_search(self, query: str, message_ids: list[str]) -> None:
+        """Searches for exactly ``query`` match ``message_ids``, in this order
+        (threads: their ``t-<id>`` threads)."""
+        with self.mailbox.lock:
+            self.mailbox.search_results[query] = message_ids
 
 
 class ManualClock:

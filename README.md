@@ -60,6 +60,7 @@ await runner.compact("alice@example.com")  # drops what every live consumer has 
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
 threads = await runner.threads("alice@example.com", ["18c…"])  # thread views, in one call
+hits = await runner.search("alice@example.com", "from:bob has:attachment")  # Gmail's own search
 ```
 
 A thread view (`ThreadView`) is folded from the mirror on every read: its

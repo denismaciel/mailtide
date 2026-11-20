@@ -1,6 +1,6 @@
 # Search: a Gmail query to message and thread ids
 
-Plan: `features/search.toml` (roadmap R9). Status: planned.
+Plan: `features/search.toml` (roadmap R9). Status: done.
 
 ## 1. Goal and scope
 
@@ -107,8 +107,8 @@ search_threads(account, &SearchQuery, budget) -> Result<ThreadSearchPage, Search
 | `SearchQuery` field | Meaning |
 |---|---|
 | `query: String` | Sent as `q`, byte for byte. Blank is refused (`EmptyQuery`) |
-| `label_ids: Vec<LabelId>` | Gmail label **ids**, all required (`labelIds`). Sorted and deduplicated |
-| `include_spam_trash: bool` | Default false, as the Gmail search box |
+| `label_ids: Vec<LabelId>` | Gmail label **ids**, all required (`labelIds`). Sorted and deduplicated; an id the mirror's label definitions lack is refused (`UnknownLabel`) |
+| `include_spam_trash: bool` | Default false, as the Gmail search box. Only a query without `in:trash`, `in:spam` or `in:anywhere` depends on it |
 | `limit: u32` | Default 100, clamped to 1..=500 |
 | `page_token: Option<SearchPageToken>` | From the previous page of the same request |
 | `priority: Priority` | Default `Foreground`; `Live` or `Backfill` for background jobs |
@@ -124,19 +124,25 @@ and no `deleted`.
   asked; `cursor` and `phase` are the sync position read with it.
 
 `SearchError`: `EmptyQuery`, `InvalidPageToken` (not ours, or issued for
-another request; no Gmail call), `PageTokenRejected` (Gmail refused a
-continuation), `Refused { detail }` (Gmail's 400 or 403), `Deferred { until }`,
-`Retryable`, `AccountBlocked`, `NotTracked`, and the runner's store and gate
-errors.
+another request; no Gmail call), `UnknownLabel` (a `label_ids` entry the
+mirror's label definitions lack; no Gmail call), `PageTokenRejected` (Gmail
+refused a continuation), `Refused` (Gmail's 400 or 403, an account problem,
+an answer that is not a page), `Deferred { until }`, `Retryable`,
+`AccountBlocked` (with its reason), `NotTracked`, and the runner's store and
+gate errors.
 
 Python: `Runner.search(account, query, *, label_ids=(), include_spam_trash=False,
 limit=100, page_token=None, priority="foreground", budget_s=10.0)` and
 `search_threads(...)`, on `Runner` and `BlockingRunner`; frozen dataclasses
 `SearchPage`, `SearchHit`, `ThreadSearchPage`, `ThreadHit`; exceptions
-`SearchRefused`, `InvalidPageToken`, `PageTokenRejected` (a subclass),
-the shared `QuotaDeferred` (`until_ms`), `GmailUnavailable`, `AccountBlocked`;
-`AccountNotTracked` exists. Two pure helpers, `mailtide.search_literal(text)`
-and `mailtide.search_by_message_id(id)`.
+`SearchRefused` and its subclass `UnknownLabel` (`label_id`),
+`InvalidPageToken` and its subclass `PageTokenRejected`, the shared
+`QuotaDeferred` (`until_ms`), `GmailUnavailable`, `AccountBlocked`;
+`AccountNotTracked` exists; a blank query is a `ValueError`. Two pure
+helpers, `mailtide.search_literal(text)` and
+`mailtide.search_by_message_id(id)`. The binding takes the keyword
+arguments as `**options` and checks them itself (an unknown one is a
+`TypeError`), so no function takes more arguments than the lint allows.
 
 ### The query
 
@@ -152,11 +158,22 @@ not a query:
   standalone `OR` or `AND` is lowercased, and anything but a bare word is
   double-quoted. `None` when no word is left.
 - `by_message_id(id) -> Option<String>`: `rfc822msgid:` plus the id without
-  angle brackets. `None` for an id Gmail's syntax cannot carry: refused, never
-  loosened.
+  angle brackets, bare (Gmail matched ids holding `+ - = / $ ! %` bare,
+  ignoring case: `search-msgid-match`). `None` for an id Gmail's syntax
+  cannot carry (a blank, a quote, a brace, a parenthesis, an angle
+  bracket): refused, never loosened. It finds the `Message-ID` **Gmail
+  stored**. Gmail replaces a client's `Message-ID` on every API send and
+  draft save (rule "A message mailtide writes is identified by a private
+  header" in `docs/features/README.md`), so it cannot find a message
+  mailtide just sent; `send` does not use it.
 
 **Dates.** A host that needs an exact bound writes `after:1794646800` (Unix
 seconds); `after:2026/11/14` means midnight PST.
+
+**Spam and Trash.** `in:trash`, `in:spam` and `in:anywhere` reach Trash and
+Spam whatever `include_spam_trash` says (`search-spam-trash-default`); the
+flag matters only for a query naming none of them, which then searches Spam
+and Trash too when it is set.
 
 **Labels.** Two different things, and mailtide translates neither:
 
@@ -168,8 +185,22 @@ seconds); `after:2026/11/14` means midnight PST.
   name to an id or an id to a name: that would mean parsing the query, and
   the mirror's label table can trail a rename.
 
-`label_ids` are not checked against the mirror's label table for the same
-reason; an id Gmail rejects comes back as `Refused`.
+`label_ids` **are** checked against the mirror's label definitions
+(`Store::labels`), before Gmail is asked: Gmail answers a `labelIds` value it
+does not have (never created, or deleted) with 200 and no hits, which cannot
+be told from an empty result (`search-unknown-label-id`, refuted). An id the
+definitions lack is `UnknownLabel`. Before the first label listing the
+mirror holds no definitions, so every label filter is refused until a sync
+has run (its first step lists the labels): a host that searches a brand-new
+account without a filter is unaffected, and one with a filter gets a
+refusal it can act on instead of "no hits". A label created in Gmail since
+the last listing is refused until the next one (at most `label_refresh`, or
+sooner when history names it); deleting one is the case the check exists
+for. Gmail answers a label *name* in `labelIds` with 400 (`Refused`), but a
+name is not a mirror label id, so it is `UnknownLabel` first. Inside the
+query, `label:` matches names in the search box's spellings (lower case,
+hyphens for spaces and slashes, or quoted) and never ids
+(`search-label-terms`).
 
 ### Paging
 
@@ -253,11 +284,15 @@ read before the Gmail call, a change that lands during the call is after it. A
 host cache should also set a time limit: `mirror_state` cannot see a change
 the mirror has not synced or Gmail has not indexed (`search-index-lag`).
 
-**Requests and events.** The driver issues `GmailRequest::Search(SearchQuery)`
-with a command id of epoch 0, as `drift` does, and reuses the runner's gate,
-lease guard and logging; the answer is `EventKind::Searched`, which the engine
-ignores. The simulator is not extended: search has no state and no invariant
-beyond "writes nothing", which a driver test checks.
+**Requests and events.** The driver issues `GmailRequest::Search(SearchRequest)`
+(the canonical request: scope, query, sorted label ids, flag, clamped limit
+and Gmail's own token) through `Runner::call_gmail`, with a command id of
+epoch 0, as `drift` does, and reuses the runner's gate, lease guard and
+logging (the request kind is `search_messages` or `search_threads`); the
+answer is `EventKind::Searched`, which the engine ignores. The simulator is
+not extended: search has no state and no invariant beyond "writes nothing",
+which a driver test checks; its Gmail only refuses a search request, which
+the engine never issues.
 
 ### Failure and retry
 
@@ -266,9 +301,10 @@ mailtide never retries a search; it is idempotent, so the host may.
 | Gmail answers | Result |
 |---|---|
 | 400, 403 (bad label id, `gmail.metadata` scope) on a first page | `Refused`. The caller's error: the account is **not** blocked |
-| 4xx on a continuation | `PageTokenRejected` |
+| 4xx (refused for good) or 404 on a continuation | `PageTokenRejected` |
+| 404 on a first page | `Refused` |
 | 429, `userRateLimitExceeded`, project limits | `Retryable`; the gate is cooled down for `Retry-After`, as the engine would |
-| 5xx, timeout, 401 (token dropped and re-minted next call) | `Retryable` |
+| 5xx, timeout or lost answer, 401 (token dropped and re-minted next call) | `Retryable` |
 | An account problem (delegation revoked, mail disabled) | `Refused`; nothing is committed, the next `run()` records the block |
 | A body that is not a list page | an error, never an empty page |
 
@@ -333,10 +369,11 @@ and pimalaya core's `search_emails_query.rs` (a query language and a local
 matcher: the host's side of the line); `tests/google.rs` (live). jmap-client
 and the Stalwart server have no query tests in their pinned trees.
 
-Our own 40 tests cover the request shape and costs; the token binding; the
+Our own 45 tests cover the request shape and costs; the token binding; the
 mirror state of hits (unknown, not imported, tombstoned); "writes nothing" and
 "does not supersede a sync"; the gate (deferral, priority, cooldown); every row
-of the failure table; read-only, blocked and untracked accounts; logs; thread
+of the failure table; label ids the mirror lacks; read-only, blocked and
+untracked accounts; logs (in a process of their own); thread
 search; and the Python API.
 
 ## 6. Slices
@@ -380,8 +417,10 @@ slice 1.
    second language to keep in step with Gmail. *Would change it:* another
    provider behind the same API.
 2. **Two quoting helpers ship with it.** Hosts will build `from:<user text>`
-   and `send` will look a message up by Message-ID; the quirks of Gmail's
-   quoting belong in one tested place. They build a value and parse nothing.
+   and look a received message up by its Message-ID; the quirks of Gmail's
+   quoting belong in one tested place. (`send` no longer looks its own
+   message up by Message-ID: Gmail replaces it, so mailtide identifies what
+   it writes by a private header.) They build a value and parse nothing.
    *Would change it:* `search-literal-quoting` showing plain quotes are enough.
 3. **Hits are ids with a mirror state; hydration is `messages()`.** JMAP's
    split, and it keeps a page cheap. The state is needed because `messages()`
@@ -418,7 +457,11 @@ slice 1.
 10. **Foreground by default, with a `priority` field.** A user is usually
     waiting; a background job must be able to say it is not.
 11. **Labels are not translated either way.** `label_ids` for ids, Gmail's
-    own operators for names.
+    own operators for names. Ids are checked against the mirror's
+    definitions, because Gmail answers an unknown id with no hits
+    (`search-unknown-label-id` refuted); before the first label listing every
+    id is refused. *Would change it:* Gmail answering an unknown id with an
+    error.
 12. **A refused search never blocks the account**, and a rate limit cools the
     gate but is not persisted: search commits nothing. The next engine request
     records what is still true.
@@ -431,9 +474,15 @@ Unknowns (`features/search.toml`):
 - `search-page-token-lifetime`: a token lives at least an hour.
 - `search-index-lag`: Gmail's index trails history by seconds.
 - `search-literal-quoting`: operators are read inside quotes; nothing escapes.
-- `search-msgid-match`: `rfc822msgid:` matches one id; which ids need quotes.
-- `search-label-terms`: `label:` takes names, not ids.
-- `search-unknown-label-id`: an unknown `labelIds` value is a 400.
-- `search-spam-trash-default`: `in:trash` works without `includeSpamTrash`.
-- `search-thread-history-id`: listed threads carry `historyId`.
+- `search-msgid-match` (confirmed): `rfc822msgid:` matches one id, bare,
+  any case, `+ - = / $ ! %` included.
+- `search-label-terms` (confirmed): `label:` takes names, not ids;
+  `labelIds` takes ids and answers a name with 400.
+- `search-unknown-label-id` (refuted): an unknown `labelIds` value answers
+  200 with no hits, so `label_ids` are checked against the mirror.
+- `search-spam-trash-default` (refuted in one detail): `in:trash` and
+  `in:spam` work without `includeSpamTrash`, and so does `in:anywhere`; only
+  a query naming none of them depends on the flag. Guidance only.
+- `search-thread-history-id` (confirmed): every listed thread carries
+  `historyId`, its newest message's.
 - `search-drafts-in-results`: `in:draft` returns a draft's current message.

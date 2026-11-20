@@ -21,6 +21,15 @@ class SchemaOutOfDate(MailtideError): ...
 class ReadOnlyMode(MailtideError): ...
 class AccountNotTracked(MailtideError): ...
 class BlobNotFound(MailtideError): ...
+class SearchRefused(MailtideError): ...
+
+class UnknownLabel(SearchRefused):
+    label_id: str
+
+class InvalidPageToken(MailtideError): ...
+class PageTokenRejected(InvalidPageToken): ...
+class GmailUnavailable(MailtideError): ...
+class AccountBlocked(MailtideError): ...
 
 class ComposeError(ValueError):
     """compose_message refused its input; the message never holds the value."""
@@ -204,6 +213,7 @@ Action = Literal[
     "not_spam",
     "change_labels",
 ]
+Priority = Literal["foreground", "live", "backfill"]
 
 @final
 class Notification:
@@ -366,6 +376,42 @@ class PrioritiseResult:
     over_limit: list[str]
 
 @final
+class SearchHit:
+    """A message Gmail's search matched, and what the mirror holds for it."""
+
+    message_id: str
+    thread_id: str
+    state: Literal["imported", "not_imported", "unknown"]
+
+@final
+class SearchPage:
+    """One page of ``search``: hits in Gmail's order, deleted ones left out."""
+
+    hits: list[SearchHit]
+    next_page_token: str | None
+    estimate: int
+    deleted: int
+    mirror_state: str
+    cursor: int | None
+    phase: Literal["bootstrapping", "live", "reconciling", "blocked"]
+
+@final
+class ThreadHit:
+    thread_id: str
+    history_id: int | None
+
+@final
+class ThreadSearchPage:
+    """One page of ``search_threads``."""
+
+    hits: list[ThreadHit]
+    next_page_token: str | None
+    estimate: int
+    mirror_state: str
+    cursor: int | None
+    phase: Literal["bootstrapping", "live", "reconciling", "blocked"]
+
+@final
 class ForgetResult:
     outcome: Literal["forgotten", "unknown"]
     messages: int
@@ -433,6 +479,30 @@ class Runner:
     def resume(self, account: str) -> Awaitable[ResumeResult]: ...
     def forget(self, account: str) -> Awaitable[ForgetResult]: ...
     def health(self) -> Awaitable[Health]: ...
+    def search(
+        self,
+        account: str,
+        query: str,
+        *,
+        label_ids: list[str] = ...,
+        include_spam_trash: bool = False,
+        limit: int = 100,
+        page_token: str | None = None,
+        priority: Priority = "foreground",
+        budget_s: float = 10.0,
+    ) -> Awaitable[SearchPage]: ...
+    def search_threads(
+        self,
+        account: str,
+        query: str,
+        *,
+        label_ids: list[str] = ...,
+        include_spam_trash: bool = False,
+        limit: int = 100,
+        page_token: str | None = None,
+        priority: Priority = "foreground",
+        budget_s: float = 10.0,
+    ) -> Awaitable[ThreadSearchPage]: ...
     def labels(self, account: str) -> Awaitable[list[Label]]: ...
     def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
     def threads(self, account: str, thread_ids: list[str]) -> Awaitable[list[ThreadView]]: ...
@@ -503,6 +573,30 @@ class BlockingRunner:
     def resume(self, account: str) -> ResumeResult: ...
     def forget(self, account: str) -> ForgetResult: ...
     def health(self) -> Health: ...
+    def search(
+        self,
+        account: str,
+        query: str,
+        *,
+        label_ids: list[str] = ...,
+        include_spam_trash: bool = False,
+        limit: int = 100,
+        page_token: str | None = None,
+        priority: Priority = "foreground",
+        budget_s: float = 10.0,
+    ) -> SearchPage: ...
+    def search_threads(
+        self,
+        account: str,
+        query: str,
+        *,
+        label_ids: list[str] = ...,
+        include_spam_trash: bool = False,
+        limit: int = 100,
+        page_token: str | None = None,
+        priority: Priority = "foreground",
+        budget_s: float = 10.0,
+    ) -> ThreadSearchPage: ...
     def labels(self, account: str) -> list[Label]: ...
     def messages(self, account: str, message_ids: list[str]) -> list[MessageView]: ...
     def threads(self, account: str, thread_ids: list[str]) -> list[ThreadView]: ...
@@ -541,3 +635,5 @@ def new_message_id(sender: str) -> str: ...
 def new_tracking_id() -> str: ...
 def tracking_id(raw: bytes) -> str | None: ...
 def parse_addresses(value: str) -> list[Address]: ...
+def search_literal(text: str) -> str: ...
+def search_by_message_id(message_id: str) -> str: ...
