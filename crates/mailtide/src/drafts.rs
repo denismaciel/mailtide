@@ -1254,6 +1254,34 @@ mod tests {
     }
 
     #[test]
+    fn a_sent_message_the_mirror_has_not_seen_is_verified() {
+        let mut mirror = mirror();
+        save(&mut mirror, draft("r1", "m1", "t1"), 1);
+        let DraftRecorded::Started { draft: row, .. } = begin_send(&mut mirror, "r1", 1_000) else {
+            panic!("started");
+        };
+        let started = row.state.attempt().map(|a| a.started).expect("an attempt");
+        let sent = DraftWrite::EndSend {
+            draft: DraftId("r1".into()),
+            started,
+            end: SendEnd::Sent {
+                message: MessageId("s1".into()),
+                thread_id: ThreadId("t1".into()),
+            },
+        };
+        assert_eq!(
+            mirror.record_draft(&sent, Timestamp(2_000)),
+            DraftRecorded::Done
+        );
+        assert!(
+            mirror
+                .jobs
+                .contains_key(&JobKind::Verify(MessageId("s1".into()))),
+            "fetched at once, whatever history and listings miss"
+        );
+    }
+
+    #[test]
     fn a_send_is_begun_once_and_retried_only_after_its_request_timed_out() {
         let mut mirror = mirror();
         assert_eq!(begin_send(&mut mirror, "r1", 0), DraftRecorded::NotIndexed);

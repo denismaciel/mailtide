@@ -394,17 +394,16 @@ impl Engine {
             EventKind::ActionRequested { action } => self.on_action(action, now),
             EventKind::LabelsModified { command } => self.on_modified(command, now),
             EventKind::DraftsListed { command, page } => self.on_drafts_listed(command, page, now),
-            // A search, its label check and the label writes are the
-            // driver's direct calls: no engine command waits for them.
+            // A search, its label check, the label writes and the draft
+            // methods are the driver's direct calls: no engine command waits
+            // for them.
             EventKind::Searched { .. }
             | EventKind::LabelFetched { .. }
             | EventKind::LabelSaved { .. }
             | EventKind::LabelNameTaken { .. }
             | EventKind::LabelDeleted { .. }
-            | EventKind::MessagesDeleted { .. } => Vec::new(),
-            // Answers to direct calls (the driver's draft methods): no
-            // engine command asks for these.
-            EventKind::DraftFetched { .. }
+            | EventKind::MessagesDeleted { .. }
+            | EventKind::DraftFetched { .. }
             | EventKind::DraftSaved { .. }
             | EventKind::DraftDeleted { .. }
             | EventKind::DraftSent { .. }

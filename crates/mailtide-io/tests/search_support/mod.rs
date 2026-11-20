@@ -252,6 +252,8 @@ impl FakeGmail {
                     ok(&body)
                 }
             },
+            // No drafts: a reconciliation ends by listing them.
+            ["drafts"] => ok(&json!({"resultSizeEstimate": 0})),
             other => panic!("unexpected request {other:?}"),
         }
     }

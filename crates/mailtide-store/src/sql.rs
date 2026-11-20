@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp, MessageOp, Rejection};
 use mailtide::drafts::{
-    DraftIndex, DraftOp, DraftRecord, DraftRecorded, DraftState, DraftView, DraftWrite,
+    DraftIndex, DraftOp, DraftRecord, DraftRecorded, DraftState, DraftView, DraftWrite, SendEnd,
 };
 use mailtide::gmail::{Label, LabelColor, LabelKind, LabelListVisibility, MessageListVisibility};
 use mailtide::ids::{
@@ -1535,6 +1535,14 @@ impl SqlStore {
         mirror.seq = seq;
         mirror.drafts = load_drafts(&mut *tx, account).await?;
         Self::load_account_jobs(&mut tx, account, &mut mirror).await?;
+        // A sent message the mirror may not have seen gets a verification.
+        if let DraftWrite::EndSend {
+            end: SendEnd::Sent { message, .. },
+            ..
+        } = write
+        {
+            Self::load_rows(&mut tx, account, std::slice::from_ref(message), &mut mirror).await?;
+        }
         let before = mirror.clone();
         let outcome = mirror.record_draft(write, now);
         Self::write_diff(&mut tx, &before, &mirror).await?;

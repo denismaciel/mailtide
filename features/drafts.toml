@@ -2,7 +2,7 @@ id = "drafts"
 title = "Drafts: create, update, delete, list, read and send"
 summary = "Draft writes as quota-gated calls to Gmail's drafts API that return Gmail's draft id at once, plus a mirrored draft index (draft id -> current message id, and the X-Mailtide-Id the bytes carry) that follows drafts changed elsewhere and confirms a send whose answer was lost."
 roadmap = ["C2"]
-status = "in_progress"
+status = "done"
 design = "docs/features/drafts.md"
 # No hard dependency: the API takes RFC 5322 bytes.
 #   compose-mime (C1) builds those bytes; send (C3) reuses `send_draft` and owns
@@ -662,6 +662,11 @@ covers = "drafts.list is not a snapshot: a row pointing at a message the mirror 
 target = "crates/mailtide/src/drafts.rs"
 name = "a_listed_draft_whose_message_the_mirror_never_saw_is_verified"
 covers = "Listings are not snapshots: a message a reconciliation's listing skipped can still be named by drafts.list, which then gets it a verification fetch (and so a row and an import), as an unknown id in history does. Found by the simulator"
+
+[[test]]
+target = "crates/mailtide/src/drafts.rs"
+name = "a_sent_message_the_mirror_has_not_seen_is_verified"
+covers = "Recording a send's answer enqueues a verification of the sent message if the mirror has no row or tombstone for it, so mailtide's own sent message is mirrored even when a history window expired and a reconciliation's listing skipped it. Found by the simulator"
 
 [[test]]
 target = "crates/mailtide/src/drafts.rs"

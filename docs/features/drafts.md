@@ -1,6 +1,6 @@
 # Drafts: create, update, delete, list, read and send
 
-Plan: `features/drafts.toml` (roadmap C2). Status: in progress.
+Plan: `features/drafts.toml` (roadmap C2). Status: done.
 
 ## 1. Goal and scope
 
@@ -197,10 +197,15 @@ read in key order.
 
 Store-evaluated rules in `mirror.rs`, in the same commit as the message op:
 
-- a newly created `DRAFT` message that no row points at, a tombstone of a
-  message a row points at (the row turns `stale`), and the end of a full
-  reconciliation each enqueue the account's `RefreshDrafts` job, due after
-  `draft_refresh_delay` (default 10 s, deduplicated);
+- a newly created `DRAFT` message that no row points at and a tombstone of
+  a message a row points at (the row turns `stale`) each enqueue the
+  account's `RefreshDrafts` job, due after `draft_refresh_delay` (default
+  10 s, deduplicated); the end of a full reconciliation enqueues it due at
+  once, so a first run does not wait out the delay;
+- a listing naming a message the mirror never saw, and a send's recorded
+  answer naming a sent message it never saw, enqueue that message's
+  verification (found by the simulator: a reconciliation's listing, not a
+  snapshot, can skip a message whose history window expired);
 - our own writes trigger nothing: the added message is the one the row
   already names.
 
@@ -314,7 +319,7 @@ the count and thread-summary suites (read projections), the suites
 `scripts/zero_tests.py` owns, and himalaya's `tests/send_outcome.rs` and
 JMAP tests (`send`).
 
-Our own 63 tests cover what no reference has: the request shapes and costs;
+Our own 64 tests cover what no reference has: the request shapes and costs;
 the index rules (stale rows, stale listings, the generation fence, the
 periodic refresh); every row of Appendix B, including a crash between
 Gmail's send and its record and the three send fences; drafts changed

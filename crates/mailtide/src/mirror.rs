@@ -14,6 +14,7 @@ use crate::commit::{
 };
 use crate::drafts::{
     self, DraftEffects, DraftIndex, DraftOp, DraftRecorded, DraftView, DraftWrite, Reconciled,
+    SendEnd,
 };
 use crate::gmail::{HeaderFacts, Label, LabelKind, MessageFacts, MessageObservation};
 use crate::ids::{
@@ -1105,7 +1106,7 @@ impl AccountMirror {
                 skipped += 1;
             }
             self.settle(op, commit.claim.as_ref(), seq);
-            let effects = self.draft_rules(op, existed);
+            let effects = self.draft_rules(op, existed, commit.job_plan.verify_due_at);
             self.draft_effects(effects, commit.job_plan.draft_refresh_due_at, seq);
         }
         for op in &commit.intents {
@@ -1699,8 +1700,9 @@ impl AccountMirror {
     // ------------------------------------------------------------ drafts (SPEC §7a)
 
     /// What the draft rules make of one message operation, applied just
-    /// before: `existed` says whether its row was there before.
-    fn draft_rules(&mut self, op: &MessageOp, existed: bool) -> DraftEffects {
+    /// before: `existed` says whether its row was there before; `now` is
+    /// when a listing that needs no delay is due.
+    fn draft_rules(&mut self, op: &MessageOp, existed: bool, now: Timestamp) -> DraftEffects {
         match op {
             MessageOp::Observe(MessageObservation { id, .. })
             | MessageOp::PatchLabels { id, .. } => match self.messages.get(id) {
@@ -1732,12 +1734,17 @@ impl AccountMirror {
                 effects
             }
             MessageOp::Tombstone { id, .. } => drafts::on_tombstone(&mut self.drafts, id),
-            // History was lost: draft changes in that window left no record.
-            MessageOp::FinishReconcile { .. } => DraftEffects {
-                changes: Vec::new(),
-                refresh: true,
-                changed: true,
-            },
+            // History was lost: draft changes in that window left no
+            // record. Listed at once (no saves to coalesce), so a first run
+            // does not wait out the delay for its drafts.
+            MessageOp::FinishReconcile { .. } => {
+                self.enqueue_draft_refresh(now);
+                DraftEffects {
+                    changes: Vec::new(),
+                    refresh: false,
+                    changed: true,
+                }
+            }
             MessageOp::Listed { .. } => DraftEffects::default(),
         }
     }
@@ -1829,6 +1836,22 @@ impl AccountMirror {
         }
         let seq = self.seq;
         self.draft_effects(effects, due, seq);
+        // The message mailtide just sent exists: fetch it if the mirror
+        // has not seen it, rather than rely on history alone (a window of
+        // it may have expired) or a listing (not a snapshot).
+        if let DraftWrite::EndSend {
+            end: SendEnd::Sent { message, .. },
+            ..
+        } = write
+            && !self.messages.contains_key(message)
+            && !self.tombstones.contains_key(message)
+        {
+            self.enqueue(&NewJob {
+                kind: JobKind::Verify(message.clone()),
+                priority: Priority::Live,
+                due_at: now,
+            });
+        }
         outcome
     }
 

@@ -581,10 +581,11 @@ and the sync keep true.
    `if_message_id` refuses an update or send of a draft that holds another
    message (from the index if it already shows one, else after a
    `drafts.get`).
-5. **The index follows Gmail.** A `DRAFT` message no row names, a
-   tombstone under a row (which turns `stale`) and the end of a
-   reconciliation enqueue the account-level `RefreshDrafts` job, due
-   `draft_refresh_delay` (10 s) later; the engine also enqueues it while
+5. **The index follows Gmail.** A `DRAFT` message no row names and a
+   tombstone under a row (which turns `stale`) enqueue the account-level
+   `RefreshDrafts` job, due `draft_refresh_delay` (10 s) later so a burst of
+   saves shares one listing; the end of a reconciliation enqueues it due at
+   once; the engine also enqueues it while
    live once the persisted last listing is `draft_refresh_every` (15 min)
    old, by the rule of §6.6. It pages `drafts.list` and commits one
    reconcile, applied only if the draft generation is still the one its
@@ -596,7 +597,9 @@ and the sync keep true.
    `SendInProgress`); a retry is accepted only once the first request's
    timeout has passed, and reads the draft first (gone: `SendUnconfirmed`,
    nothing sent; another message: conflict). A lost answer or a 5xx leaves
-   the row `sending`; the sync settles it: the import of a `SENT` message
+   the row `sending`; the sync settles it (a send's answer also asks for a
+   verification of the sent message, so the mirror has it even if history
+   and a reconciliation's listing missed it): the import of a `SENT` message
    carrying the row's tracking id emits `DraftSent` (in whatever thread);
    a listing claimed after the request's timeout that still shows the draft
    returns it to `saved`; a draft gone from the list is `send_unconfirmed`,
