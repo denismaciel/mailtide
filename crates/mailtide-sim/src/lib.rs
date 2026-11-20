@@ -234,7 +234,8 @@ pub enum UserOp {
         /// Which label.
         pick: usize,
     },
-    /// 31 days pass: past the deleted-label memory.
+    /// 31 days pass: past the deleted-label memory, and past Gmail's
+    /// history (a cursor from before reads 404).
     MonthPasses,
     /// The user acts in the host's UI on the n-th mirrored message (or
     /// its whole thread); the engine delivers it to Gmail.
@@ -1276,6 +1277,10 @@ impl Sim {
         }
         if op == UserOp::MonthPasses {
             self.now = self.now.plus(Duration::from_hours(31 * 24));
+            // Gmail keeps history about a week: nothing from before is
+            // available any more.
+            self.gmail.expired_before = self.gmail.last_history;
+            self.stats.expiries += 1;
             return;
         }
         let op = match op {
