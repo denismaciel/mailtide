@@ -351,6 +351,9 @@ impl Engine {
             EventKind::RequestDeferred { command, until } => self.on_deferred(command, until),
             EventKind::ActionRequested { action } => self.on_action(action, now),
             EventKind::LabelsModified { command } => self.on_modified(command, now),
+            // A search is the driver's direct call: no engine command waits
+            // for it.
+            EventKind::Searched { .. } => Vec::new(),
         }
     }
 

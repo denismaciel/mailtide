@@ -43,7 +43,7 @@ use mailtide::outbox::{
     StarState,
 };
 use mailtide::reconcile::ListScope;
-use mailtide::retry::{Failure, Retryable, RetryableFailure};
+use mailtide::retry::{Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::revision::{
     AckOutcome, Change, ChangeFeed, ConsumerName, FeedCursor, FeedPosition, Retention, StateSeq,
 };
@@ -1473,6 +1473,15 @@ impl Sim {
                 }
                 EventKind::LabelsModified { command }
             }
+            // Searches are the driver's direct calls; the engine never
+            // issues one, so the simulated Gmail refuses it.
+            GmailRequest::Search(_) => EventKind::RequestFailed {
+                command,
+                failure: Failure::Blocking(BlockingFailure {
+                    class: Blocking::Permanent,
+                    detail: "the engine never searches".into(),
+                }),
+            },
         }
     }
 

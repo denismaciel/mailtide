@@ -127,6 +127,20 @@ impl MessageRecord {
     }
 }
 
+/// What the mirror holds for a message id (see [`AccountMirror::locate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Located {
+    /// A row; `imported` once its content is stored.
+    Row {
+        /// Whether the content is stored.
+        imported: bool,
+    },
+    /// The message was deleted (I5: for good).
+    Tombstone,
+    /// Neither: never discovered here.
+    Absent,
+}
+
 /// The account row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
@@ -748,6 +762,25 @@ impl AccountMirror {
             .map(|record| record.view(&self.intents_of(&record.id)))
             .collect();
         crate::thread::view(id, members)
+    }
+
+    /// What the mirror holds for each of `ids`, in the order given: a row
+    /// (with or without its content), a tombstone, or nothing. A read: it
+    /// changes nothing.
+    #[must_use]
+    pub fn locate(&self, ids: &[MessageId]) -> Vec<(MessageId, Located)> {
+        ids.iter()
+            .map(|id| {
+                let located = match (self.messages.get(id), self.tombstones.contains_key(id)) {
+                    (_, true) => Located::Tombstone,
+                    (Some(record), false) => Located::Row {
+                        imported: matches!(record.content, Content::Imported(_)),
+                    },
+                    (None, false) => Located::Absent,
+                };
+                (id.clone(), located)
+            })
+            .collect()
     }
 
     /// The label definitions as last synced, in id order.

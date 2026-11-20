@@ -2,7 +2,7 @@ id = "search"
 title = "Search: a Gmail query to message and thread ids"
 summary = "A read-only driver call that sends the host's query string to Gmail's own search through the quota gate and returns one page of ids, each marked with what the mirror holds for it; it parses no query, builds no index, caches nothing and writes nothing."
 roadmap = ["R9"]
-status = "approved"
+status = "in_progress"
 design = "docs/features/search.md"
 # No hard dependency. Soft links, none needed to build this:
 #   threads (R7) hydrates thread hits; prioritise (S1) bumps a hit whose body is
@@ -41,6 +41,11 @@ role = "Costs: messages.list 5, threads.list 10"
 path = "crates/mailtide/src/engine.rs"
 change = "modify"
 role = "Ignore Searched: it never answers an engine command"
+
+[[file]]
+path = "crates/mailtide-sim/src/lib.rs"
+change = "modify"
+role = "Its Gmail refuses a search request: the engine never issues one, so search is not simulated (it has no state)"
 
 [[file]]
 path = "crates/mailtide/src/mirror.rs"

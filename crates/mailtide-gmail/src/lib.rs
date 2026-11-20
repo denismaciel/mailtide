@@ -15,3 +15,4 @@ pub mod headers;
 pub mod http;
 pub mod push;
 pub mod request;
+pub mod search;

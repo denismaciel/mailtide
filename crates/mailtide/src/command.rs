@@ -110,4 +110,8 @@ pub enum GmailRequest {
     /// `messages.modify` or `batchModify` for one group of identical label
     /// changes (phase 6).
     Modify(ModifyGroup),
+    /// `messages.list` or `threads.list` with the host's query: one page of
+    /// a search. Issued by the driver (`Runner::search`), never by the
+    /// engine; answered with [`crate::event::EventKind::Searched`].
+    Search(crate::search::SearchRequest),
 }

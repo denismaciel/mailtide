@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::command::GmailRequest;
 use crate::ids::{AccountId, Timestamp};
+use crate::search::SearchScope;
 
 /// Gmail quota units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,6 +44,10 @@ pub fn cost(request: &GmailRequest) -> QuotaUnits {
         GmailRequest::Modify(group) => match u32::try_from(group.messages.len()) {
             Ok(n) if n < BATCH_MODIFY_THRESHOLD => 5 * n,
             _ => 50,
+        },
+        GmailRequest::Search(request) => match request.scope {
+            SearchScope::Messages => 5,
+            SearchScope::Threads => 10,
         },
     })
 }
@@ -302,6 +307,17 @@ mod tests {
             }),
             QuotaUnits(60)
         );
+    }
+
+    #[test]
+    fn search_costs_follow_gmails_quota_table() {
+        let search = |scope| {
+            let query = crate::search::SearchQuery::new("from:alice");
+            let account = AccountId("a@example.com".into());
+            GmailRequest::Search(query.request(&account, scope).expect("a request"))
+        };
+        assert_eq!(cost(&search(SearchScope::Messages)), QuotaUnits(5));
+        assert_eq!(cost(&search(SearchScope::Threads)), QuotaUnits(10));
     }
 
     fn account(name: &str) -> AccountId {

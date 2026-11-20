@@ -8,6 +8,7 @@ use mailtide::gmail::{
 };
 use mailtide::ids::{HistoryId, LabelId, MessageId, PageToken, ThreadId, Timestamp};
 use mailtide::labels::LabelSet;
+use mailtide::search::{ListedHits, SearchListing, SearchScope, ThreadHit};
 use serde::Deserialize;
 
 /// A response body that isn't what Gmail documents.
@@ -260,6 +261,67 @@ pub fn message_raw(body: &[u8]) -> Result<RawMessage, DecodeError> {
     })
 }
 
+// ------------------------------------------------------------ search
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireThreadEntry {
+    id: String,
+    history_id: Option<Number>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSearch {
+    #[serde(default)]
+    messages: Vec<WireListEntry>,
+    #[serde(default)]
+    threads: Vec<WireThreadEntry>,
+    result_size_estimate: Option<Number>,
+    next_page_token: Option<String>,
+}
+
+/// A page of `messages.list` or `threads.list` with `q`: the ids in
+/// Gmail's order, `resultSizeEstimate` and `nextPageToken`. Gmail sends
+/// the estimate on every page, an empty one included (it leaves out the
+/// list), so a body without it is not a page and is refused: an answer
+/// that is not a page must never read as "no hits". A thread's snippet is
+/// ignored; its `historyId` is kept when present.
+pub fn search(scope: SearchScope, body: &[u8]) -> Result<SearchListing, DecodeError> {
+    let wire: WireSearch = json(body)?;
+    let estimate = wire
+        .result_size_estimate
+        .ok_or(DecodeError::MissingField("resultSizeEstimate"))?
+        .parse("resultSizeEstimate")?;
+    let hits = match scope {
+        SearchScope::Messages => ListedHits::Messages(
+            wire.messages
+                .into_iter()
+                .map(|m| (MessageId(m.id), ThreadId(m.thread_id)))
+                .collect(),
+        ),
+        SearchScope::Threads => ListedHits::Threads(
+            wire.threads
+                .into_iter()
+                .map(|t| {
+                    Ok(ThreadHit {
+                        thread_id: ThreadId(t.id),
+                        history_id: t
+                            .history_id
+                            .map(|h| h.parse("threads[].historyId").map(HistoryId))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<_, DecodeError>>()?,
+        ),
+    };
+    Ok(SearchListing {
+        hits,
+        estimate,
+        next_page_token: wire.next_page_token.map(PageToken),
+    })
+}
+
 // ------------------------------------------------------------ account
 
 #[derive(Deserialize)]
@@ -419,5 +481,62 @@ mod tests {
             watch(br#"{"historyId":"1","expiration":"1700000000000"}"#),
             Ok(Timestamp(1_700_000_000_000))
         );
+    }
+
+    #[test]
+    fn a_thread_search_page_decodes_ids_and_history_ids() {
+        let page = search(
+            SearchScope::Threads,
+            br#"{"threads":[
+                {"id":"t1","snippet":"Hello there","historyId":"812"},
+                {"id":"t2","snippet":"x"}
+              ],
+              "nextPageToken":"n2","resultSizeEstimate":201}"#,
+        )
+        .expect("decodes");
+        assert_eq!(
+            page.hits,
+            ListedHits::Threads(vec![
+                ThreadHit {
+                    thread_id: ThreadId("t1".into()),
+                    history_id: Some(HistoryId(812)),
+                },
+                ThreadHit {
+                    thread_id: ThreadId("t2".into()),
+                    history_id: None,
+                },
+            ])
+        );
+        assert_eq!(page.estimate, 201);
+        assert_eq!(page.next_page_token, Some(PageToken("n2".into())));
+    }
+
+    #[test]
+    fn a_search_answer_that_is_not_a_page_is_refused() {
+        for body in [
+            &b"not json"[..],
+            b"[]",
+            b"{}",
+            br#"{"messages":[]}"#,
+            br#"{"error":{"code":400,"message":"Invalid"}}"#,
+            br#"{"messages":[{"id":"m1"}],"resultSizeEstimate":1}"#,
+            br#"{"resultSizeEstimate":"many"}"#,
+        ] {
+            assert!(
+                search(SearchScope::Messages, body).is_err(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert!(
+            search(
+                SearchScope::Threads,
+                br#"{"threads":[{"id":"t1","historyId":"x"}],"resultSizeEstimate":1}"#
+            )
+            .is_err()
+        );
+        let empty = search(SearchScope::Messages, br#"{"resultSizeEstimate":0}"#)
+            .expect("an empty page is a page");
+        assert_eq!(empty.hits, ListedHits::Messages(Vec::new()));
     }
 }

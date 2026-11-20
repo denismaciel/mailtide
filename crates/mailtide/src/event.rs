@@ -152,4 +152,12 @@ pub enum EventKind {
         /// The command it answers.
         command: CommandId,
     },
+    /// A page of a search arrived. It answers the driver's direct call,
+    /// never an engine command: the engine ignores it.
+    Searched {
+        /// The command it answers.
+        command: CommandId,
+        /// The page.
+        listing: crate::search::SearchListing,
+    },
 }

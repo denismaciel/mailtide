@@ -27,6 +27,7 @@ pub mod reconcile;
 pub mod retry;
 pub mod revision;
 pub mod schedule;
+pub mod search;
 pub mod state;
 pub mod status;
 pub mod thread;

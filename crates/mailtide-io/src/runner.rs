@@ -22,6 +22,7 @@ use mailtide::quota::{Admission, Priority};
 use mailtide::retry::{Backoff, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::revision::{AckOutcome, ConsumerList, ConsumerName, FeedPosition, Retention};
 use mailtide::schedule::TimerKind;
+use mailtide::search::SearchScope;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status, TrackOutcome};
 use mailtide::thread::ThreadView;
 use mailtide::{Engine, EngineConfig};
@@ -131,6 +132,11 @@ fn request_kind(request: &GmailRequest) -> &'static str {
         GmailRequest::ListLabels => "list_labels",
         GmailRequest::Watch => "watch",
         GmailRequest::Modify(_) => "modify",
+        // The request kind only: never the query, its label ids or hits.
+        GmailRequest::Search(search) => match search.scope {
+            SearchScope::Messages => "search_messages",
+            SearchScope::Threads => "search_threads",
+        },
     }
 }
 
@@ -1275,6 +1281,8 @@ where
                 expiration,
             }),
             GmailRequest::Modify(_) => Ok(EventKind::LabelsModified { command }),
+            GmailRequest::Search(search) => decode::search(search.scope, body)
+                .map(|listing| EventKind::Searched { command, listing }),
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
@@ -1387,7 +1395,8 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::GetMessage { .. }
         | GmailRequest::ImportMessage { .. }
         | GmailRequest::ListLabels
-        | GmailRequest::Watch => false,
+        | GmailRequest::Watch
+        | GmailRequest::Search(_) => false,
     }
 }
 
