@@ -245,7 +245,8 @@ class Runner:
     ) -> ChangePage | StateTooOld:
         """Feed entries after state string ``since`` (``None``: from the start), or
         ``StateTooOld`` if that state was compacted away. A page holds at most
-        ``limit`` entries (at most 5,000) and may end inside a commit; continue
+        ``limit`` entries (at most 5,000), ending at the last commit boundary that
+        fits; only a commit larger than ``limit`` is split across pages. Continue
         from ``page.next`` while ``page.has_more``."""
         return await self._core.changes(account, since, limit)
 

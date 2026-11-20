@@ -155,9 +155,13 @@ def test_a_large_commit_pages_within_the_limit() -> None:
         assert all(len(page.changes) <= 7 for page in pages)
         discovered = [c.id for c in entries(pages) if isinstance(c, mailtide.MessageDiscovered)]
         assert sorted(discovered) == [f"m{n:02}" for n in range(40)]
-        # Every `next` is a state string; some point inside a commit.
+        # Every `next` is a state string; some point inside the commit that
+        # discovered the mailbox, each from a page that commit fills alone.
         assert all(STATE.fullmatch(page.next) for page in pages)
-        assert any(page.next.count(".") == 2 for page in pages)
+        inside = [page for page in pages if page.next.count(".") == 2]
+        assert inside
+        for page in inside:
+            assert len(page.changes) == 7 and len({c.state for c in page.changes}) == 1
         # The identities are those of one unbounded read.
         whole = entries(read_to_end(runner, None, 5_000))
         assert [(c.state, c.index) for c in entries(pages)] == [(c.state, c.index) for c in whole]
@@ -186,15 +190,17 @@ def test_compacting_through_a_mid_commit_position_keeps_the_rest() -> None:
     with FakeGmail() as gmail:
         runner, _ = bootstrapped(gmail, 10)
         whole = entries(read_to_end(runner, None, 5_000))
-        # The first page ends inside a commit.
-        read = 1 + next(n for n, c in enumerate(whole) if c.state != whole[0].state)
-        page = runner.changes(ACCOUNT, limit=read)
+        # Read the first commit whole, then 3 entries of the next, larger one.
+        first = sum(1 for c in whole if c.state == whole[0].state)
+        page = runner.changes(ACCOUNT, limit=first)
+        assert isinstance(page, mailtide.ChangePage) and page.next.count(".") == 1
+        page = runner.changes(ACCOUNT, since=page.next, limit=3)
         assert isinstance(page, mailtide.ChangePage)
         assert page.next.count(".") == 2 and page.has_more
-        # Only the whole commits before the reader's go.
-        before = sum(1 for c in page.changes if c.state != page.changes[-1].state)
-        assert runner.compact(ACCOUNT, page.next) == before > 0
+        # Only the whole commit before the reader's goes.
+        assert runner.compact(ACCOUNT, page.next) == first
         rest = entries(read_to_end(runner, page.next, 500))
+        read = first + 3
         assert [(c.state, c.index) for c in rest] == [(c.state, c.index) for c in whole[read:]]
         too_old = runner.changes(ACCOUNT)
         assert isinstance(too_old, mailtide.StateTooOld)

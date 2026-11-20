@@ -28,7 +28,7 @@ use mailtide::outbox::{ActionRequest, Intent, IntentOp, plan_delivery};
 use mailtide::quota::Priority;
 use mailtide::reconcile::ListScope;
 use mailtide::revision::{
-    Change, ChangeEntry, ChangeFeed, ChangePage, FeedCursor, MAX_FEED_PAGE, StateSeq,
+    Change, ChangeEntry, ChangeFeed, ChangePage, FeedCursor, StateSeq, cut_page, page_window,
 };
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{
@@ -1099,42 +1099,40 @@ impl SqlStore {
         since: FeedCursor,
         limit: u32,
     ) -> Result<ChangePage, StoreError> {
-        // One keyset read on the log's key, for the page and one entry more:
-        // the extra entry says whether more are waiting and whether the
-        // page's last commit is finished (commits are written whole, so none
-        // of its entries can appear later). A commit position reads after
-        // every entry of its commit.
-        let limit = limit.clamp(1, MAX_FEED_PAGE);
-        let mut rows = sqlx::query(
+        // One keyset read on the log's key for the page's window (`limit`
+        // entries and one more, which says where the last commit in the
+        // window ends): the page is cut from it at the last commit boundary
+        // within `limit`. A commit position reads after every entry of its
+        // commit.
+        let rows = sqlx::query(
             "SELECT seq, idx, change FROM mailtide_changes
              WHERE account = $1 AND (seq, idx) > ($2, $3) ORDER BY seq, idx LIMIT $4",
         )
         .bind(account.as_str())
         .bind(int("since", since.seq.0)?)
         .bind(since.entry.map_or(i64::MAX, i64::from))
-        .bind(i64::from(limit) + 1)
+        .bind(i64::from(page_window(limit)))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| unavailable(&e))?;
-        let extra = if rows.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
-            rows.pop()
-        } else {
-            None
-        };
-        let following = extra
+        let window = rows
+            .iter()
             .map(|row| {
                 let seq: i64 = row.try_get("seq").map_err(|e| corrupt("seq", e))?;
-                uint("seq", seq).map(StateSeq)
+                let idx: i64 = row.try_get("idx").map_err(|e| corrupt("idx", e))?;
+                Ok((
+                    StateSeq(uint("seq", seq)?),
+                    u32::try_from(idx).map_err(|e| corrupt("idx", e))?,
+                ))
             })
-            .transpose()?;
-        let mut changes = Vec::with_capacity(rows.len());
-        for row in rows {
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let cut = cut_page(&window, limit);
+        let mut changes = Vec::with_capacity(cut.take);
+        for (row, (state, index)) in rows.iter().zip(window).take(cut.take) {
             let change: String = row.try_get("change").map_err(|e| corrupt("change", e))?;
-            let seq: i64 = row.try_get("seq").map_err(|e| corrupt("seq", e))?;
-            let idx: i64 = row.try_get("idx").map_err(|e| corrupt("idx", e))?;
             changes.push(ChangeEntry {
-                state: StateSeq(uint("seq", seq)?),
-                index: u32::try_from(idx).map_err(|e| corrupt("idx", e))?,
+                state,
+                index,
                 change: parse::<Change>("change", &change)?,
                 content: None,
             });
@@ -1152,15 +1150,13 @@ impl SqlStore {
                 entry.content = contents.remove(id);
             }
         }
-        let next = changes.last().map_or(since, |last| {
-            FeedCursor::read_through(last.state, last.index, following != Some(last.state))
-        });
+        let next = cut.next.unwrap_or(since);
         Ok(ChangePage {
             generation: 0,
             head: next.seq,
             changes,
             next,
-            has_more: following.is_some(),
+            has_more: cut.has_more,
         })
     }
 

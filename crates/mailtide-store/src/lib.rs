@@ -96,8 +96,9 @@ pub trait Store: Send + Sync {
     ) -> impl Future<Output = Result<ClaimOutcome, StoreError>> + Send;
 
     /// The change feed after `since`: at most `limit` entries (clamped to
-    /// `1..=MAX_FEED_PAGE`, see [`mailtide::revision`]), in `(state, index)`
-    /// order, a page ending inside a commit when the commit is larger; or
+    /// `1..=MAX_FEED_PAGE`), in `(state, index)` order, ending at the last
+    /// commit boundary within `limit` and inside a commit only when that
+    /// commit alone is larger (see [`mailtide::revision::cut_page`]); or
     /// `TooOld` if entries after `since` were compacted away (it is behind
     /// the floor, or inside the floor commit).
     fn changes(

@@ -782,7 +782,18 @@ async fn read_all<S: Store>(
     since: FeedCursor,
     limit: u32,
 ) -> Result<(Vec<ChangeEntry>, Vec<usize>), String> {
-    let (mut entries, mut sizes, mut since) = (Vec::new(), Vec::new(), since);
+    let (entries, sizes, _) = read_pages(store, since, limit).await?;
+    Ok((entries, sizes))
+}
+
+/// Like [`read_all`], also returning each page's `next`.
+async fn read_pages<S: Store>(
+    store: &S,
+    since: FeedCursor,
+    limit: u32,
+) -> Result<(Vec<ChangeEntry>, Vec<usize>, Vec<FeedCursor>), String> {
+    let (mut entries, mut sizes, mut nexts, mut since) =
+        (Vec::new(), Vec::new(), Vec::new(), since);
     loop {
         let page = store
             .changes(&account(), since, limit)
@@ -790,10 +801,11 @@ async fn read_all<S: Store>(
             .map_err(|e| format!("{e:?}"))
             .and_then(page)?;
         sizes.push(page.changes.len());
+        nexts.push(page.next);
         entries.extend(page.changes);
         since = page.next;
         if !page.has_more {
-            return Ok((entries, sizes));
+            return Ok((entries, sizes, nexts));
         }
     }
 }
@@ -886,8 +898,28 @@ async fn commit_positions_read_as_before<S: Store>(store: &S) -> Result<(), Stri
             "a page that reads to the head ends on its commit",
         )?;
     }
-    // Where the limit falls on a commit boundary, the pages and positions
-    // are the ones a whole-commit reader saw.
+    // No commit is larger than the limit: every page holds whole commits
+    // and every position is a commit position, as before. Where the limit
+    // falls on a commit boundary the pages are the ones a whole-commit reader
+    // saw; elsewhere a page now ends at the last boundary before the limit
+    // (the old rule went past it to finish the commit).
+    for limit in [3, 4, 5, 6] {
+        let (entries, sizes, nexts) = read_pages(store, StateSeq(0).into(), limit).await?;
+        expect(
+            discovered(&entries) == ["a", "b", "c", "d", "e", "f"]
+                && nexts.iter().all(|next| next.entry.is_none()),
+            &format!("limit {limit}: whole commits, commit positions"),
+        )?;
+        let expected: &[usize] = match limit {
+            3 => &[3, 3],
+            4 | 5 => &[4, 2],
+            _ => &[6],
+        };
+        expect(
+            sizes == expected,
+            &format!("limit {limit}: pages {sizes:?}"),
+        )?;
+    }
     let page_one = store
         .changes(&account(), StateSeq(0).into(), 4)
         .await
@@ -917,8 +949,10 @@ async fn compaction_keeps_a_commit_a_reader_is_inside<S: Store>(store: &S) -> Re
     let first = discover(store, &snapshot, 0, &["a"]).await?;
     let second = discover(store, &snapshot, 1, &["b", "c", "d"]).await?;
     discover(store, &snapshot, 2, &["e"]).await?;
+    // The second commit is larger than the limit: the reader is split
+    // inside it.
     let reading = store
-        .changes(&account(), StateSeq(0).into(), 2)
+        .changes(&account(), first.into(), 2)
         .await
         .map_err(|e| format!("{e:?}"))
         .and_then(page)?;
@@ -927,7 +961,7 @@ async fn compaction_keeps_a_commit_a_reader_is_inside<S: Store>(store: &S) -> Re
         inside
             == FeedCursor {
                 seq: second,
-                entry: Some(0),
+                entry: Some(1),
             },
         "the reader is inside the second commit",
     )?;
@@ -942,7 +976,7 @@ async fn compaction_keeps_a_commit_a_reader_is_inside<S: Store>(store: &S) -> Re
     expect(removed == 1, "only the first commit is removed")?;
     let (rest, _) = read_all(store, inside, 100).await?;
     expect(
-        discovered(&rest) == ["c", "d", "e"],
+        discovered(&rest) == ["d", "e"],
         "the reader continues where it was",
     )?;
     store

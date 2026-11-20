@@ -294,7 +294,7 @@ mod _core {
     }
 
     /// Changes to the mirror after a state string: at most the call's
-    /// `limit`, and a page may end inside a commit.
+    /// `limit`, whole commits unless one commit alone is larger.
     #[pyclass(frozen, get_all)]
     struct ChangePage {
         /// The changes, oldest first: `MessageDiscovered`, `MessageImported`,

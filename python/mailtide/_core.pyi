@@ -123,10 +123,10 @@ class StateTooOld:
 
 @final
 class ChangePage:
-    """At most ``limit`` entries; a page may end inside a commit."""
+    """At most ``limit`` entries: whole commits, unless one alone is larger."""
 
     changes: list[Change]
-    next: str  # opaque: pass to changes() or compact(); may point inside a commit
+    next: str  # opaque; inside a commit only when that commit is larger than limit
     has_more: bool
 
 @final

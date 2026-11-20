@@ -88,11 +88,12 @@ Fields are hex, as today. The decoder accepts both; anything else is
 commit boundary, so:
 
 - strings stored by consumers decode to exactly the position they named;
-- a two-field string passed back means the whole commit, as before, and a
-  page that ends on a commit boundary returns one; a page ends inside a
-  commit wherever its `limit` falls there (not only in commits larger than
-  the limit), so a consumer meets three-field strings whenever its pages and
-  commits do not line up;
+- a consumer that never meets a commit larger than its `limit` never sees a
+  three-field string: its pages hold whole commits, as before, and only a
+  page that one commit fills on its own ends inside it. Such a page ends at
+  the last commit boundary within `limit`, where the old rule ran past the
+  limit to the end of the commit; where `limit` falls on a boundary, the
+  pages and `next` are the old ones;
 - an entry's `state` (the commit it belongs to) stays two-field, so
   `(state, index)` identities recorded for deduplication stay valid.
 
@@ -105,12 +106,18 @@ commit boundary, so:
    `since.entry` is `Some`: compaction removes whole commits, so a reader
    inside the floor commit has lost the rest of it. `oldest` is the floor, a
    commit position, as today.
-3. Take the first `limit + 1` entries strictly after `since` in
-   `(seq, idx)` order. The page is the first `limit`; `has_more` is whether
-   the extra one exists.
-4. `next` is the last entry returned, written as the commit form if the extra
-   entry is absent or belongs to another commit. An empty page returns
-   `since`.
+3. Read the window: the first `limit + 1` entries strictly after `since` in
+   `(seq, idx)` order. An entry of it ends its commit when the next entry of
+   the window belongs to another commit, or when the window has no next
+   entry because the log ends (commits are written whole).
+4. The page ends at the last entry within the first `limit` that ends its
+   commit, and `next` is that commit, in the two-field form. Only when none
+   does (the first commit after `since`, or the rest of the one `since` is
+   inside, is larger than `limit`) is the commit split: the page is the first
+   `limit` entries and `next` the last of them, in the three-field form.
+   Following pages continue inside the commit until it is finished, then
+   return to boundaries. `has_more` is whether the window holds entries past
+   the page. An empty page returns `since`.
 5. `MessageImported` entries of the page are hydrated with the stored
    content, as on `main`.
 
@@ -139,13 +146,17 @@ entry instead of from the start of the page.
   of a commit, nor commit `S+1` before `S`. The page is read by a single
   statement.
 - The log is append-only; nothing is ever inserted before an existing entry.
-- A page is the first `limit` entries after the cursor in a total order and
-  `next` is the last of them, so consecutive pages tile the log.
+- A page is a prefix of the entries after the cursor in a total order (never
+  empty while entries remain) and `next` is its last entry, so consecutive
+  pages tile the log.
 - Compaction removes whole commits and only raises the floor; rule 2 turns
   the one case where a reader's remaining entries were removed into
   `StateTooOld` instead of a silent gap.
-- Rule 4 can call a commit finished only when no later entry of it exists.
-  Commits are atomic, so none can appear afterwards.
+- Rule 3 can call a commit finished only when no later entry of it exists.
+  Commits are atomic, so none can appear afterwards. Finding the last
+  boundary needs no query beyond the window: the extra entry tells whether
+  the `limit`-th entry ends its commit, and every earlier one is followed by
+  an entry of the window.
 
 ### Compaction
 
@@ -161,7 +172,7 @@ The floor stays one number, so no schema change.
 | | Whole commits (today) | Bounded (this plan) |
 |---|---|---|
 | Statements | 1 account read + 3 + ⌈imports ÷ 500⌉ | 1 account read + 1 + ⌈imports in page ÷ 500⌉ |
-| Rows returned | the whole commit | ≤ `limit` (+1 probed) |
+| Rows returned | the whole commit | ≤ `limit` + 1 (the window) |
 | Default page (`limit` 500) | unbounded | ≤ 3 statements, ≤ 500 entries |
 | Largest page (`limit` 5,000) | unbounded | ≤ 12 statements |
 
@@ -210,13 +221,21 @@ wrong page. Reverting:
 DELETE FROM mailtide_schema WHERE version = <this migration>;
 ```
 
-Nothing in the database is lost. A consumer holding a three-field position
-must first read on with the new build until `next` is a commit boundary (a
+Nothing in the database is lost. Three-field positions arise only for a
+commit larger than the consumer's `limit` (the commit that ends a
+reconciliation of a mailbox with more messages than that, or a large batch
+of imports), and only until the consumer has read through it. A consumer
+holding one must first read on with the new build until `next` is a commit boundary (a
 two-field string again), or rebuild as after `StateTooOld` (D4). Two-field
 positions mean the same in every build.
 
 ## 4. Alternatives rejected
 
+- **Cut every page at its limit, wherever it falls**: simpler (no boundary
+  search) and pages always full, but positions would be inside commits in
+  ordinary operation, a consumer applying a page in one transaction would see
+  states no commit produced, and rolling back to an older build would strand
+  most consumers. Pages end at the last boundary that fits instead (D7).
 - **Split large commits when they are written** (`FinishReconcile` in
   batches): the finish must move the cursor and settle every row atomically
   (I1, I4); the feed should not shape the write path.
@@ -242,13 +261,17 @@ No reference suite is declared. jmap-client has no `/changes` test, the
 pinned Stalwart tree ships no test files beside its changes code, and Zero
 has no feed. The JMAP behaviour is cited from the RFC.
 
-Own tests (21), in four layers:
+Own tests (24), in four layers:
 
 - **Core** (`revision.rs`, `mirror.rs`): the codec both ways, old strings,
   malformed strings, cursor order; a page never exceeds its limit; an
   exhaustive check over small logs and limits that pages concatenate to the
-  log with the identities of one unbounded read; boundary normalisation;
-  commits appended between pages; too-old inside the floor commit; clamping.
+  log with the identities of one unbounded read, and that no position is
+  inside a commit unless one commit filled the page alone; where a page ends
+  (the last boundary within the limit, a commit of exactly the limit, a
+  commit larger than it split and resumed until paging returns to
+  boundaries); boundary normalisation; commits appended between pages;
+  too-old inside the floor commit; clamping.
 - **Store conformance** (memory, SQLite, Postgres): `whole_commit_pages` and
   `large_import_commits` assert the behaviour being removed and are replaced
   by `pages_split_inside_a_commit` and `a_large_commit_arrives_in_bounded_pages`
@@ -279,8 +302,19 @@ Own tests (21), in four layers:
   the feature, and a second mode doubles the conformance surface. Consumers
   apply entries one at a time; no entry depends on another of its commit
   arriving in the same page. *Would change it:* a consumer that must apply a
-  commit atomically; then `ChangePage` gains a flag saying whether it ends
-  inside a commit, and that consumer reads on until it does not.
+  commit atomically even when it is larger than any page it can hold; then
+  `ChangePage` gains a flag saying whether it ends inside a commit, and that
+  consumer reads on until it does not.
+- **D7. A page ends at the last commit boundary within `limit`; a commit is
+  split only when it alone is larger than `limit`.** Consumers often apply a
+  page in one transaction, and a commit is the engine's atomic unit: whole
+  commits keep states no commit produced out of sight, and positions stay
+  two-field in ordinary operation, which keeps a rollback to an older build
+  trivial for most consumers. Pages are uneven (a small commit before one
+  that does not fit ends a short page); `limit` stays the hard bound. The
+  window of `limit + 1` entries is enough to find the boundary, so a page is
+  still one keyset statement. *Would change it:* consumers that want full
+  pages and never apply commits as units.
 - **D2. The position names the last entry read; the short form is kept for
   commit boundaries.** It reuses the identity consumers already see and keeps
   old strings byte-identical. *Would change it:* nothing foreseeable.
@@ -289,8 +323,8 @@ Own tests (21), in four layers:
   low megabytes and under a dozen statements. A caller that asked for more
   gets `has_more`. *Would change it:* a measured need for larger pages.
 - **D4. No downgrade path for three-field strings; older builds are kept
-  out by the schema version.** The strings exist only while a consumer's
-  last page ended inside a commit. Writing them in a form an older
+  out by the schema version.** The strings exist only while a consumer is
+  inside a commit larger than its limit. Writing them in a form an older
   build could misread as a commit boundary would skip entries; a refusal at
   startup, and an error if one is decoded anyway, are the safe failures.
   *Would change it:* a host that must roll back under load; it can drain to

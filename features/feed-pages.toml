@@ -1,6 +1,6 @@
 id = "feed-pages"
 title = "Feed pages bounded by `limit`, also inside a commit"
-summary = "A feed position can name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`), so `changes(account, since, limit)` never returns more than `limit` entries; state strings already persisted keep their meaning; no table or column changes, only a version-only migration."
+summary = "Pages of `changes(account, since, limit)` hold at most `limit` entries, ending at the last commit boundary that fits; a commit larger than `limit` is split, and a feed position can then name an entry inside it (`mt2-<gen>.<seq>.<idx>`); state strings already persisted keep their meaning; no table or column changes, only a version-only migration."
 roadmap = ["R6"]
 status = "done"
 design = "docs/features/feed-pages.md"
@@ -11,12 +11,12 @@ depends_on = []
 [[file]]
 path = "crates/mailtide/src/revision.rs"
 change = "modify"
-role = "FeedCursor (a commit, or an entry inside one) and its order; FeedPosition carries it and encodes the third field; ChangePage.next becomes a FeedCursor; MAX_FEED_PAGE"
+role = "FeedCursor (a commit, or an entry inside one) and its order; FeedPosition carries it and encodes the third field; ChangePage.next becomes a FeedCursor; MAX_FEED_PAGE; cut_page, the page rule every store shares (the last commit boundary within `limit`, a split only for a commit larger than it)"
 
 [[file]]
 path = "crates/mailtide/src/mirror.rs"
 change = "modify"
-role = "AccountMirror::changes and ::feed page by cursor and stop at `limit`; an entry's index is counted from its commit's first entry, not from the page; TooOld also for a cursor inside the floor commit"
+role = "AccountMirror::changes and ::feed page by cursor and cut pages with cut_page; an entry's index is counted from its commit's first entry, not from the page; TooOld also for a cursor inside the floor commit"
 
 [[file]]
 path = "crates/mailtide/src/invariants.rs"
@@ -53,7 +53,7 @@ role = "Pass the cursor through to the mirror"
 [[file]]
 path = "crates/mailtide-store/src/sql.rs"
 change = "modify"
-role = "One keyset query on (seq, idx) for limit + 1 rows replaces the three whole-commit queries; content hydration is bounded by the page. The next migration is a version-only step (no statement of its own): it keeps a build that cannot decode a three-field state string away from the database"
+role = "One keyset query on (seq, idx) for the limit + 1 window, cut with cut_page, replaces the three whole-commit queries; content hydration is bounded by the page. The next migration is a version-only step (no statement of its own): it keeps a build that cannot decode a three-field state string away from the database"
 
 [[file]]
 path = "crates/mailtide-store/src/conformance.rs"
@@ -156,6 +156,11 @@ name = "cursors_order_by_commit_then_entry_with_the_whole_commit_last"
 covers = "(S, entry i) < (S, entry i+1) < (S, whole) < (S+1, entry 0): the order every store's comparison must match"
 
 [[test]]
+target = "crates/mailtide/src/revision.rs"
+name = "pages_end_at_the_last_commit_boundary_within_the_limit"
+covers = "cut_page: commits of 3 and 2 with limit 4 give a page of 3 (not 4 ending inside the second); a limit on a boundary takes both; a commit of exactly the limit is one page; a first commit larger than the limit is split; the rest of a split commit plus whole commits ends on a boundary; has_more; the limit + 1 window and clamping"
+
+[[test]]
 target = "crates/mailtide/src/mirror.rs"
 name = "a_page_never_exceeds_its_limit"
 covers = "A commit of 7 entries read with limit 3 arrives as 3 + 3 + 1; has_more is true until the last page"
@@ -163,7 +168,17 @@ covers = "A commit of 7 entries read with limit 3 arrives as 3 + 3 + 1; has_more
 [[test]]
 target = "crates/mailtide/src/mirror.rs"
 name = "pages_of_every_limit_concatenate_to_the_log"
-covers = "Exhaustive over small logs (commit sizes 0 to 4, up to 4 commits) and limits 1 to 6: reading to the end yields every entry once, in order, with the identities a single unbounded read gives"
+covers = "Exhaustive over small logs (commit sizes 0 to 4, up to 4 commits) and limits 1 to 6: reading to the end yields every entry once, in order, with the identities a single unbounded read gives; a position is inside a commit only after a full page of that one commit, and never when no commit exceeds the limit"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_commit_of_exactly_the_limit_is_one_page"
+covers = "Two commits of 3 read with limit 3: one page each, both ending on the commit position"
+
+[[test]]
+target = "crates/mailtide/src/mirror.rs"
+name = "a_split_commit_resumes_then_pages_return_to_boundaries"
+covers = "Commits of 1, 7, 2, 2 with limit 4 arrive as 1 | 4 (inside) | 3 (rest, stopping at the boundary within the limit) | 4, with has_more until the last"
 
 [[test]]
 target = "crates/mailtide/src/mirror.rs"
@@ -210,12 +225,12 @@ covers = "An import whose message was deleted before the page was read has conte
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
 name = "commit_positions_read_as_before"
-covers = "A consumer that only ever passes commit positions (the old state strings) gets from each exactly the commits after it, as before; where its limit falls on a commit boundary its pages and `next` are the ones it saw before the change (elsewhere a page now ends inside a commit)"
+covers = "A consumer that only ever passes commit positions (the old state strings) and a limit no commit exceeds gets from each exactly the commits after it and only whole-commit pages with two-field `next`, for limits 3 to 6; where the limit falls on a boundary the pages and `next` are the old ones (elsewhere the page ends at the last boundary before the limit, where the old rule ran past it)"
 
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
 name = "compaction_keeps_a_commit_a_reader_is_inside"
-covers = "Compacting through the commit before a mid-commit cursor removes only earlier commits and the reader continues; compacting through the cursor's commit makes it TooOld with `oldest` at that commit"
+covers = "A commit larger than the limit splits the reader inside it. Compacting through the commit before a mid-commit cursor removes only earlier commits and the reader continues; compacting through the cursor's commit makes it TooOld with `oldest` at that commit"
 
 [[test]]
 target = "crates/mailtide-store/src/conformance.rs"
@@ -227,7 +242,7 @@ covers = "apply and admit between two pages of one commit: no entry skipped or r
 [[test]]
 target = "tests/test_feed.py"
 name = "test_a_large_commit_pages_within_the_limit"
-covers = "FakeGmail mailbox of 40 messages bootstrapped, changes(limit=7) to the end: no page above 7, ids discovered equal the mailbox, `next` strings parse back"
+covers = "FakeGmail mailbox of 40 messages bootstrapped, changes(limit=7) to the end: no page above 7, ids discovered equal the mailbox, `next` strings parse back; a three-field `next` only after a full page of one commit"
 
 [[test]]
 target = "tests/test_feed.py"
@@ -244,4 +259,4 @@ covers = "compact(account, next) with `next` inside a commit removes only whole 
 [[test]]
 target = "crates/mailtide-sim/src/lib.rs"
 name = "a_feed_reader_with_random_limits_sees_the_whole_log"
-covers = "During every seeded run a reader takes one page of a random limit (1 to 8) between steps, across crashes, rebuilds and admissions; at the end its entries equal the mirror's log entry for entry (FeedPagesDiverged otherwise)"
+covers = "During every seeded run a reader takes one page of a random limit (1 to 8) between steps, across crashes, rebuilds and admissions; at the end its entries equal the mirror's log entry for entry (FeedPagesDiverged otherwise); a page ending inside a commit must be a full page of that one commit"

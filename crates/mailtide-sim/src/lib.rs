@@ -269,7 +269,8 @@ pub struct Stats {
     pub opens: u64,
     /// Imports those opens raised to the Foreground class.
     pub raised: u64,
-    /// Feed pages the reader took that ended inside a commit.
+    /// Feed pages the reader took that ended inside a commit (one larger
+    /// than the page's limit).
     pub feed_pages_split: u64,
 }
 
@@ -699,8 +700,9 @@ impl FeedReader {
         }
     }
 
-    /// Take one page: whether more are waiting. A page above its limit is
-    /// a divergence.
+    /// Take one page: whether more are waiting. A page above its limit, or
+    /// one that ends inside a commit it does not fill alone, is a
+    /// divergence.
     fn take_page(&mut self, mirror: &AccountMirror, stats: &mut Stats) -> Result<bool, Violation> {
         let limit = u32::try_from(self.rng.below(8) + 1).unwrap_or(1);
         let page = mirror.changes(self.at, limit);
@@ -710,7 +712,21 @@ impl FeedReader {
                 page.changes.len()
             )));
         }
+        // A page ends inside a commit only when that commit alone fills it.
         if page.next.entry.is_some() {
+            if page.changes.len() != usize::try_from(limit).unwrap_or(usize::MAX)
+                || page
+                    .changes
+                    .iter()
+                    .any(|entry| entry.state != page.next.seq)
+            {
+                return Err(self.diverged(format!(
+                    "a page of {} entries with limit {limit} ends inside commit {:?} \
+                     without being filled by it",
+                    page.changes.len(),
+                    page.next.seq
+                )));
+            }
             stats.feed_pages_split += 1;
         }
         self.read.extend(

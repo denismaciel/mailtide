@@ -146,9 +146,10 @@ The store keeps, per account:
   changed since state S" [J]. Entries are numbered within their commit, and
   a state string names how far a consumer read: `mt2-<gen>.<seq>` is commit
   `seq` and everything before it, `mt2-<gen>.<seq>.<idx>` everything through
-  entry `idx` of commit `seq` (fields hex). A page that ends inside a commit
-  returns the three-field form; one that ends on a commit boundary returns
-  the two-field form, which means what it always did. An import
+  entry `idx` of commit `seq` (fields hex). Pages end on commit boundaries,
+  so `next` is the two-field form, which means what it always did; only a
+  commit larger than the page's limit is split, and `next` inside it is the
+  three-field form. An import
   entry is read together with the envelope its message row holds (header
   facts and blob) instead of keeping a copy in the log: a message's content
   never changes in Gmail, so the row matches the entry, and older entries
@@ -516,11 +517,14 @@ engine's epoch, so results meant for a dead engine are ignored).
   unfenced writes for users' actions (§7.1) and opened messages (§6.4).
 - `changes(account, since: FeedCursor, limit)`: the change feed
   (`ChangeFeed::Page` of `ChangeEntry { state, index, change, content }`, or
-  `TooOld` after compaction). A page is the first `limit` entries after
-  `since` in `(state, index)` order (`limit` clamped to `1..=MAX_FEED_PAGE`,
-  5,000), so it may end inside a commit; `next` is its last entry, as the
-  whole commit when that entry ends it (or `since` for an empty page), and
-  `has_more` says whether more follow. `TooOld` when `since` is behind the
+  `TooOld` after compaction). The store reads the first `limit + 1` entries
+  after `since` in `(state, index)` order (`limit` clamped to
+  `1..=MAX_FEED_PAGE`, 5,000) in one keyset statement, and the page ends at
+  the last commit boundary among the first `limit` (`next` is that commit).
+  Only when none is there, because the first commit after `since` (or the
+  rest of the one it is inside) is larger than `limit`, is the commit split:
+  the page is its first `limit` entries and `next` the last of them. An
+  empty page returns `since`; `has_more` says whether more follow. `TooOld` when `since` is behind the
   floor or inside the floor commit (compaction removes whole commits).
   `content` is the stored content of a `MessageImported` entry's message,
   loaded for the page's imports in chunks of ids, `None` once it is
@@ -579,8 +583,10 @@ runner per process, after forking:
   they changed) means: read them again;
 - `await changes(account, since, limit=500) -> ChangePage | StateTooOld`:
   at most `limit` entries per page (at most 5,000), continuing from
-  `page.next` while `page.has_more`; `next` may point inside a commit, and
-  every state string stored before still resumes where it did. Typed entries,
+  `page.next` while `page.has_more`. Pages hold whole commits, ending at the
+  last boundary that fits; only a commit larger than `limit` is split, and
+  `next` then points inside it. Every state string stored before still
+  resumes where it did. Typed entries,
   each with a stable `(state, index)` identity: `MessageDiscovered`,
   `MessageImported` (once per message, with its labels then, e.g. `SENT`, its
   blob, and `content`: the `MessageContent` `messages` returns, so a message
@@ -637,7 +643,9 @@ Migration 5 has no statement of its own: it raises the version because
 state strings may now name an entry inside a commit (`mt2-<gen>.<seq>.<idx>`,
 §4), which a build from before it cannot decode, so such a build sees the
 database as `ahead` and refuses to sync (its `changes` raises `ValueError`
-for such a string, never a wrong page). Reverting loses nothing:
+for such a string, never a wrong page). Such strings arise only while a
+consumer reads through a commit larger than its `limit`. Reverting loses
+nothing:
 
 ```sql
 DELETE FROM mailtide_schema WHERE version = 5;

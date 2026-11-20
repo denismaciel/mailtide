@@ -26,7 +26,7 @@ use crate::outbox::{self, ActionRequest, Delivery, Intent, IntentOp, IntentState
 use crate::quota::Priority;
 use crate::reconcile::{ListScope, ReconcileProgress, ReconcileReason};
 use crate::retry::Cooldown;
-use crate::revision::{Change, ChangePage, FeedCursor, MAX_FEED_PAGE, StateSeq};
+use crate::revision::{Change, ChangePage, FeedCursor, StateSeq, cut_page, page_window};
 use crate::state::{StoreSnapshot, SyncState};
 
 /// A message as a store holds it.
@@ -1492,16 +1492,17 @@ impl AccountMirror {
     }
 
     /// Changes after `since` (no compaction check; see [`Self::feed`]): at
-    /// most `limit` (clamped to `1..=MAX_FEED_PAGE`), and a page may end
-    /// inside a commit. An entry's index counts from its commit's first
-    /// entry, wherever the page starts.
+    /// most `limit` (clamped to `1..=MAX_FEED_PAGE`), ending at the last
+    /// commit boundary within it, inside a commit only when that commit is
+    /// larger than `limit` (see [`crate::revision::cut_page`]). An entry's
+    /// index counts from its commit's first entry, wherever the page starts.
     #[must_use]
     pub fn changes(&self, since: FeedCursor, limit: u32) -> ChangePage {
-        let limit = usize::try_from(limit.clamp(1, MAX_FEED_PAGE)).unwrap_or(usize::MAX);
+        let window = usize::try_from(page_window(limit)).unwrap_or(usize::MAX);
         // The log is in commit order: start at the first entry of `since`'s
         // commit and number entries from there.
         let first = self.log.partition_point(|(seq, _)| *seq < since.seq);
-        let mut entries = self.log[first..]
+        let entries: Vec<_> = self.log[first..]
             .iter()
             .scan(
                 None,
@@ -1519,14 +1520,17 @@ impl AccountMirror {
                     seq: *seq,
                     entry: Some(*index),
                 } > since
-            });
-        let page: Vec<_> = entries.by_ref().take(limit).collect();
-        let following = entries.next().map(|(seq, _, _)| seq);
-        let next = page.last().map_or(since, |(seq, index, _)| {
-            FeedCursor::read_through(*seq, *index, following != Some(*seq))
-        });
-        let changes = page
+            })
+            .take(window)
+            .collect();
+        let identities: Vec<_> = entries
+            .iter()
+            .map(|(seq, index, _)| (*seq, *index))
+            .collect();
+        let cut = cut_page(&identities, limit);
+        let changes = entries
             .into_iter()
+            .take(cut.take)
             .map(|(state, index, change)| crate::revision::ChangeEntry {
                 state,
                 index,
@@ -1538,8 +1542,8 @@ impl AccountMirror {
             generation: self.record.generation,
             head: self.seq,
             changes,
-            next,
-            has_more: following.is_some(),
+            next: cut.next.unwrap_or(since),
+            has_more: cut.has_more,
         }
     }
 }
@@ -1551,6 +1555,7 @@ mod tests {
     use crate::ids::{CommitId, ENGINE_VERSION, LabelId};
     use crate::labels::set;
     use crate::quota::Priority;
+    use crate::revision::MAX_FEED_PAGE;
 
     fn account() -> AccountId {
         AccountId("alice@example.com".into())
@@ -2063,15 +2068,15 @@ mod tests {
         mirror: &AccountMirror,
         since: FeedCursor,
         limit: u32,
-    ) -> (Vec<crate::revision::ChangeEntry>, Vec<usize>) {
-        let (mut entries, mut sizes, mut since) = (Vec::new(), Vec::new(), since);
+    ) -> (Vec<crate::revision::ChangeEntry>, Vec<ChangePage>) {
+        let (mut entries, mut pages, mut since) = (Vec::new(), Vec::new(), since);
         loop {
             let page = mirror.changes(since, limit);
-            sizes.push(page.changes.len());
+            pages.push(page.clone());
             entries.extend(page.changes);
             since = page.next;
             if !page.has_more {
-                return (entries, sizes);
+                return (entries, pages);
             }
         }
     }
@@ -2128,12 +2133,72 @@ mod tests {
             for limit in 1..=6 {
                 let (entries, pages) = read_all(&mirror, start(), limit);
                 assert_eq!(entries, whole.changes, "{sizes:?} with limit {limit}");
-                assert!(
-                    pages.iter().all(|&n| n <= limit as usize),
-                    "{sizes:?} with limit {limit}: {pages:?}"
-                );
+                for page in &pages {
+                    let n = page.changes.len();
+                    assert!(n <= limit as usize, "{sizes:?} with limit {limit}");
+                    // Inside a commit only as a full page of one commit
+                    // larger than the limit.
+                    if page.next.entry.is_some() {
+                        let size = sizes[usize::try_from(page.next.seq.0).unwrap_or(0) - 1];
+                        assert!(
+                            n == limit as usize
+                                && size > n
+                                && page.changes.iter().all(|e| e.state == page.next.seq),
+                            "{sizes:?} with limit {limit}: {page:?}"
+                        );
+                    }
+                }
+                // The promise: no commit above the limit, no position
+                // inside one.
+                if sizes.iter().all(|&size| size <= limit as usize) {
+                    assert!(
+                        pages.iter().all(|page| page.next.entry.is_none()),
+                        "{sizes:?} with limit {limit}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_commit_of_exactly_the_limit_is_one_page() {
+        let (mirror, states) = logged(&[3, 3]);
+        let first = mirror.changes(start(), 3);
+        assert_eq!(first.changes.len(), 3);
+        assert_eq!(first.next, FeedCursor::from(states[0]));
+        assert!(first.has_more);
+        let second = mirror.changes(first.next, 3);
+        assert_eq!(second.next, FeedCursor::from(states[1]));
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn a_split_commit_resumes_then_pages_return_to_boundaries() {
+        // Commits of 1, 7, 2, 2 with limit 4: the first page ends before
+        // the large commit, which is split 4 + 3; its rest ends a page that
+        // stops at the boundary within the limit, then whole commits.
+        let (mirror, states) = logged(&[1, 7, 2, 2]);
+        let (_, pages) = read_all(&mirror, start(), 4);
+        let shape: Vec<_> = pages.iter().map(|p| (p.changes.len(), p.next)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (1, FeedCursor::from(states[0])),
+                (
+                    4,
+                    FeedCursor {
+                        seq: states[1],
+                        entry: Some(3),
+                    }
+                ),
+                (3, FeedCursor::from(states[1])),
+                (4, FeedCursor::from(states[3])),
+            ]
+        );
+        assert_eq!(
+            pages.iter().map(|p| p.has_more).collect::<Vec<_>>(),
+            vec![true, true, true, false]
+        );
     }
 
     #[test]

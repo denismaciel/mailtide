@@ -33,16 +33,6 @@ pub struct FeedCursor {
 }
 
 impl FeedCursor {
-    /// The cursor after reading entry `index` of commit `seq`: the whole
-    /// commit when that entry is its last.
-    #[must_use]
-    pub fn read_through(seq: StateSeq, index: u32, last_of_commit: bool) -> Self {
-        Self {
-            seq,
-            entry: (!last_of_commit).then_some(index),
-        }
-    }
-
     /// The last commit wholly behind the cursor: what a consumer holding it
     /// can compact through (the commit itself, or the one before when the
     /// cursor is inside it).
@@ -93,6 +83,62 @@ impl PartialOrd for FeedCursor {
 /// The most entries one page of the feed holds; a larger `limit` is clamped
 /// to it (the caller continues from `next`).
 pub const MAX_FEED_PAGE: u32 = 5_000;
+
+/// How many entries a store reads for a page of `limit`: the limit (clamped
+/// to `1..=MAX_FEED_PAGE`) and one more, which says where the page's last
+/// commit ends.
+#[must_use]
+pub fn page_window(limit: u32) -> u32 {
+    limit.clamp(1, MAX_FEED_PAGE) + 1
+}
+
+/// Where a page ends ([`cut_page`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCut {
+    /// How many entries of the window the page holds.
+    pub take: usize,
+    /// The position after them; `None` for an empty page (the caller's
+    /// position stands).
+    pub next: Option<FeedCursor>,
+    /// Whether entries follow the page.
+    pub has_more: bool,
+}
+
+/// Cut a page from `window`, the `(state, index)` of the first
+/// [`page_window`]`(limit)` entries after the reader's position (fewer at the
+/// end of the log): the page ends at the last commit boundary within `limit`
+/// entries, so it holds whole commits (or the rest of the commit the reader
+/// is inside). Only when no boundary fits, because the first commit (or its
+/// rest) is larger than `limit`, is it split: the page is its first `limit`
+/// entries and `next` points inside it.
+///
+/// An entry ends its commit when the window's next entry belongs to another
+/// commit, or when the window ends before `limit + 1` entries: commits are
+/// written whole, so none of its entries can appear later.
+#[must_use]
+pub fn cut_page(window: &[(StateSeq, u32)], limit: u32) -> PageCut {
+    let limit = usize::try_from(limit.clamp(1, MAX_FEED_PAGE)).unwrap_or(usize::MAX);
+    let ends_commit = |i: usize| window.get(i + 1).is_none_or(|next| next.0 != window[i].0);
+    let within = window.len().min(limit);
+    let (take, next) = match (0..within).rev().find(|&i| ends_commit(i)) {
+        Some(last) => (last + 1, Some(FeedCursor::from(window[last].0))),
+        None => match within.checked_sub(1) {
+            None => (0, None),
+            Some(last) => (
+                within,
+                Some(FeedCursor {
+                    seq: window[last].0,
+                    entry: Some(window[last].1),
+                }),
+            ),
+        },
+    };
+    PageCut {
+        take,
+        next,
+        has_more: window.len() > take,
+    }
+}
 
 /// A position in a specific incarnation of an account's change log: the
 /// account's generation (new each time it is tracked) and how far into it.
@@ -198,8 +244,8 @@ mod tests {
         };
         assert_eq!(boundary.encode(), old, "byte for byte the old string");
         assert_eq!(
-            FeedCursor::read_through(StateSeq(0xbeef), 3, true),
-            boundary.at,
+            cut_page(&[(StateSeq(0xbeef), 0), (StateSeq(0xbeef), 1)], 5).next,
+            Some(boundary.at),
             "reading a commit's last entry reaches the commit boundary"
         );
     }
@@ -265,6 +311,56 @@ mod tests {
         assert!(FeedCursor::from(StateSeq(4)).is_compacted(s));
         assert_eq!(entry(s, 2).compactable(), StateSeq(4));
         assert_eq!(FeedCursor::from(s).compactable(), s);
+    }
+
+    /// A window of commits of these sizes (from entry 0 of the first).
+    fn window(sizes: &[(u64, u32)]) -> Vec<(StateSeq, u32)> {
+        sizes
+            .iter()
+            .flat_map(|&(seq, size)| (0..size).map(move |i| (StateSeq(seq), i)))
+            .collect()
+    }
+
+    #[test]
+    fn pages_end_at_the_last_commit_boundary_within_the_limit() {
+        let cut = |window: &[(StateSeq, u32)], limit| {
+            let cut = cut_page(window, limit);
+            (cut.take, cut.next, cut.has_more)
+        };
+        let whole = |seq| Some(FeedCursor::from(StateSeq(seq)));
+        let inside = |seq, entry| {
+            Some(FeedCursor {
+                seq: StateSeq(seq),
+                entry: Some(entry),
+            })
+        };
+        // Commits of 3 and 2 with limit 4 (window 5): the first commit only,
+        // not 4 entries ending inside the second.
+        assert_eq!(cut(&window(&[(1, 3), (2, 2)]), 4), (3, whole(1), true));
+        // The limit on a boundary: both commits.
+        assert_eq!(
+            cut(&window(&[(1, 3), (2, 1), (3, 1)]), 4),
+            (4, whole(2), true)
+        );
+        // A commit of exactly the limit is one page.
+        assert_eq!(cut(&window(&[(1, 4), (2, 1)]), 4), (4, whole(1), true));
+        assert_eq!(cut(&window(&[(1, 4)]), 4), (4, whole(1), false));
+        // No boundary fits: the first commit is larger than the limit.
+        assert_eq!(cut(&window(&[(1, 5)]), 4), (4, inside(1, 3), true));
+        // The rest of a commit a reader is inside (entries 4 to 6), then a
+        // whole commit: back to boundaries.
+        let rest: Vec<_> = (4..7)
+            .map(|i| (StateSeq(1), i))
+            .chain(window(&[(2, 1), (3, 3)]))
+            .collect();
+        assert_eq!(cut(&rest, 4), (4, whole(2), true));
+        // The end of the log: everything left, no more.
+        assert_eq!(cut(&window(&[(1, 2), (2, 1)]), 4), (3, whole(2), false));
+        assert_eq!(cut(&[], 4), (0, None, false));
+        // Clamped: limit 0 reads one entry.
+        assert_eq!(page_window(0), 2);
+        assert_eq!(page_window(u32::MAX), MAX_FEED_PAGE + 1);
+        assert_eq!(cut(&window(&[(1, 2)]), 0), (1, inside(1, 0), true));
     }
 
     #[test]
@@ -403,7 +499,8 @@ pub struct ChangePage {
     /// The log's newest position.
     pub head: StateSeq,
     /// Changes after the requested position, oldest first: at most the
-    /// page's limit, and a page may end inside a commit.
+    /// page's limit, whole commits unless one commit alone is larger (see
+    /// [`cut_page`]).
     pub changes: Vec<ChangeEntry>,
     /// The position to ask from next: the last entry returned (the whole
     /// commit when it was the commit's last), or the requested position
