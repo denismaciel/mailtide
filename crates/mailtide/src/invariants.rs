@@ -7,8 +7,9 @@
 
 use crate::commit::{Commit, CommitOutcome};
 use crate::ids::{HistoryId, MessageId};
-use crate::jobs::{JobKind, JobState};
+use crate::jobs::{JobKind, JobOp, JobState};
 use crate::mirror::{AccountMirror, Content};
+use crate::quota::Priority;
 
 /// An invariant that doesn't hold, with its evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +46,16 @@ pub enum Violation {
     MissingImportJob {
         /// The message.
         message: MessageId,
+    },
+    /// Outside a claim's finish, a job's class went down (a user's raise,
+    /// SPEC §6.4, was lost).
+    PriorityLowered {
+        /// The job.
+        job: JobKind,
+        /// Before.
+        before: Priority,
+        /// After.
+        after: Priority,
     },
     /// I9: the mirror differs from Gmail after faults healed.
     NotConverged {
@@ -94,6 +105,16 @@ pub fn check_commit(
             after: a,
         });
     }
+    let finished: Vec<&JobKind> = commit
+        .claim
+        .iter()
+        .map(|claim| &claim.kind)
+        .chain(commit.jobs.iter().filter_map(|op| match op {
+            JobOp::Finish { claim, .. } => Some(&claim.kind),
+            JobOp::Enqueue(_) => None,
+        }))
+        .collect();
+    violations.extend(lowered(before, after, &finished));
     for (id, record) in &after.messages {
         if let (Some(old), Some(new)) = (
             before.messages.get(id).and_then(|r| r.checkpoint),
@@ -109,6 +130,34 @@ pub fn check_commit(
     }
     violations.extend(check_state(after));
     violations
+}
+
+/// Check an unfenced raise of opened messages' imports
+/// ([`AccountMirror::prioritise`]): no class goes down, and every state
+/// invariant still holds.
+#[must_use]
+pub fn check_prioritise(before: &AccountMirror, after: &AccountMirror) -> Vec<Violation> {
+    let mut violations = lowered(before, after, &[]);
+    violations.extend(check_state(after));
+    violations
+}
+
+/// Jobs present before and after whose class went down, except `finished`
+/// (a finish may remove a job that a later op re-creates afresh).
+fn lowered(before: &AccountMirror, after: &AccountMirror, finished: &[&JobKind]) -> Vec<Violation> {
+    after
+        .jobs
+        .iter()
+        .filter(|(kind, _)| !finished.contains(kind))
+        .filter_map(|(kind, job)| {
+            let old = before.jobs.get(kind)?;
+            (job.priority < old.priority).then(|| Violation::PriorityLowered {
+                job: kind.clone(),
+                before: old.priority,
+                after: job.priority,
+            })
+        })
+        .collect()
 }
 
 /// Check what must hold in every state.

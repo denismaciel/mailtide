@@ -2,7 +2,7 @@ id = "prioritise"
 title = "Prioritise: fetch a message a user opened ahead of the backlog"
 summary = "`Runner.prioritise(account, message_ids)` raises the queued body imports of those messages to the Foreground class in one unfenced store write, bounded per call and per account; the import still runs as the same durable job and the feed's `MessageImported` entry says when the body is there."
 roadmap = ["S1"]
-status = "in_progress"
+status = "done"
 design = "docs/features/prioritise.md"
 depends_on = []
 
@@ -95,6 +95,11 @@ role = "Python cases against the fake Gmail"
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
 role = "UserOp::HostOpen: a user opens a mirrored message at a random step"
+
+[[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "Total the opens and raised imports across seeds"
 
 [[file]]
 path = "SPEC.md"
@@ -254,4 +259,4 @@ covers = "UserOp::HostOpen in the random op mix (also during bootstrap, reconcil
 [[test]]
 target = "crates/mailtide-sim/src/lib.rs"
 name = "an_opened_message_is_imported_within_a_bounded_number_of_imports"
-covers = "Scripted: 200 messages pending at Backfill, open the oldest; it is imported before more than JOB_CONCURRENCY other imports complete"
+covers = "Scripted: 200 messages discovered with their imports queued at Backfill; open the one the backlog would import last (the simulator's clock stands still while listing, so ties run in id order and the oldest is not last); it is imported before more than JOB_CONCURRENCY other imports complete"

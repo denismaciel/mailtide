@@ -1,6 +1,6 @@
 # Prioritise: fetch a message a user opened ahead of the backlog
 
-Plan: `features/prioritise.toml` (roadmap S1). Status: planned.
+Plan: `features/prioritise.toml` (roadmap S1). Status: done.
 
 ## 1. Goal and scope
 
@@ -256,8 +256,10 @@ already passing against the fenced path. This plan adds 22 own tests:
   report for imported and unknown ids and the `ValueError`.
 - **Simulator** (2): `UserOp::HostOpen` in the random mix on every seed, with
   the new class-never-lowered check, I5, I6 and convergence; and a scripted
-  run where the oldest of 200 pending messages is opened and must be imported
-  before more than `JOB_CONCURRENCY` others.
+  run where, of 200 discovered messages, the one the backlog would import
+  last is opened and must be imported before more than `JOB_CONCURRENCY`
+  others. (Not the oldest: the simulator's clock stands still while it
+  lists, so queued imports tie on due time and run in id order.)
 
 ## 6. Slices
 

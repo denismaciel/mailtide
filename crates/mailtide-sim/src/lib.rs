@@ -207,6 +207,13 @@ pub enum UserOp {
         /// Act on the message's whole thread.
         whole_thread: bool,
     },
+    /// The user opens the n-th mirrored message whose body isn't there yet
+    /// (or, if every body is, any mirrored message): the host calls
+    /// `prioritise`, a store write outside the engine.
+    HostOpen {
+        /// Which message, among those the mirror shows.
+        pick: usize,
+    },
 }
 
 /// Whether the mirror converged once faults healed.
@@ -256,6 +263,10 @@ pub struct Stats {
     pub label_edits: u64,
     /// `labels.list` calls Gmail answered.
     pub label_listings: u64,
+    /// Messages users opened in the host.
+    pub opens: u64,
+    /// Imports those opens raised to the Foreground class.
+    pub raised: u64,
 }
 
 /// The outcome of one run.
@@ -478,7 +489,7 @@ impl Gmail {
             }
             UserOp::Relabel { pick, label } => self.relabel(*pick, label),
             // Goes through the engine, not straight to Gmail.
-            UserOp::HostAction { .. } => {}
+            UserOp::HostAction { .. } | UserOp::HostOpen { .. } => {}
             UserOp::Delete { pick } => {
                 let ids: Vec<MessageId> = self.messages.keys().cloned().collect();
                 if ids.is_empty() {
@@ -796,6 +807,10 @@ impl Sim {
             self.host_action(pick, action, whole_thread);
             return;
         }
+        if let UserOp::HostOpen { pick } = op {
+            self.host_open(pick);
+            return;
+        }
         if matches!(
             op,
             UserOp::CreateLabel | UserOp::RenameLabel { .. } | UserOp::DeleteLabel { .. }
@@ -842,6 +857,40 @@ impl Sim {
         self.deliver(EventKind::ActionRequested { action: request });
     }
 
+    fn host_open(&mut self, pick: usize) {
+        let pending: Vec<&MessageId> = self
+            .mirror
+            .messages
+            .values()
+            .filter(|record| record.content == Content::Pending)
+            .map(|record| &record.id)
+            .collect();
+        let visible: Vec<&MessageId> = if pending.is_empty() {
+            self.mirror.messages.keys().collect()
+        } else {
+            pending
+        };
+        if visible.is_empty() {
+            return;
+        }
+        let id = visible[pick % visible.len()].clone();
+        self.stats.opens += 1;
+        let before = self.mirror.clone();
+        let report = self.mirror.prioritise(&[id], self.now);
+        let raised = self
+            .mirror
+            .foreground_imports()
+            .saturating_sub(before.foreground_imports());
+        self.stats.raised += u64::try_from(raised).unwrap_or(u64::MAX);
+        self.note(&format!("open {report:?}"));
+        for violation in invariants::check_prioritise(&before, &self.mirror) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+    }
+
     fn random_action(&mut self) -> Action {
         match self.rng.below(11) {
             0 => Action::SetRead(ReadState::Read),
@@ -867,6 +916,9 @@ impl Sim {
     fn random_op(&mut self) -> UserOp {
         let pick = self.rng.below(1_000);
         if self.rng.below(4) == 0 {
+            if self.rng.below(3) == 0 {
+                return UserOp::HostOpen { pick };
+            }
             let action = self.random_action();
             return UserOp::HostAction {
                 pick,
@@ -1230,6 +1282,8 @@ fn build_engine(mirror: &mut AccountMirror) -> Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailtide::engine::JOB_CONCURRENCY;
+    use mailtide::quota::Priority;
 
     #[test]
     fn probabilities_must_be_valid() {
@@ -1265,6 +1319,85 @@ mod tests {
                 println!("violation {violation:?}");
             }
         }
+    }
+
+    #[test]
+    fn opening_messages_never_breaks_the_invariants() {
+        // Other seeds than the general campaign: opens happen in every
+        // phase, beside crashes, expiries and rate limits.
+        let results: Vec<RunResult> = (200..400).map(|seed| run(seed, 400)).collect();
+        let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
+        assert!(
+            failures.is_empty(),
+            "{} failing seeds, first: {:#?}",
+            failures.len(),
+            failures.first()
+        );
+        let opens: u64 = results.iter().map(|r| r.stats.opens).sum();
+        let raised: u64 = results.iter().map(|r| r.stats.raised).sum();
+        assert!(
+            opens > 0 && raised > 0,
+            "{opens} opens raised {raised} imports"
+        );
+    }
+
+    #[test]
+    fn an_opened_message_is_imported_within_a_bounded_number_of_imports() {
+        const MESSAGES: usize = 200;
+        let mut sim = Sim::new(Rng(11), Faults::none(), Some(Vec::new()));
+        while sim.gmail.messages.len() < MESSAGES {
+            sim.gmail.apply(&UserOp::Receive { thread: None });
+        }
+        let start = sim.engine.start(sim.now);
+        sim.pending.extend(start);
+        let advance = |sim: &mut Sim| {
+            sim.step += 1;
+            assert!(sim.step < 100_000, "the simulation stalled");
+            sim.advance();
+        };
+        while sim.mirror.messages.len() < MESSAGES {
+            advance(&mut sim);
+        }
+        let imported = |sim: &Sim| {
+            sim.mirror
+                .messages
+                .values()
+                .filter(|r| matches!(r.content, Content::Imported(_)))
+                .count()
+        };
+        // The simulator's clock stands still while listing, so queued
+        // imports tie on due time and run in id order: open the one the
+        // backlog would import last.
+        let backlog: Vec<(Timestamp, &MessageId)> = sim
+            .mirror
+            .jobs
+            .values()
+            .filter_map(|job| match (&job.kind, &job.state, job.priority) {
+                (JobKind::Import(id), JobState::Ready { due_at }, Priority::Backfill) => {
+                    Some((*due_at, id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(backlog.len() > 50, "{} queued at Backfill", backlog.len());
+        let opened = backlog
+            .iter()
+            .max()
+            .map(|(_, id)| (*id).clone())
+            .expect("a backlog");
+        let report = sim
+            .mirror
+            .prioritise(std::slice::from_ref(&opened), sim.now);
+        assert_eq!(report.queued, vec![opened.clone()]);
+        let before = imported(&sim);
+        while sim.mirror.messages[&opened].content == Content::Pending {
+            advance(&mut sim);
+        }
+        let others = imported(&sim) - before - 1;
+        assert!(
+            others <= JOB_CONCURRENCY as usize,
+            "{others} other imports completed first"
+        );
     }
 
     #[test]

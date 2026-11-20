@@ -622,9 +622,11 @@ Wheels: abi3 for CPython ≥ 3.12, plus free-threaded 3.14t and 3.15t.
 
 Status: unit tests per rule; the simulator (`mailtide-sim`) runs the real
 engine and the shared mirror rules against a fake Gmail with swarm-sampled
-faults, including users acting through the engine and label definitions
+faults, including users acting through the engine, users opening messages
+whose bodies are still queued (`prioritise`, §6.4), and label definitions
 created, renamed and deleted in Gmail, and checks invariants after every
-commit and convergence after healing, label definitions within the refresh
+commit and every open (also that no job's class goes down outside a claim's
+finish) and convergence after healing, label definitions within the refresh
 interval (CI: 500 seeds × 1,000 steps; locally 3,000 seeds). Zero's suites
 are ported by name and tracked by `scripts/zero_tests.py`. Python tests drive
 the real `Runner` against a fake Gmail over HTTP.

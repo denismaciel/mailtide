@@ -18,6 +18,8 @@ fn main() {
         totals.deliveries += result.stats.deliveries;
         totals.label_edits += result.stats.label_edits;
         totals.label_listings += result.stats.label_listings;
+        totals.opens += result.stats.opens;
+        totals.raised += result.stats.raised;
         if !result.passed() {
             failed += 1;
             println!(
