@@ -2,7 +2,7 @@ id = "delivery-retries"
 title = "Retry and failure classes of Gmail writes and batches"
 summary = "No new feature: test coverage for behaviour the engine already has. Two reference suites test how a failed Gmail write is classified and retried (a quota deferral, a rate limit with Retry-After, revoked credentials, network and server errors, an invalid request, throttled parts of a batch); this plan maps each onto an existing mailtide test, plans the missing delivery-level tests, and marks the HTTP batch tests not applicable."
 roadmap = []
-status = "in_progress"
+status = "done"
 design = "docs/features/delivery-retries.md"
 # Nothing to build first: every path tested here exists on `main`.
 depends_on = []

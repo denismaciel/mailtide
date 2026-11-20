@@ -1,6 +1,6 @@
 # Retry and failure classes of Gmail writes and batches
 
-Plan: `features/delivery-retries.toml` (no roadmap id). Status: planned.
+Plan: `features/delivery-retries.toml` (no roadmap id). Status: done.
 
 ## 1. Goal and scope
 

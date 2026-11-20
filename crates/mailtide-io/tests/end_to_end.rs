@@ -2,6 +2,7 @@
 //! building, decoding, quota gate, blob writes and store commits.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,10 +17,11 @@ use mailtide::mirror::Content;
 use mailtide::outbox::{Action, ActionRequest, ReadState};
 use mailtide::quota::{Admission, Budget, Lease, Priority, QuotaUnits};
 use mailtide::retry::Cooldown;
-use mailtide::state::SyncPhase;
+use mailtide::state::{SyncPhase, SyncState};
 use mailtide::thread::ThreadView;
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
-use mailtide_io::auth::{AccessToken, StaticTokens};
+use mailtide_io::Clock;
+use mailtide_io::auth::{AccessToken, CachedTokens, StaticTokens, TokenError, TokenSource};
 use mailtide_io::blobs::{BlobStore, ObjectBlobs, blob_key};
 use mailtide_io::quota_gate::{GateError, LocalGate, QuotaGate};
 use mailtide_io::runner::{Access, RunError, Runner, RunnerConfig, StopReason, WatchMode};
@@ -43,6 +45,9 @@ struct Mailbox {
     /// Every raw fetch (an import), in order.
     raw_fetches: Vec<String>,
     modified: u32,
+    /// Answer this many more `messages.modify` calls 401, as Gmail does for
+    /// a token that expired between minting and use.
+    expired_tokens: u32,
 }
 
 impl Mailbox {
@@ -197,6 +202,15 @@ impl GmailTransport for FakeGmail {
                     ok(&body)
                 }
             },
+            ["messages", _, "modify"] if mailbox.expired_tokens > 0 => {
+                mailbox.expired_tokens -= 1;
+                HttpResponse {
+                    status: 401,
+                    headers: Vec::new(),
+                    body: br#"{"error":{"code":401,"message":"Invalid Credentials","errors":[{"reason":"authError"}]}}"#
+                        .to_vec(),
+                }
+            }
             ["messages", id, "modify"] => {
                 let body: serde_json::Value =
                     serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).expect("json");
@@ -223,8 +237,17 @@ fn runner(
             expires_at: Timestamp(i64::MAX),
         },
     )]));
+    runner_for(gmail, tokens, &[account()])
+}
+
+/// A runner tracking `accounts`, with `tokens` as its token source.
+fn runner_for<T: GmailTransport, A: TokenSource>(
+    gmail: T,
+    tokens: A,
+    accounts: &[AccountId],
+) -> Runner<MemoryStore, ObjectBlobs, T, LocalGate, A> {
     Runner::new(
-        MemoryStore::tracking(&[account()]),
+        MemoryStore::tracking(accounts),
         ObjectBlobs::memory(),
         gmail,
         LocalGate::new(Budget::GMAIL_DEFAULT),
@@ -625,4 +648,118 @@ async fn a_thread_action_shows_in_the_thread_view_before_it_is_delivered() {
     assert_eq!(confirmed.unread, admitted_view.unread);
     assert_eq!(confirmed.labels, admitted_view.labels);
     assert_eq!(confirmed.latest, admitted_view.latest);
+}
+
+/// A clock the test moves: the runner never sleeps on it, so work due later
+/// waits for the next run.
+#[derive(Debug, Clone)]
+struct HostClock(Arc<AtomicI64>);
+
+impl HostClock {
+    fn new() -> Self {
+        Self(Arc::new(AtomicI64::new(1_700_000_000_000)))
+    }
+
+    fn clock(&self) -> Clock {
+        let now = Arc::clone(&self.0);
+        Clock::from_fn(move || Timestamp(now.load(Ordering::SeqCst)))
+    }
+
+    fn advance(&self, by: Duration) {
+        let millis = i64::try_from(by.as_millis()).expect("a short advance");
+        self.0.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+/// Mints the test token, counting how often it is asked.
+#[derive(Debug)]
+struct Minting(Arc<AtomicU32>);
+
+impl TokenSource for Minting {
+    async fn token(&self, _account: &AccountId) -> Result<AccessToken, TokenError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(AccessToken {
+            secret: "test-token".into(),
+            expires_at: Timestamp(i64::MAX),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_401_on_a_gmail_call_drops_the_token_and_retries_without_blocking() {
+    let gmail = FakeGmail::default();
+    gmail
+        .0
+        .lock()
+        .expect("lock")
+        .add("m1", &["INBOX", "UNREAD"]);
+    let minted = Arc::new(AtomicU32::new(0));
+    let clock = HostClock::new();
+    let tokens = CachedTokens::new(Minting(Arc::clone(&minted)), Duration::from_secs(60));
+    let runner = runner_for(gmail, tokens, &[account()]).with_clock(clock.clock());
+    let outcome = runner
+        .run(&account(), Duration::from_secs(30))
+        .await
+        .expect("bootstrap");
+    assert!(matches!(outcome.stop, StopReason::Idle { .. }));
+    assert_eq!(minted.load(Ordering::SeqCst), 1, "one token, cached");
+
+    // The cached token has expired by the time the delivery uses it.
+    runner.transport().0.lock().expect("lock").expired_tokens = 1;
+    let archive = ActionRequest::Messages {
+        ids: vec![MessageId("m1".into())],
+        action: Action::Archive,
+    };
+    let outcome = runner
+        .act(&account(), archive, Duration::from_secs(30))
+        .await
+        .expect("act");
+    assert!(
+        matches!(outcome.stop, StopReason::Idle { next: Some(_) }),
+        "{:?}",
+        outcome.stop
+    );
+    assert_eq!(
+        (outcome.report.failed_requests, outcome.report.last_failure),
+        (1, Some("transient"))
+    );
+    assert_eq!(
+        outcome.report.status.expect("status").phase,
+        SyncPhase::Live
+    );
+    assert_eq!(runner.transport().0.lock().expect("lock").modified, 0);
+    let mirror = runner.store().mirror(&account()).expect("mirror");
+    assert_eq!(mirror.record.sync, SyncState::Live, "no block is committed");
+    let view = mirror.view(&MessageId("m1".into())).expect("m1");
+    assert_eq!((view.pending_actions, view.blocked_actions), (1, 0));
+
+    // The retry mints a new token and is accepted.
+    clock.advance(Duration::from_secs(60));
+    let outcome = runner
+        .run(&account(), Duration::from_secs(30))
+        .await
+        .expect("retry");
+    assert!(matches!(outcome.stop, StopReason::Idle { .. }));
+    assert_eq!(
+        minted.load(Ordering::SeqCst),
+        2,
+        "the dropped token is replaced"
+    );
+    {
+        let mailbox = runner.transport().0.lock().expect("lock");
+        assert_eq!(mailbox.modified, 1);
+        assert_eq!(mailbox.messages["m1"].labels, ["UNREAD"]);
+    }
+    let mirror = runner.store().mirror(&account()).expect("mirror");
+    let view = mirror.view(&MessageId("m1".into())).expect("m1");
+    assert_eq!((view.labels, view.pending_actions), (set(["UNREAD"]), 0));
+    assert_eq!(
+        runner
+            .status(&account())
+            .await
+            .expect("status")
+            .expect("tracked")
+            .sync,
+        SyncState::Live
+    );
 }
