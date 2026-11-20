@@ -78,7 +78,8 @@ pub struct Submission {
     pub thread_id: Option<ThreadId>,
     /// The definitive refusal, if any.
     pub refusal: Option<String>,
-    /// Gmail's cooldown, if known.
+    /// When a waiting send is tried again, or the cooldown Gmail gave with
+    /// a refusal.
     pub retry_at: Option<Timestamp>,
 }
 
@@ -246,6 +247,7 @@ impl SubmissionRow {
             Disposition::NotSent(at) => {
                 self.view.state = SubmissionState::Claimed;
                 self.view.confirmation_deadline = None;
+                self.view.retry_at = Some(*at);
                 self.due_at = Some(*at);
             }
             Disposition::Refused { reason, retry_at } => {
@@ -259,6 +261,7 @@ impl SubmissionRow {
                     self.view.thread_id = Some(thread.clone());
                 }
                 self.view.state = SubmissionState::Confirming;
+                self.view.retry_at = None;
                 self.due_at = self.view.confirmation_deadline;
             }
         }

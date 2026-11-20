@@ -274,7 +274,7 @@ fn a_pre_dispatch_deferral_requeues_without_reopening_undo() {
 }
 
 #[test]
-fn an_http_rate_limit_consumes_the_wire_request() {
+fn a_rate_limited_send_waits_out_the_cooldown_and_goes_once() {
     block_on(async {
         let (r, setup) = runner();
         synced(&r).await;
@@ -283,13 +283,23 @@ fn an_http_rate_limit_consumes_the_wire_request() {
             .gmail
             .fail_next("POST messages/send", Fault::Status(429));
         sync(&r).await;
+        // Gmail answered and sent nothing: the send waits, undo stays closed.
         let row = state(&r, &sub).await;
-        assert_eq!(row.state, SubmissionState::Refused);
-        assert!(row.refusal.unwrap().starts_with("429"));
+        assert_eq!(row.state, SubmissionState::Claimed);
+        assert_eq!(row.refusal, None);
         assert!(row.retry_at.is_some());
+        assert_eq!(
+            r.cancel_submission(&account(), &sub.key).await,
+            Err(SendError::CannotUnsend(SubmissionState::Claimed))
+        );
+        assert!(setup.gmail.lock().labelled("SENT").is_empty());
         setup.clock.advance(Duration::from_mins(10));
         sync(&r).await;
-        assert_eq!(sends(&setup), 1);
+        let row = state(&r, &sub).await;
+        assert_eq!(row.state, SubmissionState::Sent);
+        assert_eq!(row.retry_at, None);
+        assert_eq!(sends(&setup), 2);
+        assert_eq!(setup.gmail.lock().labelled("SENT").len(), 1);
     });
 }
 

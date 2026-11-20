@@ -23,6 +23,8 @@ use crate::runner::{Access, CallError, RunError, RunOutcome, Runner, SyncReport}
 use crate::transport::GmailTransport;
 
 const LOCAL_RETRY: Duration = Duration::from_secs(5);
+/// How long a send waits for Gmail's cooldown before it is refused instead.
+const RATE_LIMIT_PATIENCE: Duration = Duration::from_mins(10);
 
 /// Settings for a raw submission.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -564,10 +566,11 @@ where
                         reason: refusal.detail,
                         retry_at: response.retry_at,
                     },
-                    Err(CallError::Retryable(refusal)) => Disposition::Refused {
-                        reason: refusal.detail,
-                        retry_at: response.retry_at,
-                    },
+                    // Only 401, 429 and a rate-limit 403 reach here: Gmail
+                    // answered and applied nothing.
+                    Err(CallError::Retryable(refusal)) => {
+                        rate_limited(refusal.detail, response.retry_at, self.clock.now())
+                    }
                     _ => Disposition::Unanswered,
                 };
                 let refresh = matches!(
@@ -636,9 +639,50 @@ fn write_result(result: Result<SubmissionWritten, StoreError>) -> Result<Submiss
     }
 }
 
+/// Gmail answered a send with a rate limit or an expired token, which sends
+/// nothing. A short cooldown is waited out and the send goes again, with undo
+/// still closed. A long one (a daily sending limit pauses the account for
+/// hours) is refused now, so the host hears of it while it still matters.
+fn rate_limited(reason: String, retry_at: Option<Timestamp>, now: Timestamp) -> Disposition {
+    let at = retry_at.unwrap_or(now).max(now.plus(LOCAL_RETRY));
+    if at.since(now) <= RATE_LIMIT_PATIENCE {
+        Disposition::NotSent(at)
+    } else {
+        Disposition::Refused { reason, retry_at }
+    }
+}
+
 fn local_refusal(reason: &str) -> Disposition {
     Disposition::Refused {
         reason: reason.to_owned(),
         retry_at: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_cooldown_is_waited_out_and_a_long_one_is_refused() {
+        let now = Timestamp(1_000_000);
+        let soon = now.plus(Duration::from_secs(90));
+        let hours = now.plus(Duration::from_hours(3));
+        assert_eq!(
+            rate_limited("429".into(), Some(soon), now),
+            Disposition::NotSent(soon)
+        );
+        // An expired token carries no cooldown: try again shortly.
+        assert_eq!(
+            rate_limited("401".into(), None, now),
+            Disposition::NotSent(now.plus(LOCAL_RETRY))
+        );
+        assert_eq!(
+            rate_limited("429 daily limit".into(), Some(hours), now),
+            Disposition::Refused {
+                reason: "429 daily limit".into(),
+                retry_at: Some(hours),
+            }
+        );
     }
 }

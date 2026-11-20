@@ -137,15 +137,17 @@ leaves it closed to further writes.
 | Disposition | What the job records |
 |---|---|
 | Quota deferral, dispatch budget expired before a write, or explicit `NotSent` proving no HTTP request left | Clear that attempt's marker under its fence. Keep `claimed` with a retry time using the gate's deferral/cooldown, or existing bounded backoff. |
-| Definitive HTTP refusal, including 400, 401, 403, 404, 413 or 429 | `refused`, with Gmail's reason and any returned `retry_at`. A cooldown still applies to other work. |
+| Definitive HTTP refusal: 400, 404, 413, or a 403 that is not a rate limit | `refused`, with Gmail's reason. |
+| Rate limit or expired token: 429, a rate-limit 403, or 401. Gmail answered and sent nothing | Clear that attempt's marker. Keep `claimed` with `retry_at` set to the cooldown and send again then; undo stays closed. If the cooldown is longer than ten minutes (a daily sending limit pauses the account for hours), `refused` with Gmail's reason and `retry_at`, so the host hears of it at once. The cooldown also applies to other work. |
 | Decoded 2xx | `confirming` with the provisional receipt. |
 | Unusable 2xx, 408, 5xx, unexpected response, timeout or disconnect after possible dispatch | `confirming`. |
 | Crash, dropped future or supersession with marker still present | The successor treats it as `confirming` without making a write. |
 | No matching import by the deadline | `unknown` when `run` processes the deadline, including when the account is blocked. |
 | Read-only mode | Admission fails before staging. Previously admitted work that has no dispatch marker is refused locally. Work with a marker can still settle through sync. |
 
-A definitive HTTP response already consumed the wire request. Only proof
-that no HTTP request left allows another pre-dispatch attempt. Credential or
+A refusal ends the submission. Another attempt is made only on proof that
+Gmail sent nothing: no HTTP request left, or Gmail answered with a rate
+limit or an expired token. Credential or
 blob failures before dispatch follow the existing backoff or local refusal
 paths. An account already blocked by sync holds delivery until resumed.
 
@@ -247,6 +249,10 @@ Feed cursors can retain their positions across the deleted entries.
   its report deadline.
 - The run budget bounds dispatch. A request already issued may take up to
   the request timeout, plus bounded quota cleanup.
+- A send that keeps meeting short rate limits is tried again after each
+  cooldown with no overall limit, and cannot be canceled meanwhile.
+- A forward plan fails for a message that carries a zero-byte attachment:
+  an empty part is treated as unreadable.
 
 ### Reply and forward
 
@@ -310,8 +316,9 @@ simulator tests the send state transitions without a new Gmail fault suite.
 1. **Single JSON call.** Build the typed wire request and receipt, quota
    cost and detailed direct-call disposition. Exercise the request,
    decoder and public write guard without enabling delivery. On the
-   detailed response, an explicit refusal with `not_sent = false`
-   consumes the request even if the error class calls for cooldown.
+   detailed response, an explicit refusal with `not_sent = false` is an
+   answer from Gmail; the driver decides from its class whether the
+   submission ends or waits out a cooldown.
 2. **Raw admission and store.** Add key and token reservations, migration
    and its schema assertion, reads, due time, atomic claim/cancel and feed.
    Integrate the draft token reservation with `BeginSend` after drafts

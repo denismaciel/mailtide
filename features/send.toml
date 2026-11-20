@@ -1262,8 +1262,13 @@ covers = "Quota denial or the hard dispatch deadline expires before the request;
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
-name = "an_http_rate_limit_consumes_the_wire_request"
-covers = "A 429 records refusal and retry_at/cooldown; advancing through the cooldown cannot send that submission again"
+name = "a_rate_limited_send_waits_out_the_cooldown_and_goes_once"
+covers = "A 429 sends nothing: the submission stays claimed with retry_at, cannot be canceled, and after the cooldown is sent exactly once"
+
+[[test]]
+target = "crates/mailtide-io/src/send.rs"
+name = "a_short_cooldown_is_waited_out_and_a_long_one_is_refused"
+covers = "A cooldown of up to ten minutes requeues the send; an expired token retries shortly; a longer cooldown (a daily sending limit) is refused with Gmail's reason and retry_at"
 
 [[test]]
 target = "crates/mailtide-io/tests/send.rs"
