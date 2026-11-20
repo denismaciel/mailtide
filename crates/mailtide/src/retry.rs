@@ -145,6 +145,39 @@ impl Backoff {
         let delay = (half + jitter).max(failure.retry_after.unwrap_or_default());
         now.plus(delay)
     }
+
+    /// The pause a rate limit asks of every later request, not only of the
+    /// one that failed: the account's for per-user limits (at least
+    /// [`crate::engine::BANDWIDTH_COOLDOWN`] for the bandwidth cap), the
+    /// project's for project limits, none for a transient failure. The
+    /// engine and the driver's direct calls both use it.
+    #[must_use]
+    pub fn cooldown(
+        &self,
+        failure: &RetryableFailure,
+        account: &crate::ids::AccountId,
+        now: Timestamp,
+        seed: u64,
+    ) -> Option<Cooldown> {
+        let account = QuotaTarget::Account(account.clone());
+        match failure.class {
+            Retryable::AccountRateLimited | Retryable::AccountConcurrency => Some(Cooldown {
+                target: account,
+                until: self.next(1, failure, now, seed),
+            }),
+            Retryable::AccountBandwidth => Some(Cooldown {
+                target: account,
+                until: now.plus(
+                    crate::engine::BANDWIDTH_COOLDOWN.max(failure.retry_after.unwrap_or_default()),
+                ),
+            }),
+            Retryable::ProjectRateLimited => Some(Cooldown {
+                target: QuotaTarget::Project,
+                until: self.next(1, failure, now, seed),
+            }),
+            Retryable::Transient => None,
+        }
+    }
 }
 
 #[cfg(test)]

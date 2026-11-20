@@ -29,9 +29,7 @@ use crate::labels::LabelSet;
 use crate::outbox::{ActionRequest, IntentOp};
 use crate::quota::{self, Priority};
 use crate::reconcile::{ListScope, ReconcileProgress, ReconcileReason, ReconcileStep};
-use crate::retry::{
-    Backoff, Blocking, BlockingFailure, Cooldown, Failure, QuotaTarget, Retryable, RetryableFailure,
-};
+use crate::retry::{Backoff, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use crate::schedule::{self, TimerKind};
 use crate::state::{StoreSnapshot, SyncState, ValidSnapshot};
 use crate::status::{ImportProgress, Status};
@@ -1400,22 +1398,9 @@ impl Engine {
     /// A cooldown for rate limits that apply beyond one request.
     fn cool_down(&mut self, failure: &RetryableFailure, now: Timestamp) -> Vec<Command> {
         let seed = self.jitter_seed();
-        let account = QuotaTarget::Account(self.state.account.clone());
-        let cooldown = match failure.class {
-            Retryable::AccountRateLimited | Retryable::AccountConcurrency => Some(Cooldown {
-                target: account,
-                until: self.backoff.next(1, failure, now, seed),
-            }),
-            Retryable::AccountBandwidth => Some(Cooldown {
-                target: account,
-                until: now.plus(BANDWIDTH_COOLDOWN.max(failure.retry_after.unwrap_or_default())),
-            }),
-            Retryable::ProjectRateLimited => Some(Cooldown {
-                target: QuotaTarget::Project,
-                until: self.backoff.next(1, failure, now, seed),
-            }),
-            Retryable::Transient => None,
-        };
+        let cooldown = self
+            .backoff
+            .cooldown(failure, &self.state.account, now, seed);
         match cooldown {
             Some(cooldown)
                 if self

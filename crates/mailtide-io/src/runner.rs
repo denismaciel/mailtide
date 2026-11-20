@@ -16,8 +16,8 @@ use mailtide::gmail::{ImportedMessage, Label};
 use mailtide::ids::{AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, Timestamp};
 use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
 use mailtide::outbox::ActionRequest;
-use mailtide::quota::Admission;
-use mailtide::retry::{Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
+use mailtide::quota::{Admission, Priority};
+use mailtide::retry::{Backoff, Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::schedule::TimerKind;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, Status, TrackOutcome};
 use mailtide::{Engine, EngineConfig};
@@ -288,12 +288,88 @@ pub enum Checked {
     Failed(&'static str),
 }
 
+/// The quota gate would make a direct call wait past its budget: nothing
+/// was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaDeferred {
+    /// When the gate would admit it, at the earliest.
+    pub until: Timestamp,
+}
+
+/// Why a direct call ([`Runner::call_gmail`]) brought back no answer.
+/// Nothing here is recorded on the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+    /// The request changes the mailbox and the runner is read-only: nothing
+    /// was sent.
+    ReadOnly,
+    /// The quota gate would make it wait past its budget: nothing was sent.
+    Deferred(QuotaDeferred),
+    /// Gmail has no such resource (404). A message get answers
+    /// [`EventKind::MessageNotFound`] instead, as for the engine.
+    NotFound,
+    /// Refused for good, the caller's to report: a 400, a 403 (a missing
+    /// scope or a disabled API is [`Blocking::Account`] with
+    /// `ApiAccessDenied`), an account problem from Gmail or the token
+    /// source, or an answer that does not decode. The account is not
+    /// blocked by it.
+    Refused(BlockingFailure),
+    /// Worth asking again later: a 5xx, a rate limit (the gate is cooled
+    /// down), an expired token, a request that certainly wasn't sent.
+    Retryable(RetryableFailure),
+    /// The request may have reached Gmail and its answer was lost (a
+    /// timeout, a dropped connection): a write may have been applied.
+    OutcomeUnknown(String),
+    /// The runner's own resources failed (the quota gate, blob storage).
+    Run(RunError),
+}
+
+impl From<RunError> for CallError {
+    fn from(error: RunError) -> Self {
+        Self::Run(error)
+    }
+}
+
+impl CallError {
+    /// A stable name for logs (no detail: Gmail's error text can quote
+    /// data).
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Deferred(_) => "deferred",
+            Self::NotFound => failure_kind(&Failure::NotFound),
+            Self::Refused(refusal) => failure_kind(&Failure::Blocking(refusal.clone())),
+            Self::Retryable(failure) => failure_kind(&Failure::Retryable(failure.clone())),
+            Self::OutcomeUnknown(_) => "outcome_unknown",
+            Self::Run(error) => error.code(),
+        }
+    }
+}
+
+/// The command id of a direct call: epoch 0 never matches a live engine.
+const DIRECT_CALL: CommandId = CommandId {
+    epoch: mailtide::ids::Epoch(0),
+    seq: 0,
+};
+
 /// One Gmail response, decoded into the engine's terms.
 enum Outcome {
     Event(EventKind),
     Failed(Failure),
+    /// The request may have reached Gmail, but no answer came back (a
+    /// timeout, a dropped connection): a write may have been applied.
+    Unanswered(String),
     /// Gmail answered but the content couldn't be stored.
     StoreFailed(BlobError),
+}
+
+/// What the quota gate made of one request.
+enum Attempt {
+    /// Not sent: the gate admits it at `until` at the earliest.
+    Deferred(Timestamp),
+    /// Sent (or failed before Gmail answered).
+    Done(Outcome),
 }
 
 impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
@@ -433,47 +509,117 @@ where
             .messages(account, ids)
             .await
             .map_err(RunError::Store)?;
-        let mut report = SyncReport::default();
         let mut checked = Vec::with_capacity(views.len());
-        for (seq, view) in (0_u64..).zip(views) {
+        for view in views {
             let request = GmailRequest::GetMessage {
                 id: view.id.clone(),
             };
-            let call = GmailCall {
-                account: account.clone(),
-                cost: mailtide::quota::cost(&request),
-                request,
-                priority: mailtide::quota::Priority::Backfill,
-            };
-            // Not an engine's command: epoch 0 never matches a live engine.
-            let command = CommandId {
-                epoch: mailtide::ids::Epoch(0),
-                seq,
-            };
-            let mut answer = self.gmail(command, call.clone(), &mut report).await?;
-            while let EventKind::RequestDeferred { until, .. } = answer {
-                let wait =
-                    Duration::from_millis(u64::try_from(until.0 - self.clock.now().0).unwrap_or(0));
-                if !self.clock.can_wait() || Instant::now() + wait >= deadline {
-                    break;
-                }
-                tokio::time::sleep(wait).await;
-                answer = self.gmail(command, call.clone(), &mut report).await?;
-            }
-            let result = match answer {
-                EventKind::MessageFetched { message, .. } => {
+            let result = match self
+                .call_gmail(account, request, Priority::Backfill, deadline)
+                .await
+            {
+                Ok(EventKind::MessageFetched { message, .. }) => {
                     Checked::Compared(mailtide::drift::compare(&view, Some(&message)))
                 }
-                EventKind::MessageNotFound { .. } => {
+                Ok(EventKind::MessageNotFound { .. }) => {
                     Checked::Compared(mailtide::drift::compare(&view, None))
                 }
-                EventKind::RequestDeferred { .. } => Checked::Deferred,
-                EventKind::RequestFailed { failure, .. } => Checked::Failed(failure_kind(&failure)),
-                _ => return Err(RunError::Invariant("unexpected answer to a message get")),
+                Ok(_) => return Err(RunError::Invariant("unexpected answer to a message get")),
+                Err(CallError::Deferred(_)) => Checked::Deferred,
+                // An unanswered read is only a transient failure.
+                Err(CallError::OutcomeUnknown(_)) => Checked::Failed("transient"),
+                Err(CallError::Run(error)) => return Err(error),
+                Err(error) => Checked::Failed(error.code()),
             };
             checked.push((view.id, result));
         }
         Ok(checked)
+    }
+
+    /// One Gmail request outside the engine: the shared path of every call
+    /// whose answer a host needs at once (drift checks, searches, draft,
+    /// label and settings writes, purges). It
+    ///
+    /// - refuses a request that changes the mailbox in read-only mode,
+    ///   before any credential or quota is spent;
+    /// - admits the request through the quota gate at `priority` with its
+    ///   declared cost ([`mailtide::quota::cost`]), waits out deferrals while
+    ///   that ends before `deadline`, and otherwise returns
+    ///   [`CallError::Deferred`] without sending it;
+    /// - sends it with the account's token (a 401 drops the token, so the
+    ///   next call mints another) and decodes the answer as the engine's
+    ///   commands are decoded;
+    /// - cools the gate down after a rate limit, as the engine would, so
+    ///   later calls and syncs wait instead of being refused too.
+    ///
+    /// It claims nothing and commits nothing: its command id has epoch 0,
+    /// which no engine has, so it can neither supersede a sync nor be
+    /// fenced by one, and it never moves the history cursor. A refusal is
+    /// the caller's, never the account's: a 400, a 403 (a scope the token
+    /// lacks is [`AccountProblem::ApiAccessDenied`]) or an account problem
+    /// comes back as [`CallError::Refused`] and blocks nothing; a real
+    /// account problem is recorded by the account's next run.
+    ///
+    /// A caller that keeps Gmail's answer in the mirror records it after
+    /// this returns, with an unfenced store method (no epoch, as
+    /// [`Store::admit`]): the answer only, never the cursor. A crash between
+    /// the answer and the record loses nothing the next sync does not bring
+    /// back.
+    ///
+    /// [`AccountProblem::ApiAccessDenied`]: mailtide::retry::AccountProblem::ApiAccessDenied
+    pub async fn call_gmail(
+        &self,
+        account: &AccountId,
+        request: GmailRequest,
+        priority: Priority,
+        deadline: Instant,
+    ) -> Result<EventKind, CallError> {
+        if changes_mailbox(&request) && self.config.access == Access::ReadOnly {
+            return Err(CallError::ReadOnly);
+        }
+        let call = GmailCall {
+            account: account.clone(),
+            cost: mailtide::quota::cost(&request),
+            request,
+            priority,
+        };
+        let mut report = SyncReport::default();
+        let outcome = loop {
+            match self.attempt(DIRECT_CALL, &call, &mut report).await? {
+                Attempt::Done(outcome) => break outcome,
+                Attempt::Deferred(until) => {
+                    let wait = Duration::from_millis(
+                        u64::try_from(until.0 - self.clock.now().0).unwrap_or(0),
+                    );
+                    if !self.clock.can_wait() || Instant::now() + wait >= deadline {
+                        return Err(CallError::Deferred(QuotaDeferred { until }));
+                    }
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        };
+        let failure = match outcome {
+            Outcome::Event(event) => return Ok(event),
+            Outcome::Unanswered(detail) => return Err(CallError::OutcomeUnknown(detail)),
+            Outcome::Failed(failure) => failure,
+            Outcome::StoreFailed(error) => blob_failure(error)?,
+        };
+        Err(match failure {
+            Failure::NotFound => CallError::NotFound,
+            Failure::Blocking(refusal) => CallError::Refused(refusal),
+            Failure::Retryable(failure) => {
+                let now = self.clock.now();
+                let seed = mailtide::ids::stable_hash(account.as_str().as_bytes())
+                    ^ u64::try_from(now.0).unwrap_or(0);
+                if let Some(cooldown) = Backoff::DEFAULT.cooldown(&failure, account, now, seed) {
+                    self.quota
+                        .cool_down(cooldown)
+                        .await
+                        .map_err(|e| RunError::Quota(e.0))?;
+                }
+                CallError::Retryable(failure)
+            }
+        })
     }
 
     /// Resume a blocked account once its cause is fixed.
@@ -840,7 +986,7 @@ where
         call: GmailCall,
         report: &mut SyncReport,
     ) -> Result<EventKind, RunError> {
-        if let (GmailRequest::Modify(_), Access::ReadOnly) = (&call.request, self.config.access) {
+        if changes_mailbox(&call.request) && self.config.access == Access::ReadOnly {
             // Never sent: the intents block (shown as blocked), the job ends.
             return Ok(EventKind::RequestFailed {
                 command,
@@ -850,6 +996,33 @@ where
                 }),
             });
         }
+        match self.attempt(command, &call, report).await? {
+            Attempt::Deferred(until) => Ok(EventKind::RequestDeferred { command, until }),
+            Attempt::Done(Outcome::Event(event)) => Ok(event),
+            Attempt::Done(Outcome::Failed(failure)) => {
+                Ok(EventKind::RequestFailed { command, failure })
+            }
+            // Retried after backoff, as any transient failure.
+            Attempt::Done(Outcome::Unanswered(detail)) => Ok(EventKind::RequestFailed {
+                command,
+                failure: transient(detail),
+            }),
+            Attempt::Done(Outcome::StoreFailed(error)) => Ok(EventKind::RequestFailed {
+                command,
+                failure: blob_failure(error)?,
+            }),
+        }
+    }
+
+    /// Admit `call` through the quota gate and, if granted, send it; the
+    /// lease is released (or given back if this future is dropped). Shared
+    /// by the engine's commands and direct calls.
+    async fn attempt(
+        &self,
+        command: CommandId,
+        call: &GmailCall,
+        report: &mut SyncReport,
+    ) -> Result<Attempt, RunError> {
         let topic = match (&call.request, &self.config.watch) {
             (GmailRequest::Watch, WatchMode::Disabled) => {
                 return Err(RunError::Invariant(
@@ -872,7 +1045,7 @@ where
                     until = until.0,
                     "deferred by the quota gate"
                 );
-                return Ok(EventKind::RequestDeferred { command, until });
+                return Ok(Attempt::Deferred(until));
             }
         };
         // If this future is dropped mid-request (cancellation), the guard
@@ -895,14 +1068,11 @@ where
                 "gmail request"
             ),
             Outcome::Failed(failure) => {
-                report.failed_requests += 1;
-                report.last_failure = Some(failure_kind(failure));
-                tracing::warn!(
-                    request = request_kind(&call.request),
-                    failure = failure_kind(failure),
-                    duration_ms,
-                    "gmail request failed"
-                );
+                request_failed(report, &call.request, failure_kind(failure), duration_ms);
+            }
+            // For retrying, an unanswered request is a transient failure.
+            Outcome::Unanswered(_) => {
+                request_failed(report, &call.request, "transient", duration_ms);
             }
             // No error text: it can carry the object path.
             Outcome::StoreFailed(error) => {
@@ -920,29 +1090,16 @@ where
         }
         let bytes = match &outcome {
             Outcome::Event(EventKind::MessageImported { message, .. }) => message.size,
-            Outcome::Event(_) | Outcome::Failed(_) | Outcome::StoreFailed(_) => 0,
+            Outcome::Event(_)
+            | Outcome::Failed(_)
+            | Outcome::Unanswered(_)
+            | Outcome::StoreFailed(_) => 0,
         };
         self.quota
             .release(lease, bytes, self.clock.now())
             .await
             .map_err(|e| RunError::Quota(e.0))?;
-        match outcome {
-            Outcome::Event(event) => Ok(event),
-            Outcome::Failed(failure) => Ok(EventKind::RequestFailed { command, failure }),
-            // A store that can't work as configured fails the run: retrying
-            // each import can't fix it, and the host must hear about it.
-            Outcome::StoreFailed(BlobError::Misconfigured(detail)) => Err(RunError::Blobs(detail)),
-            // Unavailable: the import retries after backoff.
-            Outcome::StoreFailed(BlobError::Unavailable(detail)) => Ok(EventKind::RequestFailed {
-                command,
-                failure: transient(format!("blob write failed: {detail}")),
-            }),
-            // A write can't miss an object; treat it as unavailable.
-            Outcome::StoreFailed(BlobError::NotFound) => Ok(EventKind::RequestFailed {
-                command,
-                failure: transient("blob write failed: not found".to_owned()),
-            }),
-        }
+        Ok(Attempt::Done(outcome))
     }
 
     async fn perform(
@@ -965,9 +1122,8 @@ where
             report.gmail_requests += 1;
             let response = match self.transport.send(http, &token).await {
                 Ok(response) => response,
-                Err(TransportError::NotSent(detail) | TransportError::OutcomeUnknown(detail)) => {
-                    return Outcome::Failed(transient(detail));
-                }
+                Err(TransportError::NotSent(detail)) => return Outcome::Failed(transient(detail)),
+                Err(TransportError::OutcomeUnknown(detail)) => return Outcome::Unanswered(detail),
             };
             if response.status == 401 {
                 // The token was rejected: the next call mints a fresh one.
@@ -1099,6 +1255,52 @@ fn transient(detail: String) -> Failure {
         retry_after: None,
         detail,
     })
+}
+
+/// A blob write that failed after Gmail answered. A store that can't work
+/// as configured fails the run: retrying each import can't fix it, and the
+/// host must hear about it. Otherwise the request is retried after backoff
+/// (a write can't miss an object: not found counts as unavailable).
+fn blob_failure(error: BlobError) -> Result<Failure, RunError> {
+    match error {
+        BlobError::Misconfigured(detail) => Err(RunError::Blobs(detail)),
+        BlobError::Unavailable(detail) => Ok(transient(format!("blob write failed: {detail}"))),
+        BlobError::NotFound => Ok(transient("blob write failed: not found".to_owned())),
+    }
+}
+
+/// Count and log a failed request (its class only: Gmail's error text can
+/// quote data).
+fn request_failed(
+    report: &mut SyncReport,
+    request: &GmailRequest,
+    failure: &'static str,
+    duration_ms: u64,
+) {
+    report.failed_requests += 1;
+    report.last_failure = Some(failure);
+    tracing::warn!(
+        request = request_kind(request),
+        failure,
+        duration_ms,
+        "gmail request failed"
+    );
+}
+
+/// Whether `request` changes the mailbox. Read-only mode refuses these
+/// before any credential or quota is spent. Every request kind says which
+/// it is: a new kind must choose.
+fn changes_mailbox(request: &GmailRequest) -> bool {
+    match request {
+        GmailRequest::Modify(_) => true,
+        GmailRequest::GetProfile
+        | GmailRequest::ListHistory { .. }
+        | GmailRequest::ListMessages { .. }
+        | GmailRequest::GetMessage { .. }
+        | GmailRequest::ImportMessage { .. }
+        | GmailRequest::ListLabels
+        | GmailRequest::Watch => false,
+    }
 }
 
 fn stopped(engine: &Engine) -> Option<StopReason> {

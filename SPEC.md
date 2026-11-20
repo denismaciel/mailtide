@@ -415,6 +415,21 @@ Per-call costs [G]:
   - `Retry-After` is a minimum. Cooldowns never shorten an existing pause [Z].
 - A quota denial is a **deferral**, not a failure: it never counts against an
   attempt budget [Z].
+- **Direct calls** (`Runner::call_gmail`; drift checks use it): a request a
+  host needs answered at once, made outside the engine through the same
+  gate, with its declared cost and a priority the caller picks. A deferral
+  is waited out while it ends within the call's budget; otherwise the call
+  returns `QuotaDeferred { until }` and nothing is sent. A rate limit cools
+  the gate down as the engine would. Read-only mode refuses a request that
+  changes the mailbox before any credential or quota is spent. A direct
+  call claims nothing, commits nothing and never moves the cursor (its
+  command id has epoch 0, which no engine has). A refusal (a 400, a 403
+  including a scope the token lacks, an account problem) is the caller's
+  and blocks nothing; a real account problem is recorded by the account's
+  next run. An answer lost after the request went out (a timeout, a dropped
+  connection) is reported as outcome unknown, never as unsent. A caller that
+  keeps Gmail's answer in the mirror records it afterwards with an unfenced
+  store method, as `admit` is: the answer only, never the cursor.
 - **Import throughput** (raw gets): ≈ 6,000 messages/hour per account, so
   100k messages ≈ 17 h. About 200 accounts can import concurrently per
   project. 80M units/day ≈ 1.33M raw messages/day before billing.
