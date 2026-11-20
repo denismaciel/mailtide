@@ -56,6 +56,7 @@ async fn seed<S: Store>(store: &S, messages: Vec<MessageOp>) {
         },
         account: account(),
         epoch: snapshot.epoch,
+        account_generation: snapshot.account_generation,
         engine_version: snapshot.engine_version,
         cursor: None,
         claim: None,

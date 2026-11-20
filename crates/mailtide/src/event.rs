@@ -113,10 +113,10 @@ pub enum EventKind {
         /// request was sent (`Store::label_generation`): the listing is
         /// applied only if no local label write happened since.
         generation: u64,
-        /// Non-system definitions in the store, read after the generation
-        /// and before sending the request. A write racing either read is
+        /// Non-system definitions in oldest-defined order, read after the
+        /// generation and before sending the request. A write racing either read is
         /// covered by the generation fence.
-        stored_user_labels: crate::labels::LabelSet,
+        stored_user_labels: Vec<crate::ids::LabelId>,
     },
     /// `users.watch` succeeded.
     WatchRenewed {
@@ -190,13 +190,17 @@ pub enum EventKind {
         /// The page.
         listing: crate::search::SearchListing,
     },
-    /// `labels.get` answered with the label. It answers the driver's direct
-    /// call, never an engine command: the engine ignores it.
+    /// `labels.get` answered with the label, for a direct call or a proof.
     LabelFetched {
         /// The command it answers.
         command: CommandId,
-        /// The label's definition.
+        /// The definition Gmail returned.
         label: Label,
+    },
+    /// `labels.get` answered 200 without a usable definition.
+    LabelExists {
+        /// The command it answers.
+        command: CommandId,
     },
     /// `labels.create` or `labels.patch` succeeded: the label as it is now.
     /// The answer of a driver call; the engine issues none.

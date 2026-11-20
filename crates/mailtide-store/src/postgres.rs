@@ -50,6 +50,10 @@ impl Store for PostgresStore {
         self.inner.track(account, generation).await
     }
 
+    async fn track_new(&self, account: &AccountId) -> Result<TrackOutcome, StoreError> {
+        crate::Store::track_new(&self.inner, account).await
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -72,14 +76,14 @@ impl Store for PostgresStore {
     async fn claim_jobs(
         &self,
         account: &AccountId,
-        epoch: Epoch,
+        claim: (Epoch, u64),
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
         floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
         self.inner
-            .claim_jobs(account, epoch, limit, now, attempt, floor)
+            .claim_jobs(account, claim, limit, now, attempt, floor)
             .await
     }
 
@@ -218,6 +222,13 @@ impl Store for PostgresStore {
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         crate::Store::labels(&self.inner, account).await
+    }
+
+    async fn user_labels_oldest_first(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<mailtide::ids::LabelId>, StoreError> {
+        crate::Store::user_labels_oldest_first(&self.inner, account).await
     }
 
     async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {

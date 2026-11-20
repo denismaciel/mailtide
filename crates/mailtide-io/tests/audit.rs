@@ -252,3 +252,150 @@ async fn an_audit_quota_deferral_survives_early_claims_after_the_gate_reopens() 
         .expect("retry at deadline");
     assert_eq!(harness.listings(), sent + 1);
 }
+
+#[tokio::test]
+async fn a_late_rate_limit_updates_the_gate_and_store_for_audit_and_history() {
+    for (suffix, request) in [("/messages", "GET messages"), ("/history", "GET history")] {
+        let harness = AuditHarness::ready().await;
+        let runner = &harness.runner;
+        let now = Timestamp(harness.clock.load(Ordering::SeqCst));
+        let until = now.plus(Duration::from_secs(300));
+        runner
+            .transport()
+            .delay_responses(suffix, Duration::from_millis(400));
+        runner
+            .transport()
+            .mailbox()
+            .fail_next(request, Fault::RateLimit(429, "userRateLimitExceeded", 300));
+        let budget = Duration::from_millis(200);
+        let outcome = if suffix == "/history" {
+            let Notified::Ran(run) = runner
+                .notify(&account(), HistoryId(10_000), budget)
+                .await
+                .expect("history push")
+            else {
+                panic!("the history push should run");
+            };
+            *run
+        } else {
+            runner.run(&account(), budget).await.expect("audit run")
+        };
+        assert_eq!(outcome.stop, StopReason::BudgetExhausted);
+        let published = harness.gate.cooldowns.lock().expect("gate").clone();
+        assert!(published.iter().any(|cooldown| {
+            cooldown.target == QuotaTarget::Account(account()) && cooldown.until == until
+        }));
+        let snapshot = runner
+            .store()
+            .claim(&account(), mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("restart");
+        assert_eq!(
+            snapshot.cooldown.map(|cooldown| cooldown.until),
+            Some(until)
+        );
+        if suffix == "/messages" {
+            assert_eq!(snapshot.audit_schedule.retry_at, Some(until));
+        }
+        let sent = runner.transport().mailbox().requests.len();
+        let push = runner
+            .notify(&account(), HistoryId(20_000), BUDGET)
+            .await
+            .expect("push before retry");
+        assert!(
+            matches!(push, Notified::Ran(run) if run.stop == StopReason::CoolingDown { until })
+        );
+        assert_eq!(runner.transport().mailbox().requests.len(), sent);
+    }
+}
+
+#[tokio::test]
+async fn an_audit_page_finishes_its_store_step_after_the_run_budget() {
+    let harness = AuditHarness::ready().await;
+    let runner = &harness.runner;
+    runner
+        .transport()
+        .delay_responses("/messages", Duration::from_millis(400));
+    runner.transport().mailbox().fail_next(
+        "GET messages",
+        Fault::Body(r#"{"messages":[{"id":"m1"}],"nextPageToken":"next"}"#),
+    );
+    let outcome = runner
+        .run(&account(), Duration::from_millis(200))
+        .await
+        .expect("slow page");
+    assert_eq!(outcome.stop, StopReason::BudgetExhausted);
+    let snapshot = runner
+        .store()
+        .claim(&account(), mailtide::ids::ENGINE_VERSION)
+        .await
+        .expect("restart");
+    assert_eq!(
+        snapshot.audit_progress,
+        Some(mailtide::audit::AuditProgress::Listing(
+            mailtide::ids::PageToken("next".into())
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_persistently_failing_continuation_is_abandoned_with_its_retry_floor() {
+    use mailtide::audit::{AUDIT_FAILURE_LIMIT, AuditAbandonment, AuditProgress};
+
+    let harness = AuditHarness::ready().await;
+    let runner = &harness.runner;
+    runner.transport().mailbox().fail_next(
+        "GET messages",
+        Fault::Body(r#"{"messages":[{"id":"m1"}],"nextPageToken":"next"}"#),
+    );
+    runner.run(&account(), BUDGET).await.expect("first page");
+
+    for attempt in 1..=AUDIT_FAILURE_LIMIT {
+        let now = Timestamp(harness.clock.load(Ordering::SeqCst));
+        let floor = now.plus(Duration::from_secs(300));
+        runner
+            .transport()
+            .mailbox()
+            .fail_next("GET messages", Fault::RateLimit(503, "backendError", 300));
+        let failure = runner.run(&account(), BUDGET).await.expect("failed page");
+        let snapshot = runner
+            .store()
+            .claim(&account(), mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("restart");
+        let retry_at = snapshot.audit_schedule.retry_at.expect("durable retry");
+        assert!(retry_at >= floor);
+        let abandoned = failure.report.status.expect("status").audit.abandoned;
+        if attempt < AUDIT_FAILURE_LIMIT {
+            assert_eq!(
+                snapshot.audit_progress,
+                Some(AuditProgress::Listing(mailtide::ids::PageToken(
+                    "next".into()
+                )))
+            );
+            assert_eq!(snapshot.audit_schedule.failures(), attempt);
+            assert_eq!(abandoned, None);
+            harness.clock.store(retry_at.0, Ordering::SeqCst);
+        } else {
+            assert_eq!(abandoned, Some(AuditAbandonment::RetryLimit));
+            assert_eq!(
+                snapshot.audit_progress,
+                Some(AuditProgress::Cleanup {
+                    after: None,
+                    complete: false
+                })
+            );
+            assert_eq!(snapshot.audit_schedule.failures(), 0);
+            let cleanup = runner.run(&account(), BUDGET).await.expect("cleanup");
+            assert_eq!(
+                cleanup.stop,
+                StopReason::Idle {
+                    next: Some(retry_at)
+                }
+            );
+            let sent = harness.listings();
+            runner.run(&account(), BUDGET).await.expect("early claim");
+            assert_eq!(harness.listings(), sent);
+        }
+    }
+}

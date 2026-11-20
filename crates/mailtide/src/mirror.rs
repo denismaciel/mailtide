@@ -254,7 +254,7 @@ pub fn check_guards(
     commit: &Commit,
     claimed: Option<&Job>,
 ) -> Result<(), Rejection> {
-    if commit.epoch != account.epoch {
+    if commit.epoch != account.epoch || commit.account_generation != account.generation {
         return Err(Rejection::StaleEpoch);
     }
     if commit.engine_version < account.engine_version {
@@ -858,11 +858,14 @@ pub fn removed_labels(stored: &[Label], generation: u64, op: &LabelOp) -> Vec<La
         LabelOp::ReplaceAll {
             labels,
             generation: listed_under,
+            removed,
             ..
         } if *listed_under == generation && complete_listing(labels) => stored
             .iter()
             .filter(|label| {
-                !is_system_label(label) && labels.iter().all(|listed| listed.id != label.id)
+                !is_system_label(label)
+                    && removed.contains(&label.id)
+                    && labels.iter().all(|listed| listed.id != label.id)
             })
             .map(|label| label.id.clone())
             .collect(),
@@ -925,6 +928,8 @@ pub struct AccountMirror {
     pub audit_seen: BTreeSet<String>,
     /// Label definitions.
     pub labels: Vec<Label>,
+    /// Sequence at which each current definition first appeared.
+    pub label_defined: BTreeMap<LabelId, StateSeq>,
     /// Pending user actions, one per (message, label).
     pub intents: BTreeMap<(MessageId, crate::ids::LabelId), Intent>,
     /// The draft index.
@@ -950,6 +955,7 @@ impl AccountMirror {
             seen: BTreeMap::new(),
             audit_seen: BTreeSet::new(),
             labels: Vec::new(),
+            label_defined: BTreeMap::new(),
             intents: BTreeMap::new(),
             drafts: DraftIndex::new(),
             log: Vec::new(),
@@ -1059,7 +1065,6 @@ impl AccountMirror {
             audit_progress: self.record.audit_progress.clone(),
             audit_schedule: self.record.audit_schedule,
             account_generation: self.record.generation,
-            label_generation: self.record.label_generation,
             label_ids: self.labels.iter().map(|label| label.id.clone()).collect(),
             drafts_refreshed_at: self.record.drafts_refreshed_at,
         }
@@ -1069,6 +1074,7 @@ impl AccountMirror {
     pub fn advance_audit(&mut self, request: &AuditRequest) -> AuditOutcome {
         if let Err(reason) = request.check(
             self.record.epoch,
+            self.record.generation,
             self.record.sync == SyncState::Live,
             self.record.audit_progress.as_ref(),
         ) {
@@ -1138,6 +1144,10 @@ impl AccountMirror {
             }
             (AuditStep::Defer(until), _) => {
                 schedule.defer(*until);
+                request.expected.clone()
+            }
+            (AuditStep::Retry(until), _) => {
+                report.abandoned = schedule.failed(*until);
                 request.expected.clone()
             }
             (AuditStep::Abandon(reason), _) => {
@@ -1299,6 +1309,7 @@ impl AccountMirror {
                 labels,
                 generation,
                 at,
+                ..
             } => {
                 // A local write since the listing was sent: it is stale. A
                 // listing without Gmail's system labels is no listing at
@@ -1313,8 +1324,19 @@ impl AccountMirror {
                     deleted.remove(&label.id);
                 }
                 let gone = removed_labels(&self.labels, self.record.label_generation, op);
-                if !same_labels(&self.labels, labels) {
-                    self.labels.clone_from(labels);
+                let listed_ids: LabelSet = labels.iter().map(|label| label.id.clone()).collect();
+                let merged: Vec<_> = labels
+                    .iter()
+                    .chain(self.labels.iter().filter(|label| {
+                        !is_system_label(label)
+                            && !listed_ids.contains(&label.id)
+                            && !gone.contains(&label.id)
+                    }))
+                    .cloned()
+                    .collect();
+                if !same_labels(&self.labels, &merged) {
+                    self.labels = merged;
+                    self.note_label_definition_ages(seq);
                     self.log.push((seq, Change::LabelDefinitionsChanged));
                 }
                 for id in gone {
@@ -1334,6 +1356,7 @@ impl AccountMirror {
                     }
                     None => {
                         self.labels.push(label.clone());
+                        self.label_defined.insert(label.id.clone(), seq);
                         self.log.push((seq, Change::LabelDefinitionsChanged));
                     }
                 }
@@ -1344,6 +1367,7 @@ impl AccountMirror {
             LabelOp::Remove { id, at } => {
                 let before = self.labels.len();
                 self.labels.retain(|label| &label.id != id);
+                self.label_defined.remove(id);
                 if self.labels.len() != before {
                     self.log.push((seq, Change::LabelDefinitionsChanged));
                 }
@@ -1384,6 +1408,32 @@ impl AccountMirror {
         for message in affected {
             self.log_overlay(&message, seq);
         }
+    }
+
+    fn note_label_definition_ages(&mut self, seq: StateSeq) {
+        let ids: LabelSet = self.labels.iter().map(|label| label.id.clone()).collect();
+        self.label_defined.retain(|id, _| ids.contains(id));
+        for id in ids {
+            self.label_defined.entry(id).or_insert(seq);
+        }
+    }
+
+    /// Stored user definitions from oldest to newest, breaking ties by id.
+    #[must_use]
+    pub fn user_labels_oldest_first(&self) -> Vec<LabelId> {
+        let mut ids: Vec<_> = self
+            .labels
+            .iter()
+            .filter(|label| !is_system_label(label))
+            .map(|label| label.id.clone())
+            .collect();
+        ids.sort_by(|a, b| {
+            self.label_defined
+                .get(a)
+                .cmp(&self.label_defined.get(b))
+                .then(a.cmp(b))
+        });
+        ids
     }
 
     /// Record the answer of a local label write (a create, a patch or a
@@ -2548,6 +2598,7 @@ mod tests {
             },
             account: account(),
             epoch: mirror.record.epoch,
+            account_generation: mirror.record.generation,
             engine_version: ENGINE_VERSION,
             cursor: None,
             claim: None,
@@ -3944,9 +3995,16 @@ mod tests {
 
     fn listed(mirror: &mut AccountMirror, labels: &[&str], at: i64) {
         let mut c = commit(mirror);
+        let removed = mirror
+            .labels
+            .iter()
+            .filter(|label| !is_system_label(label) && !labels.contains(&label.id.0.as_str()))
+            .map(|label| label.id.clone())
+            .collect();
         c.labels = vec![LabelOp::ReplaceAll {
             labels: labels.iter().map(|id| defined(id, id)).collect(),
             generation: mirror.record.label_generation,
+            removed,
             at: Timestamp(at),
         }];
         assert!(matches!(mirror.apply(&c), CommitOutcome::Applied { .. }));
@@ -4201,6 +4259,7 @@ mod tests {
                 defined("Label_3", "Label_3"),
                 defined("UNREAD", "UNREAD"),
             ],
+            removed: set(["Label_2"]),
             generation: sent_under,
             at: Timestamp(20),
         }];
@@ -4321,6 +4380,7 @@ mod tests {
                 defined("Label_1", "Label_1"),
             ],
             generation: 0,
+            removed: LabelSet::new(),
             at: Timestamp(0),
         }];
         mirror.apply(&c);

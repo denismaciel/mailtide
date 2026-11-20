@@ -293,6 +293,9 @@ fn draft_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
 /// The cases of label attributes and local label writes.
 fn label_edit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     vec![
+        ("label proof order follows first definition", |s| {
+            Box::pin(label_definition_order(s))
+        }),
         (
             "label refreshes persist their time; unchanged ones log nothing",
             |s| Box::pin(label_refreshes(s)),
@@ -309,6 +312,29 @@ fn label_edit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
             Box::pin(an_incomplete_listing_changes_nothing(s))
         }),
     ]
+}
+
+async fn label_definition_order<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    for (id, name) in [
+        ("Label_z", "Oldest"),
+        ("Label_b", "Second"),
+        ("Label_z", "Renamed"),
+    ] {
+        let label = Label::plain(LabelId(id.into()), name, LabelKind::User);
+        store
+            .record_label(&snapshot.account, &LabelOp::Upsert(label))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    let ids = store
+        .user_labels_oldest_first(&snapshot.account)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        ids == [LabelId("Label_z".into()), LabelId("Label_b".into())],
+        "a rename must not change the original definition order",
+    )
 }
 
 fn account() -> AccountId {
@@ -336,6 +362,7 @@ fn commit(snapshot: &StoreSnapshot, seq: u64) -> Commit {
         },
         account: snapshot.account.clone(),
         epoch: snapshot.epoch,
+        account_generation: snapshot.account_generation,
         engine_version: snapshot.engine_version,
         cursor: None,
         claim: None,
@@ -540,7 +567,7 @@ async fn tombstones<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             10,
             Timestamp(0),
             AttemptId(1),
@@ -570,7 +597,7 @@ async fn unknown_patch<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             10,
             Timestamp(0),
             AttemptId(1),
@@ -594,7 +621,7 @@ async fn claims<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             10,
             Timestamp(0),
             AttemptId(7),
@@ -607,7 +634,7 @@ async fn claims<S: Store>(store: &S) -> Result<(), String> {
     let again = store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             10,
             Timestamp(0),
             AttemptId(8),
@@ -685,7 +712,7 @@ async fn stale_claims<S: Store>(store: &S) -> Result<(), String> {
     let stale = store
         .claim_jobs(
             &account(),
-            old.epoch,
+            (old.epoch, old.account_generation),
             10,
             Timestamp(0),
             AttemptId(1),
@@ -702,7 +729,7 @@ async fn stale_claims<S: Store>(store: &S) -> Result<(), String> {
     let current = store
         .claim_jobs(
             &account(),
-            new.epoch,
+            (new.epoch, new.account_generation),
             10,
             Timestamp(0),
             AttemptId(2),
@@ -734,7 +761,7 @@ async fn claim_all<S: Store>(
     store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             100,
             Timestamp(0),
             AttemptId(attempt),
@@ -1170,7 +1197,7 @@ async fn accounts_are_kept_apart<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(
             &account(),
-            mine.epoch,
+            (mine.epoch, mine.account_generation),
             10,
             Timestamp(i64::MAX),
             AttemptId(1),
@@ -1910,7 +1937,7 @@ async fn deletions_are_recorded_unfenced<S: Store>(store: &S) -> Result<(), Stri
     let jobs = store
         .claim_jobs(
             &account(),
-            new.epoch,
+            (new.epoch, new.account_generation),
             100,
             Timestamp(1_000).plus(mailtide::engine::BLOB_GRACE),
             AttemptId(1),
@@ -2049,7 +2076,7 @@ async fn claim_order<S: Store>(store: &S) -> Result<(), String> {
         let jobs = store
             .claim_jobs(
                 &account(),
-                snapshot.epoch,
+                (snapshot.epoch, snapshot.account_generation),
                 1,
                 Timestamp(10),
                 AttemptId(attempt),
@@ -2085,7 +2112,7 @@ async fn claims_report_next_due<S: Store>(store: &S) -> Result<(), String> {
     let outcome = store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             10,
             Timestamp(0),
             AttemptId(1),
@@ -2115,7 +2142,7 @@ async fn claims_respect_the_floor<S: Store>(store: &S) -> Result<(), String> {
     let jobs = store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             10,
             Timestamp(0),
             AttemptId(1),
@@ -2189,6 +2216,7 @@ fn label(id: &str, name: &str, kind: LabelKind) -> Label {
 fn listing(labels: Vec<Label>) -> LabelOp {
     LabelOp::ReplaceAll {
         labels,
+        removed: LabelSet::new(),
         generation: 0,
         at: Timestamp(0),
     }
@@ -2233,6 +2261,9 @@ async fn label_definitions<S: Store>(store: &S) -> Result<(), String> {
         label("Label_2", "Invoices", LabelKind::User),
         label("UNREAD", "UNREAD", LabelKind::System),
     ])];
+    if let LabelOp::ReplaceAll { removed, .. } = &mut refresh.labels[0] {
+        removed.insert(LabelId("Label_1".into()));
+    }
     apply(store, &refresh).await?;
     expect(
         labels(store, &account()).await?
@@ -2331,6 +2362,9 @@ async fn label_refreshes<S: Store>(store: &S) -> Result<(), String> {
 fn audit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
     use mailtide::audit::AuditAbandonment;
     vec![
+        ("re-tracking fences all work from a recycled epoch", |s| {
+            Box::pin(recycled_epoch(s))
+        }),
         (
             "mailbox audits persist progress and queue bounded verification",
             |s| Box::pin(mailbox_audit(s)),
@@ -2346,6 +2380,70 @@ fn audit_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
             |s| Box::pin(abandon_audit(s, AuditAbandonment::PageBudget)),
         ),
     ]
+}
+
+async fn recycled_epoch<S: Store>(store: &S) -> Result<(), String> {
+    let account = account();
+    store
+        .track_new(&account)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let first = store
+        .claim(&account, ENGINE_VERSION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let mut activity = commit(&first, 0);
+    activity.account_ops = vec![mailtide::commit::AccountOp::SetLastActivity(Timestamp(1))];
+    store.forget(&account).await.map_err(|e| format!("{e:?}"))?;
+    store
+        .track_new(&account)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let second = store
+        .claim(&account, ENGINE_VERSION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(first.epoch == second.epoch, "the numeric epoch is recycled")?;
+    expect(
+        first.account_generation != second.account_generation,
+        "the incarnation must change",
+    )?;
+    expect(
+        apply(store, &activity).await? == CommitOutcome::Rejected(Rejection::StaleEpoch),
+        "stale activity updates must be fenced",
+    )?;
+    let audit = AuditRequest {
+        account: account.clone(),
+        epoch: first.epoch,
+        account_generation: first.account_generation,
+        expected: None,
+        step: AuditStep::Defer(Timestamp(1)),
+        now: Timestamp(0),
+        interval: std::time::Duration::from_hours(24),
+    };
+    expect(
+        store
+            .advance_audit(&audit)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            == AuditOutcome::Rejected(Rejection::StaleEpoch),
+        "the stale audit must be fenced",
+    )?;
+    let stale_jobs = store
+        .claim_jobs(
+            &account,
+            (first.epoch, first.account_generation),
+            1,
+            Timestamp(0),
+            AttemptId(1),
+            Priority::Backfill,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(
+        stale_jobs == mailtide::jobs::ClaimOutcome::Rejected(Rejection::StaleEpoch),
+        "the stale job claim must be fenced",
+    )
 }
 
 async fn abandon_audit<S: Store>(
@@ -2530,6 +2628,7 @@ async fn audit_step<S: Store>(
         .advance_audit(&AuditRequest {
             account: snapshot.account.clone(),
             epoch: snapshot.epoch,
+            account_generation: snapshot.account_generation,
             expected: snapshot.audit_progress.clone(),
             step,
             now: Timestamp(now),
@@ -2562,7 +2661,7 @@ async fn sweep_and_complete_audit<S: Store>(store: &S, state: StateSeq) -> Resul
     let outcome = store
         .claim_jobs(
             &account(),
-            next.epoch,
+            (next.epoch, next.account_generation),
             10,
             Timestamp(14),
             AttemptId(1),
@@ -2739,7 +2838,7 @@ async fn claim_at<S: Store>(
     store
         .claim_jobs(
             &account(),
-            snapshot.epoch,
+            (snapshot.epoch, snapshot.account_generation),
             limit,
             Timestamp(now),
             AttemptId(attempt),
@@ -2804,7 +2903,7 @@ async fn prioritise_is_unfenced<S: Store>(store: &S) -> Result<(), String> {
     let stale = store
         .claim_jobs(
             &account(),
-            first.epoch,
+            (first.epoch, first.account_generation),
             10,
             Timestamp(0),
             AttemptId(3),
@@ -3909,6 +4008,7 @@ async fn removing_a_label_finds_exactly_the_rows_that_carry_it<S: Store>(
             .collect(),
         generation: label_generation(store, &account()).await?,
         at: Timestamp(6),
+        removed: set(["Label_10"]),
     }];
     apply(store, &later).await?;
     let views = store
@@ -4001,7 +4101,7 @@ async fn claimed_generation<S: Store>(
         store
             .claim_jobs(
                 &account(),
-                snapshot.epoch,
+                (snapshot.epoch, snapshot.account_generation),
                 10,
                 Timestamp(at),
                 AttemptId(attempt),

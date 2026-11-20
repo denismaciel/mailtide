@@ -5,21 +5,19 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tracing::Instrument as _;
 
 use mailtide::command::{Command, CommandKind, GmailCall, GmailRequest};
 use mailtide::commit::{AccountOp, CommitOutcome, Rejection};
-use mailtide::engine::{LabelConfirmation, Stopped};
+use mailtide::engine::Stopped;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{ImportedMessage, Label, MessageFacts};
 use mailtide::ids::{
-    AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, ThreadId, Timestamp,
+    AccountId, CommandId, ENGINE_VERSION, HistoryId, LabelId, MessageId, ThreadId, Timestamp,
 };
 use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
-use mailtide::labels::LabelSet;
 use mailtide::outbox::ActionRequest;
 use mailtide::purge::PurgePolicy;
 use mailtide::quota::{Admission, Priority};
@@ -196,101 +194,6 @@ pub struct Runner<S, B, T, Q, A> {
     pub(crate) clock: crate::Clock,
     extract: fn(&[u8]) -> MessageFacts,
     purge: PurgePolicy,
-    label_confirmations: LabelConfirmations,
-}
-
-// Pending evidence is single-use. The active entry lets forget and
-// overlapping runs invalidate evidence even before a run finishes.
-const MAX_LABEL_CONFIRMATIONS: usize = 128;
-
-#[derive(Debug)]
-enum CachedConfirmation {
-    Running(Arc<()>),
-    Pending(LabelConfirmation),
-}
-
-#[derive(Debug, Default)]
-struct LabelConfirmations(Mutex<BTreeMap<AccountId, (Timestamp, CachedConfirmation)>>);
-
-impl LabelConfirmations {
-    fn remove(&self, account: &AccountId) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(account);
-    }
-
-    fn start<'a>(
-        &'a self,
-        account: &'a AccountId,
-        now: Timestamp,
-    ) -> (ConfirmationRun<'a>, Option<LabelConfirmation>) {
-        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        cache.retain(|_, (_, entry)| match entry {
-            CachedConfirmation::Running(_) => true,
-            CachedConfirmation::Pending(evidence) => now < evidence.expires_at(),
-        });
-        let previous = match cache.remove(account) {
-            Some((_, CachedConfirmation::Pending(evidence))) => Some(evidence),
-            _ => None,
-        };
-        if cache.len() >= MAX_LABEL_CONFIRMATIONS
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (started, _))| *started)
-                .map(|(id, _)| id.clone())
-        {
-            cache.remove(&oldest);
-        }
-        let run = ConfirmationRun {
-            cache: self,
-            account,
-            token: Arc::new(()),
-        };
-        cache.insert(
-            account.clone(),
-            (now, CachedConfirmation::Running(Arc::clone(&run.token))),
-        );
-        (run, previous)
-    }
-}
-
-struct ConfirmationRun<'a> {
-    cache: &'a LabelConfirmations,
-    account: &'a AccountId,
-    token: Arc<()>,
-}
-
-impl ConfirmationRun<'_> {
-    fn owns(&self, entry: &CachedConfirmation) -> bool {
-        matches!(entry, CachedConfirmation::Running(token) if Arc::ptr_eq(token, &self.token))
-    }
-
-    fn finish(self, report: SyncReport, engine: &Engine, stop: StopReason) -> RunOutcome {
-        if engine.stopped().is_none()
-            && let Some(evidence) = engine.label_confirmation()
-        {
-            let mut cache = self.cache.0.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some((_, entry)) = cache.get_mut(self.account)
-                && self.owns(entry)
-            {
-                *entry = CachedConfirmation::Pending(evidence);
-            }
-        }
-        finish(report, engine, stop)
-    }
-}
-
-impl Drop for ConfirmationRun<'_> {
-    fn drop(&mut self) {
-        let mut cache = self.cache.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache
-            .get(self.account)
-            .is_some_and(|(_, entry)| self.owns(entry))
-        {
-            cache.remove(self.account);
-        }
-    }
 }
 
 /// What one run did.
@@ -740,7 +643,6 @@ where
             clock: crate::Clock::system(),
             extract: mailtide_mime::facts,
             purge: PurgePolicy::Off,
-            label_confirmations: LabelConfirmations::default(),
         }
     }
 
@@ -848,14 +750,9 @@ where
     }
 
     /// Start mirroring `account` (a no-op if it already is). Its feed gets a
-    /// new generation, the current time, so positions from an earlier
-    /// incarnation (before a forget) are recognisably stale.
+    /// fresh store-allocated generation so old claims and feed positions are stale.
     pub async fn track(&self, account: &AccountId) -> Result<TrackOutcome, RunError> {
-        let generation = u64::try_from(self.clock.now().0).unwrap_or(0);
-        self.store
-            .track(account, generation)
-            .await
-            .map_err(RunError::Store)
+        self.store.track_new(account).await.map_err(RunError::Store)
     }
 
     /// What the store holds about `account`, without claiming it.
@@ -1215,10 +1112,7 @@ where
 
     /// Delete everything stored for `account`: rows, then raw content.
     pub async fn forget(&self, account: &AccountId) -> Result<Forgotten, RunError> {
-        self.label_confirmations.remove(account);
-        let forgotten = self.store.forget(account).await;
-        self.label_confirmations.remove(account);
-        let store = forgotten.map_err(RunError::Store)?;
+        let store = self.store.forget(account).await.map_err(RunError::Store)?;
         let blobs = self
             .blobs
             .delete_account(account)
@@ -1321,11 +1215,7 @@ where
 
     /// Claim the account and build its engine; `None` when a newer engine
     /// holds it.
-    async fn claim_engine(
-        &self,
-        account: &AccountId,
-        previous: Option<LabelConfirmation>,
-    ) -> Result<Option<Engine>, RunError> {
+    async fn claim_engine(&self, account: &AccountId) -> Result<Option<Engine>, RunError> {
         let snapshot = match self.store.claim(account, ENGINE_VERSION).await {
             Ok(snapshot) => snapshot,
             Err(StoreError::Rejected(_)) => return Ok(None),
@@ -1338,11 +1228,7 @@ where
             watch: self.config.watch.policy(),
             ..self.config.engine.clone()
         };
-        let mut engine = Engine::new(snapshot, config);
-        if let Some(previous) = previous {
-            engine.restore_label_confirmation(previous, self.clock.now());
-        }
-        Ok(Some(engine))
+        Ok(Some(Engine::new(snapshot, config)))
     }
 
     /// Queued work (jobs deferred by the quota gate or backing off, a
@@ -1383,9 +1269,7 @@ where
         let started = Instant::now();
         let mut reported = started;
         let deadline = started + budget;
-        let (confirmation_run, previous) =
-            self.label_confirmations.start(account, self.clock.now());
-        let Some(mut engine) = self.claim_engine(account, previous).await? else {
+        let Some(mut engine) = self.claim_engine(account).await? else {
             return Ok(RunOutcome {
                 report: SyncReport::default(),
                 stop: StopReason::Superseded,
@@ -1412,14 +1296,16 @@ where
                         (StopReason::Blocked(_), Some(_)) => StopReason::Superseded,
                         (stop, _) => stop,
                     };
-                    return Ok(confirmation_run.finish(report, &engine, stop));
+                    return Ok(finish(report, &engine, stop));
                 }
-                if Instant::now() > deadline {
-                    return Ok(confirmation_run.finish(
-                        report,
-                        &engine,
-                        StopReason::BudgetExhausted,
-                    ));
+                // Complete the durable effects of responses already received.
+                if Instant::now() >= deadline
+                    && !matches!(
+                        command.kind,
+                        CommandKind::Commit(_) | CommandKind::AdvanceAudit(_)
+                    )
+                {
+                    continue;
                 }
                 if let Some(progress) = progress
                     && reported.elapsed() >= PROGRESS_EVERY
@@ -1444,16 +1330,22 @@ where
                     | CommandKind::ClaimJobs { .. }
                     | CommandKind::DeleteBlob { .. }) => {
                         if let Some(event) = self.execute(id, kind, &mut report).await? {
-                            queue.extend(engine.handle(Event {
-                                now: self.clock.now(),
-                                kind: event,
-                            }));
+                            enqueue_followups(
+                                &mut queue,
+                                engine.handle(Event {
+                                    now: self.clock.now(),
+                                    kind: event,
+                                }),
+                            );
                         }
                     }
                 }
             }
             if let Some(stop) = stopped(&engine) {
-                return Ok(confirmation_run.finish(report, &engine, stop));
+                return Ok(finish(report, &engine, stop));
+            }
+            if Instant::now() >= deadline {
+                return Ok(finish(report, &engine, StopReason::BudgetExhausted));
             }
             let clock = self.clock.now();
             let due: Vec<TimerKind> = timers
@@ -1468,7 +1360,7 @@ where
                     continue;
                 }
                 let stop = idle_stop(&engine, timers.values().copied().min(), clock);
-                return Ok(confirmation_run.finish(report, &engine, stop));
+                return Ok(finish(report, &engine, stop));
             }
             for timer in due {
                 timers.remove(&timer);
@@ -1488,9 +1380,9 @@ where
     ) -> Result<Option<Rejection>, RunError> {
         let mut refused = None;
         while let Some(command) = queue.pop_front() {
-            if let CommandKind::Commit(commit) = command.kind
+            if matches!(command.kind, CommandKind::Commit(_))
                 && let Some(EventKind::CommitRejected { reason, .. }) =
-                    self.apply_commit(&commit, report).await?
+                    self.execute(command.id, command.kind, report).await?
             {
                 refused = Some(reason);
             }
@@ -1534,13 +1426,21 @@ where
             CommandKind::ClaimJobs {
                 account,
                 epoch,
+                account_generation,
                 limit,
                 now,
                 attempt,
                 floor,
             } => match self
                 .store
-                .claim_jobs(&account, epoch, limit, now, attempt, floor)
+                .claim_jobs(
+                    &account,
+                    (epoch, account_generation),
+                    limit,
+                    now,
+                    attempt,
+                    floor,
+                )
                 .await
             {
                 Ok(ClaimOutcome::Claimed { jobs, next_due }) => Ok(Some(EventKind::JobsClaimed {
@@ -1636,25 +1536,23 @@ where
 
     /// The stored catalogue and its generation before sending a listing.
     /// A local write racing either read makes the eventual listing stale.
-    async fn label_listing_context(&self, call: &GmailCall) -> Result<(u64, LabelSet), RunError> {
+    async fn label_listing_context(
+        &self,
+        call: &GmailCall,
+    ) -> Result<(u64, Vec<LabelId>), RunError> {
         if call.request != GmailRequest::ListLabels {
-            return Ok((0, LabelSet::new()));
+            return Ok((0, Vec::new()));
         }
         let generation = self
             .store
             .label_generation(&call.account)
             .await
             .map_err(RunError::Store)?;
-        let stored = self
+        let users = self
             .store
-            .labels(&call.account)
+            .user_labels_oldest_first(&call.account)
             .await
             .map_err(RunError::Store)?;
-        let users = stored
-            .into_iter()
-            .filter(|label| !mailtide::mirror::is_system_label(label))
-            .map(|label| label.id)
-            .collect();
         Ok((generation, users))
     }
 
@@ -1678,6 +1576,7 @@ where
             (_, WatchMode::Disabled) => String::new(),
         };
         let label_context = self.label_listing_context(call).await?;
+        let budget = send_before.map(|deadline| deadline.budget);
         let Some(admission) = before_budget(
             budget,
             self.quota
@@ -1722,6 +1621,8 @@ where
                 duration_ms,
                 "gmail request"
             ),
+            Outcome::Failed(Failure::NotFound)
+                if matches!(call.request, GmailRequest::GetLabel { .. }) => {}
             Outcome::Failed(failure) | Outcome::NotSent(failure) => {
                 request_failed(report, &call.request, failure_kind(failure), duration_ms);
             }
@@ -1767,7 +1668,7 @@ where
         call: &GmailCall,
         command: CommandId,
         topic: &str,
-        label_context: (u64, LabelSet),
+        label_context: (u64, Vec<LabelId>),
         report: &mut SyncReport,
         send_before: Option<DispatchDeadline>,
     ) -> Outcome {
@@ -1811,7 +1712,7 @@ where
         let Some(response) = last else {
             return Outcome::Failed(transient("no request built".into()));
         };
-        self.decode_response(call, command, &response, generation, report)
+        self.decode_response(call, command, &response, label_context, report)
             .await
     }
 
@@ -1820,7 +1721,7 @@ where
         call: &GmailCall,
         command: CommandId,
         response: &mailtide_gmail::http::HttpResponse,
-        generation: u64,
+        label_context: (u64, Vec<LabelId>),
         report: &mut SyncReport,
     ) -> Outcome {
         let account = &call.account;
@@ -1872,8 +1773,12 @@ where
             GmailRequest::Modify(_) => Ok(EventKind::LabelsModified { command }),
             GmailRequest::Search(search) => decode::search(search.scope, body)
                 .map(|listing| EventKind::Searched { command, listing }),
+            GmailRequest::GetLabel { .. } if response.status == 200 => Ok(decode::label_get(body)
+                .map_or(EventKind::LabelExists { command }, |label| {
+                    EventKind::LabelFetched { command, label }
+                })),
             GmailRequest::GetLabel { .. } => {
-                decode::label_get(body).map(|label| EventKind::LabelFetched { command, label })
+                return Outcome::Failed(transient("unexpected labels.get status".into()));
             }
             GmailRequest::CreateLabel(_) | GmailRequest::PatchLabel { .. } => {
                 mailtide_gmail::labels::label(body)
@@ -2003,6 +1908,7 @@ fn decode_draft(
         GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }
+        | GmailRequest::AuditMessages { .. }
         | GmailRequest::GetMessage { .. }
         | GmailRequest::ImportMessage { .. }
         | GmailRequest::ListLabels
@@ -2164,6 +2070,18 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::Watch
         | GmailRequest::Search(_)
         | GmailRequest::GetLabel { .. } => false,
+    }
+}
+
+fn enqueue_followups(queue: &mut VecDeque<Command>, commands: Vec<Command>) {
+    for command in commands {
+        if matches!(&command.kind, CommandKind::Commit(commit)
+            if commit.account_ops.iter().any(|op| matches!(op, AccountOp::SetCooldown(_))))
+        {
+            queue.push_front(command);
+        } else {
+            queue.push_back(command);
+        }
     }
 }
 

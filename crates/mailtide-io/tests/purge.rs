@@ -169,6 +169,7 @@ async fn a_stale_mirror_refuses_the_whole_purge() {
         },
         account: account(),
         epoch: snapshot.epoch,
+        account_generation: snapshot.account_generation,
         engine_version: snapshot.engine_version,
         cursor: None,
         claim: None,

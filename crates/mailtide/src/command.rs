@@ -44,6 +44,8 @@ pub enum CommandKind {
         account: AccountId,
         /// The claiming engine's epoch; claims from older epochs are refused.
         epoch: crate::ids::Epoch,
+        /// Account incarnation at claim time.
+        account_generation: u64,
         /// At most this many.
         limit: u32,
         /// Due at or before this time.
@@ -126,8 +128,8 @@ pub enum GmailRequest {
     /// engine; answered with [`crate::event::EventKind::Searched`].
     Search(crate::search::SearchRequest),
     /// `labels.get`: whether Gmail has a label the mirror's definitions
-    /// lack. Issued by the driver (a search's label check), never by the
-    /// engine; answered with [`crate::event::EventKind::LabelFetched`].
+    /// lack or a listing omitted, answered with
+    /// [`crate::event::EventKind::LabelFetched`].
     GetLabel {
         /// The label.
         id: crate::ids::LabelId,

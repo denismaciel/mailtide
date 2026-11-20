@@ -69,6 +69,7 @@ async fn synced() -> MemoryStore {
         },
         account: account(),
         epoch: snapshot.epoch,
+        account_generation: snapshot.account_generation,
         engine_version: snapshot.engine_version,
         cursor: None,
         claim: None,

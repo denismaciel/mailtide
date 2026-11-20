@@ -88,13 +88,15 @@ Three rules make deletion safe:
    days; every later observation, history delta, import and late write
    answer (an `Upsert` racing the delete) is stored without it. Only a
    `labels.list` naming the id again (Gmail's own word) restores it.
-3. **Listings must pass the core check and agree on omissions.** A listing
+3. **A listing needs a point lookup to prove each deletion.** A listing
    must name `INBOX` and `UNREAD`, carry no page token and have unique ids.
-   A listing that omits stored user labels is compared with a second one
-   under the same label generation. The second may omit fewer labels.
-   If it introduces an omission, compare it with a third listing. Three
-   unsettled answers fail with backoff and count as a failed request. System
-   labels are never stripped from message rows by catalogue removal.
+   Look up at most 50 omitted, previously defined user labels, oldest
+   definition first and ties by id. Each `labels.get` costs one unit at
+   the listing's priority. Only a 404 authorizes removal. A 200 rejects
+   the entire listing and reports failure. Other responses and quota
+   deferrals keep those definitions while the listing applies its upserts
+   and proven removals. Ids above the cap wait for a later refresh.
+   System labels are never stripped from message rows by catalogue removal.
 
 These do not make deletion independent of history in one case: an id the
 definitions never held (a label created elsewhere, applied, and deleted
@@ -161,7 +163,7 @@ and `parent_id: str | None`. Exceptions: `LabelNotFound`, `LabelNameTaken`
 | `labels.create` | 5 | `create_label` | foreground |
 | `labels.patch` | 5 (declared; see Decisions) | `update_label`, once per label renamed | foreground |
 | `labels.delete` | 5 | `delete_label`, once per label deleted | foreground |
-| `labels.get` | 1 | to confirm a known id omitted before delete | foreground |
+| `labels.get` | 1 | prove deletion for a stored id omitted from a listing | listing priority (foreground before a direct delete) |
 | `labels.list` | 1 | before a rename that moves sublabels and before every delete; after a 409 | foreground |
 
 Renaming a label with n sublabels costs 1 + 5(n + 1) units. A deferral waits
@@ -274,23 +276,16 @@ several labels scans for all of them in one statement.
 Rules in `mirror.rs`, shared by every store:
 
 - `LabelOp::Upsert` and `LabelOp::Remove { id, at }` apply local writes.
-  `LabelOp::ReplaceAll` applies a listing. On `main` it already replaces the
-  definitions only when the listing differs from them and logs
-  `LabelDefinitionsChanged` only then; here it becomes
-  `ReplaceAll { labels, generation, at }`, and a label the listing lacks is
-  removed by the same rule as `Remove`, messages included, after the
-  engine confirms the omission. `at` is when the
-  listing was made (a commit carries no clock): a removal is remembered
-  from then, and the deleted memory is pruned against it.
-- **Generation fence.** The driver reads the generation before sending
-  `labels.list`, then reads the stored user-label ids and reports both with
-  `LabelsListed`; the engine copies it into
-  `ReplaceAll`, for reconciliation's listing and for the §6.6 refresh alike;
-  the store skips the op if a local write happened since. A stale listing can
-  therefore not remove a label just created here, nor restore one just
-  deleted. The next refresh (at most `label_refresh` later) applies. When
-  reconciliation lists the labels, a refresh still in flight is dropped, so
-  two listings answered out of order cannot apply the older last.
+  `LabelOp::ReplaceAll { labels, generation, removed, at }` applies a
+  listing with the ids it proved missing. A removal is remembered from
+  `at` and the deleted memory is pruned against it. A changed catalogue
+  logs `LabelDefinitionsChanged`.
+- **Generation fence.** The driver reads the generation and the stored
+  user-label ids in definition order before sending `labels.list`. The
+  engine copies the generation into `ReplaceAll` and the store skips the
+  operation if a local write happened since. The next refresh can apply.
+  When reconciliation lists the labels, it takes over from an in-flight
+  refresh.
 - **Removal** strips the id from trusted and unverified rows alike without
   moving a checkpoint (if Gmail also sends `labelsRemoved`, those records
   then change nothing), and drops pending, delivered and blocked intents on
@@ -321,8 +316,8 @@ listing has been applied (it removes a deleted label and the intents on
 it) finishes the job so the store enqueues what is still pending and it goes
 again. Failed, deferred, fenced and incomplete listings release the held
 delivery unchanged. Each held delivery occupies one of four job slots and
-can delay imports, verifications and other actions until the listing
-finishes, defers or exhausts its three attempts. An existing listing
+can delay imports, verifications and other actions until the listing and
+its bounded proof batch finish, or the listing fails or is deferred. An existing listing
 backoff can delay sending. History has its own slot. With no held delivery,
 rechecks after a refusal are spaced at least one minute apart. Refused a second time, the adds that may be
 gone are blocked and the rest goes alone; refused again, everything left
@@ -494,22 +489,18 @@ makes the change; this branch makes it, with
    records, and reconciliation verifies rows but would keep a dead id on a
    row a listing never names again. Would simplify to "history only" if
    replayed history were shown never to carry a dead id.
-3. **Confirm user-label omissions.** A partial answer can still contain
-   every system label. Compare up to three complete listings under the
-   generation fence. Confirm immediately for a held delivery, otherwise wait
-   one minute between attempts. A single cut keeps the catalogue and
-   message memberships in place and produces a confirmation wakeup.
-   Two consecutive answers with the same omission can strip a live label.
-   The runner keeps up to 128 unfinished comparisons in memory for three
-   minutes. Only the next claim of the same account incarnation and label
-   generation can use a comparison. An intervening claim that ends before
-   listing again consumes that evidence. A process that restarts every
-   short run can keep making a first listing and reporting a wakeup while the
-   old catalogue stays visible. Three inconsistent answers report failure.
-   A live refresh keeps the old catalogue and reconciliation retries from
-   baseline capture. INBOX and UNREAD are the core check because they back
-   the inbox and unread views. Retiring another system definition can
-   update the catalogue while preserving the id on message rows.
+3. **Prove user-label omissions individually.** A listing can include
+   every core label and still omit a live user label. A `labels.get` 200
+   makes the runner report an inconsistent listing in
+   `label_listing_failures` and back off, so the host keeps seeing the
+   previous catalogue and memberships. Reconciliation stays at baseline
+   capture for the retry. When a lookup fails or is deferred, the host
+   continues to see that definition. The same commit can show new
+   definitions or remove ids that returned 404. If a run ends before
+   the proof batch answers, the host keeps seeing the old catalogue and
+   the next listing starts from scratch. INBOX and UNREAD back the inbox
+   and unread views. Retiring another system definition can update the
+   catalogue while preserving the id on message rows.
 4. **Per-message `LabelsChanged` entries for a removal**, up to one commit
    with as many entries as the label had messages. Would change to a single
    entry if `feed-pages` is not built and such commits prove too large.

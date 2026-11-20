@@ -120,8 +120,6 @@ def test_a_label_deleted_elsewhere_reaches_the_feed() -> None:
             gmail.mailbox.delete_label(lid, history=False)
         clock.advance(601)
         runner.run(ACCOUNT, budget_s=30)
-        clock.advance(60)
-        runner.run(ACCOUNT, budget_s=30)
         later = runner.changes(ACCOUNT, since=page.next)
         assert isinstance(later, mailtide.ChangePage)
         assert any(isinstance(c, mailtide.LabelDefinitionsChanged) for c in later.changes)

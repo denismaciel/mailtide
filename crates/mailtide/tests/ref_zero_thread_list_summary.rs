@@ -51,6 +51,7 @@ impl Mailbox {
             },
             account: self.mirror.account.clone(),
             epoch: self.mirror.record.epoch,
+            account_generation: self.mirror.record.generation,
             engine_version: ENGINE_VERSION,
             cursor: None,
             claim: None,

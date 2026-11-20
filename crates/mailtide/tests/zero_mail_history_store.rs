@@ -86,6 +86,7 @@ mod common {
             },
             account: mirror.account.clone(),
             epoch: mirror.record.epoch,
+            account_generation: mirror.record.generation,
             engine_version: ENGINE_VERSION,
             cursor: None,
             claim: None,
@@ -761,7 +762,7 @@ fn durable_gmail_history_checkpoints_resumes_full_reconciliation_after_restart_a
             })
             .collect(),
         generation: 0,
-        stored_user_labels: set([]),
+        stored_user_labels: Vec::new(),
     });
     let profile = host.only_call(&GmailRequest::GetProfile);
     host.handle(EventKind::ProfileFetched {

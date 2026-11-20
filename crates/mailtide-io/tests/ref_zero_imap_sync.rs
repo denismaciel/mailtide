@@ -29,8 +29,6 @@ async fn a_label_missing_from_a_later_listing_leaves_the_definitions_and_every_m
     // The next refresh lists the labels again.
     runner.advance(Duration::from_mins(16));
     sync(&runner).await;
-    runner.advance(mailtide::schedule::UNKNOWN_LABEL_GAP);
-    sync(&runner).await;
     assert!(labels(&runner).await.iter().all(|l| l.name != "Projects"));
     assert_eq!(view(&runner, "p").await.labels, set([]));
 }

@@ -111,6 +111,7 @@ impl Mailbox {
             },
             account: self.snapshot.account.clone(),
             epoch: self.snapshot.epoch,
+            account_generation: self.snapshot.account_generation,
             engine_version: self.snapshot.engine_version,
             cursor: None,
             claim: None,

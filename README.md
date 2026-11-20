@@ -13,6 +13,11 @@ reconciliation missed. Schedule the next account run from `Idle.next`
 advances at most one audit step. Stop old workers before migrating the
 database because running workers cache the schema check.
 
+A label refresh looks up up to 50 previously defined user labels missing
+from Gmail's listing. Only a `labels.get` 404 removes a definition and its
+memberships. A 200 rejects the listing, keeps the existing catalogue, and
+increments `label_listing_failures`.
+
 ## Install
 
 Wheels are attached to each [GitHub release](https://github.com/denismaciel/mailtide/releases)

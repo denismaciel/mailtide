@@ -26,6 +26,7 @@ fn commit(account: &AccountId, epoch: mailtide::ids::Epoch, seq: u64) -> Commit 
         id: CommitId { epoch, seq },
         account: account.clone(),
         epoch,
+        account_generation: 1,
         engine_version: ENGINE_VERSION,
         cursor: None,
         claim: None,
@@ -78,6 +79,7 @@ async fn main() {
         labels: defined.iter().map(|id| label(id)).collect(),
         generation: 0,
         at: Timestamp(0),
+        removed: LabelSet::new(),
     }];
     store.apply(&first).await.expect("labels");
     let started = Instant::now();
@@ -138,6 +140,7 @@ async fn main() {
         labels: vec![label("INBOX"), label("UNREAD")],
         generation,
         at: Timestamp(2),
+        removed: mailtide::labels::set(["Label_2", "Label_3", "Label_4", "Label_5"]),
     }];
     let started = Instant::now();
     store.apply(&listing).await.expect("listing");

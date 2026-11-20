@@ -145,6 +145,11 @@ const MIGRATIONS: &[&[&str]] = &[&[
     "ALTER TABLE mailtide_accounts ADD COLUMN audited_at BIGINT",
     "ALTER TABLE mailtide_accounts ADD COLUMN audit_progress TEXT",
     "ALTER TABLE mailtide_accounts ADD COLUMN audit_schedule TEXT",
+    "ALTER TABLE mailtide_labels ADD COLUMN defined_seq BIGINT NOT NULL DEFAULT 0",
+    "CREATE TABLE mailtide_generation (singleton BIGINT PRIMARY KEY, generation BIGINT NOT NULL)",
+    "INSERT INTO mailtide_generation (singleton, generation)
+       SELECT 1, COALESCE(MAX(CASE WHEN generation > 4611686018427387904 THEN generation ELSE 4611686018427387904 END), 4611686018427387904)
+       FROM mailtide_accounts",
     "CREATE TABLE mailtide_audit_seen (
         account TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (account, id))",
 ]];
@@ -1052,31 +1057,8 @@ impl SqlStore {
         write_seen(tx, account, before, after).await?;
         write_intents(tx, account, before, after).await?;
         write_drafts(tx, account, before, after).await?;
-        // Definitions are loaded only for a commit that lists them, so they
-        // differ only when that listing changed them.
         if before.labels != after.labels {
-            sqlx::query("DELETE FROM mailtide_labels WHERE account = $1")
-                .bind(account)
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| unavailable(&e))?;
-            for label in &after.labels {
-                let kind = match label.kind {
-                    LabelKind::System => "system",
-                    LabelKind::User => "user",
-                };
-                sqlx::query(
-                    "INSERT INTO mailtide_labels (account, id, name, kind, attrs) VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(account)
-                .bind(label.id.0.as_str())
-                .bind(label.name.as_str())
-                .bind(kind)
-                .bind(LabelAttrs::of(label).map(|attrs| json(&attrs)).transpose()?)
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| unavailable(&e))?;
-            }
+            write_labels(tx, account, &before.labels, &after.labels, after.seq).await?;
         }
         put_changes(tx, account, &after.log).await
     }
@@ -1088,7 +1070,29 @@ impl SqlStore {
         account: &AccountId,
         generation: u64,
     ) -> Result<TrackOutcome, StoreError> {
+        self.track_with(account, Some(generation)).await
+    }
+
+    async fn track_with(
+        &self,
+        account: &AccountId,
+        generation: Option<u64>,
+    ) -> Result<TrackOutcome, StoreError> {
         self.ensure_schema().await?;
+        let mut tx = self.begin().await?;
+        let generation = if let Some(generation) = generation {
+            sqlx::query("UPDATE mailtide_generation SET generation = $1 WHERE singleton = 1 AND generation < $1")
+                .bind(int("generation", generation)?).execute(&mut *tx).await.map_err(|e| unavailable(&e))?;
+            generation
+        } else {
+            let next = sqlx::query("UPDATE mailtide_generation SET generation = generation + 1 WHERE singleton = 1 RETURNING generation")
+                .fetch_one(&mut *tx).await.map_err(|e| unavailable(&e))?;
+            uint(
+                "generation",
+                next.try_get("generation")
+                    .map_err(|e| corrupt("generation", e))?,
+            )?
+        };
         let initial = AccountRecord::new(account, generation);
         let inserted = sqlx::query(
             "INSERT INTO mailtide_accounts
@@ -1102,10 +1106,13 @@ impl SqlStore {
         .bind(json(&initial.sync)?)
         .bind(initial.rng_seed.cast_signed())
         .bind(int("generation", generation)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| unavailable(&e))?
         .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::OutcomeUnknown(e.to_string()))?;
         Ok(if inserted == 1 {
             TrackOutcome::Tracked { generation }
         } else {
@@ -1163,7 +1170,6 @@ impl SqlStore {
             audit_progress: record.audit_progress,
             audit_schedule: record.audit_schedule,
             account_generation: record.generation,
-            label_generation: record.label_generation,
             label_ids,
             drafts_refreshed_at: record.drafts_refreshed_at,
         })
@@ -1175,6 +1181,9 @@ impl SqlStore {
         let Some((record, seq)) = self.load_account(&mut tx, &commit.account).await? else {
             return Ok(CommitOutcome::Rejected(Rejection::StaleEpoch));
         };
+        if record.epoch != commit.epoch || record.generation != commit.account_generation {
+            return Ok(CommitOutcome::Rejected(Rejection::StaleEpoch));
+        }
         let mut mirror = self
             .load_partial(&mut tx, &commit.account, record, seq, commit)
             .await?;
@@ -1214,6 +1223,7 @@ impl SqlStore {
             },
             account: account.clone(),
             epoch: record.epoch,
+            account_generation: record.generation,
             engine_version: record.engine_version,
             cursor: None,
             claim: None,
@@ -1267,7 +1277,7 @@ impl SqlStore {
     pub(crate) async fn claim_jobs(
         &self,
         account: &AccountId,
-        epoch: Epoch,
+        claim: (Epoch, u64),
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
@@ -1276,7 +1286,9 @@ impl SqlStore {
         self.ensure_schema().await?;
         let mut tx = self.begin().await?;
         let record = self.load_account(&mut tx, account).await?;
-        let Some((record, _)) = record.filter(|(record, _)| record.epoch == epoch) else {
+        let Some((record, _)) =
+            record.filter(|(record, _)| (record.epoch, record.generation) == claim)
+        else {
             return Ok(ClaimOutcome::Rejected(Rejection::StaleEpoch));
         };
         let context = ClaimContext {
@@ -2139,6 +2151,10 @@ impl crate::Store for SqlStore {
         Self::track(self, account, generation).await
     }
 
+    async fn track_new(&self, account: &AccountId) -> Result<TrackOutcome, StoreError> {
+        self.track_with(account, None).await
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -2161,13 +2177,13 @@ impl crate::Store for SqlStore {
     async fn claim_jobs(
         &self,
         account: &AccountId,
-        epoch: Epoch,
+        claim: (Epoch, u64),
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
         floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
-        Self::claim_jobs(self, account, epoch, limit, now, attempt, floor).await
+        Self::claim_jobs(self, account, claim, limit, now, attempt, floor).await
     }
 
     async fn changes(
@@ -2467,6 +2483,7 @@ impl crate::Store for SqlStore {
             },
             account: account.clone(),
             epoch: record.epoch,
+            account_generation: record.generation,
             engine_version: record.engine_version,
             cursor: None,
             claim: None,
@@ -2825,6 +2842,32 @@ impl crate::Store for SqlStore {
         load_labels(&self.pool, account).await
     }
 
+    async fn user_labels_oldest_first(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<LabelId>, StoreError> {
+        self.ensure_schema().await?;
+        let rows = sqlx::query(
+            "SELECT id, defined_seq FROM mailtide_labels WHERE account = $1 AND kind = 'user'",
+        )
+        .bind(account.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| unavailable(&e))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id: String = row.try_get("id").map_err(|e| corrupt("id", e))?;
+            if !mailtide::labels::system::is_system(&id) {
+                let seq: i64 = row
+                    .try_get("defined_seq")
+                    .map_err(|e| corrupt("defined_seq", e))?;
+                ids.push((seq, LabelId(id)));
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids.into_iter().map(|(_, id)| id).collect())
+    }
+
     async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {
         Self::record_label(self, account, op).await
     }
@@ -2862,6 +2905,41 @@ impl crate::Store for SqlStore {
             .into_iter()
             .next())
     }
+}
+
+async fn write_labels(
+    tx: &mut Transaction<'static, Any>,
+    account: &str,
+    before: &[Label],
+    after: &[Label],
+    seq: StateSeq,
+) -> Result<(), StoreError> {
+    let before: BTreeMap<_, _> = before.iter().map(|label| (&label.id, label)).collect();
+    let after: BTreeMap<_, _> = after.iter().map(|label| (&label.id, label)).collect();
+    for id in before.keys().filter(|id| !after.contains_key(*id)) {
+        sqlx::query("DELETE FROM mailtide_labels WHERE account = $1 AND id = $2")
+            .bind(account)
+            .bind(id.0.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| unavailable(&e))?;
+    }
+    for (id, label) in &after {
+        if before.get(id) == Some(label) {
+            continue;
+        }
+        let kind = match label.kind {
+            LabelKind::System => "system",
+            LabelKind::User => "user",
+        };
+        sqlx::query("INSERT INTO mailtide_labels (account, id, name, kind, attrs, defined_seq) VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (account, id) DO UPDATE SET name = excluded.name, kind = excluded.kind, attrs = excluded.attrs")
+            .bind(account).bind(label.id.0.as_str()).bind(label.name.as_str()).bind(kind)
+            .bind(LabelAttrs::of(label).map(|attrs| json(&attrs)).transpose()?)
+            .bind(int("defined_seq", seq.0)?)
+            .execute(&mut **tx).await.map_err(|e| unavailable(&e))?;
+    }
+    Ok(())
 }
 
 /// An account's label definitions, in id order.

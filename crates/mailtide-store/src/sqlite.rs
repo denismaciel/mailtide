@@ -50,6 +50,10 @@ impl Store for SqliteStore {
         self.inner.track(account, generation).await
     }
 
+    async fn track_new(&self, account: &AccountId) -> Result<TrackOutcome, StoreError> {
+        crate::Store::track_new(&self.inner, account).await
+    }
+
     async fn claim(
         &self,
         account: &AccountId,
@@ -72,14 +76,14 @@ impl Store for SqliteStore {
     async fn claim_jobs(
         &self,
         account: &AccountId,
-        epoch: Epoch,
+        claim: (Epoch, u64),
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
         floor: mailtide::quota::Priority,
     ) -> Result<ClaimOutcome, StoreError> {
         self.inner
-            .claim_jobs(account, epoch, limit, now, attempt, floor)
+            .claim_jobs(account, claim, limit, now, attempt, floor)
             .await
     }
 
@@ -220,6 +224,13 @@ impl Store for SqliteStore {
         crate::Store::labels(&self.inner, account).await
     }
 
+    async fn user_labels_oldest_first(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<mailtide::ids::LabelId>, StoreError> {
+        crate::Store::user_labels_oldest_first(&self.inner, account).await
+    }
+
     async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {
         crate::Store::record_label(&self.inner, account, op).await
     }
@@ -344,7 +355,14 @@ mod tests {
         );
         refused("apply", store.apply(commit).await.err());
         let jobs = store
-            .claim_jobs(account, commit.epoch, 1, now, AttemptId(1), floor)
+            .claim_jobs(
+                account,
+                (commit.epoch, commit.account_generation),
+                1,
+                now,
+                AttemptId(1),
+                floor,
+            )
             .await;
         refused("claim_jobs", jobs.err());
         refused(
@@ -396,12 +414,13 @@ mod tests {
         let threads = [ThreadId("t".into())];
         refused("threads", store.threads(account, &threads).await.err());
         refused("locate", store.locate(account, &ids).await.err());
-        assert_maintenance_refused(store, commit, refused).await;
+        assert_maintenance_refused(store, commit, applied, refused).await;
     }
 
     async fn assert_maintenance_refused(
         store: &SqliteStore,
         commit: &Commit,
+        applied: u32,
         refused: impl Fn(&str, Option<StoreError>),
     ) {
         let account = &commit.account;
@@ -409,6 +428,7 @@ mod tests {
         let audit = mailtide::audit::AuditRequest {
             account: account.clone(),
             epoch: commit.epoch,
+            account_generation: commit.account_generation,
             expected: None,
             step: mailtide::audit::AuditStep::Page {
                 ids: Vec::new(),
@@ -419,6 +439,11 @@ mod tests {
         };
         refused("advance_audit", store.advance_audit(&audit).await.err());
         refused("labels", store.labels(account).await.err());
+        refused("track_new", store.track_new(account).await.err());
+        refused(
+            "user_labels_oldest_first",
+            store.user_labels_oldest_first(account).await.err(),
+        );
         let write = mailtide::commit::LabelOp::Remove {
             id: mailtide::ids::LabelId("Label_1".into()),
             at: now,
@@ -559,6 +584,7 @@ mod tests {
             },
             account: snapshot.account.clone(),
             epoch: snapshot.epoch,
+            account_generation: snapshot.account_generation,
             engine_version: mailtide::ids::ENGINE_VERSION,
             cursor,
             claim: None,
@@ -1229,6 +1255,8 @@ mod tests {
         vec![
             "UPDATE mailtide_jobs SET state = 'ready' WHERE state = 'deferred'".to_owned(),
             "DROP TABLE mailtide_audit_seen".to_owned(),
+            "DROP TABLE mailtide_generation".to_owned(),
+            "ALTER TABLE mailtide_labels DROP COLUMN defined_seq".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN audit_progress".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN audit_schedule".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN audited_at".to_owned(),
@@ -1258,6 +1286,15 @@ mod tests {
              VALUES ('a@example.com', 1, 1, 7, '\"Live\"', 0, 0)"
         ).await.expect("old account");
         store.migrate().await.expect("migrate");
+        store
+            .inner
+            .execute_for_tests(
+                "INSERT INTO mailtide_jobs
+                 (account, kind, message, priority, failed_attempts, state, due_at)
+                 VALUES ('a@example.com', 1, 'm', 0, 0, 'deferred', 9000)",
+            )
+            .await
+            .expect("deferred job");
         let account = AccountId("a@example.com".into());
         let snapshot = store
             .claim(&account, mailtide::ids::ENGINE_VERSION)
@@ -1276,6 +1313,14 @@ mod tests {
                 .await
                 .expect("rollback");
         }
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests("SELECT state || ':' || CAST(due_at AS TEXT) FROM mailtide_jobs")
+                .await
+                .expect("job after rollback"),
+            "ready:9000"
+        );
         assert_eq!(
             store.inner.schema().await.expect("schema"),
             SchemaState::Behind {

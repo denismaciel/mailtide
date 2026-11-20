@@ -95,7 +95,8 @@ inform the design. No code is copied from them.
   same events in the same order produce the same commands. That makes it fit
   inside Temporal workflows, replayable, and simulatable.
 - **Commits are conditional operations** (Q3, revised). The engine emits
-  `Commit`s: guarded by epoch, engine version, expected cursor and job claim,
+  `Commit`s guarded by account incarnation, epoch, engine version, expected
+  cursor and job claim,
   each carrying message, label, account, job and intent operations. A store
   evaluates each operation's condition (checkpoints, tombstones) and applies
   the whole commit atomically or rejects it.
@@ -397,7 +398,13 @@ or store step still occupies the serial runner until it returns.
   starting at one minute and capped at the audit interval. Cleanup keeps
   the next attempt in the future. Quota deferrals and transient failures
   persist their retry floor across claims. Gmail rate limits also publish
-  the usual shared cooldown with `Retry-After`.
+  the usual shared cooldown with `Retry-After`. Five consecutive
+  transient failures on a step report `retry_limit` and abandon the audit
+  with its retry floor intact. A successful page resets the count.
+- A Gmail response received after the run deadline still publishes its
+  cooldown and completes its bounded store work. The same rule applies
+  to all engine requests. The deadline stops new Gmail requests and job
+  claims.
 - After the last page, sweep mirror ids in primary key order, at most 500
   per claim. A row missing from the seen set also queues a verification.
   An arrival during the listing can be verified by the sweep. A listing
@@ -505,30 +512,27 @@ so the definitions are listed again (`labels.list`) on a schedule [Z]:
   refusal or a 404 doesn't block the account, and the next periodic listing
   tries again.
 - Store label ids, never names, on messages. Renames are a label-table update.
-- **A label that goes leaves every message.** A listing that lacks
-  stored user labels must be followed by a complete listing under the same
-  label generation that lacks a subset of those ids. A new omission
-  permits one more comparison, then the attempt fails with backoff. The
-  engine asks for confirmation after one minute, or immediately for a held
-  delivery. A whole listing names `INBOX` and `UNREAD`. A missing core
-  label is reported as a failed request and leaves the refresh time
-  unchanged. Empty, paged and duplicate-id listings fail to decode.
-  The driver confirms a known id missing from its own pre-delete listing
-  with `labels.get`. Only a 404 records that removal. A confirmed deletion
-  strips the id from every row without moving checkpoints, drops its intents,
-  and logs `LabelDefinitionsChanged` and one `LabelsChanged` per row in
-  the same commit. System labels are never stripped by this rule. When
-  reconciliation lists the labels, it takes over from an in-flight refresh.
-- A single cut leaves the stored catalogue and message memberships in
-  place while the engine waits for confirmation. Two consecutive
-  core-complete answers with the same omission can strip a live label.
-  Evidence survives only in the same process, for three minutes, and can
-  cross to the immediately following claim of the same account incarnation
-  and label generation. Hosts that restart the process for every short
-  run can repeatedly see a first listing and a confirmation wakeup, while
-  the previous catalogue remains visible. Three inconsistent answers
-  report failure. Live refresh keeps the previous catalogue and
-  reconciliation stays at baseline capture for its retry.
+- **Prove a label deletion with `labels.get`.** A whole listing names
+  `INBOX` and `UNREAD`. Missing either counts as a failed listing and keeps
+  the previous refresh time. Empty, paged and duplicate-id listings fail
+  to decode. For a whole listing that omits stored user labels, look up
+  at most 50 of the omitted ids, serially, oldest-defined first and then
+  by id. Each lookup costs one unit at the listing's priority. A 404
+  proves deletion. A 200 rejects the entire listing, reports an
+  inconsistent listing and backs off. Other failures, quota deferrals
+  and the cap leave the affected definitions in place while the listing
+  applies its upserts and proven removals atomically. If the run ends
+  before all lookups in its batch finish, the listing is discarded.
+  Reconciliation waits for the proof batch before capturing its baseline
+  and takes over from an in-flight refresh. It builds label scopes from
+  the ids Gmail listed. A held delivery is released when its listing
+  applies or fails.
+- A proven deletion strips the id from every row without moving
+  checkpoints, drops its intents, and logs `LabelDefinitionsChanged`
+  and one `LabelsChanged` per row in the same commit. A retired system
+  definition can leave the catalogue while the id stays on message rows.
+  A direct delete also checks a stored id omitted from its pre-delete
+  listing and records its removal on a 404.
 - **A deleted id has a 30-day filter.** An applied listing prunes its
   memory. Observations, history deltas, imports, reconciliation scopes,
   new admissions and late write answers omit remembered ids. After
@@ -868,13 +872,12 @@ engine's epoch, so results meant for a dead engine are ignored).
   `MessagesListed{page}`, `AuditListed{ids, next}`, `MessageFetched{observation}`,
   `MessageImported{message}` (after the blob is stored), `MessageNotFound`,
   `LabelsListed{labels, generation, stored_user_labels}` (the generation and
-  stored user-label definitions read before sending it), `WatchRenewed{expiration}`, `LabelsModified`,
-  `DraftsListed{page}`, and
-  `Searched{listing}` and `MessagesDeleted{ids}`, which answer the driver's
-  own search and delete requests and which the engine ignores. The driver's own label requests answer
-  `LabelFetched{label}`, `LabelSaved{label}`, `LabelNameTaken` (a 409) and
-  `LabelDeleted`, and its draft calls `DraftFetched`, `DraftSaved`,
-  `DraftDeleted`, `DraftSent` and `DraftNotFound`; the engine issues none.
+  stored user-label ids read before sending it, oldest-defined first),
+  `LabelFetched{label}` or `LabelExists` (a 200 from `labels.get`),
+  `WatchRenewed{expiration}` `LabelsModified`, and `DraftsListed{page}`.
+  Direct driver calls also use `Searched{listing}`, `MessagesDeleted{ids}`,
+  `LabelSaved{label}`, `LabelNameTaken` (a 409) `LabelDeleted`,
+  `DraftFetched`, `DraftSaved`, `DraftDeleted`, `DraftSent` and `DraftNotFound`.
 - Store results: `CommitApplied`, `CommitRejected{reason}`,
   `AuditAdvanced{outcome}`, `JobsClaimed{jobs}`, `BlobDeleted`.
 - Failures: `RequestFailed{failure}` (retryable with class and
@@ -886,9 +889,10 @@ engine's epoch, so results meant for a dead engine are ignored).
 - `Gmail{account, request, priority, cost}`. The engine never issues
   `GmailRequest::Search`, `DeleteMessage` or `BatchDeleteMessages`: only
   the driver's direct calls do.
-- `Commit(commit)`: atomic, guarded (epoch, engine version, expected cursor,
-  job claim).
-- `AdvanceAudit(request)`, `ClaimJobs{epoch, limit, now, attempt}`,
+- `Commit(commit)`: atomic, guarded by account incarnation, epoch, engine
+  version, expected cursor and job claim.
+- `AdvanceAudit(request)`,
+  `ClaimJobs{epoch, account_generation, limit, now, attempt, floor}`,
   `DeleteBlob{message}`.
 - `Schedule{timer, at}`, `ReportStatus(status)`.
 
@@ -896,20 +900,26 @@ engine's epoch, so results meant for a dead engine are ignored).
 
 `mailtide_store::Store`:
 
+- `track_new(account)` allocates a fresh account incarnation from a
+  store-wide sequence and uses it as the change-feed generation. Forgetting
+  the account discards its rows while the shared allocator preserves
+  uniqueness.
 - `claim(account, version)`: bump the epoch (fencing every older writer),
   release jobs held by older engines, return the snapshot to build an engine
   from (validated into a `ValidSnapshot`), including when the label
   definitions were last listed and their ids (§6.6).
 - `apply(commit)`: all or nothing; rejections (`StaleEpoch`, `StaleVersion`,
   `CursorMismatch`, `StaleClaim`) are outcomes, not errors.
-- `claim_jobs(account, epoch, limit, now, attempt)`: refused for an older
-  epoch; `Deliver` jobs carry their pending changes.
+- `claim_jobs(account, (epoch, account_generation), limit, now, attempt, floor)`:
+  refused for a stale incarnation or epoch. `Deliver` jobs carry their pending changes.
 - `admit(account, request, now)` and `prioritise(account, ids, now)`:
   unfenced writes for users' actions (§7.1) and opened messages (§6.4).
 - `record_label(account, op)` (an `Upsert` or a `Remove`): the unfenced
   record of a local label write, bumping the label generation;
-  `label_generation(account)` reads it (0 for an untracked account) (§6.6).
-- `advance_audit(request)` checks the account epoch and continuation,
+  `label_generation(account)` reads it (0 for an untracked account), and
+  `user_labels_oldest_first(account)` reads user-label ids for omission
+  checks (§6.6).
+- `advance_audit(request)` checks the account incarnation, epoch and continuation,
   then records a bounded audit page and its verification jobs atomically
   (§6.3).
 - `changes(account, since: FeedCursor, limit)`: the change feed
@@ -1341,17 +1351,21 @@ DELETE FROM mailtide_schema WHERE version = 10;
 
 Migration 11 adds nullable `audited_at`, `audit_progress` and `audit_schedule` to
 `mailtide_accounts` and the temporary `mailtide_audit_seen` table (§6.3).
-The audit uses existing verification jobs and produces no new feed entry
-types. Jobs now persist quota deferral as `deferred` so a higher-priority
-confirmation can re-enter the quota gate while the old class waits. Rollback
-converts deferred jobs to ready with their existing due times. Newly opened
-stores on older builds refuse this schema. Stop old workers before migration. Rollback discards the audit
-schedule and unfinished listing. Already queued verifications can still
+It adds `mailtide_labels.defined_seq` for proof order (§6.6), with existing
+definitions at sequence 0 and ties ordered by id, and `mailtide_generation`
+for allocating account incarnations (§10.3). Jobs persist quota deferral
+as `deferred` so a higher-priority confirmation can re-enter the quota
+gate while the old class waits. Stop old workers before migration. Newly
+opened stores on older builds refuse this schema. Rollback converts deferred
+jobs to ready with their existing due times, and discards the audit schedule,
+unfinished scan, and definition ages. Already queued verifications can still
 run, and the first audit after upgrading starts at page one.
 
 ```sql
 UPDATE mailtide_jobs SET state = 'ready' WHERE state = 'deferred';
 DROP TABLE mailtide_audit_seen;
+DROP TABLE mailtide_generation;
+ALTER TABLE mailtide_labels DROP COLUMN defined_seq;
 ALTER TABLE mailtide_accounts DROP COLUMN audit_schedule;
 ALTER TABLE mailtide_accounts DROP COLUMN audit_progress;
 ALTER TABLE mailtide_accounts DROP COLUMN audited_at;

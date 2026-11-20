@@ -464,12 +464,23 @@ fn not_found() -> HttpResponse {
 
 /// The fake Gmail, as the runner's transport.
 #[derive(Debug, Default)]
-pub struct FakeGmail(Mutex<Mailbox>);
+pub struct FakeGmail {
+    mailbox: Mutex<Mailbox>,
+    response_delay: Mutex<Option<(&'static str, Duration)>>,
+}
 
 impl FakeGmail {
     /// The mailbox, to change it as another client or to inspect it.
     pub fn mailbox(&self) -> MutexGuard<'_, Mailbox> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.mailbox.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Delay responses on the given path beyond the runner's budget.
+    pub fn delay_responses(&self, suffix: &'static str, delay: Duration) {
+        *self
+            .response_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((suffix, delay));
     }
 }
 
@@ -480,6 +491,12 @@ impl GmailTransport for FakeGmail {
         token: &AccessToken,
     ) -> Result<HttpResponse, TransportError> {
         assert_eq!(token.secret, "test-token");
+        let delay = *self.response_delay.lock().expect("response delay");
+        if let Some((suffix, duration)) = delay
+            && request.path.ends_with(suffix)
+        {
+            tokio::time::sleep(duration).await;
+        }
         let mut mailbox = self.mailbox();
         let line = format!(
             "{} {}",

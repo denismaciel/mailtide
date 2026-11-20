@@ -36,6 +36,8 @@ pub struct AuditRequest {
     pub account: AccountId,
     /// The account claim that performed this step.
     pub epoch: Epoch,
+    /// Account incarnation at claim time.
+    pub account_generation: u64,
     /// The audit state when the step started.
     pub expected: Option<AuditProgress>,
     /// The work to apply.
@@ -60,6 +62,8 @@ pub enum AuditStep {
     Continue,
     /// Retain the current continuation and wait before asking again.
     Defer(Timestamp),
+    /// A transient failure retried this step at the supplied time.
+    Retry(Timestamp),
     /// Abandon the audit and clean its temporary state.
     Abandon(AuditAbandonment),
 }
@@ -96,10 +100,11 @@ impl AuditRequest {
     pub fn check(
         &self,
         epoch: Epoch,
+        account_generation: u64,
         live: bool,
         progress: Option<&AuditProgress>,
     ) -> Result<(), Rejection> {
-        if epoch != self.epoch {
+        if epoch != self.epoch || account_generation != self.account_generation {
             return Err(Rejection::StaleEpoch);
         }
         if !live || self.expected.as_ref() != progress {
@@ -114,7 +119,7 @@ impl AuditRequest {
                 Some(AuditProgress::Sweep(_) | AuditProgress::Cleanup { .. }),
             )
             | (
-                AuditStep::Defer(_) | AuditStep::Abandon(_),
+                AuditStep::Defer(_) | AuditStep::Retry(_) | AuditStep::Abandon(_),
                 None | Some(AuditProgress::Listing(_)),
             ) => true,
             _ => false,
@@ -140,6 +145,8 @@ pub enum AuditAbandonment {
     MalformedPage,
     /// Gmail refused a listing request.
     Rejected,
+    /// Transient failures exhausted the attempt limit for this step.
+    RetryLimit,
 }
 
 impl AuditAbandonment {
@@ -152,6 +159,7 @@ impl AuditAbandonment {
             Self::NoProgress => "no_progress",
             Self::MalformedPage => "malformed_page",
             Self::Rejected => "rejected",
+            Self::RetryLimit => "retry_limit",
         }
     }
 }
@@ -162,11 +170,29 @@ pub struct AuditSchedule {
     /// Earliest Gmail retry or replacement audit.
     pub retry_at: Option<Timestamp>,
     abandonments: u32,
+    #[serde(default)]
+    failures: u32,
     /// Remaining pages of the current listing or sweep.
     pub pages_left: Option<u64>,
 }
 
+/// Consecutive transient failures allowed on a listing step.
+pub const AUDIT_FAILURE_LIMIT: u32 = 5;
+
 impl AuditSchedule {
+    /// Consecutive failures of the current step.
+    #[must_use]
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// Count a failed attempt and remember the latest permitted retry.
+    pub fn failed(&mut self, until: Timestamp) -> Option<AuditAbandonment> {
+        self.defer(until);
+        self.failures = self.failures.saturating_add(1);
+        (self.failures >= AUDIT_FAILURE_LIMIT).then_some(AuditAbandonment::RetryLimit)
+    }
+
     /// Add a retry floor without losing a later one.
     pub fn defer(&mut self, until: Timestamp) {
         self.retry_at = Some(self.retry_at.map_or(until, |at| at.max(until)));
@@ -177,6 +203,7 @@ impl AuditSchedule {
         self.abandonments = self.abandonments.saturating_add(1);
         self.wait_after_abandonment(request);
         self.pages_left = None;
+        self.failures = 0;
         cleanup(false)
     }
 
@@ -196,6 +223,7 @@ impl AuditSchedule {
                 .saturating_add(8)
         });
         self.retry_at = None;
+        self.failures = 0;
         self.pages_left = more.then(|| budget.saturating_sub(1));
         if more && budget <= 1 {
             Err(AuditAbandonment::PageBudget)
@@ -319,6 +347,7 @@ mod tests {
             let request = AuditRequest {
                 account: AccountId("a@example.com".into()),
                 epoch: Epoch(1),
+                account_generation: 1,
                 expected: None,
                 step: AuditStep::Abandon(AuditAbandonment::Rejected),
                 now,

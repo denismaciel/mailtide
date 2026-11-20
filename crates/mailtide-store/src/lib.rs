@@ -66,12 +66,18 @@ pub enum StoreError {
 /// The store contract.
 pub trait Store: Send + Sync {
     /// Start mirroring `account` (a no-op if it already is), as incarnation
-    /// `generation` of its feed: use a value never used for this account
-    /// before, e.g. the current time in milliseconds.
+    /// `generation` of its feed. The caller supplies a value never used
+    /// for this account before. Use `track_new` to allocate it in the store.
     fn track(
         &self,
         account: &AccountId,
         generation: u64,
+    ) -> impl Future<Output = Result<TrackOutcome, StoreError>> + Send;
+
+    /// Track with a fresh store-allocated incarnation and feed generation.
+    fn track_new(
+        &self,
+        account: &AccountId,
     ) -> impl Future<Output = Result<TrackOutcome, StoreError>> + Send;
 
     /// Claim the account for a new engine: bump its epoch, record `version`,
@@ -101,7 +107,7 @@ pub trait Store: Send + Sync {
     fn claim_jobs(
         &self,
         account: &AccountId,
-        epoch: Epoch,
+        claim: (Epoch, u64),
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
@@ -288,6 +294,12 @@ pub trait Store: Send + Sync {
         &self,
         account: &AccountId,
     ) -> impl Future<Output = Result<Vec<Label>, StoreError>> + Send;
+
+    /// Stored user label ids in first-definition order, breaking ties by id.
+    fn user_labels_oldest_first(
+        &self,
+        account: &AccountId,
+    ) -> impl Future<Output = Result<Vec<LabelId>, StoreError>> + Send;
 
     /// Record Gmail's answer to a local label write (`Upsert` after a create
     /// or a patch, `Remove` after a delete or its 404; see

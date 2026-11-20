@@ -384,6 +384,7 @@ impl Mailbox {
             (Method::Get, ["drafts"]) => ok(&json!({"resultSizeEstimate": 0})),
             (Method::Get, ["labels"]) => ok(&json!({"labels": [
                 {"id": "INBOX", "name": "INBOX", "type": "system"},
+                {"id": "UNREAD", "name": "UNREAD", "type": "system"},
                 {"id": "TRASH", "name": "TRASH", "type": "system"},
                 {"id": "SPAM", "name": "SPAM", "type": "system"},
             ]})),
@@ -857,6 +858,7 @@ impl Host {
             },
             account: account(),
             epoch: snapshot.epoch,
+            account_generation: snapshot.account_generation,
             engine_version: snapshot.engine_version,
             cursor: Some(CursorMove {
                 expected: snapshot.cursor,

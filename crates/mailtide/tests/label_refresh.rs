@@ -67,6 +67,7 @@ fn commit(mirror: &AccountMirror) -> Commit {
         },
         account: mirror.account.clone(),
         epoch: mirror.record.epoch,
+        account_generation: mirror.record.generation,
         engine_version: ENGINE_VERSION,
         cursor: None,
         claim: None,
@@ -103,6 +104,7 @@ fn live_mirror() -> AccountMirror {
     c.labels = vec![LabelOp::ReplaceAll {
         labels: stored_labels(),
         generation: 0,
+        removed: set([]),
         at: Timestamp(0),
     }];
     c.account_ops = vec![AccountOp::SetLabelsRefreshedAt(Timestamp(LISTED))];
@@ -332,7 +334,7 @@ fn a_refresh_is_due_from_the_persisted_refresh_time_across_restarts() {
         command: call,
         labels: renamed.clone(),
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     assert_eq!(host.mirror.label_definitions(), {
         let mut sorted = renamed;
@@ -367,7 +369,7 @@ fn a_long_running_engine_refreshes_when_its_timer_fires() {
         command: call,
         labels: stored_labels(),
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     assert_eq!(host.mirror.record.labels_refreshed_at, Some(due));
 }
@@ -384,7 +386,7 @@ fn an_unchanged_listing_adds_no_feed_entry() {
         command: call,
         labels: reordered,
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     assert_eq!(
         host.mirror.log.len(),
@@ -419,7 +421,7 @@ fn reconciliation_listing_unchanged_labels_adds_no_feed_entry_either() {
         command: call,
         labels: stored_labels(),
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     assert_eq!(host.definitions_changes(), before);
     assert_eq!(
@@ -494,7 +496,7 @@ fn unknown_label_ids_coalesce_into_one_throttled_refresh() {
         command: call,
         labels: listed,
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     assert_eq!(
         host.timers.get(&TimerKind::Labels),
@@ -533,7 +535,7 @@ fn unknown_label_ids_coalesce_into_one_throttled_refresh() {
         command: call,
         labels: listed,
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     host.at(LISTED + 11 * MINUTE)
         .handle(EventKind::PushReceived {
@@ -653,7 +655,7 @@ fn a_failed_refresh_neither_blocks_sync_nor_moves_the_cursor() {
         command: labels,
         labels: stored_labels(),
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     // No label commit ever touched the cursor.
     for commit in &host.commits {
@@ -698,7 +700,7 @@ fn an_unknown_label_seen_during_a_listing_is_asked_about_once_more() {
         command: labels,
         labels: stored_labels(),
         generation: 0,
-        stored_user_labels: set(["Label_1"]),
+        stored_user_labels: vec![LabelId("Label_1".into())],
     });
     let again = Timestamp(start).plus(UNKNOWN_LABEL_GAP);
     assert_eq!(host.timers.get(&TimerKind::Labels), Some(&again));
@@ -723,69 +725,36 @@ fn a_cooldown_holds_the_refresh_until_it_ends() {
 }
 
 #[test]
-fn three_inconsistent_omissions_fail_without_changing_definitions() {
-    let start = LISTED + INTERVAL;
-    let mut mirror = live_mirror();
-    for id in ["Label_2", "Label_3"] {
-        mirror.record_label(&LabelOp::Upsert(label(id, id)));
-    }
-    let before = mirror.label_definitions();
-    let generation = mirror.record.label_generation;
-    let mut host = Host::new(mirror, start);
-    let stored = set(["Label_1", "Label_2", "Label_3"]);
-    for round in 0..3 {
-        if round > 0 {
-            host.at(start + round * MINUTE).fire(TimerKind::Labels);
-        }
-        let (command, _) = host.take_label_call();
-        let mut labels = stored_labels();
-        labels.pop();
-        for other in (0..3).filter(|other| *other != round) {
-            let id = format!("Label_{}", other + 1);
-            labels.push(label(&id, &id));
-        }
-        host.handle(EventKind::LabelsListed {
-            command,
-            labels,
-            generation,
-            stored_user_labels: stored.clone(),
-        });
-        assert_eq!(
-            host.mirror.record.labels_refreshed_at,
-            Some(Timestamp(LISTED))
-        );
-        assert_eq!(host.mirror.label_definitions(), before);
-    }
-    assert_eq!(host.engine.status().label_listing_failures, 1);
-    assert!(host.timers[&TimerKind::Labels] > host.now);
-}
-
-#[test]
-fn reconciliation_waits_for_confirmation_before_capturing_the_baseline() {
-    let start = LISTED + MINUTE;
-    let mut host = Host::new(live_mirror(), start);
+fn reconciliation_waits_for_label_proofs_before_capturing_the_baseline() {
+    let mut host = Host::new(live_mirror(), LISTED + MINUTE);
     let pass = host.take_history_call();
     host.handle(EventKind::HistoryExpired { command: pass });
+    let (command, _) = host.take_label_call();
     let mut cut = stored_labels();
     cut.pop();
-    for round in 0..2 {
-        let (command, _) = host.take_label_call();
-        host.handle(EventKind::LabelsListed {
-            command,
-            labels: cut.clone(),
-            generation: 0,
-            stored_user_labels: set(["Label_1"]),
-        });
-        if round == 0 {
-            assert!(
-                !host
-                    .gmail
-                    .iter()
-                    .any(|(_, call)| call.request == GmailRequest::GetProfile)
-            );
-            host.at(start + MINUTE).fire(TimerKind::Poll);
-        }
-    }
+    host.handle(EventKind::LabelsListed {
+        command,
+        labels: cut,
+        generation: 0,
+        stored_user_labels: vec![LabelId("Label_1".into())],
+    });
+    assert!(
+        !host
+            .gmail
+            .iter()
+            .any(|(_, call)| call.request == GmailRequest::GetProfile)
+    );
+    let (proof, call) = host
+        .gmail
+        .iter()
+        .find(|(_, call)| matches!(call.request, GmailRequest::GetLabel { .. }))
+        .expect("point lookup");
+    assert_eq!(call.priority, Priority::Backfill);
+    assert_eq!(call.cost, QuotaUnits(1));
+    host.handle(EventKind::RequestFailed {
+        command: *proof,
+        failure: Failure::NotFound,
+    });
     assert!(
         host.gmail
             .iter()
@@ -796,5 +765,70 @@ fn reconciliation_waits_for_confirmation_before_capturing_the_baseline() {
             .record
             .deleted_labels
             .contains_key(&LabelId("Label_1".into()))
+    );
+}
+
+#[test]
+fn refresh_checks_at_most_fifty_omissions_in_definition_order() {
+    let mut host = Host::new(live_mirror(), LISTED + INTERVAL);
+    let (command, _) = host.take_label_call();
+    let mut labels = stored_labels();
+    labels.pop();
+    let stored_user_labels: Vec<_> = (1..=52u32)
+        .rev()
+        .map(|number| LabelId(format!("Label_{number}")))
+        .collect();
+    host.handle(EventKind::LabelsListed {
+        command,
+        labels,
+        generation: 0,
+        stored_user_labels: stored_user_labels.clone(),
+    });
+    for id in &stored_user_labels[..50] {
+        assert!(host.commits.iter().all(|commit| commit.labels.is_empty()));
+        let probes: Vec<_> = host
+            .gmail
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, call))| matches!(call.request, GmailRequest::GetLabel { .. }))
+            .collect();
+        assert_eq!(probes.len(), 1);
+        let (at, _) = probes[0];
+        let (command, call) = host.gmail.remove(at);
+        assert_eq!(call.request, GmailRequest::GetLabel { id: id.clone() });
+        assert_eq!((call.priority, call.cost), (Priority::Live, QuotaUnits(1)));
+        host.handle(EventKind::RequestFailed {
+            command,
+            failure: Failure::NotFound,
+        });
+    }
+    assert!(
+        host.gmail
+            .iter()
+            .all(|(_, call)| !matches!(call.request, GmailRequest::GetLabel { .. }))
+    );
+    let removals = host
+        .commits
+        .iter()
+        .flat_map(|commit| &commit.labels)
+        .find_map(|op| {
+            if let LabelOp::ReplaceAll { removed, .. } = op {
+                Some(removed)
+            } else {
+                None
+            }
+        })
+        .expect("the entire batch commits together");
+    assert_eq!(removals.len(), 50);
+    assert!(
+        stored_user_labels[..50]
+            .iter()
+            .all(|id| removals.contains(id))
+    );
+    assert!(
+        host.mirror
+            .labels
+            .iter()
+            .any(|label| label.id.0 == "Label_1")
     );
 }

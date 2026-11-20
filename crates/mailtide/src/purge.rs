@@ -390,6 +390,7 @@ pub fn request_ids(request: &GmailRequest) -> Vec<MessageId> {
         GmailRequest::GetProfile
         | GmailRequest::ListHistory { .. }
         | GmailRequest::ListMessages { .. }
+        | GmailRequest::AuditMessages { .. }
         | GmailRequest::GetMessage { .. }
         | GmailRequest::ImportMessage { .. }
         | GmailRequest::ListLabels

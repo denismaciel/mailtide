@@ -2,7 +2,10 @@
 //! commits with the core's shared rules ([`mailtide::mirror`]).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
 use mailtide::drafts::{DraftRecorded, DraftView, DraftWrite};
@@ -27,6 +30,7 @@ use crate::{Store, StoreError};
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     accounts: Mutex<BTreeMap<AccountId, AccountMirror>>,
+    generation: AtomicU64,
 }
 
 impl MemoryStore {
@@ -99,6 +103,26 @@ impl Store for MemoryStore {
         if accounts.contains_key(account) {
             return Ok(TrackOutcome::AlreadyTracked);
         }
+        self.generation.fetch_max(generation, Ordering::Relaxed);
+        accounts.insert(
+            account.clone(),
+            AccountMirror::new(account.clone(), generation),
+        );
+        Ok(TrackOutcome::Tracked { generation })
+    }
+
+    async fn track_new(&self, account: &AccountId) -> Result<TrackOutcome, StoreError> {
+        let mut accounts = self.lock()?;
+        if accounts.contains_key(account) {
+            return Ok(TrackOutcome::AlreadyTracked);
+        }
+        let generation = self
+            .generation
+            .load(Ordering::Relaxed)
+            .max(1 << 62)
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Unavailable("account generations exhausted".into()))?;
+        self.generation.store(generation, Ordering::Relaxed);
         accounts.insert(
             account.clone(),
             AccountMirror::new(account.clone(), generation),
@@ -137,7 +161,7 @@ impl Store for MemoryStore {
     async fn claim_jobs(
         &self,
         account: &AccountId,
-        epoch: Epoch,
+        claim: (Epoch, u64),
         limit: u32,
         now: Timestamp,
         attempt: AttemptId,
@@ -145,7 +169,10 @@ impl Store for MemoryStore {
     ) -> Result<ClaimOutcome, StoreError> {
         let untracked = ClaimOutcome::Rejected(mailtide::commit::Rejection::StaleEpoch);
         self.on_account(account, untracked, |mirror| {
-            match mirror.claim_jobs_from(epoch, limit, now, attempt, floor) {
+            if claim.1 != mirror.record.generation {
+                return ClaimOutcome::Rejected(mailtide::commit::Rejection::StaleEpoch);
+            }
+            match mirror.claim_jobs_from(claim.0, limit, now, attempt, floor) {
                 Ok(jobs) => ClaimOutcome::Claimed {
                     jobs,
                     next_due: mirror.next_due(),
@@ -323,6 +350,15 @@ impl Store for MemoryStore {
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         self.on_account(account, Vec::new(), |mirror| mirror.label_definitions())
+    }
+
+    async fn user_labels_oldest_first(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<mailtide::ids::LabelId>, StoreError> {
+        self.on_account(account, Vec::new(), |mirror| {
+            mirror.user_labels_oldest_first()
+        })
     }
 
     async fn record_label(&self, account: &AccountId, op: &LabelOp) -> Result<(), StoreError> {

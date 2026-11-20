@@ -525,10 +525,15 @@ async fn a_label_deleted_elsewhere_without_history_records_still_leaves_every_me
     runner.transport().mailbox().delete_label("Label_1", false);
     runner.advance(REFRESH);
     sync(&runner).await;
-    assert_eq!(view(&runner, "m1").await.labels, set(["INBOX", "Label_1"]));
-    runner.advance(mailtide::schedule::UNKNOWN_LABEL_GAP);
-    sync(&runner).await;
     assert_eq!(view(&runner, "m1").await.labels, set(["INBOX"]));
+    assert!(
+        runner
+            .transport()
+            .mailbox()
+            .requests
+            .iter()
+            .any(|r| r == "GET labels/Label_1")
+    );
     assert!(user_names(&runner).await.is_empty());
 }
 
@@ -581,11 +586,7 @@ async fn a_pending_action_on_a_label_deleted_elsewhere_is_dropped_not_blocked() 
         (shown.labels, shown.pending_actions, shown.blocked_actions),
         (set(["INBOX"]), 0, 0)
     );
-    assert_eq!(
-        writes(&runner),
-        ["POST messages/m1/modify"],
-        "the first refusal prompted confirmation"
-    );
+    assert!(writes(&runner).is_empty());
 }
 
 #[tokio::test]
@@ -950,10 +951,9 @@ async fn a_single_cut_that_contains_every_system_label_keeps_live_uses() {
         .mailbox()
         .fail_next("GET labels", Fault::Body(CORE_LABELS));
     runner.advance(REFRESH);
-    sync(&runner).await;
+    let run = sync(&runner).await;
+    assert_eq!(run.report.status.expect("status").label_listing_failures, 1);
     assert_eq!(view(&runner, "m1").await.labels, set(["Label_1"]));
-    runner.advance(mailtide::schedule::UNKNOWN_LABEL_GAP);
-    sync(&runner).await;
     assert_eq!(user_names(&runner).await["Label_1"], "Kept");
     assert!(feed_since(&runner, before).await.is_empty());
 }
@@ -1181,56 +1181,125 @@ async fn a_listing_answered_after_a_local_write_is_not_applied() {
     );
 }
 
+const LISTING_WITH_NEW_LABEL: &str = r#"{"labels":[{"id":"INBOX","name":"INBOX","type":"system"},{"id":"UNREAD","name":"UNREAD","type":"system"},{"id":"Label_3","name":"New","type":"user"}]}"#;
+
 #[tokio::test]
-async fn an_intervening_runner_listing_invalidates_a_carried_cut() {
-    use mailtide_store::{Store as _, sqlite::SqliteStore};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicI64, Ordering},
-    };
-    let store = SqliteStore::connect("sqlite::memory:")
-        .await
-        .expect("store");
-    store.migrate().await.expect("migrate");
-    store.track(&account(), 1).await.expect("track");
-    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
-    let gate = Arc::new(label_support::GateState::default());
-    let runner = || {
-        let gmail = label_support::FakeGmail::default();
-        label_support::with_defaults(&gmail);
-        let id = gmail.mailbox().create_label("Kept");
-        gmail.mailbox().add("m1", &[&id]);
-        label_support::runner_over(store.clone(), gmail, Access::ReadWrite, &clock, &gate)
-    };
-    let a = runner();
-    let b = runner();
-    a.run(&account(), BUDGET).await.expect("bootstrap");
-    clock.fetch_add(960_000, Ordering::SeqCst);
-    a.transport()
-        .mailbox()
-        .fail_next("GET labels", Fault::Body(CORE_LABELS));
-    a.run(&account(), BUDGET).await.expect("first cut");
-    b.run(&account(), BUDGET)
-        .await
-        .expect("intervening full listing");
-    clock.fetch_add(960_000, Ordering::SeqCst);
-    a.transport()
-        .mailbox()
-        .fail_next("GET labels", Fault::Body(CORE_LABELS));
-    a.run(&account(), BUDGET).await.expect("second cut");
-    assert!(
-        a.labels(&account())
-            .await
-            .expect("definitions")
-            .iter()
-            .any(|label| label.id == id("Label_1"))
-    );
+async fn a_live_label_disproves_the_listing_even_after_an_earlier_404() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        let gone = mailbox.create_label("Gone");
+        let live = mailbox.create_label("Live");
+        mailbox.add("m1", &[&gone, &live]);
+    })
+    .await;
+    let before = head(&runner).await;
+    {
+        let mut gmail = runner.transport().mailbox();
+        gmail.delete_label("Label_1", false);
+        gmail.create_label("New");
+        gmail.fail_next("GET labels", Fault::Body(LISTING_WITH_NEW_LABEL));
+        gmail.fail_next("GET labels/Label_2", Fault::Undecodable);
+    }
+    runner.advance(REFRESH);
+    let run = sync(&runner).await;
+    assert_eq!(run.report.status.expect("status").label_listing_failures, 1);
     assert_eq!(
-        store
-            .messages(&account(), &[MessageId("m1".into())])
-            .await
-            .expect("messages")[0]
-            .labels,
-        set(["Label_1"])
+        view(&runner, "m1").await.labels,
+        set(["Label_1", "Label_2"])
+    );
+    assert_eq!(user_names(&runner).await.len(), 2);
+    assert_eq!(
+        runner
+            .transport()
+            .mailbox()
+            .requests
+            .iter()
+            .filter(|request| request.starts_with("GET labels/"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["GET labels/Label_1", "GET labels/Label_2"]
+    );
+    assert!(feed_since(&runner, before).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_transient_label_lookup_keeps_that_label_and_applies_the_other_proof() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        let live = mailbox.create_label("Live");
+        let gone = mailbox.create_label("Gone");
+        mailbox.add("m1", &[&live, &gone]);
+    })
+    .await;
+    {
+        let mut gmail = runner.transport().mailbox();
+        gmail.delete_label("Label_2", false);
+        gmail.create_label("New");
+        gmail.fail_next("GET labels", Fault::Body(LISTING_WITH_NEW_LABEL));
+        gmail.fail_next("GET labels/Label_1", Fault::Status(503, "backendError"));
+    }
+    runner.advance(REFRESH);
+    sync(&runner).await;
+    assert_eq!(view(&runner, "m1").await.labels, set(["Label_1"]));
+    let names = user_names(&runner).await;
+    assert_eq!(names.len(), 2);
+    assert_eq!(names["Label_1"], "Live");
+    assert_eq!(names["Label_3"], "New");
+}
+
+#[tokio::test]
+async fn a_run_ending_mid_proof_discards_the_listing_and_its_completed_lookups() {
+    let runner = synced(Access::ReadWrite, |mailbox| {
+        let first = mailbox.create_label("First");
+        let second = mailbox.create_label("Second");
+        mailbox.add("m1", &[&first, &second]);
+    })
+    .await;
+    {
+        let mut gmail = runner.transport().mailbox();
+        gmail.delete_label("Label_1", false);
+        gmail.delete_label("Label_2", false);
+    }
+    runner
+        .transport()
+        .delay_responses("/labels/Label_1", Duration::from_millis(400));
+    runner.advance(REFRESH);
+    let run = runner
+        .run(&account(), Duration::from_millis(200))
+        .await
+        .expect("interrupted proofs");
+    assert_eq!(run.stop, mailtide_io::runner::StopReason::BudgetExhausted);
+    assert_eq!(
+        view(&runner, "m1").await.labels,
+        set(["Label_1", "Label_2"])
+    );
+    {
+        let gmail = runner.transport().mailbox();
+        assert!(
+            gmail
+                .requests
+                .iter()
+                .any(|request| request == "GET labels/Label_1")
+        );
+        assert!(
+            !gmail
+                .requests
+                .iter()
+                .any(|request| request == "GET labels/Label_2")
+        );
+    }
+
+    runner
+        .transport()
+        .delay_responses("/labels/Label_1", Duration::ZERO);
+    sync(&runner).await;
+    assert!(view(&runner, "m1").await.labels.is_empty());
+    assert_eq!(
+        runner
+            .transport()
+            .mailbox()
+            .requests
+            .iter()
+            .filter(|request| request.as_str() == "GET labels/Label_1")
+            .count(),
+        2
     );
 }

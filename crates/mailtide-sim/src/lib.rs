@@ -159,7 +159,7 @@ pub struct Faults {
     /// A host draft call is not atomic: Gmail acts later (a send, within
     /// its request timeout) and the answer is recorded steps later.
     pub draft_late: Probability,
-    /// Always omit the first user label, to characterize identical cuts.
+    /// Always omit the first user label, to check repeated partial listings.
     pub repeat_label_cut: bool,
     /// Use unsafe live offsets for message listings, for regression tests.
     pub offset_paging: bool,
@@ -394,6 +394,12 @@ pub struct Stats {
     pub refused_deliveries: u64,
     /// Label listings Gmail answered without labels or cut short.
     pub bad_listings: u64,
+    /// Point lookups sent to check listing omissions.
+    pub label_proofs: u64,
+    /// Point lookups returning a 404.
+    pub label_proof_missing: u64,
+    /// Point lookups returning a 200.
+    pub label_proof_live: u64,
     /// Listings not applied because a local label write made them stale.
     pub fenced_listings: u64,
     /// Deleted-label memory entries that expired.
@@ -1242,7 +1248,6 @@ struct Sim {
     engine: Engine,
     now: Timestamp,
     pending: Vec<Command>,
-    listing_cut_short: bool,
     deliveries: Vec<Event>,
     timers: BTreeMap<TimerKind, Timestamp>,
     blobs: BTreeSet<MessageId>,
@@ -1337,7 +1342,6 @@ impl Sim {
             engine,
             now: Timestamp(1_000_000),
             pending: Vec::new(),
-            listing_cut_short: false,
             deliveries: Vec::new(),
             timers: BTreeMap::new(),
             blobs: BTreeSet::new(),
@@ -2468,6 +2472,9 @@ impl Sim {
         let id = command.id;
         match command.kind {
             CommandKind::Gmail(call) => {
+                if matches!(call.request, GmailRequest::GetLabel { .. }) {
+                    self.stats.label_proofs += 1;
+                }
                 let failure = if self.rng.chance(self.faults.transient) {
                     Some((Retryable::Transient, None))
                 } else if self.rng.chance(self.faults.rate_limited) {
@@ -2589,35 +2596,22 @@ impl Sim {
                     }),
                 };
             }
-            // A transient cut can keep every system label. The next
-            // listing is whole; two identical omissions would vote for
-            // deletion even with confirmation.
+            // A cut can omit a live user label while keeping every system label.
             let users: Vec<_> = labels
                 .iter()
                 .enumerate()
                 .filter(|(_, label)| !mailtide::mirror::is_system_label(label))
                 .map(|(index, _)| index)
                 .collect();
-            if !self.listing_cut_short && !users.is_empty() {
+            if !users.is_empty() {
                 labels.remove(users[self.rng.below(users.len())]);
-                self.listing_cut_short = true;
-            } else {
-                self.listing_cut_short = false;
             }
-        } else {
-            self.listing_cut_short = false;
         }
         EventKind::LabelsListed {
             command,
             labels,
             generation: self.mirror.record.label_generation,
-            stored_user_labels: self
-                .mirror
-                .labels
-                .iter()
-                .filter(|label| !mailtide::mirror::is_system_label(label))
-                .map(|label| label.id.clone())
-                .collect(),
+            stored_user_labels: self.mirror.user_labels_oldest_first(),
         }
     }
 
@@ -2714,41 +2708,13 @@ impl Sim {
                 command,
                 expiration: self.now.plus(Duration::from_hours(168)),
             },
-            GmailRequest::Modify(group) => {
-                match self.gmail.modify(group) {
-                    Modified::Done => {}
-                    Modified::NotFound => {
-                        return EventKind::MessageNotFound {
-                            command,
-                            message_id: group.messages[0].clone(),
-                        };
-                    }
-                    Modified::UnknownLabel => {
-                        self.stats.refused_deliveries += 1;
-                        return EventKind::RequestFailed {
-                            command,
-                            failure: Failure::Blocking(BlockingFailure {
-                                class: Blocking::Permanent,
-                                detail: "400 invalidArgument labelId not found".into(),
-                            }),
-                        };
-                    }
-                }
-                self.stats.deliveries += 1;
-                // Gmail notifies about our own changes too.
-                if !self.rng.chance(self.faults.push_dropped) {
-                    self.deliver(EventKind::PushReceived {
-                        history_id: self.gmail.current(),
-                    });
-                }
-                EventKind::LabelsModified { command }
-            }
-            // Searches, their label checks and label writes are the
+            GmailRequest::Modify(group) => self.modify_labels(command, group),
+            GmailRequest::GetLabel { id } => self.get_label(command, id),
+            // Searches and label writes are the
             // driver's direct calls; the engine never issues one, so the
             // simulated Gmail refuses them (a bug would show as a blocked
             // request).
             GmailRequest::Search(_)
-            | GmailRequest::GetLabel { .. }
             | GmailRequest::CreateLabel(_)
             | GmailRequest::PatchLabel { .. }
             | GmailRequest::DeleteLabel { .. }
@@ -2764,6 +2730,53 @@ impl Sim {
                 command,
                 page: self.gmail.list_drafts(page_token.as_ref()),
             },
+        }
+    }
+
+    fn modify_labels(&mut self, command: CommandId, group: &ModifyGroup) -> EventKind {
+        match self.gmail.modify(group) {
+            Modified::Done => {}
+            Modified::NotFound => {
+                return EventKind::MessageNotFound {
+                    command,
+                    message_id: group.messages[0].clone(),
+                };
+            }
+            Modified::UnknownLabel => {
+                self.stats.refused_deliveries += 1;
+                return EventKind::RequestFailed {
+                    command,
+                    failure: Failure::Blocking(BlockingFailure {
+                        class: Blocking::Permanent,
+                        detail: "400 invalidArgument labelId not found".into(),
+                    }),
+                };
+            }
+        }
+        self.stats.deliveries += 1;
+        // Gmail notifies about our own changes too.
+        if !self.rng.chance(self.faults.push_dropped) {
+            self.deliver(EventKind::PushReceived {
+                history_id: self.gmail.current(),
+            });
+        }
+        EventKind::LabelsModified { command }
+    }
+
+    fn get_label(&mut self, command: CommandId, id: &LabelId) -> EventKind {
+        let definition = self.gmail.user_label_definition(id).or_else(|| {
+            (LABELS.contains(&id.0.as_str()) || id.0 == "DRAFT")
+                .then(|| Label::plain(id.clone(), &id.0, LabelKind::System))
+        });
+        if let Some(label) = definition {
+            self.stats.label_proof_live += 1;
+            EventKind::LabelFetched { command, label }
+        } else {
+            self.stats.label_proof_missing += 1;
+            EventKind::RequestFailed {
+                command,
+                failure: Failure::NotFound,
+            }
         }
     }
 
@@ -3572,10 +3585,11 @@ mod tests {
                 .iter()
                 .any(|r| r.faults.draft_late != Probability::NEVER),
             "draft calls were not atomic"
+        );
     }
 
     #[test]
-    fn two_identical_core_complete_cuts_can_strip_a_live_user_label() {
+    fn two_identical_core_complete_cuts_do_not_strip_a_live_user_label() {
         let mut sim = Sim::new(Rng(1), Faults::none(), None);
         let live = LabelId("Label_1".into());
         let id = sim.gmail.add(
@@ -3587,14 +3601,14 @@ mod tests {
         assert!(sim.mirror.messages[&id].labels.contains(&live));
         sim.faults.repeat_label_cut = true;
         sim.now = sim.now.plus(EngineConfig::default().label_refresh);
-        for round in 0..2 {
-            let events = sim.engine.handle(Event {
+        for _ in 0..2 {
+            let commands = sim.engine.handle(Event {
                 now: sim.now,
                 kind: EventKind::TimerFired {
                     timer: TimerKind::Labels,
                 },
             });
-            let command = events
+            let listing = commands
                 .into_iter()
                 .find(|command| {
                     matches!(&command.kind,
@@ -3602,7 +3616,7 @@ mod tests {
                     )
                 })
                 .expect("label listing");
-            let answer = sim.list_labels(command.id);
+            let answer = sim.list_labels(listing.id);
             let EventKind::LabelsListed { labels, .. } = &answer else {
                 panic!("well-formed cut");
             };
@@ -3612,30 +3626,32 @@ mod tests {
                     .all(|id| labels.iter().any(|label| label.id.0 == *id))
             );
             assert!(labels.iter().all(|label| label.id != live));
-            let commands = sim.engine.handle(Event {
+            let lookup = sim
+                .engine
+                .handle(Event {
+                    now: sim.now,
+                    kind: answer,
+                })
+                .remove(0);
+            let CommandKind::Gmail(call) = &lookup.kind else {
+                panic!("point lookup");
+            };
+            assert_eq!(call.request, GmailRequest::GetLabel { id: live.clone() });
+            let proof = sim.gmail_result(lookup.id, &call.request);
+            let rejected = sim.engine.handle(Event {
                 now: sim.now,
-                kind: answer,
+                kind: proof,
             });
-            if round == 0 {
-                assert!(
-                    commands
-                        .iter()
-                        .all(|command| !matches!(command.kind, CommandKind::Commit(_)))
-                );
-                assert!(sim.mirror.messages[&id].labels.contains(&live));
-            } else {
-                for command in commands {
-                    sim.execute(command);
-                }
-            }
+            assert!(
+                rejected
+                    .iter()
+                    .all(|command| !matches!(command.kind, CommandKind::Commit(_)))
+            );
+            assert!(sim.mirror.messages[&id].labels.contains(&live));
             sim.now = sim.now.plus(mailtide::schedule::UNKNOWN_LABEL_GAP);
         }
-        assert!(
-            sim.violations
-                .iter()
-                .any(|observed| matches!(&observed.violation,
-            Violation::LiveLabelStripped { message, label } if message == &id && label == &live))
-        );
+        assert_eq!(sim.stats.label_proof_live, 2);
+        assert!(sim.violations.is_empty());
     }
 
     #[test]

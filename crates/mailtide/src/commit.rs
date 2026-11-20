@@ -32,6 +32,8 @@ pub struct Commit {
     pub account: AccountId,
     /// The writer's epoch; stale epochs are rejected.
     pub epoch: Epoch,
+    /// The account incarnation captured by the writer.
+    pub account_generation: u64,
     /// The writer's engine version; older versions are rejected.
     pub engine_version: EngineVersion,
     /// Move the cursor, conditionally on its current value.
@@ -216,9 +218,8 @@ pub enum LabelOp {
     /// label generation is still `generation`, the one read before the
     /// listing was sent: a local label write since then makes the listing
     /// stale, and the next one applies. A list equal to the stored one (in
-    /// any order) changes no definition and logs nothing; a stored label it
-    /// lacks is removed as by [`LabelOp::Remove`]; a remembered-deleted id it
-    /// names is restored.
+    /// any order) changes no definition and logs nothing. Omissions need
+    /// point-lookup proof. A remembered-deleted id it names is restored.
     ReplaceAll {
         /// Every definition Gmail listed.
         labels: Vec<Label>,
@@ -226,6 +227,8 @@ pub enum LabelOp {
         generation: u64,
         /// When it was listed.
         at: Timestamp,
+        /// Omitted user labels proven deleted by their individual 404s.
+        removed: LabelSet,
     },
     /// Gmail's answer to a local create or patch: the definition as it is
     /// now.

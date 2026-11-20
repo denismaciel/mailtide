@@ -27,6 +27,7 @@ impl SqlStore {
         };
         if let Err(reason) = request.check(
             record.epoch,
+            record.generation,
             record.sync == SyncState::Live,
             record.audit_progress.as_ref(),
         ) {
@@ -121,6 +122,10 @@ async fn apply_step(
         }
         (AuditStep::Defer(until), _) => {
             schedule.defer(*until);
+            request.expected.clone()
+        }
+        (AuditStep::Retry(until), _) => {
+            report.abandoned = schedule.failed(*until);
             request.expected.clone()
         }
         (AuditStep::Abandon(reason), _) => {

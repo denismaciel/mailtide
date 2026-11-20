@@ -364,7 +364,9 @@ where
                 .await
             {
                 Err(CallError::NotFound) => {}
-                Ok(EventKind::LabelFetched { .. }) => return Err(short_listing()),
+                Ok(EventKind::LabelFetched { .. } | EventKind::LabelExists { .. }) => {
+                    return Err(short_listing());
+                }
                 Ok(_) => return Err(unexpected()),
                 Err(error) => return Err(error.into()),
             }

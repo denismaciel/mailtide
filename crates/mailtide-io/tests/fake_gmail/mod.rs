@@ -338,6 +338,7 @@ impl FakeGmail {
                 200,
                 &json!({"labels": [
                     {"id": "INBOX", "name": "INBOX", "type": "system"},
+                    {"id": "UNREAD", "name": "UNREAD", "type": "system"},
                     {"id": "DRAFT", "name": "DRAFT", "type": "system"},
                     {"id": "SENT", "name": "SENT", "type": "system"},
                 ]}),

@@ -44,6 +44,7 @@ fn commit(mirror: &AccountMirror) -> Commit {
         },
         account: mirror.account.clone(),
         epoch: mirror.record.epoch,
+        account_generation: mirror.record.generation,
         engine_version: ENGINE_VERSION,
         cursor: None,
         claim: None,
