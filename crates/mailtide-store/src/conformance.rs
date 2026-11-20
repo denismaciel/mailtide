@@ -21,6 +21,7 @@ use mailtide::outbox::{Action, ActionRequest, IntentOp, ReadState};
 use mailtide::quota::Priority;
 use mailtide::revision::{Change, ChangeEntry, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
+use mailtide::thread::ThreadView;
 
 use crate::{Store, StoreError};
 
@@ -126,6 +127,7 @@ where
     ];
     cases.extend(prioritise_cases());
     cases.extend(feed_page_cases());
+    cases.extend(thread_cases());
     let mut results = Vec::new();
     for (name, case) in cases {
         let failure = match make().await {
@@ -227,16 +229,21 @@ fn commit(snapshot: &StoreSnapshot, seq: u64) -> Commit {
 
 /// The import of `id` with header facts derived from it.
 fn import(id: &str, labels: &[&str], checkpoint: u64) -> MessageOp {
+    import_in("t", id, labels, checkpoint, 1_700_000_000_000)
+}
+
+/// The import of `id` into `thread`, dated `date`.
+fn import_in(thread: &str, id: &str, labels: &[&str], checkpoint: u64, date: i64) -> MessageOp {
     MessageOp::MarkImported {
         observation: MessageObservation {
             id: MessageId(id.into()),
-            thread_id: ThreadId("t".into()),
+            thread_id: ThreadId(thread.into()),
             labels: set(labels.iter().copied()),
             checkpoint: HistoryId(checkpoint),
         },
         blob: BlobRef(format!("{id}.eml")),
         size: 100,
-        internal_date: Timestamp(1_700_000_000_000),
+        internal_date: Timestamp(date),
         headers: Box::new(HeaderFacts {
             rfc822_message_id: Some(format!("<{id}@example.com>")),
             from: Some(format!("{id}@example.com")),
@@ -723,6 +730,239 @@ async fn thread_actions<S: Store>(store: &S) -> Result<(), String> {
     expect(
         view(store, "c").await?.pending_actions == 0,
         "other threads are untouched",
+    )
+}
+
+/// The thread view cases.
+fn thread_cases<S: Store>() -> Vec<(&'static str, CaseFn<S>)> {
+    vec![
+        (
+            "thread views fold their members as messages() shows them",
+            |s| Box::pin(thread_views(s)),
+        ),
+        ("thread views span statement chunks whole", |s| {
+            Box::pin(thread_views_span_statement_chunks(s))
+        }),
+        ("thread views never mix accounts", |s| {
+            Box::pin(thread_views_never_mix_accounts(s))
+        }),
+    ]
+}
+
+async fn threads<S: Store>(
+    store: &S,
+    account: &AccountId,
+    ids: &[&str],
+) -> Result<Vec<ThreadView>, String> {
+    let ids: Vec<ThreadId> = ids.iter().map(|id| ThreadId((*id).into())).collect();
+    store
+        .threads(account, &ids)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn members(thread: &ThreadView) -> Vec<&str> {
+    thread.messages.iter().map(|m| m.id.0.as_str()).collect()
+}
+
+async fn thread_views<S: Store>(store: &S) -> Result<(), String> {
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = vec![
+        import_in("t1", "a", &["INBOX"], 10, 20),
+        import_in("t1", "b", &["INBOX", "UNREAD"], 11, 10),
+        observe_in("t1", "c", &["INBOX"], 12),
+        observe_in("t1", "d", &["DRAFT"], 13),
+        import_in("t2", "e", &["INBOX"], 14, 30),
+        observe_in("t3", "f", &["INBOX"], 15),
+    ];
+    apply(store, &c).await?;
+    expect(
+        threads(store, &account(), &[]).await?.is_empty(),
+        "no ids read nothing",
+    )?;
+    let read = threads(store, &account(), &["t2", "unknown", "", "t1"]).await?;
+    let ids: Vec<&str> = read.iter().map(|t| t.id.0.as_str()).collect();
+    expect(
+        ids == ["t2", "t1"],
+        &format!("answers come in the order asked, unknown and empty ids left out: {ids:?}"),
+    )?;
+    let t1 = &read[1];
+    expect(
+        members(t1) == ["b", "a", "c", "d"],
+        &format!(
+            "members by date, then those awaiting import: {:?}",
+            members(t1)
+        ),
+    )?;
+    expect(t1.labels == set(["INBOX", "UNREAD"]) && t1.unread, "labels")?;
+    expect(t1.latest == Some(MessageId("a".into())), "latest")?;
+    expect(
+        (t1.message_count, t1.draft_count, t1.awaiting_import) == (3, 1, 1),
+        "counts",
+    )?;
+    expect(
+        t1.participants == ["b@example.com", "a@example.com"],
+        "participants",
+    )?;
+    let ids: Vec<MessageId> = t1.messages.iter().map(|m| m.id.clone()).collect();
+    let views = store
+        .messages(&account(), &ids)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(views == t1.messages, "each member is its messages() view")?;
+
+    // A pending action shows at once.
+    store
+        .admit(
+            &account(),
+            &ActionRequest::Thread {
+                id: ThreadId("t1".into()),
+                action: Action::SetRead(ReadState::Read),
+            },
+            Timestamp(0),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let t1 = threads(store, &account(), &["t1"])
+        .await?
+        .pop()
+        .ok_or("t1")?;
+    expect(!t1.unread && t1.labels == set(["INBOX"]), "the overlay")?;
+
+    // A deleted member leaves; a thread whose members are all deleted goes.
+    let mut d = commit(&snapshot, 1);
+    d.messages = ["a", "e"]
+        .iter()
+        .map(|id| MessageOp::Tombstone {
+            id: MessageId((*id).into()),
+            evidence: DeletionEvidence::History { at: HistoryId(20) },
+        })
+        .collect();
+    apply(store, &d).await?;
+    let read = threads(store, &account(), &["t1", "t2", "t3"]).await?;
+    let ids: Vec<&str> = read.iter().map(|t| t.id.0.as_str()).collect();
+    expect(ids == ["t1", "t3"], "a thread with no members is gone")?;
+    expect(
+        members(&read[0]) == ["b", "c", "d"] && read[0].latest == Some(MessageId("b".into())),
+        "the member before the deleted one is latest",
+    )?;
+    expect(
+        threads(store, &AccountId("stranger@example.com".into()), &["t1"])
+            .await?
+            .is_empty(),
+        "an untracked account reads as empty",
+    )
+}
+
+async fn thread_views_span_statement_chunks<S: Store>(store: &S) -> Result<(), String> {
+    // More thread ids than one statement takes, and one thread with more
+    // rows (each joined with two intents) than a chunk of ids.
+    const THREADS: u64 = 1_200;
+    const BIG: u64 = 600;
+    let snapshot = claim(store).await?;
+    let mut c = commit(&snapshot, 0);
+    c.messages = (0..THREADS)
+        .map(|n| {
+            import_in(
+                &format!("t{n:04}"),
+                &format!("m{n:04}"),
+                &["INBOX"],
+                n + 1,
+                1,
+            )
+        })
+        .chain((0..BIG).map(|n| {
+            import_in(
+                "big",
+                &format!("b{n:04}"),
+                &["INBOX", "UNREAD"],
+                THREADS + n + 1,
+                i64::try_from(n).unwrap_or(i64::MAX),
+            )
+        }))
+        .collect();
+    apply(store, &c).await?;
+    let admitted = store
+        .admit(
+            &account(),
+            &ActionRequest::Thread {
+                id: ThreadId("big".into()),
+                action: Action::MarkSpam,
+            },
+            Timestamp(0),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    expect(u64::from(admitted) == BIG, "every member of the big thread")?;
+    let mut ids: Vec<String> = (0..THREADS).rev().map(|n| format!("t{n:04}")).collect();
+    ids.insert(ids.len() / 2, "big".into());
+    let asked: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let read = threads(store, &account(), &asked).await?;
+    let answered: Vec<&str> = read.iter().map(|t| t.id.0.as_str()).collect();
+    expect(answered == asked, "every thread once, in the order asked")?;
+    expect(
+        read.iter()
+            .filter(|t| t.id.0 != "big")
+            .all(|t| t.message_count == 1 && t.messages.len() == 1),
+        "each small thread whole",
+    )?;
+    let big = read
+        .iter()
+        .find(|t| t.id.0 == "big")
+        .ok_or("the big thread")?;
+    expect(
+        u64::from(big.message_count) == BIG
+            && big
+                .messages
+                .iter()
+                .all(|m| m.pending_actions == 2 && !m.labels.contains(&LabelId("INBOX".into()))),
+        "the big thread whole, each member with both intents",
+    )?;
+    expect(
+        big.labels == set(["SPAM", "UNREAD"]),
+        "the big thread's labels with the overlay",
+    )?;
+    expect(
+        big.messages.windows(2).all(|w| {
+            w[0].content.as_ref().map(|c| c.internal_date)
+                < w[1].content.as_ref().map(|c| c.internal_date)
+        }),
+        "the big thread in date order",
+    )
+}
+
+async fn thread_views_never_mix_accounts<S: Store>(store: &S) -> Result<(), String> {
+    let other = AccountId("delegate@example.com".into());
+    let mine = claim(store).await?;
+    store
+        .track(&other, GENERATION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let theirs = store
+        .claim(&other, ENGINE_VERSION)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let mut c = commit(&mine, 0);
+    c.messages = vec![import_in("t", "a", &["INBOX"], 1, 10)];
+    apply(store, &c).await?;
+    let mut c = commit(&theirs, 0);
+    c.messages = vec![
+        import_in("t", "a", &["STARRED"], 1, 10),
+        import_in("t", "b", &["INBOX", "UNREAD"], 2, 20),
+    ];
+    apply(store, &c).await?;
+    let read = threads(store, &account(), &["t"]).await?;
+    expect(
+        read.len() == 1 && members(&read[0]) == ["a"] && read[0].labels == set(["INBOX"]),
+        "only the account's own rows",
+    )?;
+    let read = threads(store, &other, &["t"]).await?;
+    expect(
+        read.len() == 1
+            && members(&read[0]) == ["a", "b"]
+            && read[0].labels == set(["INBOX", "STARRED", "UNREAD"]),
+        "the other account's own rows",
     )
 }
 

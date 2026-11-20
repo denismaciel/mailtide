@@ -2,13 +2,14 @@
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::thread::ThreadView;
 
 use crate::sql::SqlStore;
 use crate::{Store, StoreError};
@@ -138,6 +139,14 @@ impl Store for SqliteStore {
         crate::Store::messages(&self.inner, account, ids).await
     }
 
+    async fn threads(
+        &self,
+        account: &AccountId,
+        ids: &[ThreadId],
+    ) -> Result<Vec<ThreadView>, StoreError> {
+        crate::Store::threads(&self.inner, account, ids).await
+    }
+
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         crate::Store::labels(&self.inner, account).await
     }
@@ -253,6 +262,8 @@ mod tests {
         refused("resume", store.resume(account, now).await.err());
         refused("forget", store.forget(account).await.err());
         refused("messages", store.messages(account, &ids).await.err());
+        let threads = [ThreadId("t".into())];
+        refused("threads", store.threads(account, &threads).await.err());
         refused("labels", store.labels(account).await.err());
     }
 
@@ -494,8 +505,8 @@ mod tests {
             .expect("claim");
         assert_eq!(snapshot.sync, mailtide::state::SyncState::Live);
         assert_eq!(snapshot.labels_refreshed_at, None);
-        // The documented downgrade, after forgetting the later
-        // (version-only) migrations.
+        // The documented downgrade, after forgetting the later migrations
+        // (version-only, or an index that migrating again keeps).
         run(vec![
             "DELETE FROM mailtide_schema WHERE version > 4".to_owned(),
             "ALTER TABLE mailtide_accounts DROP COLUMN labels_refreshed_at".to_owned(),
@@ -523,8 +534,8 @@ mod tests {
     #[tokio::test]
     async fn migration_5_is_version_only_and_revertible() {
         use crate::sql::{SCHEMA_VERSION, SchemaState, migrations};
-        assert_eq!(SCHEMA_VERSION, 5);
         let all = migrations();
+        assert_eq!(all[4].version, 5);
         assert_eq!(
             all[4].statements[1..],
             ["INSERT INTO mailtide_schema (version) VALUES (5)".to_owned()]
@@ -533,12 +544,18 @@ mod tests {
             .await
             .expect("store");
         store.migrate().await.expect("migrate");
-        // The documented downgrade.
-        store
-            .inner
-            .execute_for_tests("DELETE FROM mailtide_schema WHERE version = 5")
-            .await
-            .expect("revert");
+        // The documented downgrade, after forgetting the later migrations
+        // (an index that migrating again keeps).
+        for statement in [
+            "DELETE FROM mailtide_schema WHERE version > 5",
+            "DELETE FROM mailtide_schema WHERE version = 5",
+        ] {
+            store
+                .inner
+                .execute_for_tests(statement)
+                .await
+                .expect("revert");
+        }
         assert_eq!(
             store.inner.schema().await.expect("schema"),
             SchemaState::Behind {
@@ -577,5 +594,262 @@ mod tests {
             Err(StoreError::Corrupt(reason)) => assert!(reason.contains("history id"), "{reason}"),
             other => panic!("expected Corrupt, got {other:?}"),
         }
+    }
+
+    /// The migration that adds the thread index, by its statement (its
+    /// number is assigned when it lands), and the migrations before it.
+    fn thread_index_migration() -> (Vec<crate::sql::Migration>, crate::sql::Migration) {
+        let all = crate::sql::migrations();
+        let index = all
+            .iter()
+            .position(|m| {
+                m.statements
+                    .iter()
+                    .any(|s| s.contains("mailtide_messages_thread"))
+            })
+            .expect("the thread index migration");
+        (all[..index].to_vec(), all[index].clone())
+    }
+
+    async fn run_statements(store: &SqliteStore, migrations: &[crate::sql::Migration]) {
+        for statement in migrations.iter().flat_map(|m| &m.statements) {
+            store
+                .inner
+                .execute_for_tests(statement)
+                .await
+                .expect("statement");
+        }
+    }
+
+    /// Two threads, one with a draft, a message awaiting import and a
+    /// pending action; returns the views of both.
+    async fn populate(store: &SqliteStore) -> Vec<ThreadView> {
+        use mailtide::gmail::{HeaderFacts, MessageObservation};
+        use mailtide::ids::{BlobRef, HistoryId};
+        use mailtide::labels::set;
+        let account = AccountId("a@example.com".into());
+        store.track(&account, 1).await.expect("track");
+        let snapshot = store
+            .claim(&account, mailtide::ids::ENGINE_VERSION)
+            .await
+            .expect("claim");
+        let mut commit = lifecycle_commit(
+            &snapshot,
+            0,
+            mailtide::state::SyncState::Live,
+            Some(mailtide::commit::CursorMove {
+                expected: None,
+                to: HistoryId(7),
+            }),
+            0,
+        );
+        let observation = |thread: &str, id: &str, labels: &[&str]| MessageObservation {
+            id: MessageId(id.into()),
+            thread_id: ThreadId(thread.into()),
+            labels: set(labels.iter().copied()),
+            checkpoint: HistoryId(1),
+        };
+        let import = |thread: &str, id: &str, labels: &[&str], date: i64| {
+            mailtide::commit::MessageOp::MarkImported {
+                observation: observation(thread, id, labels),
+                blob: BlobRef(format!("{id}.eml")),
+                size: 10,
+                internal_date: Timestamp(date),
+                headers: Box::new(HeaderFacts {
+                    from: Some(format!("{id}@example.com")),
+                    ..HeaderFacts::default()
+                }),
+            }
+        };
+        commit.messages = vec![
+            import("t1", "a", &["INBOX"], 20),
+            import("t1", "b", &["INBOX", "UNREAD"], 10),
+            mailtide::commit::MessageOp::Observe(observation("t1", "c", &["INBOX"])),
+            import("t1", "d", &["DRAFT"], 30),
+            import("t2", "e", &["INBOX"], 5),
+        ];
+        assert!(matches!(
+            store.apply(&commit).await.expect("apply"),
+            CommitOutcome::Applied { .. }
+        ));
+        store
+            .admit(
+                &account,
+                &ActionRequest::Thread {
+                    id: ThreadId("t2".into()),
+                    action: mailtide::outbox::Action::Archive,
+                },
+                Timestamp(0),
+            )
+            .await
+            .expect("admit");
+        views(store).await
+    }
+
+    async fn views(store: &SqliteStore) -> Vec<ThreadView> {
+        store
+            .threads(
+                &AccountId("a@example.com".into()),
+                &[ThreadId("t1".into()), ThreadId("t2".into())],
+            )
+            .await
+            .expect("threads")
+    }
+
+    async fn has_thread_index(store: &SqliteStore) -> bool {
+        store
+            .inner
+            .text_for_tests(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'mailtide_messages_thread'",
+            )
+            .await
+            .expect("index count")
+            == "1"
+    }
+
+    /// The documented rollback (SPEC §11) takes a populated database back to
+    /// the previous version and loses nothing; migrating again restores the
+    /// index, and the views read the same.
+    #[tokio::test]
+    async fn the_thread_index_migration_applies_to_a_populated_database() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState};
+        let (_, migration) = thread_index_migration();
+        assert_eq!(
+            migration.statements[1..],
+            [
+                "CREATE INDEX IF NOT EXISTS mailtide_messages_thread ON mailtide_messages (account, thread_id, id)"
+                    .to_owned(),
+                format!(
+                    "INSERT INTO mailtide_schema (version) VALUES ({})",
+                    migration.version
+                ),
+            ]
+        );
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        let read = populate(&store).await;
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].message_count, 3);
+        assert_eq!(read[1].labels.len(), 0, "the archive overlays");
+        for statement in [
+            "DROP INDEX mailtide_messages_thread".to_owned(),
+            format!(
+                "DELETE FROM mailtide_schema WHERE version = {}",
+                migration.version
+            ),
+        ] {
+            store
+                .inner
+                .execute_for_tests(&statement)
+                .await
+                .expect("rollback");
+        }
+        assert!(!has_thread_index(&store).await);
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Behind {
+                applied: migration.version - 1,
+                expected: SCHEMA_VERSION
+            }
+        );
+        store.migrate().await.expect("migrate");
+        assert!(has_thread_index(&store).await);
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Current {
+                version: SCHEMA_VERSION
+            }
+        );
+        assert_eq!(views(&store).await, read);
+    }
+
+    /// The thread read and the admission lookup search the thread index
+    /// instead of reading every row of the account.
+    #[tokio::test]
+    async fn thread_reads_and_thread_actions_use_the_thread_index() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        store.migrate().await.expect("migrate");
+        populate(&store).await;
+        for (statement, binds) in [
+            (
+                crate::sql::thread_rows(2),
+                vec!["a@example.com", "t1", "t2"],
+            ),
+            (
+                crate::sql::THREAD_MEMBERS.to_owned(),
+                vec!["a@example.com", "t1"],
+            ),
+        ] {
+            let plan = store
+                .inner
+                .plan_for_tests(&statement, &binds)
+                .await
+                .expect("plan");
+            let messages: Vec<&String> = plan
+                .iter()
+                .filter(|step| step.contains(" m ") || step.contains("mailtide_messages"))
+                .collect();
+            assert!(
+                messages
+                    .iter()
+                    .any(|step| step.contains("mailtide_messages_thread")),
+                "{statement}: {plan:?}"
+            );
+            assert!(
+                messages.iter().all(|step| !step.starts_with("SCAN")
+                    && !step.contains("sqlite_autoindex_mailtide_messages")),
+                "{statement}: {plan:?}"
+            );
+        }
+    }
+
+    /// A host that built the index itself (on Postgres, `CREATE INDEX
+    /// CONCURRENTLY` under the same name) runs the migration as a no-op.
+    #[tokio::test]
+    async fn the_index_a_host_created_beforehand_is_kept() {
+        use crate::sql::{SCHEMA_VERSION, SchemaState};
+        let (before, _) = thread_index_migration();
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        run_statements(&store, &before).await;
+        store
+            .inner
+            .execute_for_tests(
+                "CREATE INDEX mailtide_messages_thread ON mailtide_messages (account, thread_id, id)",
+            )
+            .await
+            .expect("the host's index");
+        let host_sql = store
+            .inner
+            .text_for_tests("SELECT sql FROM sqlite_master WHERE name = 'mailtide_messages_thread'")
+            .await
+            .expect("sql");
+        store.migrate().await.expect("migrate");
+        assert_eq!(
+            store.inner.schema().await.expect("schema"),
+            SchemaState::Current {
+                version: SCHEMA_VERSION
+            }
+        );
+        assert!(has_thread_index(&store).await);
+        assert_eq!(
+            store
+                .inner
+                .text_for_tests(
+                    "SELECT sql FROM sqlite_master WHERE name = 'mailtide_messages_thread'",
+                )
+                .await
+                .expect("sql"),
+            host_sql
+        );
+        let read = populate(&store).await;
+        assert_eq!(read.len(), 2);
+        assert_eq!(views(&store).await, read);
     }
 }

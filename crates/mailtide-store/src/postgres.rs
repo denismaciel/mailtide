@@ -2,13 +2,14 @@
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::thread::ThreadView;
 
 use crate::sql::SqlStore;
 use crate::{Store, StoreError};
@@ -136,6 +137,14 @@ impl Store for PostgresStore {
         ids: &[MessageId],
     ) -> Result<Vec<MessageView>, StoreError> {
         crate::Store::messages(&self.inner, account, ids).await
+    }
+
+    async fn threads(
+        &self,
+        account: &AccountId,
+        ids: &[ThreadId],
+    ) -> Result<Vec<ThreadView>, StoreError> {
+        crate::Store::threads(&self.inner, account, ids).await
     }
 
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {

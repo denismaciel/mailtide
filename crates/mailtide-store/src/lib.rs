@@ -13,13 +13,14 @@ use std::future::Future;
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::MessageView;
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::thread::ThreadView;
 
 pub mod config;
 pub mod conformance;
@@ -180,6 +181,16 @@ pub trait Store: Send + Sync {
         account: &AccountId,
         ids: &[MessageId],
     ) -> impl Future<Output = Result<Vec<MessageView>, StoreError>> + Send;
+
+    /// How hosts see these threads, in the order asked: every member with its
+    /// view, folded by [`mailtide::thread::view`]. A thread the mirror has no
+    /// message in is left out, as is every id of an untracked account; no ids
+    /// read nothing. Each answer comes from one consistent read of its rows.
+    fn threads(
+        &self,
+        account: &AccountId,
+        ids: &[ThreadId],
+    ) -> impl Future<Output = Result<Vec<ThreadView>, StoreError>> + Send;
 
     /// The account's label definitions as the mirror last synced them, in id
     /// order: empty before the first label sync, and for an unknown account.

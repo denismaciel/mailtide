@@ -6,13 +6,14 @@ use std::sync::Mutex;
 
 use mailtide::commit::{Commit, CommitOutcome};
 use mailtide::gmail::Label;
-use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, Timestamp};
+use mailtide::ids::{AccountId, EngineVersion, Epoch, MessageId, ThreadId, Timestamp};
 use mailtide::jobs::{AttemptId, ClaimOutcome, Prioritised};
 use mailtide::mirror::{AccountMirror, MessageView};
 use mailtide::outbox::ActionRequest;
 use mailtide::revision::{ChangeFeed, FeedCursor, StateSeq};
 use mailtide::state::StoreSnapshot;
 use mailtide::status::{AccountStatus, ForgetOutcome, ResumeOutcome, TrackOutcome};
+use mailtide::thread::ThreadView;
 
 use crate::{Store, StoreError};
 
@@ -228,6 +229,16 @@ impl Store for MemoryStore {
     ) -> Result<Vec<MessageView>, StoreError> {
         self.on_account(account, Vec::new(), |mirror| {
             ids.iter().filter_map(|id| mirror.view(id)).collect()
+        })
+    }
+
+    async fn threads(
+        &self,
+        account: &AccountId,
+        ids: &[ThreadId],
+    ) -> Result<Vec<ThreadView>, StoreError> {
+        self.on_account(account, Vec::new(), |mirror| {
+            ids.iter().filter_map(|id| mirror.thread(id)).collect()
         })
     }
 

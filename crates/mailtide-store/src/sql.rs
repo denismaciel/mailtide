@@ -34,6 +34,7 @@ use mailtide::state::StoreSnapshot;
 use mailtide::status::{
     AccountStatus, ActionCounts, ForgetOutcome, JobCounts, ResumeOutcome, TrackOutcome,
 };
+use mailtide::thread::ThreadView;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolOptions;
 use sqlx::{Any, AssertSqlSafe, Pool, Row, Transaction};
@@ -93,7 +94,11 @@ const MIGRATIONS: &[&[&str]] = &[&[
 // 5: version only. State strings may name an entry inside a commit
 // (`mt2-<gen>.<seq>.<idx>`), which older builds can't decode: they must see
 // the database as ahead.
-&[]];
+&[],
+// 6: thread lookups (thread views, thread action admission) read the
+// thread's rows, not every row of the account. Only an index: dropping it
+// makes them slow, never wrong.
+&["CREATE INDEX IF NOT EXISTS mailtide_messages_thread ON mailtide_messages (account, thread_id, id)"]];
 
 /// The schema version this build expects.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations, checked at compile time below
@@ -416,6 +421,26 @@ impl SqlStore {
         row.try_get(0).map_err(|e| corrupt("text", e))
     }
 
+    /// The steps of `SQLite`'s plan for `statement` with `binds` (tests only).
+    #[cfg(test)]
+    pub(crate) async fn plan_for_tests(
+        &self,
+        statement: &str,
+        binds: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        let mut query = sqlx::query(AssertSqlSafe(format!("EXPLAIN QUERY PLAN {statement}")));
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| unavailable(&e))?
+            .iter()
+            .map(|row| row.try_get("detail").map_err(|e| corrupt("detail", e)))
+            .collect()
+    }
+
     /// Run one statement (tests only).
     #[cfg(test)]
     pub(crate) async fn execute_for_tests(&self, statement: &str) -> Result<(), StoreError> {
@@ -629,14 +654,12 @@ impl SqlStore {
                     ids.extend(targets.iter().cloned());
                 }
                 IntentOp::Request(ActionRequest::Thread { id: thread, .. }) => {
-                    let rows = sqlx::query(
-                        "SELECT id FROM mailtide_messages WHERE account = $1 AND thread_id = $2",
-                    )
-                    .bind(account.as_str())
-                    .bind(thread.0.as_str())
-                    .fetch_all(&mut **tx)
-                    .await
-                    .map_err(|e| unavailable(&e))?;
+                    let rows = sqlx::query(THREAD_MEMBERS)
+                        .bind(account.as_str())
+                        .bind(thread.0.as_str())
+                        .fetch_all(&mut **tx)
+                        .await
+                        .map_err(|e| unavailable(&e))?;
                     for row in rows {
                         ids.insert(MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?));
                     }
@@ -1835,6 +1858,62 @@ impl crate::Store for SqlStore {
             .collect())
     }
 
+    async fn threads(
+        &self,
+        account: &AccountId,
+        ids: &[ThreadId],
+    ) -> Result<Vec<ThreadView>, StoreError> {
+        self.ensure_schema().await?;
+        // The empty id is never a thread; each id is read once.
+        let wanted: Vec<&ThreadId> = ids
+            .iter()
+            .filter(|id| !id.0.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut members: BTreeMap<ThreadId, BTreeMap<MessageId, (MessageRecord, Vec<Intent>)>> =
+            BTreeMap::new();
+        for chunk in wanted.chunks(VIEW_CHUNK) {
+            // One statement per chunk: each thread's rows and their intents
+            // come from one snapshot, never a row from before a commit with
+            // an intent from after it.
+            let mut query =
+                sqlx::query(AssertSqlSafe(thread_rows(chunk.len()))).bind(account.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| unavailable(&e))?
+            {
+                let id = MessageId(row.try_get("id").map_err(|e| corrupt("id", e))?);
+                let intent: Option<String> =
+                    row.try_get("intent").map_err(|e| corrupt("intent", e))?;
+                let record = message_from_row(&id, &row)?;
+                let (_, intents) = members
+                    .entry(record.thread_id.clone())
+                    .or_default()
+                    .entry(id)
+                    .or_insert_with(|| (record, Vec::new()));
+                if let Some(text) = intent {
+                    intents.push(parse::<Intent>("intent", &text)?);
+                }
+            }
+        }
+        let views: BTreeMap<&ThreadId, ThreadView> = members
+            .iter()
+            .filter_map(|(id, rows)| {
+                let views = rows
+                    .values()
+                    .map(|(record, intents)| record.view(intents))
+                    .collect();
+                Some((id, mailtide::thread::view(id, views)?))
+            })
+            .collect();
+        Ok(ids.iter().filter_map(|id| views.get(id).cloned()).collect())
+    }
+
     async fn labels(&self, account: &AccountId) -> Result<Vec<Label>, StoreError> {
         self.ensure_schema().await?;
         load_labels(&self.pool, account).await
@@ -1873,3 +1952,25 @@ where
 /// Ids per `IN (...)` query when reading views and feed content (well under
 /// every backend's bind-parameter limit).
 const VIEW_CHUNK: usize = 500;
+
+/// The ids of a thread's rows, for thread action admission. Served by the
+/// `mailtide_messages_thread` index (migration 6).
+pub(crate) const THREAD_MEMBERS: &str =
+    "SELECT id FROM mailtide_messages WHERE account = $1 AND thread_id = $2";
+
+/// The rows of `count` threads with their intents, one row per (message,
+/// intent): one statement, so one snapshot. Served by the
+/// `mailtide_messages_thread` index (migration 6).
+pub(crate) fn thread_rows(count: usize) -> String {
+    let placeholders = (2..count + 2)
+        .map(|n| format!("${n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Only numbered placeholders are interpolated; ids are bound.
+    format!(
+        "SELECT m.id, m.thread_id, m.labels, m.checkpoint, m.unverified, m.content, i.intent
+         FROM mailtide_messages m
+         LEFT JOIN mailtide_intents i ON i.account = m.account AND i.message = m.id
+         WHERE m.account = $1 AND m.thread_id IN ({placeholders})"
+    )
+}

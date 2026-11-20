@@ -194,8 +194,8 @@ DELETE FROM mailtide_schema WHERE version = <this migration>;
 ```
 
 Nothing is lost. In the other direction, a build with this feature on a
-database without the index reports `behind` and refuses to sync until
-migrated; `threads()`, a read, would still answer correctly, only slowly.
+database without the index reports `behind` and refuses every call, reads
+included (`SchemaOutOfDate`), until migrated.
 
 The read is one statement per chunk of 500 thread ids, shared by both
 databases:
