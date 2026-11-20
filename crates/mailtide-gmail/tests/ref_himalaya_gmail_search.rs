@@ -57,7 +57,9 @@ fn a_value_cannot_add_operators_or_groups() {
 
 #[test]
 fn a_value_that_looks_like_an_operator_is_quoted() {
-    assert_eq!(literal("from:alice").as_deref(), Some("\"from:alice\""));
+    // himalaya keeps the colon; Gmail found the quoted phrase unreliable
+    // with one (search-literal-quoting), so it becomes a space.
+    assert_eq!(literal("from:alice").as_deref(), Some("\"from alice\""));
     assert_eq!(literal("-draft").as_deref(), Some("\"-draft\""));
 }
 

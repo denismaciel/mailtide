@@ -70,6 +70,9 @@ pub fn build(request: &GmailRequest, config: &RequestConfig) -> Vec<HttpRequest>
         )],
         GmailRequest::Modify(group) => modify(group),
         GmailRequest::Search(search) => vec![self::search(search)],
+        GmailRequest::GetLabel { id } => {
+            vec![get(format!("{USER}/labels/{}", encode(&id.0)), Vec::new())]
+        }
     }
 }
 
@@ -327,6 +330,23 @@ mod tests {
             decode(encoded),
             raw,
             "the host's bytes, nothing trimmed or folded"
+        );
+    }
+
+    #[test]
+    fn a_label_check_gets_the_one_label() {
+        let [request] = build(
+            &GmailRequest::GetLabel {
+                id: LabelId("Label 7/x".into()),
+            },
+            &config(),
+        )
+        .try_into()
+        .expect("one request");
+        assert_eq!(request.method, Method::Get);
+        assert_eq!(
+            request.path_and_query(),
+            "/gmail/v1/users/me/labels/Label%207%2Fx"
         );
     }
 

@@ -107,7 +107,7 @@ search_threads(account, &SearchQuery, budget) -> Result<ThreadSearchPage, Search
 | `SearchQuery` field | Meaning |
 |---|---|
 | `query: String` | Sent as `q`, byte for byte. Blank is refused (`EmptyQuery`) |
-| `label_ids: Vec<LabelId>` | Gmail label **ids**, all required (`labelIds`). Sorted and deduplicated; an id the mirror's label definitions lack is refused (`UnknownLabel`) |
+| `label_ids: Vec<LabelId>` | Gmail label **ids**, all required (`labelIds`). Sorted and deduplicated; an id the mirror's label definitions lack is checked with `labels.get`, and one Gmail does not have is refused (`UnknownLabel`) |
 | `include_spam_trash: bool` | Default false, as the Gmail search box. Only a query without `in:trash`, `in:spam` or `in:anywhere` depends on it |
 | `limit: u32` | Default 100, clamped to 1..=500 |
 | `page_token: Option<SearchPageToken>` | From the previous page of the same request |
@@ -124,8 +124,8 @@ and no `deleted`.
   asked; `cursor` and `phase` are the sync position read with it.
 
 `SearchError`: `EmptyQuery`, `InvalidPageToken` (not ours, or issued for
-another request; no Gmail call), `UnknownLabel` (a `label_ids` entry the
-mirror's label definitions lack; no Gmail call), `PageTokenRejected` (Gmail
+another request; no Gmail call), `UnknownLabel` (a `label_ids` entry
+Gmail's `labels.get` answered 404 for; no search sent), `PageTokenRejected` (Gmail
 refused a continuation), `Refused` (Gmail's 400 or 403, an account problem,
 an answer that is not a page), `Deferred { until }`, `Retryable`,
 `AccountBlocked` (with its reason), `NotTracked`, and the runner's store and
@@ -154,9 +154,17 @@ from user text (a "from" chip, a lookup by Message-ID). They build one value,
 not a query:
 
 - `literal(text) -> Option<String>`: the text as a value that cannot add
-  operators or groups. Quotes, braces and parentheses become spaces, a
-  standalone `OR` or `AND` is lowercased, and anything but a bare word is
-  double-quoted. `None` when no word is left.
+  operators or groups. Inside double quotes Gmail still reads `OR`, `|`,
+  braces, `AND` (consumed as syntax) and `AROUND`, a backslash escapes
+  nothing, and a colon after a word makes the phrase unreliable; lower-case
+  `or`/`and` are plain words, and parentheses, `+` and `-` are punctuation
+  (`search-literal-quoting`, refuted). So the text is ASCII-lowercased (the
+  operators are upper case only; matching ignores case), quotes, braces,
+  parentheses, `|`, `\` and `:` become spaces, and anything but one bare
+  word is double-quoted. `None` when no letter or digit is left, never a
+  value that means something else. What cannot be searched as a literal:
+  case, and punctuation that alone tells two texts apart (`from:alice` is
+  searched as the phrase `from alice`).
 - `by_message_id(id) -> Option<String>`: `rfc822msgid:` plus the id without
   angle brackets, bare (Gmail matched ids holding `+ - = / $ ! %` bare,
   ignoring case: `search-msgid-match`). `None` for an id Gmail's syntax
@@ -185,22 +193,21 @@ and Trash too when it is set.
   name to an id or an id to a name: that would mean parsing the query, and
   the mirror's label table can trail a rename.
 
-`label_ids` **are** checked against the mirror's label definitions
-(`Store::labels`), before Gmail is asked: Gmail answers a `labelIds` value it
-does not have (never created, or deleted) with 200 and no hits, which cannot
-be told from an empty result (`search-unknown-label-id`, refuted). An id the
-definitions lack is `UnknownLabel`. Before the first label listing the
-mirror holds no definitions, so every label filter is refused until a sync
-has run (its first step lists the labels): a host that searches a brand-new
-account without a filter is unaffected, and one with a filter gets a
-refusal it can act on instead of "no hits". A label created in Gmail since
-the last listing is refused until the next one (at most `label_refresh`, or
-sooner when history names it); deleting one is the case the check exists
-for. Gmail answers a label *name* in `labelIds` with 400 (`Refused`), but a
-name is not a mirror label id, so it is `UnknownLabel` first. Inside the
-query, `label:` matches names in the search box's spellings (lower case,
-hyphens for spaces and slashes, or quoted) and never ids
-(`search-label-terms`).
+`label_ids` **are** checked, before the search: Gmail answers a `labelIds`
+value it does not have (never created, or deleted) with 200 and no hits,
+which cannot be told from an empty result (`search-unknown-label-id`,
+refuted). An id the mirror's label definitions (`Store::labels`) hold is
+sent as it is. An id they lack (deleted, created since the last listing, or
+any id before the first listing) is asked about once per call with
+`labels.get` (1 unit, the search's priority): a 404 is `UnknownLabel` and no
+search is sent; an answer means the mirror is behind, and the search goes on.
+Nothing is recorded (search writes nothing; the engine's label refresh
+brings the definition). Any other failure of that call maps as the search's
+own (a 5xx is `Retryable`, a deferral `Deferred`, a 400 `Refused`). Gmail
+answers a label *name* in `labelIds` with 400; a name is not a mirror id, so
+it is checked with `labels.get` first. Inside the query, `label:` matches
+names in the search box's spellings (lower case, hyphens for spaces and
+slashes, or quoted) and never ids (`search-label-terms`).
 
 ### Paging
 
@@ -210,6 +217,15 @@ the canonical label ids, `include_spam_trash` and the clamped `limit`. Gmail's
 token follows verbatim. A token presented with any other request is
 `InvalidPageToken` before Gmail is called. It is a guard against misuse, not a
 secret, and nothing is stored.
+
+That binding is the only protection there is. Gmail's `nextPageToken` is a
+bare position (a 20-digit number) that Gmail accepts under any other request:
+another `q`, `maxResults`, label filter or flag, or a made-up number, all
+answer 200 with some page or an empty one; only a token that does not parse
+is a 400 (`search-page-token-rejection`, refuted). A token stays valid for at
+least an hour and behaves like "older than this point", also while the
+mailbox changes (`search-page-token-lifetime`, confirmed; 24 hours and 7 days
+not measured).
 
 Because a continuation repeats a request Gmail already accepted, a 4xx on it
 is attributed to the token: `PageTokenRejected`, and the host restarts from
@@ -225,6 +241,7 @@ and still carry a token; the run ends on a page without one.
 |---|---|---|---|
 | `messages.list?q=` | 5 | `search`, one per page | foreground by default |
 | `threads.list?q=` | 10 | `search_threads`, one per page | foreground by default |
+| `labels.get` | 1 | a filter label the mirror lacks, once per call | the search's |
 
 Nothing else is called: hits are marked from the mirror. At the default
 account budget (4,800 units a minute) that is 960 message searches a minute; a
@@ -300,7 +317,8 @@ mailtide never retries a search; it is idempotent, so the host may.
 
 | Gmail answers | Result |
 |---|---|
-| 400, 403 (bad label id, `gmail.metadata` scope) on a first page | `Refused`. The caller's error: the account is **not** blocked |
+| 400, 403 (a query it rejects, `gmail.metadata` scope) on a first page | `Refused`. The caller's error: the account is **not** blocked |
+| 404 to the `labels.get` of a filter label | `UnknownLabel`; no search is sent |
 | 4xx (refused for good) or 404 on a continuation | `PageTokenRejected` |
 | 404 on a first page | `Refused` |
 | 429, `userRateLimitExceeded`, project limits | `Retryable`; the gate is cooled down for `Retry-After`, as the engine would |
@@ -369,7 +387,7 @@ and pimalaya core's `search_emails_query.rs` (a query language and a local
 matcher: the host's side of the line); `tests/google.rs` (live). jmap-client
 and the Stalwart server have no query tests in their pinned trees.
 
-Our own 45 tests cover the request shape and costs; the token binding; the
+Our own 48 tests cover the request shape and costs; the token binding; the
 mirror state of hits (unknown, not imported, tombstoned); "writes nothing" and
 "does not supersede a sync"; the gate (deferral, priority, cooldown); every row
 of the failure table; label ids the mirror lacks; read-only, blocked and
@@ -421,7 +439,10 @@ slice 1.
    quoting belong in one tested place. (`send` no longer looks its own
    message up by Message-ID: Gmail replaces it, so mailtide identifies what
    it writes by a private header.) They build a value and parse nothing.
-   *Would change it:* `search-literal-quoting` showing plain quotes are enough.
+   Plain quotes are not enough (`search-literal-quoting`, refuted): Gmail
+   reads operators inside them, so `literal()` neutralises each one it was
+   measured to read and refuses what it cannot render. *Would change it:*
+   Gmail gaining an escape character.
 3. **Hits are ids with a mirror state; hydration is `messages()`.** JMAP's
    split, and it keeps a page cheap. The state is needed because `messages()`
    cannot tell "not synced yet" from "deleted". *Would change it:* hosts
@@ -440,7 +461,9 @@ slice 1.
    a time limit. `mirror_state` gives a host the fence Zero's cache has.
    *Would change it:* several hosts building the same cache.
 7. **Page tokens are wrapped and bound to their request.** A defined refusal
-   instead of undocumented Gmail behaviour, at no storage cost.
+   instead of Gmail's behaviour, at no storage cost: Gmail accepts its token
+   under any request and answers some other page
+   (`search-page-token-rejection`, refuted), so this is the only guard.
 8. **No Gmail-query parser, so no correction of results for pending actions
    (Zero's overlay).** A host with the full mirror answers label-only views
    locally with the overlay applied, which is the case Zero built it for. For
@@ -457,11 +480,15 @@ slice 1.
 10. **Foreground by default, with a `priority` field.** A user is usually
     waiting; a background job must be able to say it is not.
 11. **Labels are not translated either way.** `label_ids` for ids, Gmail's
-    own operators for names. Ids are checked against the mirror's
-    definitions, because Gmail answers an unknown id with no hits
-    (`search-unknown-label-id` refuted); before the first label listing every
-    id is refused. *Would change it:* Gmail answering an unknown id with an
-    error.
+    own operators for names. Ids are checked, because Gmail answers an
+    unknown id with no hits (`search-unknown-label-id`, refuted): one the
+    mirror's definitions hold goes out as it is, one they lack is asked about
+    with `labels.get` (1 unit, once per distinct id per call), so a label
+    created since the last listing (or before the first) is searched and a
+    deleted one is `UnknownLabel`. Refusing on the mirror alone would refuse
+    new labels for up to `label_refresh`; asking Gmail every time would
+    charge every filtered search. *Would change it:* Gmail answering an
+    unknown id with an error.
 12. **A refused search never blocks the account**, and a rate limit cools the
     gate but is not persisted: search commits nothing. The next engine request
     records what is still true.
@@ -470,19 +497,26 @@ slice 1.
 
 Unknowns (`features/search.toml`):
 
-- `search-page-token-rejection`: a token Gmail does not accept is answered 400.
-- `search-page-token-lifetime`: a token lives at least an hour.
-- `search-index-lag`: Gmail's index trails history by seconds.
-- `search-literal-quoting`: operators are read inside quotes; nothing escapes.
+- `search-page-token-rejection` (refuted): Gmail's token is a bare position it
+  accepts under any other request; only an unparsable one is a 400. The
+  binding is the only protection, as planned.
+- `search-page-token-lifetime` (confirmed): a token lives at least an hour,
+  also while the mailbox changes.
+- `search-index-lag` (confirmed): no measurable lag behind history.
+- `search-literal-quoting` (refuted): `OR`, `|`, braces, `AND` and `AROUND`
+  are read inside quotes, nothing escapes, a colon is unreliable; `literal()`
+  lowercases and splits them away.
 - `search-msgid-match` (confirmed): `rfc822msgid:` matches one id, bare,
   any case, `+ - = / $ ! %` included.
 - `search-label-terms` (confirmed): `label:` takes names, not ids;
   `labelIds` takes ids and answers a name with 400.
 - `search-unknown-label-id` (refuted): an unknown `labelIds` value answers
-  200 with no hits, so `label_ids` are checked against the mirror.
+  200 with no hits, so an id the mirror lacks is checked with `labels.get`
+  (404 for a deleted or never-created label).
 - `search-spam-trash-default` (refuted in one detail): `in:trash` and
   `in:spam` work without `includeSpamTrash`, and so does `in:anywhere`; only
   a query naming none of them depends on the flag. Guidance only.
 - `search-thread-history-id` (confirmed): every listed thread carries
   `historyId`, its newest message's.
-- `search-drafts-in-results`: `in:draft` returns a draft's current message.
+- `search-drafts-in-results` (confirmed): `in:draft` returns a draft's current
+  message, never an older one.

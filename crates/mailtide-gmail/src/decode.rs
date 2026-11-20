@@ -350,21 +350,26 @@ struct WireLabels {
     labels: Vec<WireLabel>,
 }
 
+fn label(wire: WireLabel) -> Label {
+    Label {
+        kind: match wire.kind.as_deref() {
+            Some("system") => LabelKind::System,
+            Some(_) | None => LabelKind::User,
+        },
+        id: LabelId(wire.id),
+        name: wire.name,
+    }
+}
+
+/// `labels.get`: one label's definition.
+pub fn label_get(body: &[u8]) -> Result<Label, DecodeError> {
+    json::<WireLabel>(body).map(label)
+}
+
 /// `labels.list`.
 pub fn labels_list(body: &[u8]) -> Result<Vec<Label>, DecodeError> {
     let wire: WireLabels = json(body)?;
-    Ok(wire
-        .labels
-        .into_iter()
-        .map(|label| Label {
-            kind: match label.kind.as_deref() {
-                Some("system") => LabelKind::System,
-                Some(_) | None => LabelKind::User,
-            },
-            id: LabelId(label.id),
-            name: label.name,
-        })
-        .collect())
+    Ok(wire.labels.into_iter().map(label).collect())
 }
 
 #[derive(Deserialize)]
@@ -477,6 +482,14 @@ mod tests {
         let labels = labels_list(br#"{"labels":[{"id":"INBOX","name":"INBOX","type":"system"},{"id":"Label_1","name":"Clients","type":"user"}]}"#)
             .expect("decodes");
         assert_eq!(labels[1].kind, LabelKind::User);
+        let fetched =
+            label_get(br#"{"id":"Label_1","name":"Clients","type":"user","messagesTotal":3}"#)
+                .expect("decodes");
+        assert_eq!(
+            (fetched.id.0.as_str(), fetched.kind),
+            ("Label_1", LabelKind::User)
+        );
+        assert!(label_get(br#"{"error":{"code":404}}"#).is_err());
         assert_eq!(
             watch(br#"{"historyId":"1","expiration":"1700000000000"}"#),
             Ok(Timestamp(1_700_000_000_000))

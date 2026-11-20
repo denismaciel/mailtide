@@ -82,10 +82,9 @@ pub enum SearchError {
     /// The page token is not one mailtide issued for this very request.
     /// Nothing was sent.
     InvalidPageToken,
-    /// The mirror's label definitions hold no such label id (deleted, never
-    /// created, or created since the last label listing). Gmail would
-    /// answer such a filter with an empty page, so it is refused instead.
-    /// Nothing was sent.
+    /// Gmail has no such label id (deleted, or never created): its
+    /// `labels.get` answered 404. Gmail would answer a search filtered on
+    /// it with an empty page, so it is refused instead; no search was sent.
     UnknownLabel(LabelId),
     /// Gmail refused a continuation mailtide issued for this request: start
     /// again from the first page.
@@ -263,16 +262,8 @@ where
             cursor: status.cursor,
             phase: status.sync.phase(),
         };
-        if !request.label_ids.is_empty() {
-            let known = self
-                .store()
-                .labels(account)
-                .await
-                .map_err(|e| SearchError::Run(RunError::Store(e)))?;
-            if let Some(unknown) = mailtide::search::unknown_label(&request.label_ids, &known) {
-                return Err(SearchError::UnknownLabel(unknown.clone()));
-            }
-        }
+        self.check_labels(account, &request, query, deadline)
+            .await?;
         let continuation = request.page_token.is_some();
         let answer = self
             .call_gmail(
@@ -293,6 +284,60 @@ where
             ))),
             Err(error) => Err(call_error(error, continuation)),
         }
+    }
+}
+
+impl<S, B, T, Q, A> Runner<S, B, T, Q, A>
+where
+    S: Store,
+    B: BlobStore,
+    T: GmailTransport,
+    Q: QuotaGate,
+    A: TokenSource,
+{
+    /// Make sure Gmail has every label of the filter. Gmail answers a
+    /// `labelIds` value it does not have with an empty page, so an id the
+    /// mirror's definitions lack (deleted, never created, created since the
+    /// last listing, or no listing yet) is asked about once, with
+    /// `labels.get` (1 unit): a 404 is [`SearchError::UnknownLabel`], an
+    /// answer means the mirror is behind and the search goes on. Nothing is
+    /// recorded: the engine's label refresh brings the definition.
+    async fn check_labels(
+        &self,
+        account: &AccountId,
+        request: &SearchRequest,
+        query: &SearchQuery,
+        deadline: Instant,
+    ) -> Result<(), SearchError> {
+        if request.label_ids.is_empty() {
+            return Ok(());
+        }
+        let known = self
+            .store()
+            .labels(account)
+            .await
+            .map_err(|e| SearchError::Run(RunError::Store(e)))?;
+        for id in mailtide::search::missing_labels(&request.label_ids, &known) {
+            let answer = self
+                .call_gmail(
+                    account,
+                    GmailRequest::GetLabel { id: id.clone() },
+                    query.priority,
+                    deadline,
+                )
+                .await;
+            match answer {
+                Ok(EventKind::LabelFetched { .. }) => {}
+                Ok(_) => {
+                    return Err(SearchError::Run(RunError::Invariant(
+                        "unexpected answer to a label get",
+                    )));
+                }
+                Err(CallError::NotFound) => return Err(SearchError::UnknownLabel(id.clone())),
+                Err(error) => return Err(call_error(error, false)),
+            }
+        }
+        Ok(())
     }
 }
 

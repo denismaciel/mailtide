@@ -35,7 +35,7 @@ pub enum Priority {
 #[must_use]
 pub fn cost(request: &GmailRequest) -> QuotaUnits {
     QuotaUnits(match request {
-        GmailRequest::GetProfile | GmailRequest::ListLabels => 1,
+        GmailRequest::GetProfile | GmailRequest::ListLabels | GmailRequest::GetLabel { .. } => 1,
         GmailRequest::ListHistory { .. } => 2,
         GmailRequest::ListMessages { .. } => 5,
         GmailRequest::GetMessage { .. } => 20,
@@ -318,6 +318,8 @@ mod tests {
         };
         assert_eq!(cost(&search(SearchScope::Messages)), QuotaUnits(5));
         assert_eq!(cost(&search(SearchScope::Threads)), QuotaUnits(10));
+        let label = crate::ids::LabelId("Label_1".into());
+        assert_eq!(cost(&GmailRequest::GetLabel { id: label }), QuotaUnits(1));
     }
 
     fn account(name: &str) -> AccountId {

@@ -462,40 +462,88 @@ async fn pages_of_a_changing_mailbox_may_repeat_or_skip_ids() {
     assert_eq!(two.next_page_token, None);
 }
 
-#[tokio::test]
-async fn a_label_id_the_mirror_does_not_hold_is_refused_before_gmail_is_called() {
-    let fixture = Fixture::new();
-    let filtered = |labels: &[&str]| SearchQuery {
+fn filtered(labels: &[&str]) -> SearchQuery {
+    SearchQuery {
         label_ids: labels.iter().map(|l| LabelId((*l).into())).collect(),
         ..query("invoice")
-    };
+    }
+}
 
-    // Before the first label listing the mirror holds no definitions.
-    assert_eq!(
-        fixture.search(&filtered(&["INBOX"])).await,
-        Err(SearchError::UnknownLabel(LabelId("INBOX".into())))
-    );
+#[tokio::test]
+async fn a_label_id_gmail_does_not_have_is_unknown_and_never_searched() {
+    let fixture = Fixture::new();
     fixture.sync().await;
+    let synced = fixture.admitted().len();
+
+    // Deleted or never created: labels.get answers 404.
     assert_eq!(
-        fixture.search(&filtered(&["INBOX", "Label_9"])).await,
+        fixture
+            .search(&filtered(&["INBOX", "Label_9", "Label_9"]))
+            .await,
         Err(SearchError::UnknownLabel(LabelId("Label_9".into())))
     );
-    assert!(fixture.searches().is_empty(), "Gmail was never asked");
+    assert_eq!(
+        fixture.label_gets(),
+        ["Label_9"],
+        "once, and only the missing id"
+    );
+    assert!(fixture.searches().is_empty(), "no search was sent");
+    assert_eq!(
+        fixture.admitted()[synced..],
+        [(QuotaUnits(1), Priority::Foreground)],
+        "labels.get is charged 1 unit at the search's priority"
+    );
 
-    fixture.answer_page(&[], None);
+    // Any other failure of the check maps as the search's own would.
+    fixture
+        .gmail()
+        .answer_label_gets(refusal(503, "backendError"));
+    let failed = fixture.search(&filtered(&["Label_9"])).await;
+    assert!(
+        matches!(&failed, Err(SearchError::Retryable(f)) if f.class == Retryable::Transient),
+        "{failed:?}"
+    );
+    assert!(fixture.searches().is_empty());
+}
+
+#[tokio::test]
+async fn a_label_id_newer_than_the_mirrors_listing_is_checked_with_gmail_and_searched() {
+    let fixture = Fixture::new();
+    // No label listing yet: the mirror holds no definitions at all.
+    fixture.answer_page(&["m1"], None);
     let page = fixture
-        .search(&filtered(&["Label_1", "INBOX"]))
+        .search(&filtered(&["INBOX"]))
         .await
-        .expect("a page");
-    assert!(page.hits.is_empty());
+        .expect("Gmail has INBOX");
+    assert_eq!(page.hits.len(), 1);
+    assert_eq!(fixture.label_gets(), ["INBOX"]);
+
+    // Created in Gmail after the mirror's last listing.
+    fixture.sync().await;
+    fixture.gmail().create_label("Label_2", "Projects");
+    fixture.answer_page(&[], None);
+    fixture
+        .search(&filtered(&["Label_2", "Label_1", "INBOX", "Label_2"]))
+        .await
+        .expect("Gmail has Label_2");
+    assert_eq!(
+        fixture.label_gets(),
+        ["INBOX", "Label_2"],
+        "one get per distinct id the mirror lacks; none for the ones it holds"
+    );
     let searches = fixture.searches();
-    let labels: Vec<&str> = searches[0]
+    let labels: Vec<&str> = searches[1]
         .query
         .iter()
         .filter(|(k, _)| k == "labelIds")
         .map(|(_, v)| v.as_str())
         .collect();
-    assert_eq!(labels, ["INBOX", "Label_1"]);
+    assert_eq!(labels, ["INBOX", "Label_1", "Label_2"]);
+    let views = fixture.runner.labels(&account()).await.expect("labels");
+    assert!(
+        views.iter().all(|label| label.id.0 != "Label_2"),
+        "search records nothing; the engine's refresh will"
+    );
 }
 
 /// A lost answer is a transient failure: a search is a read.

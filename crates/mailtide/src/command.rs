@@ -114,4 +114,11 @@ pub enum GmailRequest {
     /// a search. Issued by the driver (`Runner::search`), never by the
     /// engine; answered with [`crate::event::EventKind::Searched`].
     Search(crate::search::SearchRequest),
+    /// `labels.get`: whether Gmail has a label the mirror's definitions
+    /// lack. Issued by the driver (a search's label check), never by the
+    /// engine; answered with [`crate::event::EventKind::LabelFetched`].
+    GetLabel {
+        /// The label.
+        id: crate::ids::LabelId,
+    },
 }

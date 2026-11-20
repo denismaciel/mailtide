@@ -160,4 +160,12 @@ pub enum EventKind {
         /// The page.
         listing: crate::search::SearchListing,
     },
+    /// `labels.get` answered with the label. It answers the driver's direct
+    /// call, never an engine command: the engine ignores it.
+    LabelFetched {
+        /// The command it answers.
+        command: CommandId,
+        /// The label's definition.
+        label: Label,
+    },
 }

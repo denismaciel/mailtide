@@ -254,8 +254,10 @@ class Runner:
         yet: the next ``run`` brings it); hits the mirror deleted are left
         out and counted in ``deleted``. Read the hits with ``messages``.
         ``label_ids`` are label ids all hits carry (names go in the query as
-        ``label:``); an id the mirror's label definitions lack raises
-        ``UnknownLabel``, since Gmail would answer it with no hits. Pass
+        ``label:``). An id the mirror's label definitions lack is checked
+        with Gmail first (``labels.get``, 1 unit): one Gmail does not have
+        raises ``UnknownLabel``, since Gmail would answer the search with no
+        hits; one it has (created since the last label sync) is searched. Pass
         ``next_page_token`` back with the same arguments for the next page.
         A page whose ``mirror_state`` has feed entries after it may be stale.
         Writes nothing and never preempts a sync; allowed read-only. Raises

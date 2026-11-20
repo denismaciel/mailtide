@@ -130,6 +130,12 @@ struct Mailbox {
     searches: Vec<HttpRequest>,
     /// Every request.
     requests: u32,
+    /// Labels created since the start, beyond `INBOX`, `UNREAD` and `Label_1`.
+    created_labels: Vec<(String, String)>,
+    /// Each label id `labels.get` was asked for, in order.
+    label_gets: Vec<String>,
+    /// What every `labels.get` gets instead of Gmail's own answer.
+    label_answer: Option<HttpResponse>,
 }
 
 /// Gmail, served through the transport.
@@ -164,6 +170,24 @@ impl FakeGmail {
             .push_back(answer);
     }
 
+    /// A user label created in Gmail: listed from now on, and found by
+    /// `labels.get`.
+    pub fn create_label(&self, id: &str, name: &str) {
+        self.mailbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .created_labels
+            .push((id.to_owned(), name.to_owned()));
+    }
+
+    /// Every `labels.get` gets `answer` (a failure, to test its mapping).
+    pub fn answer_label_gets(&self, answer: HttpResponse) {
+        self.mailbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .label_answer = Some(answer);
+    }
+
     /// Hold every search until [`Self::release`].
     pub fn hold(&self) {
         self.holding.store(true, Ordering::SeqCst);
@@ -184,11 +208,11 @@ impl FakeGmail {
         let path = request.path.trim_start_matches("/gmail/v1/users/me/");
         match path.split('/').collect::<Vec<_>>().as_slice() {
             ["profile"] => ok(&json!({"historyId": mailbox.history_id.to_string()})),
-            ["labels"] => ok(&json!({"labels": [
-                {"id": "INBOX", "name": "INBOX", "type": "system"},
-                {"id": "UNREAD", "name": "UNREAD", "type": "system"},
-                {"id": "Label_1", "name": "Clients", "type": "user"},
-            ]})),
+            ["labels"] => ok(&json!({"labels": Self::labels(mailbox)})),
+            ["labels", id] => Self::labels(mailbox)
+                .into_iter()
+                .find(|label| label["id"] == *id)
+                .map_or_else(not_found, |label| ok(&label)),
             ["history"] => {
                 let start: u64 = query["startHistoryId"].parse().expect("start");
                 let records: Vec<&serde_json::Value> = mailbox
@@ -233,6 +257,24 @@ impl FakeGmail {
     }
 }
 
+impl FakeGmail {
+    /// Gmail's label definitions.
+    fn labels(mailbox: &Mailbox) -> Vec<serde_json::Value> {
+        let mut labels = vec![
+            json!({"id": "INBOX", "name": "INBOX", "type": "system"}),
+            json!({"id": "UNREAD", "name": "UNREAD", "type": "system"}),
+            json!({"id": "Label_1", "name": "Clients", "type": "user"}),
+        ];
+        labels.extend(
+            mailbox
+                .created_labels
+                .iter()
+                .map(|(id, name)| json!({"id": id, "name": name, "type": "user"})),
+        );
+        labels
+    }
+}
+
 /// Whether `request` is a search (`q` on a listing, or any thread listing).
 fn is_search(request: &HttpRequest) -> bool {
     request.path.ends_with("/threads")
@@ -267,6 +309,12 @@ impl GmailTransport for FakeGmail {
         }
         let mut mailbox = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
         mailbox.requests += 1;
+        if let Some(id) = request.path.strip_prefix("/gmail/v1/users/me/labels/") {
+            mailbox.label_gets.push(id.to_owned());
+            if let Some(answer) = &mailbox.label_answer {
+                return Ok(answer.clone());
+            }
+        }
         Ok(Self::sync_answer(&mailbox, &request))
     }
 }
@@ -527,6 +575,16 @@ impl Fixture {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .searches
+            .clone()
+    }
+
+    /// Each label id `labels.get` was asked for, in order.
+    pub fn label_gets(&self) -> Vec<String> {
+        self.gmail()
+            .mailbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .label_gets
             .clone()
     }
 

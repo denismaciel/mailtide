@@ -2,37 +2,59 @@
 //! text. Each helper renders one value; neither parses a query, and
 //! mailtide never rewrites the query a host passes to a search.
 //!
-//! Gmail reads `OR`, `AND`, braces and parentheses even inside double
+//! Gmail reads `OR`, `|`, braces, `AND` and `AROUND` even inside double
 //! quotes and has no escape character, so a user's text cannot simply be
-//! quoted. The rule follows himalaya's `value_q` (pimalaya/himalaya,
-//! MIT OR Apache-2.0, `src/gmail/search.rs`).
+//! quoted. The rule starts from himalaya's `value_q` (pimalaya/himalaya,
+//! MIT OR Apache-2.0, `src/gmail/search.rs`) and goes further where Gmail
+//! was measured to (`search-literal-quoting`).
 
 /// `text` as one value that matches it literally and cannot add operators
-/// or groups, for `from:`, `subject:` or a bare term: quotes, braces and
-/// parentheses become spaces (Gmail matches words and skips punctuation),
-/// a standalone `OR` or `AND` is lowercased (Gmail's operators are
-/// case-sensitive), and anything but one bare word is double-quoted, so no
-/// `-` or `:` reads as an operator. `None` when no word is left: such a
-/// value would match nothing a user meant, so it is refused rather than
-/// sent.
+/// or groups, for `from:`, `subject:` or a bare term; `None` when it cannot
+/// be made one (no letter or digit is left), never a value that means
+/// something else.
 ///
-/// The output matches the same messages as the text meant, or fewer, never
-/// more (`search-literal-quoting`).
+/// Gmail reads `OR`, `|`, braces, `AND` and `AROUND` as operators even
+/// inside double quotes, and a backslash escapes nothing; a colon after a
+/// word inside quotes makes the phrase unreliable; parentheses, `+` and `-`
+/// inside quotes are punctuation (`search-literal-quoting`). Gmail matches
+/// words, case-insensitively, skipping punctuation. So the value is:
+///
+/// - ASCII-lowercased: the operators are upper case only, so no word reads
+///   as one, however it is glued to punctuation (`\OR`), and a lower-case
+///   `or`, `and` or `around` is a plain word that matches the same text;
+/// - split into words at blanks, quotes, braces, parentheses, `|`, `\` and
+///   `:`, which become spaces;
+/// - one bare word (letters, digits, `@ . _ +`, starting with a letter or
+///   digit) as it is, anything else double-quoted, so no `-` or `:` reads
+///   as an operator.
+///
+/// What cannot be searched as a literal: case (Gmail ignores it anyway),
+/// and the punctuation that tells two texts with the same words apart:
+/// `from:alice` is searched as the phrase `from alice`, which also matches
+/// `from alice`. Text without a letter or digit is refused.
 #[must_use]
 pub fn literal(text: &str) -> Option<String> {
-    let words: Vec<&str> = text
-        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '{' | '}' | '(' | ')'))
-        .filter(|word| !word.is_empty())
-        .map(|word| match word {
-            "OR" => "or",
-            "AND" => "and",
-            word => word,
+    let lowered = text.to_ascii_lowercase();
+    let words: Vec<&str> = lowered
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '{' | '}' | '(' | ')' | '|' | '\\' | ':')
         })
+        .filter(|word| !word.is_empty())
         .collect();
-    let bare = |c: char| c.is_alphanumeric() || matches!(c, '@' | '.' | '_' | '+');
+    if !words
+        .iter()
+        .any(|word| word.chars().any(char::is_alphanumeric))
+    {
+        return None;
+    }
+    let bare = |word: &str| {
+        word.starts_with(char::is_alphanumeric)
+            && word
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '@' | '.' | '_' | '+'))
+    };
     match words.as_slice() {
-        [] => None,
-        [word] if word.chars().all(bare) => Some((*word).to_owned()),
+        [word] if bare(word) => Some((*word).to_owned()),
         words => Some(format!("\"{}\"", words.join(" "))),
     }
 }
@@ -67,6 +89,36 @@ pub fn by_message_id(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every line of `search-literal-quoting`'s result (refuted): what
+    /// Gmail still reads as syntax inside quotes comes out as plain words.
+    #[test]
+    fn literal_neutralises_every_operator_gmail_reads_inside_quotes() {
+        for (text, value) in [
+            ("Z OR K", "\"z or k\""),
+            ("Z | K", "\"z k\""),
+            ("Z|K", "\"z k\""),
+            ("{Z K}", "\"z k\""),
+            ("K AND Z", "\"k and z\""),
+            ("Z AROUND 2 K", "\"z around 2 k\""),
+            ("Z \\\"OR\\\" K", "\"z or k\""),
+            ("Z \\OR K", "\"z or k\""),
+            ("-OR- K", "\"-or- k\""),
+            ("memo from:alice", "\"memo from alice\""),
+            ("from:alice", "\"from alice\""),
+            ("(Z K)", "\"z k\""),
+            ("a-b +c", "\"a-b +c\""),
+            ("OR", "or"),
+            ("AND", "and"),
+            ("AROUND", "around"),
+            ("+tag", "\"+tag\""),
+        ] {
+            assert_eq!(literal(text).as_deref(), Some(value), "{text}");
+        }
+        for nothing in ["|", "\\", ":", "-", "+ -", "\" \\ | :"] {
+            assert_eq!(literal(nothing), None, "{nothing:?}");
+        }
+    }
 
     #[test]
     fn a_message_id_gmail_cannot_carry_is_refused_not_loosened() {

@@ -160,6 +160,10 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                 return self.reply(200, {"historyId": str(mailbox.history_id)})
             if parts == ["labels"]:
                 return self.reply(200, {"labels": list(mailbox.labels.values())})
+            if len(parts) == 2 and parts[0] == "labels":
+                if parts[1] in mailbox.labels:
+                    return self.reply(200, mailbox.labels[parts[1]])
+                return self.reply(404, {"error": {"code": 404, "message": "not found"}})
             if parts == ["history"]:
                 start = int(query["startHistoryId"])
                 if start < mailbox.history_floor:

@@ -465,6 +465,7 @@ Per-call costs [G]:
 | `messages.batchModify` | 50 |
 | `getProfile` | 1 |
 | `labels.list` | 1 |
+| `labels.get` | 1 |
 | `watch` | 100 |
 | `messages.insert` / `import` | 25 |
 | `messages.send` | 100 |
@@ -500,7 +501,8 @@ Per-call costs [G]:
   store method, as `admit` is: the answer only, never the cursor.
 - **Search** (`search`, `search_threads`) is a direct call: one
   `messages.list` (5 units) or `threads.list` (10) per page, at the caller's
-  priority (Foreground by default; a background job passes Backfill). It
+  priority (Foreground by default; a background job passes Backfill), plus
+  one `labels.get` (1 unit) per filter label the mirror does not know. It
   writes nothing; a refusal is the caller's and blocks nothing.
 - **Import throughput** (raw gets): ≈ 6,000 messages/hour per account, so
   100k messages ≈ 17 h. About 200 accounts can import concurrently per
@@ -679,15 +681,18 @@ runner per process, after forking:
   ahead of the mirror; the next `run` brings it), in Gmail's order; hits the
   mirror deleted are left out and counted in `deleted`. Read hits with
   `messages`. `label_ids` are label ids every hit carries (names go in the
-  query as `label:`); an id the mirror's label definitions lack raises
-  `UnknownLabel` before Gmail is asked, because Gmail answers an unknown
-  label id with no hits rather than an error (before the first label
-  listing every id is unknown). `include_spam_trash` reaches Spam and Trash
+  query as `label:`). Gmail answers a label id it does not have with no
+  hits rather than an error, so an id the mirror's label definitions lack
+  (all of them before the first label listing) is checked first with one
+  `labels.get` (1 unit) per distinct id: a 404 raises `UnknownLabel` and no
+  search is sent; an answer means the mirror's definitions are behind, and
+  the search goes on (nothing is recorded; the label refresh brings it). `include_spam_trash` reaches Spam and Trash
   for a query that names neither (`in:trash`, `in:spam` and `in:anywhere`
   reach them anyway). `limit` is clamped to 1..=500. `next_page_token`,
   passed back with the same arguments, reads the next page; it is refused
-  (`InvalidPageToken`, nothing sent) for any other search, and a token Gmail
-  refuses raises `PageTokenRejected`: start again. Paging is not a snapshot:
+  (`InvalidPageToken`, nothing sent) for any other search, because Gmail's
+  own token is a bare position it accepts under any other request; a token
+  Gmail refuses raises `PageTokenRejected`: start again. Paging is not a snapshot:
   ids can repeat or be skipped when the mailbox changes between pages.
   `mirror_state` is the feed state read before Gmail was asked: feed entries
   after it mean the page may be stale. `estimate` is Gmail's
@@ -701,9 +706,10 @@ runner per process, after forking:
   Gmail's history id for the thread (past the page's `cursor`, the mirror
   has not caught up with it); thread hits are not marked against the mirror;
 - `search_literal(text)` renders user text as one search value that cannot
-  add operators (quotes, braces and parentheses become spaces, a standalone
-  `OR`/`AND` is lowercased, anything but one bare word is quoted;
-  `ValueError` when no word is left); `search_by_message_id(id)` is the
+  add operators (it is ASCII-lowercased, since `OR`, `AND`, `AROUND` are
+  operators only in upper case, even inside quotes; quotes, braces,
+  parentheses, `|`, `\` and `:` become spaces; anything but one bare word
+  is quoted; `ValueError` when no letter or digit is left); `search_by_message_id(id)` is the
   `rfc822msgid:` term for the `Message-ID` Gmail stored, which is not the one
   a client wrote on a message sent or a draft saved through the API;
 - `await labels(account) -> list[Label]`: the label definitions (`id`,

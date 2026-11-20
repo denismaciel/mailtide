@@ -191,16 +191,22 @@ impl SearchPageToken {
     }
 }
 
-/// The first of `label_ids` the mirror's label definitions do not hold.
-/// Gmail answers a label id it does not have (never created, or deleted)
-/// with an empty page, not an error, so such a filter is refused before
-/// Gmail is asked. Before the first label listing the mirror holds none,
-/// so every id is refused until a sync has run.
+/// The label ids among `label_ids` the mirror's label definitions do not
+/// hold, each once, in order. The driver asks Gmail about each
+/// (`labels.get`) before searching: Gmail answers a `labelIds` value it does
+/// not have (never created, or deleted) with an empty page, not an error,
+/// so an unchecked filter could pass "no hits" off as an answer, while the
+/// mirror's definitions can trail a label created since the last listing
+/// (or hold none before the first).
 #[must_use]
-pub fn unknown_label<'a>(label_ids: &'a [LabelId], known: &[Label]) -> Option<&'a LabelId> {
-    label_ids
-        .iter()
-        .find(|id| !known.iter().any(|label| label.id == **id))
+pub fn missing_labels<'a>(label_ids: &'a [LabelId], known: &[Label]) -> Vec<&'a LabelId> {
+    let mut missing: Vec<&LabelId> = Vec::new();
+    for id in label_ids {
+        if !known.iter().any(|label| label.id == *id) && !missing.contains(&id) {
+            missing.push(id);
+        }
+    }
+    missing
 }
 
 /// One decoded page of a Gmail search.
@@ -416,16 +422,17 @@ mod tests {
             name: "INBOX".into(),
             kind: LabelKind::System,
         }];
-        let asked = labels(&["INBOX", "Label_9"]);
+        let asked = labels(&["Label_9", "INBOX", "Label_9", "Label_2"]);
         assert_eq!(
-            unknown_label(&asked, &known),
-            Some(&LabelId("Label_9".into()))
+            missing_labels(&asked, &known),
+            [&LabelId("Label_9".into()), &LabelId("Label_2".into())],
+            "each missing id once, in order"
         );
-        assert_eq!(unknown_label(&asked[..1], &known), None);
+        assert!(missing_labels(&asked[1..2], &known).is_empty());
         assert_eq!(
-            unknown_label(&asked[..1], &[]),
-            Some(&LabelId("INBOX".into())),
-            "before the first label listing every id is unknown"
+            missing_labels(&asked[1..2], &[]),
+            [&LabelId("INBOX".into())],
+            "before the first label listing every id is missing"
         );
     }
 

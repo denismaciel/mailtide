@@ -25,27 +25,27 @@ role = "Export the search module"
 [[file]]
 path = "crates/mailtide/src/command.rs"
 change = "modify"
-role = "GmailRequest::Search (issued by the driver, never by the engine)"
+role = "GmailRequest::Search and GetLabel (issued by the driver, never by the engine)"
 
 [[file]]
 path = "crates/mailtide/src/event.rs"
 change = "modify"
-role = "EventKind::Searched, the decoded page of a search"
+role = "EventKind::Searched, the decoded page of a search, and LabelFetched, a labels.get answer"
 
 [[file]]
 path = "crates/mailtide/src/quota.rs"
 change = "modify"
-role = "Costs: messages.list 5, threads.list 10"
+role = "Costs: messages.list 5, threads.list 10, labels.get 1"
 
 [[file]]
 path = "crates/mailtide/src/engine.rs"
 change = "modify"
-role = "Ignore Searched: it never answers an engine command"
+role = "Ignore Searched and LabelFetched: they never answer an engine command"
 
 [[file]]
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
-role = "Its Gmail refuses a search request: the engine never issues one, so search is not simulated (it has no state)"
+role = "Its Gmail refuses a search or label-get request: the engine never issues one, so search is not simulated (it has no state)"
 
 [[file]]
 path = "crates/mailtide/src/mirror.rs"
@@ -62,12 +62,12 @@ role = "Pure helpers for hosts that build a query from user text: literal() and 
 [[file]]
 path = "crates/mailtide-gmail/src/request.rs"
 change = "modify"
-role = "Build messages.list and threads.list with q, labelIds, maxResults, pageToken and includeSpamTrash"
+role = "Build messages.list and threads.list with q, labelIds, maxResults, pageToken and includeSpamTrash, and labels.get"
 
 [[file]]
 path = "crates/mailtide-gmail/src/decode.rs"
 change = "modify"
-role = "Decode a search page: ids, thread history ids, resultSizeEstimate, nextPageToken"
+role = "Decode a search page (ids, thread history ids, resultSizeEstimate, nextPageToken) and one label (labels.get)"
 
 [[file]]
 path = "crates/mailtide-gmail/src/lib.rs"
@@ -687,9 +687,19 @@ name = "a_message_id_gmail_cannot_carry_is_refused_not_loosened"
 covers = "by_message_id returns None for an id holding a blank, a quote, a brace or a parenthesis (himalaya: a_reply_names_the_parents_a_query_can_carry)"
 
 [[test]]
+target = "crates/mailtide-gmail/src/request.rs"
+name = "a_label_check_gets_the_one_label"
+covers = "GET /labels/<id>, the id percent-encoded as a path segment"
+
+[[test]]
+target = "crates/mailtide-gmail/src/search.rs"
+name = "literal_neutralises_every_operator_gmail_reads_inside_quotes"
+covers = "Every line of search-literal-quoting (refuted): OR, |, braces, AND, AROUND, backslash, a colon after a word, glued forms like \\OR; parentheses, + and -; text with no letter or digit is None"
+
+[[test]]
 target = "crates/mailtide/src/quota.rs"
 name = "search_costs_follow_gmails_quota_table"
-covers = "messages.list 5 units, threads.list 10 units"
+covers = "messages.list 5 units, threads.list 10 units, labels.get 1 unit"
 
 # Pure rules
 
@@ -822,8 +832,13 @@ covers = "threads.list: thread id and Gmail's historyId per hit, the page's curs
 
 [[test]]
 target = "crates/mailtide-io/tests/search.rs"
-name = "a_label_id_the_mirror_does_not_hold_is_refused_before_gmail_is_called"
-covers = "search-unknown-label-id was refuted (Gmail answers an unknown labelIds value with an empty page), so a label id missing from the mirror's definitions is UnknownLabel with no Gmail call; before the first label listing every id is; known ids go out sorted"
+name = "a_label_id_gmail_does_not_have_is_unknown_and_never_searched"
+covers = "search-unknown-label-id was refuted (Gmail answers an unknown labelIds value with an empty page): a filter id the mirror lacks gets one labels.get (1 unit, the search's priority, once per distinct id, none for ids the mirror holds); a 404 is UnknownLabel and no search is sent; a 5xx on the check is Retryable"
+
+[[test]]
+target = "crates/mailtide-io/tests/search.rs"
+name = "a_label_id_newer_than_the_mirrors_listing_is_checked_with_gmail_and_searched"
+covers = "Before the first label listing, and for a label created in Gmail after the last one, labels.get answers and the search goes out with every id sorted; nothing is recorded in the mirror's definitions"
 
 [[test]]
 target = "crates/mailtide-io/tests/search.rs"
@@ -833,7 +848,7 @@ covers = "A timeout or dropped connection (the call's OutcomeUnknown) is Retryab
 [[test]]
 target = "crates/mailtide/src/search.rs"
 name = "label_ids_the_mirror_does_not_hold_are_named"
-covers = "unknown_label names the first filter id the mirror's definitions lack; with no definitions, every id"
+covers = "missing_labels names each filter id the mirror's definitions lack, once, in order; with no definitions, every id"
 
 [[test]]
 target = "crates/mailtide-io/tests/search.rs"
@@ -879,8 +894,8 @@ covers = "mailtide.search_literal and search_by_message_id; ValueError for text 
 
 [[test]]
 target = "tests/test_search.py"
-name = "test_unknown_label_raises_before_gmail"
-covers = "UnknownLabel (a SearchRefused) with label_id, before the first label listing and for an id the listing lacks, with no request reaching FakeGmail; a known id goes out as labelIds"
+name = "test_unknown_label_is_checked_with_gmail"
+covers = "A filter id the mirror lacks is checked with labels.get: Gmail's INBOX before the first listing and a label created after it are searched; a 404 raises UnknownLabel (a SearchRefused) with label_id and no search reaches FakeGmail"
 
 [[test]]
 target = "tests/test_search.py"
@@ -947,7 +962,7 @@ result = "2026-11-20, label `<prefix>/Proj X/Sub a` on one message: label: match
 id = "search-unknown-label-id"
 question = "How do messages.list and threads.list answer a labelIds value that does not exist (never created, or deleted)?"
 assumed = "With HTTP 400 naming the label, not with 200 and no results."
-if_wrong = "A filter on a deleted label would look like an empty result. mailtide would then check label_ids against the mirror's label definitions and refuse an id it does not hold (UnknownLabel) before calling Gmail."
+if_wrong = "A filter on a deleted label would look like an empty result. mailtide would then check label_ids before searching: an id the mirror's label definitions hold goes out; one they lack (deleted, newer than the last listing, or no listing yet) gets one labels.get, and a 404 is UnknownLabel with no search sent, while an answer lets the search go on (built: refuted, so this applies)."
 test = "GET users/me/messages?labelIds=Label_doesnotexist&q=in:anywhere; then labels.create a label, labels.delete it and list with its id. Repeat on users/me/threads. Record status and error body. Run together with label-edit-modify-deleted-label (one deleted label id, used in a listing and in a modify)."
 status = "refuted"
 result = "2026-11-20: a labelIds value that does not exist is not an error. messages.list and threads.list answered 200 with no messages/threads and resultSizeEstimate 0 for a never-created id (Label_doesnotexist, Label_999999999) and for the ids of 3 labels deleted seconds before, with and without q. Nothing distinguishes it from an empty result. if_wrong applies: check label_ids against the mirror's label definitions before calling Gmail."

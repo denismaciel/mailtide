@@ -137,6 +137,7 @@ fn request_kind(request: &GmailRequest) -> &'static str {
             SearchScope::Messages => "search_messages",
             SearchScope::Threads => "search_threads",
         },
+        GmailRequest::GetLabel { .. } => "get_label",
     }
 }
 
@@ -1283,6 +1284,9 @@ where
             GmailRequest::Modify(_) => Ok(EventKind::LabelsModified { command }),
             GmailRequest::Search(search) => decode::search(search.scope, body)
                 .map(|listing| EventKind::Searched { command, listing }),
+            GmailRequest::GetLabel { .. } => {
+                decode::label_get(body).map(|label| EventKind::LabelFetched { command, label })
+            }
         };
         match decoded {
             Ok(event) => Outcome::Event(event),
@@ -1396,7 +1400,8 @@ fn changes_mailbox(request: &GmailRequest) -> bool {
         | GmailRequest::ImportMessage { .. }
         | GmailRequest::ListLabels
         | GmailRequest::Watch
-        | GmailRequest::Search(_) => false,
+        | GmailRequest::Search(_)
+        | GmailRequest::GetLabel { .. } => false,
     }
 }
 

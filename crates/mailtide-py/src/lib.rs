@@ -153,7 +153,7 @@ mod _core {
         _core,
         UnknownLabel,
         SearchRefused,
-        "A search's label filter names an id the mirror's label definitions lack (deleted, never created, or newer than the last label listing); `label_id` names it. Gmail would answer it with no hits, so nothing was sent."
+        "A search's label filter names an id Gmail does not have (deleted, or never created: its labels.get answered 404); `label_id` names it. Gmail would answer the search with no hits, so it was not sent."
     );
     create_exception!(
         _core,
@@ -293,7 +293,7 @@ mod _core {
             ),
             SearchError::UnknownLabel(label) => Python::attach(|py| {
                 let error = UnknownLabel::new_err(format!(
-                    "the mirror holds no label {:?} (deleted, never created, or newer than the last label listing: run() first)",
+                    "Gmail has no label {:?} (deleted, or never created)",
                     label.0
                 ));
                 with_attribute(error, "label_id", label.0, py)

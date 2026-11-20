@@ -144,7 +144,8 @@ def test_blocking_runner_has_search() -> None:
 def test_search_literal_quotes_user_text() -> None:
     assert mailtide.search_literal("alice@example.org") == "alice@example.org"
     assert mailtide.search_literal("rapport} OR {kangaroo") == '"rapport or kangaroo"'
-    assert mailtide.search_literal("from:alice") == '"from:alice"'
+    assert mailtide.search_literal("from:alice") == '"from alice"'
+    assert mailtide.search_literal("Z | K AROUND 2") == '"z k around 2"'
     with pytest.raises(ValueError):
         mailtide.search_literal(' "()" ')
     assert mailtide.search_by_message_id("<id123@example.org>") == "rfc822msgid:id123@example.org"
@@ -152,24 +153,27 @@ def test_search_literal_quotes_user_text() -> None:
         mailtide.search_by_message_id("<two words@example.org>")
 
 
-def test_unknown_label_raises_before_gmail() -> None:
+def test_unknown_label_is_checked_with_gmail() -> None:
     with FakeGmail() as gmail:
         runner = mailtide.BlockingRunner(make_config(gmail.origin), tokens)
         runner.migrate()
         runner.track(ACCOUNT)
-        with pytest.raises(mailtide.UnknownLabel) as unsynced:
-            runner.search(ACCOUNT, "x", label_ids=["INBOX"])
-        assert unsynced.value.label_id == "INBOX", "no label listing yet"
+        gmail.script_search("x", ["m1"])
+        # No label listing yet: Gmail is asked, has INBOX, and the search runs.
+        runner.search(ACCOUNT, "x", label_ids=("INBOX",))
+        assert gmail.mailbox.searches[0]["labelIds"] == ["INBOX"]
+
         runner.run(ACCOUNT)
         with pytest.raises(mailtide.SearchRefused) as deleted:
             runner.search(ACCOUNT, "x", label_ids=["INBOX", "Label_9"])
         assert isinstance(deleted.value, mailtide.UnknownLabel)
         assert deleted.value.label_id == "Label_9"
-        assert gmail.mailbox.searches == []
+        assert len(gmail.mailbox.searches) == 1, "no search for an unknown label"
 
-        gmail.script_search("x", ["m1"])
-        runner.search(ACCOUNT, "x", label_ids=("INBOX",))
-        assert gmail.mailbox.searches[0]["labelIds"] == ["INBOX"]
+        gmail.mailbox.label("Label_2", "Projects")  # created after the listing
+        runner.search(ACCOUNT, "x", label_ids=["Label_2"])
+        assert gmail.mailbox.searches[1]["labelIds"] == ["Label_2"]
+        assert all(label.id != "Label_2" for label in runner.labels(ACCOUNT)), "nothing recorded"
 
 
 def test_a_deferred_search_raises_quota_deferred() -> None:
