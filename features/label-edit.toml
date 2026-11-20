@@ -2,7 +2,7 @@ id = "label-edit"
 title = "Label editing: create, rename, delete, colour, visibility and nesting"
 summary = "Label definitions gain visibility and colour in the mirror; create, rename, restyle and delete are quota-gated calls to Gmail's labels API whose answers are recorded at once; a deleted label, deleted here or elsewhere, leaves every mirrored message and cannot come back from a stale observation."
 roadmap = ["W2"]
-status = "in_progress"
+status = "done"
 design = "docs/features/label-edit.md"
 # No dependency on another plan. It builds on what `main` has: Store::labels /
 # Runner.labels() and the label refresh of SPEC §6.6 (EngineConfig::label_refresh,
@@ -161,6 +161,11 @@ role = "Export the label types"
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
 role = "Labels in the fake Gmail: created, renamed and deleted here and elsewhere, with and without history records for a deletion; definitions compared at convergence"
+
+[[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "The campaign's totals count label writes recorded and lost, deletions without history records, and refused deliveries"
 
 # -------------------------------------------------------------------- bindings
 

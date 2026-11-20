@@ -1,6 +1,6 @@
 # Label editing: create, rename, delete, colour, visibility and nesting
 
-Plan: `features/label-edit.toml` (roadmap W2). Status: in progress.
+Plan: `features/label-edit.toml` (roadmap W2). Status: done.
 
 ## 1. Goal and scope
 

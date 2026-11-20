@@ -191,11 +191,11 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             with mailbox.lock:
                 self._post()
 
-        def do_PATCH(self) -> None:  # noqa: N802
+        def do_PATCH(self) -> None:
             with mailbox.lock:
                 self._patch()
 
-        def do_DELETE(self) -> None:  # noqa: N802
+        def do_DELETE(self) -> None:
             with mailbox.lock:
                 self._delete()
 

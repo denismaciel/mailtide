@@ -18,6 +18,10 @@ fn main() {
         totals.threads += result.stats.threads;
         totals.deliveries += result.stats.deliveries;
         totals.label_edits += result.stats.label_edits;
+        totals.label_writes_recorded += result.stats.label_writes_recorded;
+        totals.label_writes_lost += result.stats.label_writes_lost;
+        totals.quiet_label_deletes += result.stats.quiet_label_deletes;
+        totals.refused_deliveries += result.stats.refused_deliveries;
         totals.label_listings += result.stats.label_listings;
         totals.opens += result.stats.opens;
         totals.raised += result.stats.raised;
