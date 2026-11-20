@@ -177,6 +177,10 @@ mod _core {
             RunError::ReadOnly => ReadOnlyMode::new_err(
                 "this runner is read-only (config access=\"read_only\"): actions are refused",
             ),
+            RunError::TooManyIds { given } => PyValueError::new_err(format!(
+                "prioritise takes at most {} message ids per call, got {given}",
+                mailtide::jobs::PRIORITISE_MAX_IDS
+            )),
         }
     }
 

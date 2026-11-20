@@ -2,22 +2,26 @@
 //! building, decoding, quota gate, blob writes and store commits.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mailtide::EngineConfig;
+use mailtide::engine::JOB_CONCURRENCY;
 use mailtide::ids::{AccountId, MessageId, Timestamp};
+use mailtide::jobs::PRIORITISE_MAX_IDS;
 use mailtide::labels::set;
 use mailtide::mirror::Content;
-use mailtide::quota::Budget;
+use mailtide::outbox::{Action, ActionRequest};
+use mailtide::quota::{Admission, Budget, Lease, Priority, QuotaUnits};
+use mailtide::retry::Cooldown;
 use mailtide::state::SyncPhase;
 use mailtide_gmail::http::{HttpRequest, HttpResponse};
 use mailtide_io::auth::{AccessToken, StaticTokens};
 use mailtide_io::blobs::{BlobStore, ObjectBlobs, blob_key};
-use mailtide_io::quota_gate::LocalGate;
-use mailtide_io::runner::{Runner, RunnerConfig, StopReason, WatchMode};
+use mailtide_io::quota_gate::{GateError, LocalGate, QuotaGate};
+use mailtide_io::runner::{Access, RunError, Runner, RunnerConfig, StopReason, WatchMode};
 use mailtide_io::transport::{GmailTransport, TransportError};
 use mailtide_store::memory::MemoryStore;
 use serde_json::json;
@@ -34,6 +38,8 @@ struct Mailbox {
     messages: BTreeMap<String, Message>,
     history: Vec<serde_json::Value>,
     history_id: u64,
+    /// Every raw fetch (an import), in order.
+    raw_fetches: Vec<String>,
 }
 
 impl Mailbox {
@@ -93,13 +99,18 @@ impl GmailTransport for FakeGmail {
         token: &AccessToken,
     ) -> Result<HttpResponse, TransportError> {
         assert_eq!(token.secret, "test-token");
-        let mailbox = self.0.lock().expect("lock");
+        let mut mailbox = self.0.lock().expect("lock");
         let query: BTreeMap<&str, &str> = request
             .query
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let path = request.path.trim_start_matches("/gmail/v1/users/me/");
+        if let Some(id) = path.strip_prefix("messages/")
+            && query.get("format") == Some(&"raw")
+        {
+            mailbox.raw_fetches.push(id.to_owned());
+        }
         let response = match path.split('/').collect::<Vec<_>>().as_slice() {
             ["profile"] => ok(
                 &json!({"emailAddress": "alice@example.com", "historyId": mailbox.history_id.to_string()}),
@@ -266,4 +277,194 @@ fn runner_gmail(
     runner: &Runner<MemoryStore, ObjectBlobs, FakeGmail, LocalGate, StaticTokens>,
 ) -> &FakeGmail {
     runner.transport()
+}
+
+/// The local gate, logging the class of every import it lets through.
+#[derive(Debug)]
+struct RecordingGate {
+    gate: LocalGate,
+    imports: Arc<Mutex<Vec<Priority>>>,
+}
+
+impl QuotaGate for RecordingGate {
+    async fn admit(
+        &self,
+        account: &AccountId,
+        cost: QuotaUnits,
+        priority: Priority,
+        now: Timestamp,
+    ) -> Result<Admission, GateError> {
+        let admission = self.gate.admit(account, cost, priority, now).await?;
+        if matches!(admission, Admission::Granted(_)) && cost == QuotaUnits(60) {
+            self.imports.lock().expect("lock").push(priority);
+        }
+        Ok(admission)
+    }
+
+    async fn release(&self, lease: Lease, bytes: u64, now: Timestamp) -> Result<(), GateError> {
+        self.gate.release(lease, bytes, now).await
+    }
+
+    async fn cool_down(&self, cooldown: Cooldown) -> Result<(), GateError> {
+        self.gate.cool_down(cooldown).await
+    }
+
+    fn abandon(&self, lease: Lease) {
+        self.gate.abandon(lease);
+    }
+}
+
+type TightRunner = Runner<MemoryStore, ObjectBlobs, FakeGmail, RecordingGate, StaticTokens>;
+
+/// A mailbox of `count` messages behind a quota whose Backfill share admits
+/// the bootstrap and two imports a minute (70% of 250 units); Foreground
+/// may use all 250.
+fn backlog(count: usize, access: Access) -> (TightRunner, Arc<Mutex<Vec<Priority>>>) {
+    let gmail = FakeGmail::default();
+    {
+        let mut mailbox = gmail.0.lock().expect("lock");
+        for n in 0..count {
+            mailbox.add(&format!("m{n:03}"), &["INBOX"]);
+        }
+    }
+    let imports = Arc::new(Mutex::new(Vec::new()));
+    let gate = RecordingGate {
+        gate: LocalGate::new(Budget {
+            account_per_minute: 250,
+            ..Budget::GMAIL_DEFAULT
+        }),
+        imports: imports.clone(),
+    };
+    let tokens = StaticTokens(BTreeMap::from([(
+        account(),
+        AccessToken {
+            secret: "test-token".into(),
+            expires_at: Timestamp(i64::MAX),
+        },
+    )]));
+    let runner = Runner::new(
+        MemoryStore::tracking(&[account()]),
+        ObjectBlobs::memory(),
+        gmail,
+        gate,
+        tokens,
+        RunnerConfig {
+            engine: EngineConfig::default(),
+            access,
+            watch: WatchMode::Disabled,
+            log_accounts: mailtide_io::runner::LogAccounts::default(),
+        },
+    );
+    (runner, imports)
+}
+
+/// Messages discovered but not yet imported.
+fn pending(runner: &TightRunner) -> Vec<MessageId> {
+    let mirror = runner.store().mirror(&account()).expect("mirror");
+    mirror
+        .messages
+        .values()
+        .filter(|m| m.content == Content::Pending)
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_opened_message_jumps_the_backlog() {
+    let (runner, imports) = backlog(50, Access::ReadWrite);
+    // The bootstrap discovers everything; the quota holds the backlog back.
+    runner
+        .run(&account(), Duration::from_secs(2))
+        .await
+        .expect("bootstrap");
+    let backlog = pending(&runner);
+    assert!(backlog.len() >= 40, "{} pending", backlog.len());
+    assert!(
+        imports
+            .lock()
+            .expect("lock")
+            .iter()
+            .all(|p| *p == Priority::Backfill),
+        "the backlog imports in its own class"
+    );
+    let opened = backlog[0].clone();
+
+    let report = runner
+        .prioritise(&account(), std::slice::from_ref(&opened))
+        .await
+        .expect("prioritise");
+    assert_eq!(report.queued, vec![opened.clone()]);
+
+    let before = {
+        let mailbox = runner.transport().0.lock().expect("lock");
+        mailbox.raw_fetches.len()
+    };
+    let classes_before = imports.lock().expect("lock").len();
+    runner
+        .run(&account(), Duration::from_secs(2))
+        .await
+        .expect("run");
+    let mirror = runner.store().mirror(&account()).expect("mirror");
+    assert!(
+        matches!(mirror.messages[&opened].content, Content::Imported(_)),
+        "the opened message is imported"
+    );
+    let fetched = runner.transport().0.lock().expect("lock").raw_fetches[before..].to_vec();
+    let classes = imports.lock().expect("lock")[classes_before..].to_vec();
+    assert_eq!(fetched.len(), classes.len(), "one admission per fetch");
+    let position = fetched
+        .iter()
+        .position(|id| *id == opened.0)
+        .expect("the opened message is fetched");
+    assert_eq!(classes[position], Priority::Foreground);
+    assert!(
+        position <= JOB_CONCURRENCY as usize,
+        "{position} backlog imports went first"
+    );
+}
+
+#[tokio::test]
+async fn prioritise_refuses_more_than_the_call_limit() {
+    let (runner, _) = backlog(5, Access::ReadWrite);
+    runner
+        .run(&account(), Duration::from_secs(2))
+        .await
+        .expect("bootstrap");
+    let before = runner.store().mirror(&account());
+    let mut ids = pending(&runner);
+    ids.extend((0..=PRIORITISE_MAX_IDS).map(|n| MessageId(format!("x{n}"))));
+    assert!(matches!(
+        runner.prioritise(&account(), &ids).await,
+        Err(RunError::TooManyIds { given }) if given == ids.len()
+    ));
+    assert_eq!(runner.store().mirror(&account()), before, "nothing written");
+    ids.truncate(PRIORITISE_MAX_IDS);
+    let report = runner
+        .prioritise(&account(), &ids)
+        .await
+        .expect("the limit itself is allowed");
+    assert!(!report.queued.is_empty());
+}
+
+#[tokio::test]
+async fn prioritise_works_in_read_only_mode() {
+    let (runner, _) = backlog(10, Access::ReadOnly);
+    runner
+        .run(&account(), Duration::from_secs(2))
+        .await
+        .expect("bootstrap");
+    let opened = pending(&runner)[0].clone();
+    let report = runner
+        .prioritise(&account(), std::slice::from_ref(&opened))
+        .await
+        .expect("an import changes nothing in Gmail");
+    assert_eq!(report.queued, vec![opened.clone()]);
+    let action = ActionRequest::Messages {
+        ids: vec![opened],
+        action: Action::Archive,
+    };
+    assert!(matches!(
+        runner.act(&account(), action, Duration::from_secs(1)).await,
+        Err(RunError::ReadOnly)
+    ));
 }

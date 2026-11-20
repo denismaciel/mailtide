@@ -1666,6 +1666,124 @@ mod tests {
         );
     }
 
+    /// Answer the engine's job claim among `commands` from `mirror`, as a
+    /// store would.
+    fn claim_from(mirror: &mut crate::mirror::AccountMirror, commands: &[Command]) -> Event {
+        let (id, epoch, limit, now, attempt, floor) = commands
+            .iter()
+            .find_map(|c| match c.kind {
+                CommandKind::ClaimJobs {
+                    epoch,
+                    limit,
+                    now,
+                    attempt,
+                    floor,
+                    ..
+                } => Some((c.id, epoch, limit, now, attempt, floor)),
+                _ => None,
+            })
+            .expect("a claim");
+        let jobs = mirror
+            .claim_jobs_from(epoch, limit, now, attempt, floor)
+            .expect("the engine's epoch");
+        event(EventKind::JobsClaimed {
+            command: id,
+            jobs,
+            next_due: mirror.next_due(),
+        })
+    }
+
+    /// A user opens a message while the gate holds Backfill back: the
+    /// store write raises its import behind the engine's back, and the
+    /// engine's next claim sends it in the Foreground class.
+    #[test]
+    fn a_prioritised_import_is_requested_in_the_foreground_class() {
+        let mut mirror =
+            crate::mirror::AccountMirror::new(AccountId("alice@example.com".into()), 1);
+        mirror.claim(ENGINE_VERSION).expect("claim");
+        let mut engine = live(100);
+        let discover = |mirror: &crate::mirror::AccountMirror, seq: u64, id: &str| Commit {
+            id: CommitId {
+                epoch: mirror.record.epoch,
+                seq,
+            },
+            account: mirror.account.clone(),
+            epoch: mirror.record.epoch,
+            engine_version: ENGINE_VERSION,
+            cursor: None,
+            claim: None,
+            sync: None,
+            messages: vec![MessageOp::Observe(MessageObservation {
+                id: MessageId(id.into()),
+                thread_id: crate::ids::ThreadId(format!("t-{id}")),
+                labels: LabelSet::new(),
+                checkpoint: HistoryId(50),
+            })],
+            labels: Vec::new(),
+            account_ops: Vec::new(),
+            job_plan: JobPlan {
+                priority: Priority::Backfill,
+                import_due_at: Timestamp(0),
+                draft_import_due_at: Timestamp(0),
+                verify_due_at: Timestamp(0),
+                cleanup_due_at: Timestamp(0),
+                deliver_due_at: Timestamp(0),
+                confirm_due_at: Timestamp(0),
+            },
+            jobs: Vec::new(),
+            intents: Vec::new(),
+        };
+        mirror.apply(&discover(&mirror, 1_000, "old"));
+
+        // The backlog's import is deferred by the gate: Backfill is held back.
+        let claim = engine.claim_jobs(Timestamp(0));
+        let commands = engine.handle(claim_from(&mut mirror, &claim));
+        let import = commands
+            .iter()
+            .find(|c| matches!(&c.kind, CommandKind::Gmail(_)))
+            .expect("an import")
+            .id;
+        let deferred = engine.handle(event(EventKind::RequestDeferred {
+            command: import,
+            until: Timestamp(60_000),
+        }));
+        mirror.apply(&first_commit(deferred).expect("the deferral's commit"));
+
+        // A message is discovered, and the user opens it.
+        mirror.apply(&discover(&mirror, 1_001, "opened"));
+        let report = mirror.prioritise(&[MessageId("opened".into())], Timestamp(1_000));
+        assert_eq!(report.queued, vec![MessageId("opened".into())]);
+
+        let claim = engine.claim_jobs(Timestamp(1_000));
+        assert!(
+            claim.iter().any(|c| matches!(
+                c.kind,
+                CommandKind::ClaimJobs {
+                    floor: Priority::Live,
+                    ..
+                }
+            )),
+            "Backfill is still held back: {claim:?}"
+        );
+        let commands = engine.handle(claim_from(&mut mirror, &claim));
+        let calls: Vec<&GmailCall> = commands
+            .iter()
+            .filter_map(|c| match &c.kind {
+                CommandKind::Gmail(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{commands:?}");
+        assert_eq!(
+            calls[0].request,
+            GmailRequest::ImportMessage {
+                id: MessageId("opened".into())
+            }
+        );
+        assert_eq!(calls[0].priority, Priority::Foreground);
+        assert_eq!(calls[0].cost, quota::QuotaUnits(60));
+    }
+
     #[test]
     fn with_watches_off_no_renewal_is_scheduled_or_sent() {
         let snapshot = StoreSnapshot {

@@ -23,6 +23,11 @@ path = "crates/mailtide/src/invariants.rs"
 change = "modify"
 role = "Violation::PriorityLowered: outside a claim's finish, a job's class never goes down"
 
+[[file]]
+path = "crates/mailtide/src/engine.rs"
+change = "modify"
+role = "A test only: the engine sends a job raised behind its back in the job's class (no engine change)"
+
 # ----------------------------------------------------------------------- store
 
 [[file]]

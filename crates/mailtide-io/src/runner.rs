@@ -14,7 +14,7 @@ use mailtide::engine::Stopped;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{ImportedMessage, Label};
 use mailtide::ids::{AccountId, CommandId, ENGINE_VERSION, HistoryId, MessageId, Timestamp};
-use mailtide::jobs::ClaimOutcome;
+use mailtide::jobs::{ClaimOutcome, PRIORITISE_MAX_IDS, Prioritised};
 use mailtide::outbox::ActionRequest;
 use mailtide::quota::Admission;
 use mailtide::retry::{Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
@@ -220,6 +220,12 @@ pub enum RunError {
     Invariant(&'static str),
     /// The runner is read-only: actions are refused.
     ReadOnly,
+    /// A `prioritise` call named more than [`PRIORITISE_MAX_IDS`] ids;
+    /// nothing was written.
+    TooManyIds {
+        /// How many it named.
+        given: usize,
+    },
 }
 
 impl RunError {
@@ -237,6 +243,7 @@ impl RunError {
             Self::Blobs(_) => "blobs",
             Self::Invariant(_) => "invariant",
             Self::ReadOnly => "read_only",
+            Self::TooManyIds { .. } => "too_many_ids",
         }
     }
 }
@@ -357,6 +364,27 @@ where
         self.writable()?;
         self.store
             .admit(account, action, self.clock.now())
+            .await
+            .map_err(RunError::Store)
+    }
+
+    /// A user opened these messages: raise their queued body imports to the
+    /// Foreground class so they are fetched ahead of the backlog, by
+    /// whichever engine holds the account (call [`Self::run`] if none is
+    /// running). One store write, unfenced like [`Self::admit`]; use it from
+    /// request paths. Allowed read-only: an import changes nothing in Gmail.
+    /// At most [`PRIORITISE_MAX_IDS`] ids per call. The feed's
+    /// `MessageImported` entry (or `messages`) says when a body is stored.
+    pub async fn prioritise(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Prioritised, RunError> {
+        if ids.len() > PRIORITISE_MAX_IDS {
+            return Err(RunError::TooManyIds { given: ids.len() });
+        }
+        self.store
+            .prioritise(account, ids, self.clock.now())
             .await
             .map_err(RunError::Store)
     }
