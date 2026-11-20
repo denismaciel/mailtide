@@ -882,6 +882,8 @@ question = "Is the message that drafts.send returns in the draft's thread?"
 assumed = "Yes, for a new conversation and for a reply draft."
 if_wrong = "Nothing breaks: SentDraft and DraftSent carry the thread id from Gmail's answer or from the imported SENT message, never the row's, and a lost send is matched by Message-ID in any thread. A host that showed the draft in a thread must move it on DraftSent."
 test = "1) POST /drafts to self without threadId; note message.threadId T1. POST /drafts/send {id}; record the answer's keys, its threadId (expect T1) and labelIds (expect SENT, no DRAFT). 2) Pick an INBOX message with thread T2 and Message-ID X. POST /drafts {message:{raw with In-Reply-To: X, References: X, Subject `Re: ...`, threadId:T2}}; POST /drafts/send; expect threadId T2. 3) GET /threads/T1?format=minimal and /threads/T2?format=minimal; expect the sent messages listed."
+status = "confirmed"
+result = "2026-11-20, 3 new-conversation drafts and 3 reply drafts (threadId T2, In-Reply-To and References naming a message of T2, Subject `Re: ...`), all to self: drafts.send answered 200 with exactly the keys id, threadId, labelIds; threadId was the draft's thread every time (T1 for the new ones, T2 for the replies); labelIds [UNREAD, SENT, INBOX] (SENT, no DRAFT; UNREAD and INBOX because the recipient is the sender); the id differs from the draft's message id. threads.get(format=minimal) on T1 and T2 listed the sent messages. Note for callers: a reply draft created without threadId (headers only) did not join T2."
 
 [[unknown]]
 id = "drafts-update-keeps-thread"
@@ -889,6 +891,8 @@ question = "Does drafts.update without threadId keep a reply draft in its thread
 assumed = "Not relied on. The design assumes the worse answer (Gmail may re-thread it), so update_draft always sends a thread id: the caller's, else the index's, else one read with drafts.get."
 if_wrong = "Either answer is safe. If Gmail does keep the thread, the drafts.get fallback (20 units, only for a draft the index has never seen) can be dropped."
 test = "1) Create a reply draft D in thread T2 as in drafts-sent-thread step 2. 2) PUT /drafts/D {message:{raw}} with the same headers, a new body and no threadId; record the answer's message.threadId. 3) PUT again without threadId and with a changed Subject; record it. 4) PUT again without threadId and without In-Reply-To and References; record it. 5) GET /drafts/D?format=minimal after each."
+status = "confirmed"
+result = "2026-11-20: the worse answer the design assumes is what Gmail does. A reply draft created in thread T2 left T2 on every drafts.update sent without threadId: with the same In-Reply-To, References and `Re:` Subject and only a new body; with a changed Subject; without In-Reply-To and References; and with neither (12 of 12 updates over 3 drafts: the answer's message.threadId and a following drafts.get both showed a thread other than T2). An update that sent threadId T2 again put it back in T2 (3 of 3). So update must always send the thread id and the drafts.get fallback stays."
 
 [[unknown]]
 id = "drafts-update-resend-thread"
@@ -896,6 +900,8 @@ question = "Is an update that sends the draft's own thread id accepted when the 
 assumed = "Yes."
 if_wrong = "The rule `update always sends the thread id` would fail or re-thread standalone drafts. Then send threadId only when the mirror shows another message in the thread, and depend on drafts-update-keeps-thread for the rest."
 test = "1) POST /drafts without threadId; note D, message id M1, thread T1. 2) PUT /drafts/D {message:{raw, threadId:T1}}; expect 200, a new message id, threadId T1. 3) PUT again with threadId T1 and a different Subject; record status and threadId. 4) GET /threads/T1?format=minimal; expect one message, the draft's current one."
+status = "confirmed"
+result = "2026-11-20, 3 standalone drafts: drafts.update with message.threadId set to the draft's own thread T1 answered 200 with a new message id and threadId T1; a second update with T1 and a different Subject also 200 with threadId T1. threads.get(T1, format=minimal) then held exactly one message, the draft's current one. T1 equals the id of the draft's first message, which no longer exists after the first update, and is still accepted. After drafts.delete, threads.get(T1) is 404."
 
 [[unknown]]
 id = "drafts-list-consistent"
@@ -910,6 +916,8 @@ question = "Do draft create, update and delete appear in history.list as message
 assumed = "Yes: create adds M1 [DRAFT]; update adds M2 [DRAFT] and deletes M1; delete deletes M2."
 if_wrong = "Rows would not turn stale and drafts made elsewhere would not trigger a refresh, so the index would be only as fresh as the periodic refresh, and replaced draft messages would stay in the mirror until a reconciliation. The periodic interval would have to drop for accounts with drafts."
 test = "GET /profile; note H. POST /drafts; note D, M1. PUT /drafts/D; note M2. DELETE /drafts/D. GET /history?startHistoryId=H (all pages, no historyTypes or labelId filter); expect, in order, messagesAdded M1 with labelIds [DRAFT], messagesAdded M2 with [DRAFT], messagesDeleted M1, messagesDeleted M2. Repeat while typing, then discarding, a draft in Gmail's web UI. Run together with drafts-history-on-send and send-history-on-send (one history window read after each call)."
+status = "confirmed"
+result = "2026-11-20, 3 rounds, history.list from the historyId read before, no filter, read after each call: create -> messagesAdded M1 labelIds [DRAFT]; update -> messagesDeleted M1 [DRAFT] then messagesAdded M2 [DRAFT]; delete (204) -> messagesDeleted M2 [DRAFT]. Every record was present in the read made right after the call. Order differs from the test's expectation in one place: on update the messagesDeleted for the old message comes first (record id n), the messagesAdded for the new one next (n+1), so a reader between the two sees the draft with no message. Not run: typing and discarding a draft in Gmail's web UI."
 
 [[unknown]]
 id = "drafts-history-on-send"
@@ -917,6 +925,8 @@ question = "Does sending a draft appear in history.list as messagesDeleted for t
 assumed = "Yes: the sent message has a new id and the SENT label, and the draft's message id answers 404 afterwards."
 if_wrong = "If Gmail relabels the same message instead (labelsRemoved DRAFT, labelsAdded SENT), no tombstone marks the row stale and a draft sent elsewhere stays saved until a refresh. The mirror rule must then also schedule a refresh when DRAFT leaves a message a row points at; until it does, the periodic refresh bounds the lag."
 test = "GET /profile; note H. POST /drafts to self; note D, M1. POST /drafts/send {id:D}; note S. GET /history?startHistoryId=H (all pages); record every record naming M1 or S. GET /messages/S?format=minimal; record labelIds. GET /messages/M1?format=minimal; expect 404. Repeat sending the draft from Gmail's web UI. Run together with drafts-history-on-save and send-history-on-send (one history window read after each call)."
+status = "confirmed"
+result = "2026-11-20, 6 drafts to self (3 new, 3 replies): history.list read right after drafts.send answered held messagesDeleted for the draft's message M1 (labelIds [DRAFT]) and messagesAdded for a new message S with labelIds [UNREAD, SENT, INBOX] (SENT and INBOX together because the recipient is the sender), 6 of 6 on the first read and unchanged 2 s later. S has a new id; messages.get(S) shows the same labels; messages.get(M1) is 404 notFound. No labelsRemoved/labelsAdded relabelling was seen. Not run: sending the draft from Gmail's web UI."
 
 [[unknown]]
 id = "drafts-gone-is-404"
@@ -931,6 +941,8 @@ question = "Does drafts.get answer 404 when given a message id instead of a draf
 assumed = "Yes: draft ids and message ids are separate namespaces."
 if_wrong = "Already guarded: a drafts.get answer whose message lacks the DRAFT label decodes to not found, so a non-draft is never returned as an editable draft."
 test = "GET /drafts/{id}?format=minimal with a) the id of an INBOX message, b) the message id of an existing draft (not its draft id), c) the message id drafts.send returned for a sent draft; record status and, on 200, the answer's id and labelIds."
+status = "confirmed"
+result = "2026-11-20: drafts.get(format=minimal) answered 404 NOT_FOUND (reason notFound) when given a) the id of a message in INBOX, b) the message id of an existing draft, c) the message id drafts.send had returned; the draft's own id answered 200 with labelIds [DRAFT]. Draft ids here look like `r` plus an optional `-` and up to 19 digits; message ids are 16 hex digits."
 
 [[unknown]]
 id = "drafts-write-answer-ids"
@@ -938,6 +950,8 @@ question = "Do drafts.create and drafts.update answers always carry id, message.
 assumed = "Yes."
 if_wrong = "A write whose answer lacks them is completed with one drafts.get?format=minimal (20 units) before it is recorded; if that fails the call returns OutcomeUnknown and a refresh is scheduled. No row is ever written with an empty id."
 test = "POST /drafts and PUT /drafts/D on the metadata URI, 20 times each, for a standalone draft and for a reply draft with threadId; record the JSON keys of every answer and of answer.message."
+status = "confirmed"
+result = "2026-11-20: 20 drafts.create and 20 drafts.update on the metadata URI for a standalone draft, and the same for a reply draft with threadId (80 answers): every answer had exactly the keys {id, message} and message had exactly {id, threadId, labelIds}; none lacked an id."
 
 [[unknown]]
 id = "drafts-no-precondition"
@@ -945,3 +959,5 @@ question = "Does Gmail honour an HTTP precondition (ETag with If-Match) on draft
 assumed = "No: the reference pages mention none, so if_message_id is a read with drafts.get followed by the write, with a small race between them."
 if_wrong = "Good news: send the precondition with the write and drop the separate read (20 units and the race)."
 test = "1) POST /drafts; note D. GET /drafts/D?format=minimal; record any ETag header and any etag field. 2) PUT /drafts/D with header `If-Match: \"bogus\"`; record status (200 means ignored, 412 means honoured). 3) If an ETag was returned: PUT with it (expect 200), then PUT with the old one again (expect 412 if honoured). 4) Same with POST /drafts/send {id:D} and `If-Match: \"bogus\"` on a draft to self."
+status = "confirmed"
+result = "2026-11-20: drafts.create and drafts.get return no ETag header and no etag field. drafts.update with `If-Match: \"bogus\"` answered 200 and replaced the draft (2 of 2), as did `If-Unmodified-Since` set to the year 2000; drafts.send with `If-Match: \"bogus\"` answered 200 and sent the message. Gmail ignores HTTP preconditions on drafts."
