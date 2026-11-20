@@ -1,4 +1,6 @@
+import ast
 import re
+from pathlib import Path
 
 import mailtide
 import pytest
@@ -142,3 +144,55 @@ def test_parse_addresses_bridges_mirror_headers() -> None:
         "dan@example.org",
     ]
     assert b"\r\nReferences: <root@example.org> <orig@example.org>\r\n" in reply.raw
+
+
+def stub_keywords() -> list[str]:
+    """The keywords `_core.pyi` documents for ``OutgoingMessage.__init__``."""
+    stub = Path(mailtide.__file__).with_name("_core.pyi")
+    for node in ast.walk(ast.parse(stub.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == "OutgoingMessage":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                    return [arg.arg for arg in item.args.kwonlyargs]
+    raise AssertionError("no OutgoingMessage.__init__ in the stub")
+
+
+def test_outgoing_message_takes_every_documented_keyword() -> None:
+    image = Attachment("image/png", PNG, content_id="logo")
+    pdf = Attachment("application/pdf", b"%PDF", filename="quote.pdf")
+    values: dict[str, object] = {
+        "sender": Address("assistant@example.com"),
+        "reply_to": [Address("team@example.com", "Team")],
+        "to": [Address("bob@example.org")],
+        "cc": [Address("carol@example.org")],
+        "bcc": [Address("eve@example.org")],
+        "subject": "Fleet policy",
+        "sent_at_ms": 1_795_165_200_000,
+        "message_id": "<m1@example.com>",
+        "tracking_id": "AAECAwQFBgcICQoLDA0ODw",
+        "in_reply_to": "<p0@example.org>",
+        "references": ["<r0@example.org>", "<p0@example.org>"],
+        "headers": [("X-Note", "kept")],
+        "text": "Hello\r\n",
+        "html": '<p>Hello <img src="cid:logo"></p>',
+        "inline": [image],
+        "attachments": [pdf],
+    }
+    assert sorted(stub_keywords()) == sorted(values)
+    built = OutgoingMessage(Address("ann@example.com"), **values)
+    assert built.from_ == Address("ann@example.com")
+    for keyword, value in values.items():
+        got = getattr(built, keyword)
+        if keyword in ("inline", "attachments"):
+            assert [part.data for part in got] == [part.data for part in value]
+        else:
+            assert got == value, keyword
+    composed = mailtide.compose_message(built)
+    assert composed.message_id == "<m1@example.com>"
+    assert composed.tracking_id == "AAECAwQFBgcICQoLDA0ODw"
+    assert composed.recipients == ["bob@example.org", "carol@example.org", "eve@example.org"]
+
+
+def test_outgoing_message_refuses_an_unknown_keyword() -> None:
+    with pytest.raises(TypeError, match="subjet"):
+        OutgoingMessage("ann@example.com", subjet="typo")

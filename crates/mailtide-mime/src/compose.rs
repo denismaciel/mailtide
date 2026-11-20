@@ -265,7 +265,9 @@ const MAX_LINE: usize = 998;
 /// The date and the ids are inputs and each multipart boundary is derived
 /// from them, so the same input always gives the same bytes. The input is
 /// checked first and refused, never repaired; only line ends in the bodies
-/// become CRLF, and a message of one part ends with one.
+/// become CRLF, and a message of one part ends with one. No part declared
+/// `7bit` holds a control character other than tab, CR and LF: such a body
+/// is base64-encoded.
 ///
 /// The tree, each level present only when it has more than one child:
 ///
@@ -328,7 +330,7 @@ pub fn compose(
     };
 
     let html = html.map(|html| {
-        let html = MimePart::new("text/html", BodyPart::Text(html));
+        let html = body_part("text/html", html);
         match related {
             Some(boundary) => {
                 let content_type = ContentType::new("multipart/related")
@@ -341,7 +343,7 @@ pub fn compose(
             None => html,
         }
     });
-    let text = text.map(|text| MimePart::new("text/plain", BodyPart::Text(text)));
+    let text = text.map(|text| body_part("text/plain", text));
     let body = match (text, html, alternative) {
         (Some(text), Some(html), Some(boundary)) => {
             let content_type =
@@ -659,6 +661,19 @@ fn is_exact_text(bytes: &[u8]) -> bool {
         && !bytes
             .iter()
             .any(|&byte| byte < b' ' && !matches!(byte, b'\t' | b'\r' | b'\n'))
+}
+
+/// A text or HTML body, UTF-8, line ends already CRLF. mail-builder picks
+/// 7bit, quoted-printable or base64 by line length and 8-bit content only,
+/// so a body holding any other control character (NUL, ESC, ...) would be
+/// declared 7bit and written raw: such a body is base64-encoded here.
+fn body_part<'a>(media_type: &'a str, body: Cow<'a, str>) -> MimePart<'a> {
+    if is_exact_text(body.as_bytes()) {
+        return MimePart::new(media_type, BodyPart::Text(body));
+    }
+    let content_type = ContentType::new(media_type).attribute("charset", "utf-8");
+    let encoded = MIME.encode(body.as_bytes()).into_bytes();
+    MimePart::new(content_type, BodyPart::Binary(Cow::Owned(encoded))).transfer_encoding("base64")
 }
 
 /// Where a leaf sits.
@@ -1593,6 +1608,68 @@ mod tests {
         assert_eq!(compose(&message, &ComposeOptions::default()), Ok(composed));
         let parsed = crate::parse(raw.as_bytes()).expect("parse");
         assert_eq!(parsed.attachments.len(), 2);
+    }
+
+    /// Every Content-Transfer-Encoding of `raw`, in document order.
+    fn transfer_encodings(raw: &str) -> Vec<&str> {
+        raw.split("\r\n")
+            .filter_map(|line| line.strip_prefix("Content-Transfer-Encoding: "))
+            .collect()
+    }
+
+    fn body_round_trip(text: &str, html: &str) -> String {
+        let mut message = message();
+        message.text = Some(text.to_owned());
+        message.html = Some(html.to_owned());
+        let raw = written(&message);
+        let parsed = crate::parse(raw.as_bytes()).expect("parse");
+        assert_eq!(parsed.text.as_deref(), Some(text));
+        assert_eq!(parsed.html.as_deref(), Some(html));
+        raw
+    }
+
+    #[test]
+    fn a_body_with_nul_is_encoded_and_round_trips() {
+        let raw = body_round_trip("before\0after\r\n", "<p>a\0b</p>");
+        assert!(!raw.contains('\0'));
+        assert_eq!(transfer_encodings(&raw), ["base64", "base64"], "{raw}");
+        assert!(
+            raw.contains("Content-Type: text/plain; charset=\"utf-8\"\r\n"),
+            "{raw}"
+        );
+        assert!(
+            raw.contains("Content-Type: text/html; charset=\"utf-8\"\r\n"),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn a_body_with_a_bare_control_character_is_encoded_and_round_trips() {
+        for control in ['\u{1}', '\u{7}', '\u{b}', '\u{c}', '\u{1b}', '\u{1f}'] {
+            let text = format!("ring {control} here\r\n");
+            let raw = body_round_trip(&text, "<p>plain</p>");
+            assert!(!raw.contains(control), "{control:?}");
+            assert_eq!(transfer_encodings(&raw), ["base64", "7bit"], "{control:?}");
+        }
+        // Tab, CR and LF alone stay 7bit.
+        let raw = body_round_trip("a\tb\r\nc\r\n", "<p>\tx</p>");
+        assert_eq!(transfer_encodings(&raw), ["7bit", "7bit"], "{raw}");
+    }
+
+    #[test]
+    fn a_body_with_an_over_long_line_is_encoded_and_round_trips() {
+        let long = format!("{}\r\nshort\r\n", "x".repeat(MAX_LINE + 500));
+        let raw = body_round_trip(&long, &format!("<p>{}</p>", "y ".repeat(800)));
+        assert!(
+            raw.split("\r\n").all(|line| line.len() <= MAX_LINE),
+            "a line over 998 octets"
+        );
+        assert!(
+            transfer_encodings(&raw)
+                .iter()
+                .all(|encoding| *encoding != "7bit"),
+            "{raw}"
+        );
     }
 
     /// xorshift64: a seeded generator, so every run checks the same inputs.

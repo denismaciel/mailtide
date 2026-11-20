@@ -216,9 +216,11 @@ header value, file name or id (header injection), addresses that are not ASCII
 attachment types, no recipient for a send, more than `max_bytes`. One tree,
 each level only when it has more than one child: `multipart/mixed` >
 [`multipart/alternative` > [text, `multipart/related` > [html, inline
-parts]], attachments]. An attached `message/rfc822` is written `7bit` when
-it is 7-bit clean and otherwise as a base64 `application/octet-stream` file.
-Bcc is a header: Gmail's send has no envelope.
+parts]], attachments]. A text or HTML body holding a control character other
+than tab, CR and LF is base64-encoded, never written raw under `7bit`. An
+attached `message/rfc822` is written `7bit` when it is 7-bit clean and
+otherwise as a base64 `application/octet-stream` file. Bcc is a header:
+Gmail's send has no envelope.
 
 Gmail replaces a client's `Message-ID` and `Date` on every API send and
 every draft save, and keeps every other client header byte for byte. So the

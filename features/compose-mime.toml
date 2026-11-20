@@ -826,6 +826,23 @@ target = "crates/mailtide-mime/src/compose.rs"
 name = "compose_then_parse_returns_the_input"
 covers = "mailtide_mime::parse of the output gives back the text, the html, and every inline part and attachment with its type, name, content id and exact bytes (all 256 byte values)"
 
+# Bodies with control characters or long lines: never raw under 7bit
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_body_with_nul_is_encoded_and_round_trips"
+covers = "A text or HTML body holding NUL is written base64 (charset utf-8), never raw under 7bit, and parse gives back the same text"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_body_with_a_bare_control_character_is_encoded_and_round_trips"
+covers = "Any control character but tab, CR and LF (SOH, BEL, VT, FF, ESC, US) makes the body base64 and it round-trips; tab, CR and LF alone stay 7bit"
+
+[[test]]
+target = "crates/mailtide-mime/src/compose.rs"
+name = "a_body_with_an_over_long_line_is_encoded_and_round_trips"
+covers = "A text line over 998 octets and a long HTML line are transfer-encoded, no output line exceeds 998 octets, and both round-trip"
+
 # Headers
 
 [[test]]
@@ -1010,6 +1027,16 @@ covers = "Attachment objects from parse_message are accepted by OutgoingMessage,
 target = "tests/test_compose.py"
 name = "test_parse_addresses_bridges_mirror_headers"
 covers = "parse_addresses on the strings MessageContent.sender, to and cc hold gives Address values compose accepts"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_outgoing_message_takes_every_documented_keyword"
+covers = "The keywords _core.pyi documents for OutgoingMessage.__init__ are exactly the ones the test passes; each is stored and composed, so the stub and the binding's keyword matching cannot drift apart"
+
+[[test]]
+target = "tests/test_compose.py"
+name = "test_outgoing_message_refuses_an_unknown_keyword"
+covers = "A misspelt keyword raises TypeError naming it instead of being ignored"
 
 # ------------------------------------------- Gmail behaviour assumed, not proven
 

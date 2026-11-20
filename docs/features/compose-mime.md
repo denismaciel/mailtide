@@ -181,7 +181,10 @@ multipart/mixed
 
 With neither text nor HTML an empty `text/plain` stands in. Bodies are UTF-8;
 mail-builder picks each part's transfer encoding and normalises line ends to
-CRLF. An attached `message/rfc822` is written unencoded (`7bit`) when it is
+CRLF. A body holding a control character other than tab, CR and LF (NUL,
+ESC, ...) is base64-encoded by compose, since mail-builder would declare it
+`7bit` and write it raw; long lines already make mail-builder encode. An
+attached `message/rfc822` is written unencoded (`7bit`) when it is
 7-bit clean, as RFC 2046 requires; otherwise it becomes an
 `application/octet-stream` file in base64, bytes exact.
 
@@ -279,13 +282,15 @@ and interpreters; pimalaya's template tests and Zero's
 (an SMTP envelope parsed from raw bytes; `send` may want the first as a
 pre-flight check).
 
-Our own 45 tests add: each level of the tree and the round trip through
+Our own 50 tests add: each level of the tree and the round trip through
 `parse`; the reserved-header and injection rules for custom headers;
 `Purpose`; identical bytes for identical input and boundary collisions; the
 size limit; address syntax; id minting; the tracking id written once,
 refused when malformed or duplicated, and read back from the headers only; a
-message without a Message-ID; the mirror's own header parse reading back
-the ids compose wrote; and the Python API.
+message without a Message-ID; bodies with NUL, other control characters or
+over-long lines encoded and round-tripped; the mirror's own header parse
+reading back the ids compose wrote; and the Python API, its keywords checked
+against the stub.
 
 ## 6. Slices
 
