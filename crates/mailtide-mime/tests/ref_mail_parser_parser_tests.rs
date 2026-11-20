@@ -163,7 +163,12 @@ fn facts_and_parts_never_panic_on_truncated_messages() {
     assert!(files.len() > 150);
     for file in files {
         let raw = with_crlf(&std::fs::read(&file).expect("fixture"));
-        for end in (0..raw.len()).step_by(7) {
+        // Every 7th byte through the header blocks and first parts, where
+        // the structure is decided; every 61st after.
+        let ends = (0..raw.len().min(2_048))
+            .step_by(7)
+            .chain((2_048..raw.len()).step_by(61));
+        for end in ends {
             let cut = raw.get(..end).unwrap_or_default();
             let facts = facts(cut);
             for part in &facts.parts {

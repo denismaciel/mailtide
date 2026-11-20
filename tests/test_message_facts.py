@@ -148,6 +148,7 @@ def test_parse_addresses_and_decode_header(gmail: tuple[Mailbox, str]) -> None:
     [view] = runner.messages(ACCOUNT, ["m1"])
     content = view.content
     assert content is not None
+
     def pairs(value: str) -> list[tuple[str | None, str]]:
         return [(a.name, a.email) for a in mailtide.parse_addresses(value)]
 
@@ -305,3 +306,33 @@ def test_refresh_facts_fills_old_rows_and_emits_facts_refreshed(
     assert content.tracking_id == "k3Jd9_x-Q2mZ8pLw"
     again = runner.refresh_facts(ACCOUNT)
     assert (again.examined, again.refreshed) == (2, 0)
+
+
+def test_closing_a_part_stream_inside_an_event_loop(gmail: tuple[Mailbox, str]) -> None:
+    mailbox, origin = gmail
+    runner = synced(mailbox, origin)
+    [view] = runner.messages(ACCOUNT, ["m1"])
+    part = pdf_part(view.content)
+
+    async def main() -> None:
+        r = mailtide.Runner(make_config(origin), tokens)
+        await r.migrate()
+        await r.track(ACCOUNT)
+        await r.run(ACCOUNT, budget_s=30)
+        stream = await r.open_part(ACCOUNT, "m1", part, chunk_size=1)
+        assert await stream.__anext__() == b"%"
+        stream.close()  # on the event loop, between reads: never waits
+        assert stream.closed
+        assert [chunk async for chunk in stream] == []
+
+        stream = await r.open_part(ACCOUNT, "m1", part, chunk_size=1)
+        read = asyncio.ensure_future(stream.__anext__())
+        stream.close()  # with a read in flight
+        assert stream.closed
+        try:
+            assert await read == b"%", "the read in flight finishes"
+        except StopAsyncIteration:
+            pass  # or it had not started: the stream just ends
+        assert [chunk async for chunk in stream] == []
+
+    asyncio.run(main())

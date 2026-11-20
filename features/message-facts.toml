@@ -288,11 +288,6 @@ change = "modify"
 role = "The exhaustive match over feed entries gains FactsRefreshed"
 
 [[file]]
-path = "crates/mailtide-py/Cargo.toml"
-change = "modify"
-role = "tokio's sync feature, for the lock a Python PartStream holds its Rust stream in"
-
-[[file]]
 path = "tests/test_migrations_clock.py"
 change = "modify"
 role = "SCHEMA_VERSION is 5: the version-only step"
@@ -1347,7 +1342,7 @@ covers = "Bytes from the range path equal the bytes the whole-message parse retu
 [[test]]
 target = "crates/mailtide-io/tests/parts.rs"
 name = "open_part_yields_bounded_chunks_that_concatenate_to_read_part"
-covers = "No chunk exceeds chunk_size; memory stays bounded for a 30 MB part; the bytes are the same"
+covers = "No chunk exceeds chunk_size; the read follows the consumer (a 4 MiB part in 64 KiB store pieces: a few pieces pulled per chunk, nothing ahead); the bytes are the same"
 
 [[test]]
 target = "crates/mailtide-io/tests/parts.rs"
@@ -1410,6 +1405,11 @@ covers = "async for and for over PartStream; both usable as context managers"
 target = "tests/test_message_facts.py"
 name = "test_cancelling_a_part_stream_releases_it"
 covers = "A cancelled task or an early exit from the loop drops the Rust stream"
+
+[[test]]
+target = "tests/test_message_facts.py"
+name = "test_closing_a_part_stream_inside_an_event_loop"
+covers = "close() on the event loop, between reads and with a read in flight, never waits or panics; the stream then ends"
 
 [[test]]
 target = "tests/test_message_facts.py"

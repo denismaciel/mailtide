@@ -846,11 +846,12 @@ mod _core {
     /// One part's decoded bytes, pulled one chunk at a time from a streamed
     /// ranged read (`Runner.open_part`). An async iterator (`async for`) and a
     /// plain iterator (`for`, blocking), and a context manager of both kinds
-    /// that closes it. Closing it, or an error, drops the read.
+    /// that closes it. Closing it, an error, or cancelling a read in flight
+    /// drops the read.
     #[pyclass(frozen)]
     struct PartStream {
         shared: Arc<Shared>,
-        stream: Arc<tokio::sync::Mutex<Option<mailtide_io::parts::PartStream>>>,
+        slot: Arc<StreamSlot>,
         /// The part's decoded size: what the chunks add up to.
         #[pyo3(get)]
         size: u64,
@@ -859,25 +860,92 @@ mod _core {
         part: String,
     }
 
-    /// The next chunk of `stream`; `None` at its end. The read is dropped at
-    /// the end and on an error.
-    async fn next_chunk(
-        stream: &tokio::sync::Mutex<Option<mailtide_io::parts::PartStream>>,
-    ) -> PyResult<Option<Py<PyBytes>>> {
-        let mut guard = stream.lock().await;
-        let Some(open) = guard.as_mut() else {
+    /// Where a Python `PartStream` keeps its Rust stream. The stream is
+    /// taken out for each read, so no lock is held across an await, and
+    /// `close` never waits: it marks the slot closed and drops the stream if
+    /// it is there; a read in flight drops it when it returns.
+    struct StreamSlot {
+        stream: std::sync::Mutex<Option<mailtide_io::parts::PartStream>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl StreamSlot {
+        fn new(stream: mailtide_io::parts::PartStream) -> Self {
+            Self {
+                stream: std::sync::Mutex::new(Some(stream)),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Mark it closed and drop the stream, if no read holds it.
+        fn close(&self) {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(self.take());
+        }
+
+        fn take(&self) -> Option<mailtide_io::parts::PartStream> {
+            self.stream.lock().ok().and_then(|mut stream| stream.take())
+        }
+
+        /// Give the stream back after a read, unless it was closed meanwhile.
+        fn give_back(&self, stream: mailtide_io::parts::PartStream) {
+            if self.is_closed() {
+                return;
+            }
+            if let Ok(mut slot) = self.stream.lock() {
+                *slot = Some(stream);
+            }
+        }
+    }
+
+    /// A read holding the stream: dropped before it gives the stream back
+    /// (its task was cancelled), it closes the slot, so the read is dropped.
+    struct Reading {
+        slot: Arc<StreamSlot>,
+        stream: Option<mailtide_io::parts::PartStream>,
+    }
+
+    impl Drop for Reading {
+        fn drop(&mut self) {
+            if self.stream.take().is_some() {
+                self.slot.close();
+            }
+        }
+    }
+
+    /// The next chunk of the stream in `slot`; `None` at its end or once it
+    /// is closed. The read is dropped at the end and on an error.
+    async fn next_chunk(slot: Arc<StreamSlot>) -> PyResult<Option<Py<PyBytes>>> {
+        if slot.is_closed() {
             return Ok(None);
+        }
+        let Some(stream) = slot.take() else {
+            return Err(MailtideError::new_err(
+                "another read of this part stream is in progress",
+            ));
         };
-        match open.next_chunk().await {
-            Some(Ok(chunk)) => Ok(Some(Python::attach(|py| PyBytes::new(py, &chunk).unbind()))),
-            Some(Err(error)) => {
-                *guard = None;
-                Err(part_error(error))
+        let mut reading = Reading {
+            slot,
+            stream: Some(stream),
+        };
+        let item = match reading.stream.as_mut() {
+            Some(stream) => stream.next_chunk().await,
+            None => None,
+        };
+        match item {
+            Some(Ok(chunk)) => {
+                if let Some(stream) = reading.stream.take() {
+                    reading.slot.give_back(stream);
+                }
+                Ok(Some(Python::attach(|py| PyBytes::new(py, &chunk).unbind())))
             }
-            None => {
-                *guard = None;
-                Ok(None)
-            }
+            // Dropping `reading` with its stream closes the slot.
+            Some(Err(error)) => Err(part_error(error)),
+            None => Ok(None),
         }
     }
 
@@ -886,12 +954,13 @@ mod _core {
         /// Whether the read is over: ended, failed or closed.
         #[getter]
         fn closed(&self) -> bool {
-            self.stream.try_lock().is_ok_and(|stream| stream.is_none())
+            self.slot.is_closed()
         }
 
-        /// Stop the read and drop it.
-        fn close(&self, py: Python<'_>) {
-            py.detach(|| *self.stream.blocking_lock() = None);
+        /// Stop the read and drop it. Never waits, from any thread or event
+        /// loop; a read in flight drops it when it returns.
+        fn close(&self) {
+            self.slot.close();
         }
 
         fn __aiter__(slf: Py<Self>) -> Py<Self> {
@@ -899,9 +968,9 @@ mod _core {
         }
 
         fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-            let stream = Arc::clone(&self.stream);
+            let slot = Arc::clone(&self.slot);
             future(py, &self.shared, async move {
-                next_chunk(&stream)
+                next_chunk(slot)
                     .await?
                     .ok_or_else(|| pyo3::exceptions::PyStopAsyncIteration::new_err(()))
             })
@@ -912,8 +981,8 @@ mod _core {
         }
 
         fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
-            let stream = Arc::clone(&self.stream);
-            block(py, &self.shared, async move { next_chunk(&stream).await })
+            let slot = Arc::clone(&self.slot);
+            block(py, &self.shared, next_chunk(slot))
         }
 
         fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -921,8 +990,8 @@ mod _core {
         }
 
         #[pyo3(signature = (*_exc))]
-        fn __exit__(&self, py: Python<'_>, _exc: &Bound<'_, pyo3::types::PyTuple>) -> bool {
-            self.close(py);
+        fn __exit__(&self, _exc: &Bound<'_, pyo3::types::PyTuple>) -> bool {
+            self.close();
             false
         }
 
@@ -937,11 +1006,8 @@ mod _core {
             py: Python<'py>,
             _exc: &Bound<'_, pyo3::types::PyTuple>,
         ) -> PyResult<Bound<'py, PyAny>> {
-            let stream = Arc::clone(&self.stream);
-            future(py, &self.shared, async move {
-                *stream.lock().await = None;
-                Ok(false)
-            })
+            self.close();
+            future(py, &self.shared, async move { Ok(false) })
         }
     }
 
@@ -2561,7 +2627,7 @@ mod _core {
             Ok(PartStream {
                 size: stream.size(),
                 part: part.to_string(),
-                stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+                slot: Arc::new(StreamSlot::new(stream)),
                 shared: self,
             })
         }

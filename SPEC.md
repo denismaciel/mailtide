@@ -660,13 +660,6 @@ engine's epoch, so results meant for a dead engine are ignored).
   nothing (what a search marks its hits with).
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
   last synced, in id order; empty before the first label sync.
-- The SQL store refuses every one of these with
-  `StoreError::SchemaOutOfDate { applied, expected }`, before reading or
-  writing, while the database's schema is behind this build (migrations
-  missing) or ahead of it (a newer mailtide migrated it). It asks once: after
-  it has seen the schema current, it and its clones do not ask again.
-
-
 - `refresh_facts(account, updates)`: bring stored message facts up to date
   in one transaction. Not fenced by an epoch (like `admit`: it neither
   supersedes a running sync nor is rejected by one) but conditional per row:
@@ -675,6 +668,11 @@ engine's epoch, so results meant for a dead engine are ignored).
   (or the blob's length differs from that size); the row's facts and size
   are set, nothing else. Applied updates log `FactsRefreshed` under one new
   state.
+- The SQL store refuses every one of these with
+  `StoreError::SchemaOutOfDate { applied, expected }`, before reading or
+  writing, while the database's schema is behind this build (migrations
+  missing) or ahead of it (a newer mailtide migrated it). It asks once: after
+  it has seen the schema current, it and its clones do not ask again.
 
 Facts refresh (`Runner::refresh_facts(account, after, limit, budget)`) is
 a host-scheduled maintenance call, like `drift` and `compact`, with no Gmail

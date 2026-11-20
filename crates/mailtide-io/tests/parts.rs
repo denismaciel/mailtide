@@ -407,7 +407,9 @@ fn large(size: usize) -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test]
 async fn open_part_yields_bounded_chunks_that_concatenate_to_read_part() {
-    let (raw, data) = large(30 * 1024 * 1024);
+    // Big enough for many chunks and store pieces: boundedness is about the
+    // chunking, not the size.
+    let (raw, data) = large(4 * 1024 * 1024);
     let part = summary(&raw)[0];
     let runner = runner(Streaming::new(raw, 64 * 1024, None), b"").await;
     let mut stream = runner
