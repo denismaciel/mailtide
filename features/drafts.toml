@@ -909,6 +909,8 @@ question = "Does drafts.list show a draft change as soon as history.list has sho
 assumed = "Yes."
 if_wrong = "The index can lag but heals. A listing naming a message the mirror knows is deleted is discarded and retried; one that omits a new draft or still lists a deleted one is corrected by the next draft change or by the periodic refresh, at most 15 minutes later. No write or send depends on the index being current: writes go by draft id and if_message_id asks Gmail."
 test = "GET /profile; note historyId H. Repeat 50 times: a) POST /drafts; poll GET /history?startHistoryId=H until the new message's messagesAdded appears; at once GET /drafts?maxResults=500 (all pages); record whether D with that message id is listed. b) PUT /drafts/D; poll history for the old message's messagesDeleted; list at once; record whether D carries the new message id. c) DELETE /drafts/D; poll history for messagesDeleted; list at once; record whether D is absent. Report the number of stale listings and the longest lag. Run together with label-edit-list-consistency and identities-read-after-write (the same loop: write, then list at once; a different endpoint each, so a separate answer each)."
+status = "confirmed"
+result = "2026-11-20, 50 rounds of create, update, delete: each time history.list (polled from the historyId read before the round) first showed the change, drafts.list (all pages) read at once agreed with it: the new draft listed with its message id 50 of 50, the updated draft listed with its new message id 50 of 50, the deleted draft absent 50 of 50; 0 stale listings, so no lag to report. History itself showed the change on the first read after the write (0.22 to 0.27 s after the answer) in 149 of 150 cases; once, after a drafts.delete, the messagesDeleted record appeared only on a read 1.6 s after the answer. Run alone; the labels and settings loops were separate runs."
 
 [[unknown]]
 id = "drafts-history-on-save"
@@ -934,6 +936,8 @@ question = "Do drafts.get, drafts.update, drafts.delete and drafts.send answer 4
 assumed = "Yes. himalaya's live check records 404 for get after delete; the other calls and the after-send case are inferred."
 if_wrong = "NotFound and AlreadyGone key on 404 alone; any other status is Refused, which never counts as success. A delete retry would then report an error instead of AlreadyGone and a send retry would send nothing. Map the measured status once known."
 test = "1) POST /drafts; note D. DELETE /drafts/D; expect 204. Then GET /drafts/D, PUT /drafts/D {message:{raw}}, DELETE /drafts/D, POST /drafts/send {id:D}; record status and error reason of each. 2) POST /drafts to self; note D2. POST /drafts/send {id:D2}. Then the same four calls for D2; record each."
+status = "confirmed"
+result = "2026-11-20, 3 drafts deleted (drafts.delete 204) and 3 drafts sent: afterwards drafts.get, drafts.update, drafts.delete and drafts.send on the same id each answered 404, error.status NOT_FOUND, reason notFound, message \"Requested entity was not found.\" (24 of 24 calls). A draft id that never existed and a malformed one answer the same 404."
 
 [[unknown]]
 id = "drafts-id-namespace"
