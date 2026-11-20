@@ -173,6 +173,20 @@ exception says so under its Decisions.
 - **One inline size limit.** A draft or a send whose message is at most 3 MiB goes
   in the JSON body; a send above that uses a resumable upload; a draft above it is
   refused until uploads exist for drafts.
+- **A message mailtide writes is identified by a private header, not by its
+  Message-ID.** Gmail replaces a client-supplied `Message-ID` and `Date` on every
+  API send and every draft save (settled 2026-11-20: `send-message-id-kept`,
+  `drafts-message-id-kept`, `compose-mime-date-kept`), and keeps other client
+  headers byte for byte. So the identity that survives a save and a send is
+  `X-Mailtide-Id: <token>`, where the token is 16 to 64 characters of
+  `A-Za-z0-9_-` and unguessable. `compose` writes it (`tracking_id`, minted by the
+  caller like the Message-ID was); `mailtide-mime` reads it from raw bytes; the
+  import stores it as a header fact (`tracking_id`), so the feed carries it;
+  drafts and send require it on the bytes they are given, store it on their row,
+  and settle a lost answer by the imported `SENT` message that carries it. No
+  search is involved: Gmail cannot search a private header. `In-Reply-To` and
+  `References` are kept as written, so threading headers stay the caller's. A
+  draft's `Message-ID` is whatever Gmail's copy says after each save.
 - **Periodic refreshes share one shape**: due from a persisted time, a timer of
   their own, no feed entry when nothing changed, never in the way of mail
   (labels 15 min, draft index 15 min, settings 6 h).
