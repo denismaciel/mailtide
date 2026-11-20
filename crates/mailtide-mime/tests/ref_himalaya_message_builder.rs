@@ -3,12 +3,12 @@
 //! composition cases, as `features/compose-mime.toml` maps them. Himalaya
 //! takes `Name <addr>` strings and reads the clock and host name; compose
 //! takes Address values, `parse_addresses` is the bridge, and the id and date
-//! are inputs. Reply, forward, quoting and signatures belong to `send`.
+//! are inputs. Reply, forward and quoting are mapped in `features/send.toml`.
 
 use mail_parser::MessageParser;
 use mailtide_mime::{
     Address, Attachment, ComposeOptions, MessageId, OutgoingMessage, Purpose, Reason, compose,
-    parse_addresses,
+    forward_plan, parse_addresses, quote_plain, reply_plan,
 };
 
 fn bare(email: &str) -> Address {
@@ -247,4 +247,188 @@ fn a_7_bit_attached_message_is_written_unencoded_with_crlf() {
     assert!(lf.contains("\r\nSubject: inner\r\nFrom: a@example.org\r\n\r\nbody\r\n"));
     // NOTE: himalaya re-encodes an 8-bit inner message; compose carries it as
     // a base64 file instead (an_8_bit_attached_message_becomes_a_base64_file).
+}
+
+const REPLY_SOURCE: &[u8] = b"From: Alice <alice@example.com>\r\n\
+    To: Bob <bob@example.com>, Carol <carol@example.com>\r\n\
+    Cc: Dan <dan@example.com>, ALICE@example.com\r\n\
+    Subject: Project update\r\nMessage-ID: <parent@example.com>\r\n\
+    References: <first@example.com> <second@example.com>\r\n\r\nOriginal body";
+
+fn email_list(list: &[Address]) -> Vec<&str> {
+    list.iter().map(|address| address.email.as_str()).collect()
+}
+
+#[test]
+fn a_reply_plan_sets_subject_recipients_and_threading() {
+    let plan = reply_plan(REPLY_SOURCE, &["bob@example.com"], false).unwrap();
+    assert_eq!(plan.subject, "Re: Project update");
+    assert_eq!(email_list(&plan.to), ["alice@example.com"]);
+    assert_eq!(plan.quote_text.as_deref(), Some("Original body"));
+    assert_eq!(
+        plan.in_reply_to.as_ref().map(MessageId::as_str),
+        Some("parent@example.com")
+    );
+}
+
+#[test]
+fn a_reply_subject_keeps_one_re_prefix() {
+    let plan = reply_plan(b"Subject: Re: Already replied\r\n\r\nx", &[], false).unwrap();
+    assert_eq!(plan.subject, "Re: Already replied");
+}
+
+#[test]
+fn a_subject_that_only_starts_with_the_letters_re_gets_the_prefix() {
+    let plan = reply_plan(b"Subject: Ready to ship\r\n\r\nx", &[], false).unwrap();
+    assert_eq!(plan.subject, "Re: Ready to ship");
+}
+
+#[test]
+fn a_plain_reply_plan_has_no_cc() {
+    let plan = reply_plan(REPLY_SOURCE, &["bob@example.com"], false).unwrap();
+    assert!(plan.cc.is_empty());
+}
+
+#[test]
+fn reply_all_lists_every_other_recipient_once() {
+    let plan = reply_plan(REPLY_SOURCE, &["bob@example.com"], true).unwrap();
+    assert_eq!(
+        email_list(&plan.to),
+        ["alice@example.com", "carol@example.com"]
+    );
+    assert_eq!(email_list(&plan.cc), ["dan@example.com"]);
+}
+
+#[test]
+fn reply_all_keeps_display_names() {
+    let plan = reply_plan(REPLY_SOURCE, &["bob@example.com"], true).unwrap();
+    assert_eq!(plan.to[0].name.as_deref(), Some("Alice"));
+    assert_eq!(plan.to[1].name.as_deref(), Some("Carol"));
+    assert_eq!(plan.cc[0].name.as_deref(), Some("Dan"));
+}
+
+#[test]
+fn reply_all_never_repeats_a_to_address_in_cc() {
+    let plan = reply_plan(
+        b"From: alice@example.com\r\nTo: bob@example.com\r\nCc: ALICE@example.com, BOB@example.com\r\n\r\nx",
+        &[],
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        email_list(&plan.to),
+        ["alice@example.com", "bob@example.com"]
+    );
+    assert!(plan.cc.is_empty());
+}
+
+#[test]
+fn reply_all_without_own_addresses_keeps_every_recipient() {
+    let plan = reply_plan(REPLY_SOURCE, &[], true).unwrap();
+    assert_eq!(
+        email_list(&plan.to),
+        ["alice@example.com", "bob@example.com", "carol@example.com"],
+    );
+    assert_eq!(email_list(&plan.cc), ["dan@example.com"]);
+}
+
+#[test]
+fn reply_all_leaves_out_every_own_address_given() {
+    let plan = reply_plan(REPLY_SOURCE, &["BOB@example.com", "dan@example.com"], true).unwrap();
+    assert_eq!(
+        email_list(&plan.to),
+        ["alice@example.com", "carol@example.com"]
+    );
+    assert!(plan.cc.is_empty());
+}
+
+#[test]
+fn a_forward_plan_prefixes_the_subject_and_has_references_but_no_in_reply_to() {
+    let plan = forward_plan(REPLY_SOURCE).unwrap();
+    assert_eq!(plan.subject, "Fwd: Project update");
+    assert_eq!(
+        plan.references.last().map(MessageId::as_str),
+        Some("parent@example.com")
+    );
+    let mut message = OutgoingMessage::new(bare("bob@example.com"), 0);
+    message.to.push(bare("reader@example.com"));
+    message.subject = Some(plan.subject);
+    message.references = plan.references;
+    message.text = plan.quote_text.map(|text| quote_plain(&text));
+    let composed = compose(&message, &ComposeOptions::default()).unwrap();
+    let parsed = MessageParser::new().parse(&composed.raw).unwrap();
+    assert!(parsed.in_reply_to().is_none());
+    assert!(parsed.references().unwrap().contains("parent@example.com"));
+}
+
+#[test]
+fn a_subject_prefix_needs_its_colon_and_ignores_case() {
+    for (input, expected) in [
+        ("RE: Review", "Re: Review"),
+        ("rE:Review", "Re: Review"),
+        ("Review", "Re: Review"),
+    ] {
+        let source = format!("Subject: {input}\r\n\r\nx");
+        assert_eq!(
+            reply_plan(source.as_bytes(), &[], false).unwrap().subject,
+            expected,
+        );
+    }
+}
+
+#[test]
+fn references_are_the_originals_chain_then_its_own_id() {
+    let plan = reply_plan(REPLY_SOURCE, &[], false).unwrap();
+    let ids: Vec<_> = plan.references.iter().map(MessageId::as_str).collect();
+    assert_eq!(
+        ids,
+        [
+            "first@example.com",
+            "second@example.com",
+            "parent@example.com"
+        ]
+    );
+
+    let plan = reply_plan(
+        b"Message-ID: <b@example.com>\r\nIn-Reply-To: <a@example.com>\r\n\r\nx",
+        &[],
+        false,
+    )
+    .unwrap();
+    let ids: Vec<_> = plan.references.iter().map(MessageId::as_str).collect();
+    assert_eq!(ids, ["a@example.com", "b@example.com"]);
+}
+
+#[test]
+fn forward_parts_keep_their_content_type_parameters_and_decoded_bytes() {
+    let raw = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+        --b\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n\
+        --b\r\nContent-Type: text/plain; charset=iso-8859-1; format=flowed\r\n\
+        Content-Disposition: attachment; filename=note.txt\r\n\
+        Content-Transfer-Encoding: quoted-printable\r\n\r\ncaf=E9\r\n\
+        --b\r\nContent-Type: message/rfc822\r\n\r\nSubject: inner\r\n\r\ninner body\r\n--b--\r\n";
+    let plan = forward_plan(raw).unwrap();
+    let [note, message] = plan.parts.as_slice() else {
+        panic!("expected two parts");
+    };
+    assert_eq!(note.attachment.content_type, "text/plain");
+    assert_eq!(note.attachment.bytes, b"caf\xe9");
+    assert_eq!(
+        note.content_type_parameters,
+        [
+            ("charset".into(), "iso-8859-1".into()),
+            ("format".into(), "flowed".into()),
+        ]
+    );
+    assert_eq!(
+        message.attachment.bytes,
+        b"Subject: inner\r\n\r\ninner body"
+    );
+}
+
+#[test]
+fn quoting_prefixes_every_line_and_leaves_no_trailing_blank_after_an_empty_one() {
+    assert_eq!(quote_plain("a\r\n\r\n> b"), "> a\n>\n>> b\n");
+    assert_eq!(quote_plain("x\n"), "> x\n");
+    assert_eq!(quote_plain(""), "");
 }

@@ -245,9 +245,12 @@ recipients when the user wrote it. Reply-all keeps other To in To and Cc in
 Cc, excluding the host's own addresses and deduplicating case-insensitively.
 Forwards set one `Fwd:` prefix and provide the original's headers as data,
 plain text to quote, and attachment and inline parts with type parameters
-and Content-ID. An unreadable original or part fails the plan. The host
-composes the outgoing bytes and can pass `thread_of` to join the source
-thread.
+and Content-ID. Text may come from the original HTML if no plain body is
+present. The helpers unwrap flowed plain text and keep the original HTML
+available to the host. An unreadable original or part fails the plan.
+Forward parts return the original Content-Type parameters alongside the
+attachment value and the part range. The host composes the outgoing bytes
+and can pass `thread_of` to join the source thread.
 
 ## 4. Alternatives rejected
 
@@ -309,10 +312,11 @@ after its answer is lost.
 4. **Draft routing.** Add the `send` source dispatch to the existing
    `send_draft` entry point and check its receipt, refusal and unknown
    handling. The draft path keeps its own attempt rules and record.
-5. **Reply and forward.** Implement the pure helpers and mirror-backed
-   Runner methods with their mapped tests.
-6. **Python and documentation.** Bind the methods and feed types, extend
-   FakeGmail, and document the API and rollback in SPEC.
+5. **Reply and forward.** Implement the pure MIME helpers and their mapped
+   tests.
+6. **Host integration and documentation.** Add mirror-backed Runner reply
+   and forward methods. Bind the methods and feed types, extend FakeGmail,
+   and document the API and rollback in SPEC.
 
 ## 7. Decisions
 

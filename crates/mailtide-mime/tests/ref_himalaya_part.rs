@@ -2,12 +2,12 @@
 //! (pimalaya/himalaya, MIT OR Apache-2.0, commit a5623dcac615): its part
 //! walk and its has-attachment rows, as `features/message-facts.toml` maps
 //! them. A row's "counts" is our `attached`; "does not count" is a part that
-//! is inline or not listed at all.
+//! is inline or not listed at all. Its quote-text cases map to `send`.
 
 use std::fmt::Write as _;
 
 use mailtide::gmail::{AttachmentFact, MessageFacts};
-use mailtide_mime::{PartDecoder, PartInfo, PartRole, facts, parts};
+use mailtide_mime::{PartDecoder, PartInfo, PartRole, facts, parts, reply_plan};
 
 const PDF_ATTACHMENT: &[u8] = b"Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b\r\nContent-Type: application/pdf; name=\"a.pdf\"\r\nContent-Disposition: attachment; filename=\"a.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--b--\r\n";
 const PDF_ALONE: &[u8] = b"Content-Type: application/pdf; name=\"a.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n";
@@ -236,4 +236,36 @@ fn the_parts_of_an_encrypted_message_are_not_listed() {
             .iter()
             .all(|info| info.role == PartRole::Protocol)
     );
+}
+
+#[test]
+fn an_html_only_original_offers_plain_text_to_quote() {
+    let raw = b"Content-Type: text/html; charset=utf-8\r\n\r\n\
+        <html><head><style>p { color: red }</style></head>\
+        <body><p>Caf\xc3\xa9 &amp; tea</p><p>at <b>noon</b><br>sharp</p></body></html>";
+    let plan = reply_plan(raw, &[], false).unwrap();
+    let text = plan.quote_text.expect("plain text");
+    let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines, ["Café & tea", "at noon", "sharp"]);
+}
+
+#[test]
+fn flowed_text_is_unwrapped_before_it_is_offered_for_quoting() {
+    for (charset, transfer, body) in [
+        ("us-ascii", "8bit", "Some text \r\ngoes on."),
+        ("utf-8", "8bit", "Some text \r\ngoes on."),
+        ("iso-8859-1", "quoted-printable", "Caf=E9=20\r\ngoes on."),
+    ] {
+        let raw = format!(
+            "Content-Type: text/plain; charset={charset}; format=flowed\r\n\
+             Content-Transfer-Encoding: {transfer}\r\n\r\n{body}"
+        );
+        let plan = reply_plan(raw.as_bytes(), &[], false).unwrap();
+        let expected = if charset == "iso-8859-1" {
+            "Café goes on."
+        } else {
+            "Some text goes on."
+        };
+        assert_eq!(plan.quote_text.as_deref(), Some(expected));
+    }
 }

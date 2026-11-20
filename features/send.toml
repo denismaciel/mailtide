@@ -779,6 +779,7 @@ target = "crates/mailtide-mime/tests/ref_himalaya_part.rs"
 [[suite.test]]
 name = "an_html_only_body_is_quoted_as_text"
 test = "an_html_only_original_offers_plain_text_to_quote"
+note = "Use mail-parser's plain text conversion. The test checks readable lines and decoded entities, independent of blank-line layout."
 
 [[suite.test]]
 name = "a_flowed_text_is_unwrapped_whatever_its_charset"
@@ -1370,6 +1371,11 @@ covers = "From, Date, Subject, To and Cc of the original are structured for the 
 target = "crates/mailtide-mime/src/respond.rs"
 name = "a_reply_to_a_message_without_a_message_id_has_no_threading_headers"
 covers = "Do not invent In-Reply-To or References; sending can still join by thread id"
+
+[[test]]
+target = "crates/mailtide-mime/src/respond.rs"
+name = "flowed_quotes_keep_their_depth_and_signature_boundary"
+covers = "Join soft line breaks at equal quote depth, respect DelSp and the fixed signature separator, and remove space stuffing"
 
 # tests/test_send.py
 

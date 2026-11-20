@@ -11,6 +11,7 @@ mod decode;
 mod facts;
 mod message_id;
 mod parts;
+mod respond;
 mod tracking;
 
 pub use address::{Address, parse_addresses};
@@ -21,6 +22,9 @@ pub use decode::PartDecoder;
 pub use facts::facts;
 pub use message_id::MessageId;
 pub use parts::{PartInfo, PartRole, parts};
+pub use respond::{
+    ForwardHeaders, ForwardPart, ForwardPlan, ReplyPlan, forward_plan, quote_plain, reply_plan,
+};
 pub use tracking::{
     TRACKING_HEADER, is_tracking_id, new_tracking_id, tracking_headers, tracking_id,
 };
