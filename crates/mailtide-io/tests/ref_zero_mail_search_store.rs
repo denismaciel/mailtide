@@ -93,6 +93,8 @@ async fn a_page_token_is_bound_to_its_account_query_filters_and_page_size() {
         .search(&other_account(), &next, Duration::from_secs(1))
         .await;
     assert_eq!(elsewhere, Err(SearchError::InvalidPageToken), "account");
+    let threads = fixture.search_threads(&next).await;
+    assert_eq!(threads, Err(SearchError::InvalidPageToken), "scope");
     for (what, other) in [
         (
             "query",

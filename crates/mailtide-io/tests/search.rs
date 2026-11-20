@@ -7,17 +7,19 @@ pub mod search_support;
 use std::time::Duration;
 
 use mailtide::commit::{AccountOp, DeletionEvidence, MessageOp};
-use mailtide::ids::{AccountId, Epoch, HistoryId, LabelId, MessageId};
+use mailtide::ids::{AccountId, Epoch, HistoryId, LabelId, MessageId, ThreadId};
 use mailtide::quota::{Budget, Priority, QuotaUnits};
 use mailtide::retry::{AccountProblem, Blocking, BlockingFailure, QuotaTarget, Retryable};
 use mailtide::revision::FeedPosition;
-use mailtide::search::{HitState, SearchQuery};
+use mailtide::search::{HitState, SearchQuery, ThreadHit};
 use mailtide::state::{SyncPhase, SyncState};
 use mailtide_io::runner::{Access, QuotaDeferred, StopReason};
 use mailtide_io::search::SearchError;
 use mailtide_io::transport::TransportError;
 use mailtide_store::Store as _;
-use search_support::{Fixture, Options, account, discovered, hit_ids, param, query, refusal};
+use search_support::{
+    Fixture, Options, account, discovered, hit_ids, param, query, refusal, thread_page,
+};
 
 #[tokio::test]
 async fn a_search_returns_gmails_hits_with_their_mirror_state() {
@@ -508,4 +510,76 @@ async fn a_lost_answer_is_retryable() {
         matches!(&error, Err(SearchError::Retryable(f)) if f.class == Retryable::Transient),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn search_is_charged_five_units_and_thread_search_ten() {
+    let fixture = Fixture::new();
+    fixture.answer_page(&["m1"], None);
+    fixture
+        .gmail()
+        .answer(Ok(thread_page(&[("t-m1", Some(7))], None)));
+
+    fixture.search(&query("x")).await.expect("messages");
+    fixture.search_threads(&query("x")).await.expect("threads");
+
+    assert_eq!(
+        fixture.admitted(),
+        [
+            (QuotaUnits(5), Priority::Foreground),
+            (QuotaUnits(10), Priority::Foreground),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn thread_search_returns_thread_ids_with_gmails_history_ids() {
+    let fixture = Fixture::new();
+    fixture.gmail().add("m1", &["INBOX"]);
+    fixture.sync().await;
+    let status = fixture.status().await;
+    fixture.gmail().answer(Ok(thread_page(
+        &[("t-m1", Some(1)), ("t-new", Some(99)), ("t-bare", None)],
+        Some("tn"),
+    )));
+
+    let page = fixture
+        .search_threads(&query("has:attachment"))
+        .await
+        .expect("a page");
+
+    assert_eq!(
+        page.hits,
+        [
+            ThreadHit {
+                thread_id: ThreadId("t-m1".into()),
+                history_id: Some(HistoryId(1)),
+            },
+            ThreadHit {
+                thread_id: ThreadId("t-new".into()),
+                history_id: Some(HistoryId(99)),
+            },
+            ThreadHit {
+                thread_id: ThreadId("t-bare".into()),
+                history_id: None,
+            },
+        ]
+    );
+    // The mirror trails Gmail for a thread whose history id is past it.
+    assert_eq!(page.cursor, status.cursor);
+    assert!(page.hits[1].history_id > page.cursor);
+    assert_eq!(page.estimate, 3);
+    assert_eq!(page.phase, SyncPhase::Live);
+    fixture.gmail().answer(Ok(thread_page(&[], None)));
+    let last = fixture
+        .search_threads(&SearchQuery {
+            page_token: page.next_page_token,
+            ..query("has:attachment")
+        })
+        .await
+        .expect("the next page");
+    assert!(last.hits.is_empty() && last.next_page_token.is_none());
+    let searches = fixture.searches();
+    assert_eq!(searches[0].path, "/gmail/v1/users/me/threads");
+    assert_eq!(param(&searches[1], "pageToken"), Some("tn"));
 }

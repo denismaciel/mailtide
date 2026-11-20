@@ -18,7 +18,7 @@ use mailtide::retry::{Blocking, BlockingFailure, Retryable, RetryableFailure};
 use mailtide::revision::FeedPosition;
 use mailtide::search::{
     ListedHits, SearchHit, SearchListing, SearchPageToken, SearchQuery, SearchRefusal,
-    SearchRequest, SearchScope,
+    SearchRequest, SearchScope, ThreadHit,
 };
 use mailtide::state::{SyncPhase, SyncState};
 use mailtide_store::Store;
@@ -45,6 +45,25 @@ pub struct SearchPage {
     pub deleted: u32,
     /// The account's change-feed position, read before Gmail was asked: a
     /// feed entry after it may make this page stale.
+    pub mirror_state: FeedPosition,
+    /// The mirror's history cursor, read with `mirror_state`.
+    pub cursor: Option<HistoryId>,
+    /// The sync phase, read with `mirror_state`.
+    pub phase: SyncPhase,
+}
+
+/// One page of thread hits. Not marked against the mirror: compare each
+/// hit's history id with `cursor` to tell whether the mirror has caught up
+/// with the thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadSearchPage {
+    /// The threads, in Gmail's order.
+    pub hits: Vec<ThreadHit>,
+    /// The next page of the same request; `None` ends the paging run.
+    pub next_page_token: Option<SearchPageToken>,
+    /// Gmail's `resultSizeEstimate`: a hint, not a count.
+    pub estimate: u64,
+    /// The account's change-feed position, read before Gmail was asked.
     pub mirror_state: FeedPosition,
     /// The mirror's history cursor, read with `mirror_state`.
     pub cursor: Option<HistoryId>,
@@ -178,6 +197,37 @@ where
                 .map(|next| answered.request.next_token(account, &next)),
             estimate: answered.listing.estimate,
             deleted: marked.deleted,
+            mirror_state: answered.position.mirror_state,
+            cursor: answered.position.cursor,
+            phase: answered.position.phase,
+        })
+    }
+
+    /// One page of thread ids Gmail's search matches for `query`
+    /// (`threads.list`, 10 units), each with Gmail's history id for the
+    /// thread. As [`Self::search`] otherwise; thread hits are not marked
+    /// against the mirror.
+    pub async fn search_threads(
+        &self,
+        account: &AccountId,
+        query: &SearchQuery,
+        budget: Duration,
+    ) -> Result<ThreadSearchPage, SearchError> {
+        let answered = self
+            .search_gmail(account, query, SearchScope::Threads, budget)
+            .await?;
+        let ListedHits::Threads(hits) = answered.listing.hits else {
+            return Err(SearchError::Run(RunError::Invariant(
+                "a thread search answered with messages",
+            )));
+        };
+        Ok(ThreadSearchPage {
+            hits,
+            next_page_token: answered
+                .listing
+                .next_page_token
+                .map(|next| answered.request.next_token(account, &next)),
+            estimate: answered.listing.estimate,
             mirror_state: answered.position.mirror_state,
             cursor: answered.position.cursor,
             phase: answered.position.phase,

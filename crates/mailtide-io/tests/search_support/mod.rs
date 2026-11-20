@@ -28,7 +28,7 @@ use mailtide_io::auth::{AccessToken, TokenError, TokenSource};
 use mailtide_io::blobs::ObjectBlobs;
 use mailtide_io::quota_gate::{GateError, LocalGate, QuotaGate};
 use mailtide_io::runner::{Access, LogAccounts, RunOutcome, Runner, RunnerConfig, WatchMode};
-use mailtide_io::search::{SearchError, SearchPage};
+use mailtide_io::search::{SearchError, SearchPage, ThreadSearchPage};
 use mailtide_io::transport::{GmailTransport, TransportError};
 use mailtide_store::Store as _;
 use mailtide_store::memory::MemoryStore;
@@ -60,6 +60,26 @@ pub fn page(ids: &[&str], next: Option<&str>) -> HttpResponse {
         .map(|id| json!({"id": id, "threadId": format!("t-{id}")}))
         .collect();
     let mut body = json!({"messages": messages, "resultSizeEstimate": ids.len()});
+    if let Some(next) = next {
+        body["nextPageToken"] = json!(next);
+    }
+    ok(&body)
+}
+
+/// A page of `threads.list`, each thread with its history id if given.
+#[must_use]
+pub fn thread_page(threads: &[(&str, Option<u64>)], next: Option<&str>) -> HttpResponse {
+    let threads: Vec<serde_json::Value> = threads
+        .iter()
+        .map(|(id, history)| {
+            let mut thread = json!({"id": id, "snippet": "the snippet"});
+            if let Some(history) = history {
+                thread["historyId"] = json!(history.to_string());
+            }
+            thread
+        })
+        .collect();
+    let mut body = json!({"threads": threads, "resultSizeEstimate": threads.len()});
     if let Some(next) = next {
         body["nextPageToken"] = json!(next);
     }
@@ -431,6 +451,14 @@ impl Fixture {
     /// Search [`account`]'s messages.
     pub async fn search(&self, query: &SearchQuery) -> Result<SearchPage, SearchError> {
         self.runner.search(&account(), query, BUDGET).await
+    }
+
+    /// Search [`account`]'s threads.
+    pub async fn search_threads(
+        &self,
+        query: &SearchQuery,
+    ) -> Result<ThreadSearchPage, SearchError> {
+        self.runner.search_threads(&account(), query, BUDGET).await
     }
 
     /// [`account`]'s status, read without claiming it.
