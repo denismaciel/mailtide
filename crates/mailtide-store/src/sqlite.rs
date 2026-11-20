@@ -279,6 +279,7 @@ mod tests {
     /// `SchemaOutOfDate { applied, .. }` before reading or writing.
     async fn assert_every_call_refused(store: &SqliteStore, commit: &Commit, applied: u32) {
         use crate::sql::SCHEMA_VERSION;
+        use mailtide::commit::DeletionEvidence;
         use mailtide::outbox::Action;
         let account = &commit.account;
         let ids = [MessageId("m".into())];
@@ -351,24 +352,13 @@ mod tests {
             "refresh_facts",
             store.refresh_facts(account, &[update]).await.err(),
         );
-        let deletions = [(
-            ids[0].clone(),
-            mailtide::commit::DeletionEvidence::History {
-                at: mailtide::ids::HistoryId(1),
-            },
-        )];
-        refused(
-            "record_deleted",
-            store.record_deleted(account, &deletions, now).await.err(),
-        );
+        let at = mailtide::ids::HistoryId(1);
+        let deleted = [(ids[0].clone(), DeletionEvidence::History { at })];
+        let recorded = store.record_deleted(account, &deleted, now).await;
+        refused("record_deleted", recorded.err());
         let trash = mailtide::ids::LabelId("TRASH".into());
-        refused(
-            "message_ids_labelled",
-            store
-                .message_ids_labelled(account, &trash, None, 10)
-                .await
-                .err(),
-        );
+        let labelled = store.message_ids_labelled(account, &trash, None, 10).await;
+        refused("message_ids_labelled", labelled.err());
         refused("status", store.status(account).await.err());
         refused("accounts", store.accounts().await.err());
         refused("resume", store.resume(account, now).await.err());
