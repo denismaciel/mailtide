@@ -2,8 +2,8 @@
 
 The host builds one ``Runner`` per process (``await`` its methods; ``BlockingRunner``
 for code without an event loop), calls ``run(account)`` on a schedule
-and whenever a verified push arrives, reads the mirror with ``changes`` and
-``messages``, and sends user actions with ``act``.
+and whenever a verified push arrives, reads the mirror with ``changes``,
+``messages`` and ``threads``, and sends user actions with ``act``.
 """
 
 from mailtide import config
@@ -50,6 +50,7 @@ from mailtide._core import (
     Status,
     StoreUnavailable,
     Superseded,
+    ThreadView,
     TrackResult,
     WriteOutcomeUnknown,
     migrations,
@@ -116,6 +117,7 @@ __all__ = [
     "Status",
     "StoreUnavailable",
     "Superseded",
+    "ThreadView",
     "TrackResult",
     "WriteOutcomeUnknown",
     "config",

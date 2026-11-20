@@ -29,11 +29,38 @@ class Mailbox:
         self.history: list[dict] = []
         self.labels: dict[str, dict] = {"INBOX": {"id": "INBOX", "name": "INBOX", "type": "system"}}
 
-    def add(self, mid: str, labels: list[str]) -> None:
+    def add(
+        self,
+        mid: str,
+        labels: list[str],
+        *,
+        thread: str | None = None,
+        date_ms: int = 1_700_000_000_000,
+        sender: str | None = None,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+    ) -> None:
+        """A new message: in its own thread unless ``thread`` names one, from
+        ``sender-{mid}@example.com`` unless ``sender`` says otherwise."""
         self.history_id += 1
-        self.messages[mid] = {"labels": labels, "history_id": self.history_id}
-        ref = {"id": mid, "threadId": f"t-{mid}", "labelIds": labels}
+        self.messages[mid] = {
+            "labels": labels,
+            "history_id": self.history_id,
+            "thread": thread or f"t-{mid}",
+            "date_ms": date_ms,
+            "from": sender or f"sender-{mid}@example.com",
+            "to": to or [],
+            "cc": cc or [],
+        }
+        ref = {"id": mid, "threadId": self.messages[mid]["thread"], "labelIds": labels}
         self.history.append({"id": str(self.history_id), "messagesAdded": [{"message": ref}]})
+
+    def delete(self, mid: str) -> None:
+        """The message is deleted forever."""
+        m = self.messages.pop(mid)
+        self.history_id += 1
+        ref = {"id": mid, "threadId": m["thread"]}
+        self.history.append({"id": str(self.history_id), "messagesDeleted": [{"message": ref}]})
 
     def label(self, lid: str, name: str, kind: str = "user") -> None:
         """Create a label definition, or rename it (no history record, as in Gmail)."""
@@ -46,7 +73,7 @@ class Mailbox:
 
     def modify(self, mid: str, add: list[str], remove: list[str]) -> None:
         m = self.messages[mid]
-        ref = {"id": mid, "threadId": f"t-{mid}"}
+        ref = {"id": mid, "threadId": m["thread"]}
         added = [label for label in add if label not in m["labels"]]
         removed = [label for label in remove if label in m["labels"]]
         for key, labels in (("labelsAdded", added), ("labelsRemoved", removed)):
@@ -107,7 +134,7 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
             if parts == ["messages"]:
                 label = query.get("labelIds")
                 ids = [
-                    {"id": mid, "threadId": f"t-{mid}"}
+                    {"id": mid, "threadId": m["thread"]}
                     for mid, m in mailbox.messages.items()
                     if label is None or label in m["labels"]
                 ]
@@ -117,15 +144,20 @@ def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
                 m = mailbox.messages[mid]
                 body = {
                     "id": mid,
-                    "threadId": f"t-{mid}",
+                    "threadId": m["thread"],
                     "labelIds": m["labels"],
                     "historyId": str(m["history_id"]),
-                    "internalDate": "1700000000000",
+                    "internalDate": str(m["date_ms"]),
                     "snippet": "hi",
                 }
                 if query.get("format") == "raw":
+                    recipients = "".join(
+                        f"{name}: {', '.join(m[key])}\r\n"
+                        for name, key in (("To", "to"), ("Cc", "cc"))
+                        if m[key]
+                    )
                     raw = (
-                        f"Message-ID: <{mid}@example.com>\r\nFrom: sender-{mid}@example.com\r\n"
+                        f"Message-ID: <{mid}@example.com>\r\nFrom: {m['from']}\r\n{recipients}"
                         f"Subject: Message {mid}\r\n\r\nBody of {mid}\r\n"
                     ).encode()
                     body["raw"] = base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -159,8 +191,8 @@ class FakeGmail:
     """A fake Gmail mailbox served over HTTP on localhost.
 
     ``with FakeGmail() as gmail:`` starts it; ``gmail.origin`` is the URL to
-    configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``label``,
-    ``expire_history``, ``refuse``, ``delay_s``, ``requests``).
+    configure, ``gmail.mailbox`` the state (``add``, ``modify``, ``delete``,
+    ``label``, ``expire_history``, ``refuse``, ``delay_s``, ``requests``).
     """
 
     def __init__(self) -> None:
@@ -176,10 +208,28 @@ class FakeGmail:
     def close(self) -> None:
         self._serve.close()
 
-    def add(self, message_id: str, labels: list[str]) -> None:
-        """A new message arrives with ``labels``."""
+    def add(
+        self,
+        message_id: str,
+        labels: list[str],
+        *,
+        thread: str | None = None,
+        date_ms: int = 1_700_000_000_000,
+        sender: str | None = None,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+    ) -> None:
+        """A new message arrives with ``labels``, in ``thread`` if given."""
         with self.mailbox.lock:
-            self.mailbox.add(message_id, labels)
+            self.mailbox.add(
+                message_id,
+                labels,
+                thread=thread,
+                date_ms=date_ms,
+                sender=sender,
+                to=to,
+                cc=cc,
+            )
 
 
 class ManualClock:

@@ -134,9 +134,18 @@ The store keeps, per account:
     `$seen = ¬UNREAD`, `$flagged = STARRED` and `$draft = DRAFT`; mailbox
     membership is `label_ids`.
 - **tombstone**: `message_id`, `thread_id`, `deleted_at_checkpoint`.
-- **thread** (derived or materialized): the union of non-draft message labels.
-  A thread is unread if any non-draft message is unread [Z]. Its latest
-  message is chosen by `internal_date`.
+- **thread** (derived at read time, never stored): Gmail's `threadId` groups
+  messages; the empty id is never a thread. A thread's labels are the union of
+  its non-draft messages' effective labels (trash and spam members included;
+  a draft contributes nothing), and it is unread if any non-draft message is
+  [Z]. Its messages are ordered by (`internal_date`, id), oldest first, with
+  messages not yet imported (no date yet) after them, by id; its latest
+  message is the newest *imported* non-draft one. Participants are `From`,
+  `To` and `Cc` of its imported non-draft messages as the header facts hold
+  them, one per address (the text inside the last `<…>`, else the whole
+  value, case-insensitively). One pure rule (`mailtide::thread::view`) folds
+  them; thread actions reach exactly the non-draft messages it counts. An
+  index on `(account, thread_id, id)` (migration 6) serves both.
 - **job**: durable work items (body import, verification, blob cleanup) with
   dedupe key, priority class, attempts, `next_attempt_at` and last error.
 - **intent** (phase 6): `(message_id, label_id)`, `op` (`add | remove`),
@@ -532,6 +541,11 @@ engine's epoch, so results meant for a dead engine are ignored).
   inside commit `S` compacts through `FeedCursor::compactable()`, `S - 1`;
   `message_ids(account, after, limit)` to rebuild a consumer.
 - `messages(account, ids)`: `MessageView`s for hosts.
+- `threads(account, ids)`: `ThreadView`s (§4) in the order asked, each
+  member its `messages` view; ids the mirror has no message in, and every id
+  of an untracked account, are left out; no ids read nothing. The SQL store
+  reads each chunk of ids with one statement joining rows and intents, so a
+  view never mixes rows from before a commit with intents from after it.
 - `labels(account)`: the label definitions (`Label { id, name, kind }`) as
   last synced, in id order; empty before the first label sync.
 - The SQL store refuses every one of these with
@@ -540,7 +554,7 @@ engine's epoch, so results meant for a dead engine are ignored).
   missing) or ahead of it (a newer mailtide migrated it). It asks once: after
   it has seen the schema current, it and its clones do not ask again.
 
-The conformance suite (`mailtide_store::conformance`, 39 cases) runs against
+The conformance suite (`mailtide_store::conformance`, 42 cases) runs against
 the memory store and SQLite on every test run, and Postgres in CI.
 
 ## 11. Python bindings
@@ -575,6 +589,14 @@ runner per process, after forking:
   block; `await forget(account)` deletes its rows and blobs;
 - `await messages(account, ids) -> list[MessageView]` (labels with pending
   actions applied, observed labels, and `content` once imported);
+- `await threads(account, thread_ids) -> list[ThreadView]` (§4): `messages`
+  (each a `MessageView`), `labels`, `unread`, `latest` (the same object as
+  in `messages`, or `None`), `message_count`, `draft_count`,
+  `awaiting_import`, `participants`; in the order asked, unknown ids left
+  out. A store read: no token, no Gmail call, no claim. Listing threads,
+  sorting, paging and counting them is the host's read model: collect the
+  thread ids of a `changes` page, read them in one call, upsert each answer
+  and delete the ids left out;
 - `await labels(account) -> list[Label]`: the label definitions (`id`,
   `name`, `kind`: `system` or `user`) as the mirror last synced them, in id
   order, to show label ids as names; empty before the first label sync.
@@ -622,7 +644,7 @@ advisory lock; hosts that run migrations with their own tool execute
 `schema()` reports `current`, `behind` or `ahead`. Every call that reads or
 writes the database refuses with `SchemaOutOfDate` unless it is current:
 `run`, `act`, `admit`, `prioritise`, `track`, `drift`, `notify`, and the
-reads too (`changes`, `messages`, `labels`, `message_ids`, `compact`,
+reads too (`changes`, `messages`, `threads`, `labels`, `message_ids`, `compact`,
 `status`, `accounts`, `resume`, `forget`), so a build that is too old
 refuses instead of misreading. Only `schema`, `migrate`, `health` and
 `read_blob` (blob storage only) answer whatever the schema. The SQL store
@@ -654,6 +676,19 @@ DELETE FROM mailtide_schema WHERE version = 5;
 A consumer holding a three-field position must first read on with the new
 build until `next` is a commit boundary (a two-field string), or rebuild as
 after `StateTooOld`; two-field positions mean the same in every build.
+
+Migration 6 adds the index `mailtide_messages_thread` on
+`mailtide_messages (account, thread_id, id)` (§4) and changes no row. On
+Postgres it blocks writes to the table while it builds; a host with a very
+large table can first run `CREATE INDEX CONCURRENTLY` under the same name,
+and the migration is then a no-op. A build from before it sees the database
+as `ahead`; reverting it loses nothing (thread reads and thread actions only
+get slower):
+
+```sql
+DROP INDEX mailtide_messages_thread;
+DELETE FROM mailtide_schema WHERE version = 6;
+```
 
 Tests: `mailtide.testing`
 ships the fake Gmail (`FakeGmail`) and a `ManualClock` (`clock=`) to reach
@@ -694,7 +729,8 @@ faults, including users acting through the engine, users opening messages
 whose bodies are still queued (`prioritise`, §6.4), and label definitions
 created, renamed and deleted in Gmail, and checks invariants after every
 commit and every open (also that no job's class goes down outside a claim's
-finish) and convergence after healing, label definitions within the refresh
+finish) and convergence after healing (message sets, labels, thread ids and
+thread views), label definitions within the refresh
 interval; a feed reader takes one page of a random limit (1 to 8) between
 steps and must end with the whole change log, entry for entry
 (`FeedPagesDiverged` otherwise) (CI: 500 seeds × 1,000 steps; locally 3,000
@@ -760,7 +796,7 @@ metrics or OpenTelemetry dependency.
 | OSS | Publish under `denismaciel` (MIT OR Apache-2.0) | Timing: open question |
 
 Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4
-(`changes`, `messages`, `labels`). Phase 3 needs a production host.
+(`changes`, `messages`, `labels`, `threads`). Phase 3 needs a production host.
 
 ## 15. Decisions
 
@@ -772,6 +808,7 @@ Status (2026-11-18): phases 1, 2 and 6 are implemented, with most of phase 4
 | Q4 | Raw content fetched once into blob storage; parsing is a separate optional crate | **Yes** |
 | Q5 | The engine owns import ordering and resumability; a quota gate over the core `Ledger` enforces declared costs, priority shares and cooldowns | **Yes** |
 | — | Thread model: Gmail `threadId` only; conversations across mailboxes (RFC headers) are left to hosts | **Yes** |
+| — | Threads are derived at read time and read by thread ids (`threads`, one index); listing, sorting, paging and per-label counts stay in the host's read model, fed by the change feed (`docs/features/threads.md`) | **Yes** |
 | — | Body retention and deletion: blobs of tombstoned messages are deleted after a 24 h grace period | **Yes** |
 | — | Open source: public under `denismaciel`, wheels on GitHub Releases | **Yes** |
 | — | License: MIT OR Apache-2.0 (dual) | **Yes** |

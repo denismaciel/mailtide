@@ -586,6 +586,53 @@ mod _core {
         })
     }
 
+    /// A thread as the host should show it, folded from its messages.
+    #[pyclass(frozen, get_all)]
+    struct ThreadView {
+        id: String,
+        /// Every member, drafts included: imported ones oldest first by
+        /// `internal_date_ms` then id, then those awaiting import, by id.
+        messages: Vec<Py<MessageView>>,
+        /// The union of the non-draft members' labels, pending actions applied.
+        labels: Vec<String>,
+        /// Some non-draft member is unread.
+        unread: bool,
+        /// The newest imported non-draft member: the same object as in
+        /// `messages`. `None` until one is imported.
+        latest: Option<Py<MessageView>>,
+        message_count: u32,
+        draft_count: u32,
+        /// Non-draft members not imported yet: their place is provisional.
+        awaiting_import: u32,
+        /// `From`, `To` and `Cc` of the imported non-draft members, as
+        /// written, one per address, in order of first appearance.
+        participants: Vec<String>,
+    }
+
+    fn thread_view(py: Python<'_>, view: mailtide::thread::ThreadView) -> PyResult<ThreadView> {
+        let mut latest = None;
+        let mut messages = Vec::with_capacity(view.messages.len());
+        for member in view.messages {
+            let is_latest = view.latest.as_ref() == Some(&member.id);
+            let member = Py::new(py, message_view(py, member)?)?;
+            if is_latest {
+                latest = Some(member.clone_ref(py));
+            }
+            messages.push(member);
+        }
+        Ok(ThreadView {
+            id: view.id.0,
+            messages,
+            labels: names(&view.labels),
+            unread: view.unread,
+            latest,
+            message_count: view.message_count,
+            draft_count: view.draft_count,
+            awaiting_import: view.awaiting_import,
+            participants: view.participants,
+        })
+    }
+
     /// A label definition: what a label id on a message is called.
     #[pyclass(frozen, get_all)]
     struct Label {
@@ -1505,6 +1552,19 @@ mod _core {
             Python::attach(|py| views.into_iter().map(|v| message_view(py, v)).collect())
         }
 
+        async fn threads(
+            self: Arc<Self>,
+            account: AccountId,
+            ids: Vec<ThreadId>,
+        ) -> PyResult<Vec<ThreadView>> {
+            let views = self
+                .inner
+                .threads(&account, &ids)
+                .await
+                .map_err(run_error)?;
+            Python::attach(|py| views.into_iter().map(|v| thread_view(py, v)).collect())
+        }
+
         async fn changes(
             self: Arc<Self>,
             account: AccountId,
@@ -1857,6 +1917,20 @@ mod _core {
             )
         }
 
+        fn threads<'py>(
+            &self,
+            py: Python<'py>,
+            account: &str,
+            thread_ids: Vec<String>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let ids = thread_ids.into_iter().map(ThreadId).collect();
+            future(
+                py,
+                &self.shared,
+                self.shared.clone().threads(account_id(account)?, ids),
+            )
+        }
+
         #[pyo3(signature = (account, since=None, limit=500))]
         fn changes<'py>(
             &self,
@@ -2155,6 +2229,22 @@ mod _core {
                 py,
                 &self.shared,
                 self.shared.clone().messages(account_id(account)?, ids),
+            )
+        }
+
+        /// How these threads should look, in the order asked; threads the
+        /// mirror has no message in are left out.
+        fn threads(
+            &self,
+            py: Python<'_>,
+            account: &str,
+            thread_ids: Vec<String>,
+        ) -> PyResult<Vec<ThreadView>> {
+            let ids = thread_ids.into_iter().map(ThreadId).collect();
+            block(
+                py,
+                &self.shared,
+                self.shared.clone().threads(account_id(account)?, ids),
             )
         }
 

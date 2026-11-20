@@ -57,7 +57,16 @@ status = await runner.status("alice@example.com")  # never preempts a running sy
 page = await runner.changes("alice@example.com", since=None)  # bounded pages; imports carry headers
 views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
 labels = await runner.labels("alice@example.com")  # label ids to names, as last synced
+threads = await runner.threads("alice@example.com", ["18c…"])  # thread views, in one call
 ```
+
+A thread view (`ThreadView`) is folded from the mirror on every read: its
+messages oldest first, the label union of its non-draft messages with pending
+actions applied, unread, the latest message, counts and participants. Listing
+threads by label, sorting, paging and per-label counts are the host's: keep a
+table of your own, fed by `changes` (every entry names its thread; read the
+threads of a page with one `threads` call and upsert, or delete the ids left
+out).
 
 Invalid configuration raises `ValueError` naming the field. Failures are typed:
 `StoreUnavailable`, `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`,

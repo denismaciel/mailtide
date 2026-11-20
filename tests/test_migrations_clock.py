@@ -59,6 +59,7 @@ def every_database_call(
         "forget": lambda: runner.forget(ACCOUNT),
         "labels": lambda: runner.labels(ACCOUNT),
         "messages": lambda: runner.messages(ACCOUNT, ["m1"]),
+        "threads": lambda: runner.threads(ACCOUNT, ["t-m1"]),
         "changes": lambda: runner.changes(ACCOUNT),
         "compact": lambda: runner.compact(ACCOUNT, state),
         "message_ids": lambda: runner.message_ids(ACCOUNT),

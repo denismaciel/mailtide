@@ -28,6 +28,7 @@ from mailtide._core import (
     RunOutcome,
     SchemaStatus,
     StateTooOld,
+    ThreadView,
     TrackResult,
 )
 from mailtide.config import Config
@@ -239,6 +240,13 @@ class Runner:
     async def messages(self, account: str, message_ids: list[str]) -> list[MessageView]:
         """How these messages should look; unknown ids are left out."""
         return await self._core.messages(account, message_ids)
+
+    async def threads(self, account: str, thread_ids: list[str]) -> list[ThreadView]:
+        """How these threads should look, in the order asked: each member's
+        ``MessageView``, the label union of the non-draft members, unread,
+        ``latest`` and counts. Threads with no mirrored message are left out.
+        Collect the thread ids of a ``changes`` page and read them in one call."""
+        return await self._core.threads(account, thread_ids)
 
     async def changes(
         self, account: str, since: str | None = None, limit: int = 500

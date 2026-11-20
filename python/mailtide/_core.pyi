@@ -156,6 +156,18 @@ class MessageView:
     content: MessageContent | None
 
 @final
+class ThreadView:
+    id: str
+    messages: list[MessageView]
+    labels: list[str]
+    unread: bool
+    latest: MessageView | None
+    message_count: int
+    draft_count: int
+    awaiting_import: int
+    participants: list[str]
+
+@final
 class Label:
     id: str
     name: str
@@ -340,6 +352,7 @@ class Runner:
     def health(self) -> Awaitable[Health]: ...
     def labels(self, account: str) -> Awaitable[list[Label]]: ...
     def messages(self, account: str, message_ids: list[str]) -> Awaitable[list[MessageView]]: ...
+    def threads(self, account: str, thread_ids: list[str]) -> Awaitable[list[ThreadView]]: ...
     def changes(
         self, account: str, since: str | None = None, limit: int = 500
     ) -> Awaitable[ChangePage | StateTooOld]: ...
@@ -402,6 +415,7 @@ class BlockingRunner:
     def health(self) -> Health: ...
     def labels(self, account: str) -> list[Label]: ...
     def messages(self, account: str, message_ids: list[str]) -> list[MessageView]: ...
+    def threads(self, account: str, thread_ids: list[str]) -> list[ThreadView]: ...
     def changes(
         self, account: str, since: str | None = None, limit: int = 500
     ) -> ChangePage | StateTooOld: ...

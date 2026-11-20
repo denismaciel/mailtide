@@ -2,7 +2,7 @@ id = "threads"
 title = "Thread views read from the mirror"
 summary = "A pure thread rule (messages in order, label union of non-draft messages with pending actions applied, unread, latest, counts, participants) read for a batch of thread ids through one new index; listing threads by label stays in the host's read model, fed by the change feed."
 roadmap = ["R7"]
-status = "in_progress"
+status = "done"
 design = "docs/features/threads.md"
 # No hard dependency. `message-facts` may change how header facts hold addresses;
 # participants read whatever the facts hold. Migration numbers are taken in merge
@@ -69,6 +69,11 @@ role = "Runner::threads: a store read that claims nothing and calls nothing"
 path = "crates/mailtide-sim/src/lib.rs"
 change = "modify"
 role = "Convergence also compares each message's thread id and each thread's view with the fake Gmail"
+
+[[file]]
+path = "crates/mailtide-sim/examples/campaign.rs"
+change = "modify"
+role = "Total the new threads count in the campaign's stats"
 
 # -------------------------------------------------------------------- bindings
 
@@ -143,6 +148,11 @@ role = "Thread views across a sync and an action, against the fake Gmail"
 path = "tests/test_threads.py"
 change = "new"
 role = "Python tests of threads against FakeGmail"
+
+[[file]]
+path = "tests/test_migrations_clock.py"
+change = "modify"
+role = "The schema version the migrations reach"
 
 # ------------------------------------------------------------------ references
 

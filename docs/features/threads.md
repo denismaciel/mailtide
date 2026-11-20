@@ -1,6 +1,6 @@
 # Thread views read from the mirror
 
-Plan: `features/threads.toml` (roadmap R7). Status: planned.
+Plan: `features/threads.toml` (roadmap R7). Status: done.
 
 ## 1. Goal and scope
 
