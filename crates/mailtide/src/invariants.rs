@@ -43,6 +43,20 @@ pub enum Violation {
         /// The message.
         message: MessageId,
     },
+    /// I5, as a purge needs it: a message is tombstoned while Gmail still
+    /// has it. Only Gmail's evidence (a `messagesDeleted` record, a 404)
+    /// may make a tombstone, so this never holds.
+    TombstoneOfLiveMessage {
+        /// The message.
+        message: MessageId,
+    },
+    /// A purge deleted a message that was neither in trash or spam in Gmail
+    /// when it was checked, nor moved there by an action not yet
+    /// delivered (`docs/features/purge.md`).
+    PurgedOutsideTrashOrSpam {
+        /// The message.
+        message: MessageId,
+    },
     /// I6: a message without content has no import job.
     MissingImportJob {
         /// The message.
@@ -302,6 +316,24 @@ fn lowered(before: &AccountMirror, after: &AccountMirror, finished: &[&JobKind])
                 before: old.priority,
                 after: job.priority,
             })
+        })
+        .collect()
+}
+
+/// Check that every tombstone is for a message Gmail no longer has
+/// (`gmail_has` answers for Gmail's ground truth, which only a simulator
+/// knows).
+#[must_use]
+pub fn check_tombstones(
+    mirror: &AccountMirror,
+    gmail_has: impl Fn(&MessageId) -> bool,
+) -> Vec<Violation> {
+    mirror
+        .tombstones
+        .keys()
+        .filter(|id| gmail_has(id))
+        .map(|id| Violation::TombstoneOfLiveMessage {
+            message: id.clone(),
         })
         .collect()
 }

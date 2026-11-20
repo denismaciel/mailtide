@@ -33,6 +33,9 @@ fn main() {
         totals.compacted += result.stats.compacted;
         totals.consumers_cut_off += result.stats.consumers_cut_off;
         totals.facts_refreshed += result.stats.facts_refreshed;
+        totals.purges += result.stats.purges;
+        totals.purge_deletes += result.stats.purge_deletes;
+        totals.purged += result.stats.purged;
         if !result.passed() {
             failed += 1;
             println!(

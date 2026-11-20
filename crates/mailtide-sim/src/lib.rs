@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use mailtide::EngineConfig;
 use mailtide::command::{Command, CommandKind, GmailRequest};
-use mailtide::commit::{Commit, CommitOutcome, LabelOp};
+use mailtide::commit::{Commit, CommitOutcome, DeletionEvidence, LabelOp};
 use mailtide::engine::Engine;
 use mailtide::event::{Event, EventKind};
 use mailtide::gmail::{
@@ -42,6 +42,7 @@ use mailtide::outbox::{
     Action, ActionRequest, IntentState, LabelDelta, ModifyGroup, ReadState, RestoreDestination,
     StarState,
 };
+use mailtide::purge::{self, Bin, PurgeScan, Scope, Verdict};
 use mailtide::reconcile::ListScope;
 use mailtide::retry::{Blocking, BlockingFailure, Failure, Retryable, RetryableFailure};
 use mailtide::revision::{
@@ -254,6 +255,21 @@ pub enum UserOp {
         /// Which message, among those the mirror shows.
         pick: usize,
     },
+    /// The user deletes the n-th mirrored message (or its whole thread)
+    /// for good: the host's purge call, outside the engine, with faults
+    /// (another client's change between the check and the delete, a lost
+    /// answer, a crash before the record) drawn as it runs.
+    HostPurge {
+        /// Which message, among those the mirror shows.
+        pick: usize,
+        /// Purge the message's whole thread.
+        whole_thread: bool,
+    },
+    /// The user empties the trash (or spam) for good: the host's `empty`.
+    HostEmpty {
+        /// Spam rather than trash.
+        spam: bool,
+    },
 }
 
 /// Whether the mirror converged once faults healed.
@@ -334,6 +350,12 @@ pub struct Stats {
     pub consumers_cut_off: u64,
     /// Message facts a refresh brought up to date.
     pub facts_refreshed: u64,
+    /// Purges and emptyings the host ran (checked against history).
+    pub purges: u64,
+    /// Messages they deleted in Gmail.
+    pub purge_deletes: u64,
+    /// Messages they recorded as deleted from Gmail's evidence.
+    pub purged: u64,
 }
 
 /// The outcome of one run.
@@ -579,7 +601,11 @@ impl Gmail {
             }
             UserOp::Relabel { pick, label } => self.relabel(*pick, label),
             // Goes through the engine, not straight to Gmail.
-            UserOp::HostAction { .. } | UserOp::HostOpen { .. } | UserOp::MonthPasses => {}
+            UserOp::HostAction { .. }
+            | UserOp::HostOpen { .. }
+            | UserOp::HostPurge { .. }
+            | UserOp::HostEmpty { .. }
+            | UserOp::MonthPasses => {}
             UserOp::Delete { pick } => {
                 let ids: Vec<MessageId> = self.messages.keys().cloned().collect();
                 if ids.is_empty() {
@@ -1275,6 +1301,14 @@ impl Sim {
             self.host_open(pick);
             return;
         }
+        if let UserOp::HostPurge { pick, whole_thread } = op {
+            self.host_purge(pick, whole_thread);
+            return;
+        }
+        if let UserOp::HostEmpty { spam } = op {
+            self.host_empty(spam);
+            return;
+        }
         if op == UserOp::MonthPasses {
             self.now = self.now.plus(Duration::from_hours(31 * 24));
             // Gmail keeps history about a week: nothing from before is
@@ -1438,6 +1472,215 @@ impl Sim {
         self.deliver(EventKind::ActionRequested { action: request });
     }
 
+    /// Every tombstone is for a message Gmail no longer has.
+    fn check_tombstones(&mut self) {
+        let gmail = &self.gmail.messages;
+        for violation in invariants::check_tombstones(&self.mirror, |id| gmail.contains_key(id)) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+    }
+
+    /// The host purges the n-th mirrored message (or its thread).
+    fn host_purge(&mut self, pick: usize, whole_thread: bool) {
+        let visible: Vec<(MessageId, ThreadId)> = self
+            .mirror
+            .messages
+            .values()
+            .map(|record| (record.id.clone(), record.thread_id.clone()))
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+        let (id, thread) = visible[pick % visible.len()].clone();
+        let targets = if whole_thread {
+            match self.mirror.thread(&thread) {
+                Some(view) => purge::thread_targets(&view.messages),
+                None => return,
+            }
+        } else {
+            vec![id]
+        };
+        self.purge(&targets, Scope::TrashOrSpam);
+    }
+
+    /// The host empties the trash or spam, as far as the mirror holds it.
+    fn host_empty(&mut self, spam: bool) {
+        let bin = if spam { Bin::Spam } else { Bin::Trash };
+        let targets = self
+            .mirror
+            .message_ids_labelled(&bin.label(), None, u32::MAX);
+        self.purge(&targets, Scope::Bin(bin));
+    }
+
+    /// What `Runner::purge` does, against the simulated Gmail: read history
+    /// from the cursor, decide with the pure rules, delete by id, read
+    /// history again and record only what it shows (or a single delete's
+    /// 404). Never sends a delete twice.
+    fn purge(&mut self, targets: &[MessageId], scope: Scope) {
+        let Some(cursor) = self.mirror.record.cursor else {
+            return;
+        };
+        if self.mirror.record.sync != mailtide::state::SyncState::Live || targets.is_empty() {
+            return;
+        }
+        let mut scan = PurgeScan::new();
+        if !self.read_history(cursor, &mut scan) {
+            return;
+        }
+        self.stats.purges += 1;
+        let eligible = self.eligible(targets, &scan, scope);
+        // Another client acts between the check and the delete: Gmail's
+        // window, not the mirror's (the delete still goes out).
+        if !eligible.is_empty() && self.rng.chance(self.faults.user_activity) {
+            let op = self.random_op();
+            if !matches!(
+                op,
+                UserOp::HostAction { .. }
+                    | UserOp::HostOpen { .. }
+                    | UserOp::HostPurge { .. }
+                    | UserOp::HostEmpty { .. }
+            ) {
+                self.gmail.apply(&op);
+            }
+        }
+        let mut missing = Vec::new();
+        let lost = self.rng.chance(self.faults.transient);
+        for request in purge::delete_requests(&eligible) {
+            let named = purge::request_ids(&request);
+            let single = matches!(request, GmailRequest::DeleteMessage { .. });
+            for id in &named {
+                if self.gmail.messages.contains_key(id) {
+                    self.gmail.delete(id);
+                    self.stats.purge_deletes += 1;
+                } else if single && !lost {
+                    missing.push(id.clone());
+                }
+            }
+        }
+        if !eligible.is_empty() && !self.rng.chance(self.faults.push_dropped) {
+            self.deliveries.push(Event {
+                now: self.now,
+                kind: EventKind::PushReceived {
+                    history_id: self.gmail.current(),
+                },
+            });
+        }
+        // A crash before the record: Gmail deleted, nothing recorded; the
+        // next sync's history tombstones the rows.
+        if self.rng.chance(self.faults.crash) {
+            return;
+        }
+        let Some(head) = scan.head() else {
+            return;
+        };
+        if !self.read_history(head, &mut scan) {
+            return;
+        }
+        let Some(head) = scan.head() else {
+            return;
+        };
+        let evidence: Vec<(MessageId, DeletionEvidence)> = targets
+            .iter()
+            .filter_map(|id| match scan.deleted(id) {
+                Some(at) => Some((id.clone(), DeletionEvidence::History { at })),
+                None => missing.contains(id).then(|| {
+                    (
+                        id.clone(),
+                        DeletionEvidence::VerifiedMissing {
+                            no_later_than: head,
+                        },
+                    )
+                }),
+            })
+            .collect();
+        let before = self.mirror.clone();
+        let recorded = self.mirror.record_deleted(&evidence, self.now);
+        self.stats.purged += u64::from(recorded);
+        self.note(&format!("purge recorded {evidence:?}"));
+        for violation in invariants::check_state(&self.mirror) {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation,
+            });
+        }
+        if before.record.cursor != self.mirror.record.cursor {
+            self.violations.push(ObservedViolation {
+                step: self.step,
+                violation: Violation::CursorMovedWithoutCommit {
+                    before: before.record.cursor,
+                    after: self.mirror.record.cursor,
+                },
+            });
+        }
+        self.check_tombstones();
+    }
+
+    /// The targets the pure rules allow, each checked against Gmail's
+    /// ground truth at the check: in the bin, or moved there by an action
+    /// not yet delivered.
+    fn eligible(
+        &mut self,
+        targets: &[MessageId],
+        scan: &PurgeScan,
+        scope: Scope,
+    ) -> Vec<MessageId> {
+        let mut eligible = Vec::new();
+        for id in targets {
+            let view = self.mirror.view(id);
+            if scan.verdict(id, view.as_ref(), scope) != Verdict::Eligible {
+                continue;
+            }
+            // Gmail's state at the check: in the bin, or moved there by an
+            // action not yet delivered.
+            let in_bin = |labels: &LabelSet| match scope {
+                Scope::Bin(bin) => labels.contains(&bin.label()),
+                Scope::TrashOrSpam | Scope::Anywhere => {
+                    labels::has(labels, labels::system::TRASH)
+                        || labels::has(labels, labels::system::SPAM)
+                }
+            };
+            let in_gmail = self
+                .gmail
+                .messages
+                .get(id)
+                .is_some_and(|m| in_bin(&m.labels));
+            let asked_here = view
+                .as_ref()
+                .is_some_and(|v| in_bin(&v.labels) && !in_bin(&v.observed_labels));
+            if !in_gmail && !asked_here && self.gmail.messages.contains_key(id) {
+                self.violations.push(ObservedViolation {
+                    step: self.step,
+                    violation: Violation::PurgedOutsideTrashOrSpam {
+                        message: id.clone(),
+                    },
+                });
+            }
+            eligible.push(id.clone());
+        }
+        eligible
+    }
+
+    /// Read every history page from `start` into `scan`, at most
+    /// [`purge::PURGE_HISTORY_PAGES`]; `false` if history expired or is
+    /// too long (the purge is refused as stale).
+    fn read_history(&self, start: HistoryId, scan: &mut PurgeScan) -> bool {
+        let mut token: Option<PageToken> = None;
+        for _ in 0..purge::PURGE_HISTORY_PAGES {
+            let Some(page) = self.gmail.history_page(start, token.as_ref()) else {
+                return false;
+            };
+            scan.read(&page);
+            match page.next_page_token {
+                None => return true,
+                next => token = next,
+            }
+        }
+        false
+    }
+
     fn host_open(&mut self, pick: usize) {
         let pending: Vec<&MessageId> = self
             .mirror
@@ -1497,8 +1740,20 @@ impl Sim {
     fn random_op(&mut self) -> UserOp {
         let pick = self.rng.below(1_000);
         if self.rng.below(4) == 0 {
-            if self.rng.below(3) == 0 {
-                return UserOp::HostOpen { pick };
+            match self.rng.below(12) {
+                0..=3 => return UserOp::HostOpen { pick },
+                4 => {
+                    return UserOp::HostPurge {
+                        pick,
+                        whole_thread: self.rng.below(3) == 0,
+                    };
+                }
+                5 => {
+                    return UserOp::HostEmpty {
+                        spam: self.rng.below(2) == 0,
+                    };
+                }
+                _ => {}
             }
             let action = self.random_action();
             return UserOp::HostAction {
@@ -1626,6 +1881,7 @@ impl Sim {
                         violation,
                     });
                 }
+                self.check_tombstones();
                 match &outcome {
                     CommitOutcome::Applied { .. } => self.stats.commits += 1,
                     CommitOutcome::Rejected(_) => self.stats.rejections += 1,
@@ -2060,6 +2316,31 @@ mod tests {
         assert!(
             opens > 0 && raised > 0,
             "{opens} opens raised {raised} imports"
+        );
+    }
+
+    #[test]
+    fn purges_never_tombstone_a_message_gmail_still_has() {
+        // Other seeds again: purges and emptyings from the host while the
+        // engine syncs, with restores and new trash elsewhere between the
+        // check and the delete, lost answers and crashes before the record.
+        // Every tombstone must be for a message Gmail no longer has, every
+        // purge must have been in the bin at its check, and the mirror must
+        // converge (I9) once faults heal.
+        let results: Vec<RunResult> = (400..600).map(|seed| run(seed, 400)).collect();
+        let failures: Vec<&RunResult> = results.iter().filter(|r| !r.passed()).collect();
+        assert!(
+            failures.is_empty(),
+            "{} failing seeds, first: {:#?}",
+            failures.len(),
+            failures.first()
+        );
+        let calls: u64 = results.iter().map(|r| r.stats.purges).sum();
+        let deletes: u64 = results.iter().map(|r| r.stats.purge_deletes).sum();
+        let recorded: u64 = results.iter().map(|r| r.stats.purged).sum();
+        assert!(
+            calls > 0 && deletes > 0 && recorded > 0,
+            "{calls} purges deleted {deletes} and recorded {recorded}"
         );
     }
 
