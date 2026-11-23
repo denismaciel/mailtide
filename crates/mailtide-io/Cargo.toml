@@ -9,10 +9,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mailtide = { path = "../mailtide", version = "0.3.0" }
-mailtide-gmail = { path = "../mailtide-gmail", version = "0.3.0" }
-mailtide-mime = { path = "../mailtide-mime", version = "0.3.0" }
-mailtide-store = { path = "../mailtide-store", version = "0.3.0" }
+mailtide = { path = "../mailtide", version = "0.4.0" }
+mailtide-gmail = { path = "../mailtide-gmail", version = "0.4.0" }
+mailtide-mime = { path = "../mailtide-mime", version = "0.4.0" }
+mailtide-store = { path = "../mailtide-store", version = "0.4.0" }
 bytes = "1"
 futures-util = "0.3"
 getrandom = "0.4"
