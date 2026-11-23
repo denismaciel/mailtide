@@ -6194,4 +6194,80 @@ mod _core {
     fn decode_header(value: &str) -> String {
         mailtide_mime::decode_header(value)
     }
+
+    /// Stateful multi-account fake Gmail HTTP server for local development and
+    /// stress testing. Binds loopback only; routes each account by
+    /// `Authorization: Bearer fake:<email>`.
+    #[pyclass(frozen, module = "mailtide._core")]
+    struct FakeGmailServer {
+        origin: String,
+        port: u16,
+        inner: std::sync::Mutex<Option<mailtide_fake::FakeGmailServer>>,
+    }
+
+    #[pymethods]
+    impl FakeGmailServer {
+        #[new]
+        #[pyo3(signature = (*, host="127.0.0.1", port=0, state_path=None, push_url=None, push_debounce_ms=150))]
+        fn new(
+            py: Python<'_>,
+            host: &str,
+            port: u16,
+            state_path: Option<String>,
+            push_url: Option<String>,
+            push_debounce_ms: u64,
+        ) -> PyResult<Self> {
+            let config = mailtide_fake::ServerConfig {
+                host: host.to_owned(),
+                port,
+                state_path: state_path.map(std::path::PathBuf::from),
+                push_url,
+                push_debounce: Duration::from_millis(push_debounce_ms),
+            };
+            let server = py
+                .detach(|| runtime().block_on(mailtide_fake::FakeGmailServer::start(config)))
+                .map_err(|e| PyValueError::new_err(e.0))?;
+            let origin = server.origin().to_owned();
+            let bound_port = server.port();
+            Ok(Self {
+                origin,
+                port: bound_port,
+                inner: std::sync::Mutex::new(Some(server)),
+            })
+        }
+
+        /// Base HTTP origin (e.g. `http://127.0.0.1:8200`).
+        #[getter]
+        fn origin(&self) -> &str {
+            &self.origin
+        }
+
+        /// Bound TCP port.
+        #[getter]
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        /// Shut down the server and stop any active burst tasks.
+        fn close(&self, py: Python<'_>) {
+            let server = self.inner.lock().ok().and_then(|mut g| g.take());
+            if let Some(server) = server {
+                py.detach(|| runtime().block_on(server.shutdown()));
+            }
+        }
+
+        fn __enter__(slf: Py<Self>) -> Py<Self> {
+            slf
+        }
+
+        fn __exit__(
+            &self,
+            py: Python<'_>,
+            _exc_type: Option<&Bound<'_, PyAny>>,
+            _exc: Option<&Bound<'_, PyAny>>,
+            _tb: Option<&Bound<'_, PyAny>>,
+        ) {
+            self.close(py);
+        }
+    }
 }

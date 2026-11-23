@@ -9,6 +9,9 @@ authors = [{ name = "Denis Maciel", email = "denispmaciel@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+mailtide-fake = "mailtide.fake:main"
+
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.8"]
 
