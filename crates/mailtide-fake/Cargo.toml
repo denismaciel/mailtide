@@ -1,0 +1,33 @@
+[package]
+name = "mailtide-fake"
+description = "Stateful multi-account fake Gmail HTTP server with control API, fault injection, and web UI"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mailtide = { path = "../mailtide", version = "0.3.0" }
+mailtide-gmail = { path = "../mailtide-gmail", version = "0.3.0" }
+mailtide-mime = { path = "../mailtide-mime", version = "0.3.0" }
+base64 = "0.23"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+mailtide-io = { path = "../mailtide-io", version = "0.3.0" }
+mailtide-store = { path = "../mailtide-store", version = "0.3.0" }
+
+[lints]
+workspace = true

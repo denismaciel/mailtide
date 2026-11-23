@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>mailtide-fake · Fake Gmail Inspector</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161922; --panel2: #1d212d; --border: #2a3040;
+    --text: #e6e9ef; --muted: #8b95a7; --accent: #5b9cf6; --green: #34d399;
+    --amber: #fbbf24; --red: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); font-size: 13px; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .pill { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
+  .pill.ok { color: var(--green); border-color: #245746; }
+  .pill.warn { color: var(--amber); border-color: #6b4f1d; }
+  .pill.err { color: var(--red); border-color: #6e2b2b; }
+  .layout { display: grid; grid-template-columns: 240px 1fr; min-height: calc(100vh - 46px); }
+  aside { background: var(--panel); border-right: 1px solid var(--border); padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+  main { padding: 14px 18px; overflow: auto; }
+  .acct { padding: 8px 10px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; display: flex; flex-direction: column; gap: 3px; }
+  .acct:hover { background: var(--panel2); }
+  .acct.active { background: var(--panel2); border-color: var(--accent); }
+  .acct-email { font-weight: 600; word-break: break-all; }
+  .acct-meta { font-size: 11px; color: var(--muted); }
+  .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .tab { background: transparent; border: 1px solid transparent; color: var(--muted); padding: 6px 11px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .tab.active { background: var(--panel2); color: var(--text); border-color: var(--border); }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1e3a5f; border-color: var(--accent); }
+  button.danger { background: #3b1c1f; border-color: var(--red); color: #fecaca; }
+  input, textarea, select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit; }
+  textarea { width: 100%; min-height: 76px; resize: vertical; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--text); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .lbl { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--panel2); border: 1px solid var(--border); margin: 0 3px 2px 0; color: var(--muted); }
+  .lbl.unread { color: var(--accent); border-color: #2b4c7e; }
+  .lbl.withheld { color: var(--red); border-color: #6e2b2b; }
+  pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: auto; max-height: 360px; font-size: 11px; white-space: pre-wrap; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .muted { color: var(--muted); }
+  .toast { position: fixed; bottom: 16px; right: 16px; background: var(--panel2); border: 1px solid var(--accent); padding: 8px 12px; border-radius: 6px; display: none; z-index: 99; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mailtide-fake <span class="pill ok" id="hdr-status">connected</span> <span class="pill" id="hdr-push">push: none</span></h1>
+  <div class="row">
+    <button onclick="refreshAll()">Refresh</button>
+    <button onclick="toggleGlobalPush()" id="btn-global-push">Pause All Push</button>
+    <button class="danger" onclick="resetAll()">Reset All</button>
+  </div>
+</header>
+<div class="layout">
+  <aside>
+    <div class="row">
+      <input id="new-account" placeholder="alice@example.com" style="flex:1;min-width:0" />
+      <button onclick="createAccount()">Add</button>
+    </div>
+    <div id="account-list"></div>
+  </aside>
+  <main>
+    <div class="tabs">
+      <button class="tab active" data-tab="messages" onclick="setTab('messages')">Messages</button>
+      <button class="tab" data-tab="drafts" onclick="setTab('drafts')">Drafts</button>
+      <button class="tab" data-tab="sent" onclick="setTab('sent')">Sent</button>
+      <button class="tab" data-tab="inject" onclick="setTab('inject')">Inject / Seed / Burst</button>
+      <button class="tab" data-tab="chaos" onclick="setTab('chaos')">Chaos & Faults</button>
+      <button class="tab" data-tab="requests" onclick="setTab('requests')">API Log</button>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+let state = { accounts: [], global_faults: {}, push_url: null };
+let selected = null;
+let tab = 'messages';
+let searchQ = '';
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(window._t);
+  window._t = setTimeout(() => el.style.display = 'none', 2600);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
+    ...opts,
+  });
+  const text = await res.text();
+  let data = text;
+  try { data = JSON.parse(text); } catch {}
+  if (!res.ok) throw new Error(typeof data === 'object' && data.error ? data.error : text || res.status);
+  return data;
+}
+
+function enc(s) { return encodeURIComponent(s); }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function refreshAll() {
+  state = await api('/_control/status');
+  document.getElementById('hdr-push').textContent = state.push_url
+    ? `push: ${state.global_faults.push_paused ? 'PAUSED' : 'on'}`
+    : 'push: none';
+  document.getElementById('btn-global-push').textContent = state.global_faults.push_paused ? 'Resume All Push' : 'Pause All Push';
+  if (!selected && state.accounts.length) selected = state.accounts[0].email;
+  if (selected && !state.accounts.some(a => a.email === selected)) selected = state.accounts[0]?.email || null;
+  renderAccounts();
+  await renderTab();
+}
+
+function renderAccounts() {
+  const list = document.getElementById('account-list');
+  if (!state.accounts.length) {
+    list.innerHTML = '<div class="muted">No accounts yet. Add one above or connect a runner.</div>';
+    return;
+  }
+  list.innerHTML = state.accounts.map(a => `
+    <div class="acct ${a.email === selected ? 'active' : ''}" onclick="selectAccount('${esc(a.email)}')">
+      <div class="acct-email">${esc(a.email)}</div>
+      <div class="acct-meta">${a.message_count} msgs · ${a.thread_count} thr · ${a.draft_count} drafts · h=${a.history_id}${a.burst_active ? ' · BURST' : ''}</div>
+    </div>
+  `).join('');
+}
+
+function selectAccount(email) { selected = email; renderAccounts(); renderTab(); }
+function setTab(next) {
+  tab = next;
+  document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
+  renderTab();
+}
+
+async function createAccount() {
+  const inp = document.getElementById('new-account');
+  const email = inp.value.trim();
+  if (!email) return;
+  await api('/_control/accounts', { method: 'POST', body: JSON.stringify({ email }) });
+  inp.value = '';
+  selected = email.toLowerCase();
+  toast('Account added');
+  await refreshAll();
+}
+
+async function toggleGlobalPush() {
+  await api('/_control/faults', { method: 'POST', body: JSON.stringify({ push_paused: !state.global_faults.push_paused }) });
+  await refreshAll();
+}
+
+async function resetAll() {
+  if (!confirm('Reset all fake Gmail accounts and state?')) return;
+  await api('/_control/reset', { method: 'POST', body: '{}' });
+  selected = null;
+  toast('State reset');
+  await refreshAll();
+}
+
+async function renderTab() {
+  const view = document.getElementById('view');
+  if (tab === 'requests') {
+    const data = await api('/_control/requests?limit=150');
+    view.innerHTML = `<div class="card"><h3>Recent Gmail API Requests (${data.requests.length})</h3>
+      <table><thead><tr><th>Time</th><th>Account</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th></tr></thead>
+      <tbody>${data.requests.map(r => `<tr>
+        <td class="muted">${new Date(r.at_ms).toLocaleTimeString()}</td>
+        <td>${esc(r.account || '-')}</td>
+        <td><b>${esc(r.method)}</b></td>
+        <td style="word-break:break-all">${esc(r.path)}</td>
+        <td><span class="pill ${r.status>=200&&r.status<300?'ok':r.status===0?'err':'warn'}">${r.status || 'DROP'}</span></td>
+        <td class="muted">${r.duration_ms}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+    return;
+  }
+  if (!selected) {
+    view.innerHTML = '<div class="card muted">Select or add an account on the left.</div>';
+    return;
+  }
+  const acct = state.accounts.find(a => a.email === selected);
+  if (tab === 'messages') {
+    const qParam = searchQ ? `&q=${enc(searchQ)}` : '';
+    const data = await api(`/_control/accounts/${enc(selected)}/messages?limit=100${qParam}`);
+    view.innerHTML = `
+      <div class="row" style="margin-bottom:10px">
+        <input id="msg-q" value="${esc(searchQ)}" placeholder="Gmail search (from:, is:unread, has:attachment, ...)" style="flex:1" onkeydown="if(event.key==='Enter'){searchQ=this.value;renderTab()}" />
+        <button onclick="searchQ=document.getElementById('msg-q').value;renderTab()">Search</button>
+        <button onclick="api('/_control/accounts/${enc(selected)}/push',{method:'POST'}).then(()=>toast('Push fired')).catch(e=>toast(e.message))">Fire Push</button>
+      </div>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">Showing ${data.messages.length} of ${data.total} messages</div>
+        <table><thead><tr><th>From / Subject</th><th>Labels</th><th>Date</th><th>Actions</th></tr></thead>
+        <tbody>${data.messages.map(m => `<tr>
+          <td>
+            <div><b>${esc(m.from)}</b> <span class="muted">(${esc(m.id)} · ${esc(m.thread_id)})</span></div>
+            <div>${esc(m.subject)} ${m.has_attachment ? '<span class="lbl">ATT</span>' : ''}</div>
+            <div class="muted">${esc(m.snippet)}</div>
+          </td>
+          <td>${m.labels.map(l => `<span class="lbl ${l==='UNREAD'?'unread':''}">${esc(l)}</span>`).join('')}${m.withheld ? '<span class="lbl withheld">WITHHELD</span>' : ''}</td>
+          <td class="muted" style="white-space:nowrap">${new Date(m.internal_date_ms).toLocaleString()}</td>
+          <td style="white-space:nowrap">
+            <button onclick="quickReply('${esc(m.thread_id)}')">Reply</button>
+            <button onclick="viewRaw('${esc(m.id)}')">Raw</button>
+            <button onclick="extArchive('${esc(m.id)}')">Archive</button>
+          </td>
+        </tr>`).join('')}</tbody></table>
+      </div>
+      <div id="raw-box"></div>`;
+  } else if (tab === 'drafts') {
+    const data = await api(`/_control/accounts/${enc(selected)}/drafts`);
+    view.innerHTML = `<div class="card"><h3>Active Drafts (${data.drafts.length})</h3>
+      ${!data.drafts.length ? '<div class="muted">No active drafts.</div>' : `<table><thead><tr><th>Draft / Thread</th><th>To / Subject</th><th>Tracking</th><th>Simulate Gmail Web</th></tr></thead>
+      <tbody>${data.drafts.map(d => `<tr>
+        <td><b>${esc(d.draft_id)}</b><div class="muted">${esc(d.message_id)} · ${esc(d.thread_id)}</div></td>
+        <td><div>${esc((d.to||[]).join(', '))}</div><div><b>${esc(d.subject)}</b></div><div class="muted">${esc(d.snippet)}</div></td>
+        <td class="muted">${esc(d.tracking_id || '(none / web)')}</td>
+        <td style="white-space:nowrap">
+          <button onclick="webDraftAction('${esc(d.draft_id)}','web-edit')">Web Edit</button>
+          <button class="primary" onclick="webDraftAction('${esc(d.draft_id)}','web-send')">Web Send</button>
+          <button class="danger" onclick="webDraftAction('${esc(d.draft_id)}','web-discard')">Web Discard</button>
+        </td>
+      </tr>`).join('')}</tbody></table>`}
+    </div>`;
+  } else if (tab === 'sent') {
+    const data = await api(`/_control/accounts/${enc(selected)}/sent`);
+    view.innerHTML = `<div class="card"><h3>Sent Messages (${data.sent.length})</h3>
+      ${!data.sent.length ? '<div class="muted">No messages sent yet.</div>' : `<table><thead><tr><th>#</th><th>Via</th><th>To</th><th>Subject / Snippet</th><th>IDs</th></tr></thead>
+      <tbody>${data.sent.map(s => `<tr>
+        <td>${s.seq}</td>
+        <td><span class="pill">${esc(s.via)}</span></td>
+        <td>${esc((s.to||[]).join(', '))}</td>
+        <td><b>${esc(s.subject)}</b><div class="muted">${esc(s.snippet)}</div></td>
+        <td class="muted">${esc(s.message_id)}<br/>${esc(s.thread_id)}</td>
+      </tr>`).join('')}</tbody></table>`}
+    </div>`;
+  } else if (tab === 'inject') {
+    view.innerHTML = `<div class="grid2">
+      <div class="card">
+        <h3>Deliver Message</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <input id="inj-from" placeholder="From" value="Elena Morales <elena@northwind.example>" />
+          <input id="inj-subj" placeholder="Subject" value="Quick question on timeline" />
+          <input id="inj-tid" placeholder="Thread ID (blank for new thread)" />
+          <textarea id="inj-body" placeholder="Body text">Hi! Could you send over the updated numbers when you get a chance?</textarea>
+          <button class="primary" onclick="deliverMsg()">Deliver Now</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Synthetic Seed</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="row"><label>Threads:</label><input id="seed-n" type="number" value="50" style="width:90px" />
+          <label>Drafts:</label><input id="seed-d" type="number" value="4" style="width:70px" />
+          <label><input id="seed-clear" type="checkbox" /> Clear first</label></div>
+          <div class="row">
+            <button class="primary" onclick="runSeed()">Seed Custom</button>
+            <button onclick="runSeed(3500)">Stress 3,500 Threads</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Live Message Burst</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="row"><label>Count:</label><input id="burst-n" type="number" value="25" style="width:80px" />
+          <label>Interval ms:</label><input id="burst-ms" type="number" value="200" style="width:90px" /></div>
+          <div class="row">
+            <button class="primary" onclick="startBurst()">Start Burst</button>
+            <button class="danger" onclick="stopBurst()">Stop Burst</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Import .eml Directory</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <input id="eml-dir" placeholder="/path/to/eml-folder" />
+          <button onclick="importEml()">Import .eml Files</button>
+        </div>
+      </div>
+    </div>`;
+  } else if (tab === 'chaos') {
+    const f = acct.faults;
+    view.innerHTML = `<div class="grid2">
+      <div class="card">
+        <h3>Latency & Body Sync Races</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="row"><label>Delay ms:</label><input id="f-delay" type="number" value="${f.delay_ms}" style="width:90px" />
+          <label>Jitter ms:</label><input id="f-jitter" type="number" value="${f.jitter_ms}" style="width:90px" /></div>
+          <div class="row"><label>Raw body delay ms:</label><input id="f-raw" type="number" value="${f.raw_delay_ms}" style="width:90px" /></div>
+          <div class="row"><label>Withhold next N raw bodies:</label><input id="f-wh" type="number" value="${f.withhold_next_raw}" style="width:70px" />
+          <span class="muted">(${(f.withheld_messages||[]).length} withheld)</span></div>
+          <div class="row">
+            <button class="primary" onclick="applyLatency()">Save</button>
+            <button onclick="patchFaults({release_withheld:true})">Release Withheld Bodies</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Errors, Quotas & Sends</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="row">
+            <button onclick="patchFaults({refuse:{status:429,reason:'rateLimitExceeded',message:'Rate limit exceeded',retry_after_s:5}})">429 Rate Limit</button>
+            <button onclick="patchFaults({refuse:{status:403,reason:'domainPolicy',message:'Delegation revoked'}})">403 Revoked</button>
+            <button onclick="patchFaults({refuse:null})">Clear Refusal</button>
+          </div>
+          <div class="row">
+            <button onclick="patchFaults({drop_next_send:'applied'})">Drop Next Send (Applied)</button>
+            <button onclick="patchFaults({drop_next_send:'not_applied'})">Drop Next Send (Not Applied)</button>
+          </div>
+          <div class="row">
+            <button onclick="patchFaults({send_refusal:{status:429,reason:'userRateLimitExceeded',message:'Send rate limited',remaining:1}})">Refuse Next Send (429)</button>
+            <button onclick="patchFaults({push_paused:${!f.push_paused}})">${f.push_paused ? 'Resume Push' : 'Pause Push'}</button>
+          </div>
+          <div class="row">
+            <button class="danger" onclick="expireHistory()">Expire History (Force 404 Resync)</button>
+            <button class="danger" onclick="clearFaults()">Clear All Faults</button>
+          </div>
+          <pre>${esc(JSON.stringify(f, null, 2))}</pre>
+        </div>
+      </div>
+    </div>`;
+  }
+}
+
+async function viewRaw(mid) {
+  const raw = await fetch(`/_control/accounts/${enc(selected)}/messages/${enc(mid)}/raw`).then(r => r.text());
+  document.getElementById('raw-box').innerHTML = `<div class="card"><h3>Raw RFC 822: ${esc(mid)}</h3><pre>${esc(raw)}</pre></div>`;
+}
+async function quickReply(tid) {
+  const body = prompt('Reply text:', 'Thanks! Looks good on my end.');
+  if (body === null) return;
+  await api(`/_control/accounts/${enc(selected)}/threads/${enc(tid)}/reply`, { method: 'POST', body: JSON.stringify({ body }) });
+  toast('Reply delivered');
+  await refreshAll();
+}
+async function extArchive(mid) {
+  await api(`/_control/accounts/${enc(selected)}/messages/${enc(mid)}/modify`, { method: 'POST', body: JSON.stringify({ remove_labels: ['INBOX'] }) });
+  toast('Archived externally');
+  await refreshAll();
+}
+async function webDraftAction(did, action) {
+  let body = {};
+  if (action === 'web-edit') {
+    const txt = prompt('New draft body (Gmail Web edit):', 'Edited externally in Gmail Web.');
+    if (txt === null) return;
+    body = { body: txt };
+  }
+  await api(`/_control/accounts/${enc(selected)}/drafts/${enc(did)}/${action}`, { method: 'POST', body: JSON.stringify(body) });
+  toast(`Draft ${action} done`);
+  await refreshAll();
+}
+async function deliverMsg() {
+  await api(`/_control/accounts/${enc(selected)}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({
+      from: document.getElementById('inj-from').value,
+      subject: document.getElementById('inj-subj').value,
+      thread_id: document.getElementById('inj-tid').value.trim() || null,
+      text: document.getElementById('inj-body').value,
+    }),
+  });
+  toast('Message delivered');
+  await refreshAll();
+}
+async function runSeed(overrideThreads) {
+  const threads = overrideThreads ?? parseInt(document.getElementById('seed-n').value || '40', 10);
+  const draft_count = parseInt(document.getElementById('seed-d').value || '4', 10);
+  const clear_first = document.getElementById('seed-clear').checked;
+  const res = await api(`/_control/accounts/${enc(selected)}/seed`, { method: 'POST', body: JSON.stringify({ threads, draft_count, clear_first }) });
+  toast(`Seeded ${res.threads_created} threads (${res.messages_created} msgs)`);
+  await refreshAll();
+}
+async function startBurst() {
+  const count = parseInt(document.getElementById('burst-n').value || '25', 10);
+  const interval_ms = parseInt(document.getElementById('burst-ms').value || '200', 10);
+  await api(`/_control/accounts/${enc(selected)}/burst`, { method: 'POST', body: JSON.stringify({ count, interval_ms }) });
+  toast(`Burst started (${count} msgs)`);
+  await refreshAll();
+}
+async function stopBurst() {
+  await api(`/_control/accounts/${enc(selected)}/burst`, { method: 'DELETE' });
+  toast('Burst stopped');
+  await refreshAll();
+}
+async function importEml() {
+  const dir = document.getElementById('eml-dir').value.trim();
+  if (!dir) return;
+  const res = await api(`/_control/accounts/${enc(selected)}/import-eml`, { method: 'POST', body: JSON.stringify({ dir }) });
+  toast(`Imported ${res.imported} .eml files`);
+  await refreshAll();
+}
+async function applyLatency() {
+  await patchFaults({
+    delay_ms: parseInt(document.getElementById('f-delay').value || '0', 10),
+    jitter_ms: parseInt(document.getElementById('f-jitter').value || '0', 10),
+    raw_delay_ms: parseInt(document.getElementById('f-raw').value || '0', 10),
+    withhold_next_raw: parseInt(document.getElementById('f-wh').value || '0', 10),
+  });
+}
+async function patchFaults(patch) {
+  await api(`/_control/accounts/${enc(selected)}/faults`, { method: 'POST', body: JSON.stringify(patch) });
+  toast('Faults updated');
+  await refreshAll();
+}
+async function clearFaults() {
+  await api(`/_control/accounts/${enc(selected)}/faults`, { method: 'DELETE' });
+  toast('Faults cleared');
+  await refreshAll();
+}
+async function expireHistory() {
+  await api(`/_control/accounts/${enc(selected)}/expire-history`, { method: 'POST' });
+  toast('History expired (next sync gets 404)');
+  await refreshAll();
+}
+
+refreshAll();
+</script>
+</body>
+</html>
