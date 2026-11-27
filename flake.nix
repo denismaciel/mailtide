@@ -1,5 +1,5 @@
 {
-  description = "mailtide development shell";
+  description = "mailtide: watertight Gmail sync engine (Rust core, Python bindings)";
 
   inputs = {
     # nixpkgs-unstable (not nixos-unstable): its channel gate includes Darwin.
@@ -34,18 +34,33 @@
         );
     in
     {
-      devShells = forAllSystems (pkgs: {
-        # Native code is only bundled SQLite and aws-lc, both built with `cc`:
-        # mkShell's stdenv compiler suffices (no pkg-config, cmake or OpenSSL).
-        # On Darwin its default Apple SDK also brings libiconv.
-        default = pkgs.mkShell {
-          packages = [
-            (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-            pkgs.uv
-            pkgs.cargo-deny
-            pkgs.git
-          ];
-        };
-      });
+      devShells = forAllSystems (
+        pkgs:
+        let
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          pinnedUv = pkgs.writeShellScriptBin "uv" ''
+            exec ${pkgs.uv}/bin/uv tool run --from uv==0.12.4 uv "$@"
+          '';
+        in
+        {
+          # Native code is only bundled SQLite and aws-lc, both built with `cc`:
+          # mkShell's stdenv compiler suffices (no pkg-config, cmake or OpenSSL).
+          # On Darwin its default Apple SDK also brings libiconv.
+          default = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.rust-analyzer
+              pkgs.python315
+              pinnedUv
+              pkgs.cargo-deny
+              pkgs.git
+            ];
+
+            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+            UV_PYTHON_PREFERENCE = "only-system";
+            UV_PYTHON_DOWNLOADS = "never";
+          };
+        }
+      );
     };
 }

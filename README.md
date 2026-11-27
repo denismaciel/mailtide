@@ -1,27 +1,14 @@
 # mailtide
 
-A watertight Gmail sync engine: it mirrors whole mailboxes into your own
-database (Postgres or SQLite), stores raw messages in blob storage, and
-carries user actions back to Gmail. Rust core with no I/O of its own
-(sans-IO), Python bindings via maturin.
+A watertight Gmail sync engine: it mirrors whole mailboxes into your own Postgres or SQLite database, stores raw `.eml` messages in blob storage, and carries user actions, drafts, and outgoing mail back to Gmail.
 
-Wheels for CPython ≥ 3.12 (abi3) and free-threaded 3.14t/3.15t; thread safe.
-
-A daily completeness audit verifies messages that Gmail history or a
-reconciliation missed. Schedule the next account run from `Idle.next`
-(`next_run_at_ms` in Python), including when no push arrives. Each claim
-advances at most one audit step. Stop old workers before migrating the
-database because running workers cache the schema check.
-
-A label refresh looks up up to 50 previously defined user labels missing
-from Gmail's listing. Only a `labels.get` 404 removes a definition and its
-memberships. A 200 rejects the listing, keeps the existing catalogue, and
-increments `label_listing_failures`.
+The sync core is pure sans-IO Rust (`crates/mailtide`) paired with an async Tokio driver and Python bindings (`mailtide._core`), shipping prebuilt wheels for CPython 3.12+ (`abi3`) and free-threaded 3.14t/3.15t.
 
 ## Install
 
-Wheels are attached to each [GitHub release](https://github.com/denismaciel/mailtide/releases)
-with a flat package index. With uv, in `pyproject.toml`:
+Requires Python 3.12+. Wheels for Linux (`x86_64`/`aarch64`, `manylinux_2_28`) and macOS (`arm64`/`x86_64`) are distributed via [GitHub Releases](https://github.com/denismaciel/mailtide/releases) with a flat package index (not yet on PyPI).
+
+With `uv` in `pyproject.toml`:
 
 ```toml
 [project]
@@ -37,158 +24,129 @@ explicit = true
 mailtide = { index = "mailtide" }
 ```
 
-Or with pip: `pip install mailtide==0.4.0 --find-links
-https://github.com/denismaciel/mailtide/releases/download/v0.4.0/index.html`.
-Platforms: Linux x86_64/aarch64 (manylinux 2.28), macOS arm64/x86_64.
+Or install directly with `uv pip` / `pip`:
 
-Status: v0.1, pre-release. See [SPEC.md](SPEC.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md).
+```sh
+uv pip install mailtide==0.4.0 --find-links https://github.com/denismaciel/mailtide/releases/download/v0.4.0/index.html
+```
+
+## Quick start
 
 ```python
 import mailtide
 from mailtide.config import Blobs, Config, Database, Poll
 
+async def token_source(account: str) -> tuple[str, int]:
+    # Return (oauth_access_token, expires_at_ms); sync or async, cached automatically.
+    ...
+
 runner = mailtide.Runner(
     Config(
-        # sqlx URLs: postgres://u@host/db, a Unix socket as
-        # postgres:///db?host=/cloudsql/project:region:instance, or sqlite:…
-        database=Database("postgres:///app?host=/cloudsql/p:r:i", max_connections=2),
-        blobs=Blobs("gs://bucket/mail"),  # raw .eml: gs://, s3://, file:///, memory:///
-        watch=Poll(),  # the host owns users.watch; or Topic("projects/p/topics/gmail")
+        # sqlx URLs: postgres://u@host/db, postgres:///db?host=/cloudsql/p:r:i, or sqlite:...
+        database=Database("sqlite:mail.db?mode=rwc"),
+        blobs=Blobs("file:///var/lib/mailtide/blobs"),  # gs://, s3://, file:///, memory:///
+        watch=Poll(),  # or Topic("projects/p/topics/gmail") for Gmail Pub/Sub push
     ),
-    token_source,  # account -> (access_token, expires_at_ms), sync or async; cached
+    token_source,
 )
-await runner.migrate()  # in the deploy step
-await runner.track("alice@example.com")  # only tracked accounts sync
 
-outcome = await runner.run("alice@example.com", budget_s=60)  # on a schedule and on each push
-await runner.admit("alice@example.com", "archive", thread_id="18c…")  # from request paths
-await runner.prioritise("alice@example.com", ["18c…"])  # opened: fetch its body next
-status = await runner.status("alice@example.com")  # never preempts a running sync
-page = await runner.changes("alice@example.com", since=None)  # bounded pages; imports carry headers
-await runner.ack("alice@example.com", "indexer", page.next)  # after processing a page
-await runner.compact("alice@example.com")  # drops what every live consumer has acknowledged
-views = await runner.messages("alice@example.com", ["18c…"])  # effective labels, headers
-labels = await runner.labels("alice@example.com")  # ids to names, colours, parents
-label = await runner.create_label("alice@example.com", "Work/2026")  # Gmail's id, recorded
-threads = await runner.threads("alice@example.com", ["18c…"])  # thread views, in one call
-hits = await runner.search("alice@example.com", "from:bob has:attachment")  # Gmail's own search
-content = views[0].content  # sender, dates, list headers, an attachment summary
-pdf = await runner.read_part("alice@example.com", "18c…", content.attachments[0].part)
-await runner.refresh_facts("alice@example.com")  # facts for mail imported before them
+await runner.migrate()                    # run during deploy (stop old workers first)
+await runner.track("alice@example.com")   # only tracked accounts sync
 
-raw = mailtide.compose_message(message, purpose="draft").raw  # carries X-Mailtide-Id
-draft = await runner.create_draft("alice@example.com", raw)  # Gmail's draft id at once
-draft = await runner.update_draft("alice@example.com", draft.draft_id, raw)  # autosave
-sent = await runner.send_draft("alice@example.com", draft.draft_id)  # at most once
-drafts = await runner.drafts("alice@example.com")  # the index; DraftSaved/DraftSent in changes
-
-raw = mailtide.compose_message(message).raw
-scheduled = await runner.submit("alice@example.com", raw, send_at_ms=send_at_ms)
-# Until the delivery worker claims it:
-await runner.cancel_submission("alice@example.com", scheduled.key)
-# Or submit new bytes and run immediately:
-result = await runner.send("alice@example.com", another_raw_message)
+outcome = await runner.run("alice@example.com", budget_s=60)
+# Schedule the next run from outcome.next_run_at_ms, and call run()/notify() on pushes.
 ```
 
-Drafts are saved from RFC 5322 bytes carrying exactly one `X-Mailtide-Id`
-(Gmail replaces the Message-ID on every save; that header survives) and
-read back from the mirror's draft index, which follows drafts changed in
-other clients. Gmail consumes the draft id on send. A lost answer is reconciled by the
-draft index and sent-message import. See SPEC §7a.
+No event loop? `mailtide.BlockingRunner` exposes the same API synchronously.
 
-Raw mail is staged before admission and sent by the account's next eligible
-run. Use a stable host key, or replay the exact bytes with the same
-`X-Mailtide-Id`. An HTTP receipt can be provisional. A `SubmissionChanged`
-entry reports `sent` after import finds the token on a `SENT` message, or
-`unknown` after the confirmation deadline. Raw mail gets one wire request,
-including after an unknown outcome. The default RFC 5322 size cap is 34 MiB
-for both drafts and raw mail. See SPEC §7b.
+## Usage
 
-A thread view (`ThreadView`) is folded from the mirror on every read: its
-messages oldest first, the label union of its non-draft messages with pending
-actions applied, unread, the latest message, counts and participants. Listing
-threads by label, sorting, paging and per-label counts are the host's: keep a
-table of your own, fed by `changes` (every entry names its thread; read the
-threads of a page with one `threads` call and upsert, or delete the ids left
-out).
-
-Invalid configuration raises `ValueError` naming the field. Failures are typed:
-`StoreUnavailable`, `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`,
-`QuotaGateError`, `Superseded`, `BlobNotFound`, `PartNotFound`, `PartTooLarge`
-(all `MailtideError`). A blocked account
-(`DelegationRevoked` from the token source) stays blocked until
-`await runner.resume(account)`; `forget(account)` deletes its rows and blobs.
-
-Deleting mail for good is off unless you switch it on, and only reaches what
-is in trash or spam by default:
+### Reading the mirror and change feed
 
 ```python
-config = Config(database=..., blobs=..., purge="trash_and_spam")  # default "off"
-outcome = await runner.purge("alice@example.com", message_ids=["18c…"])
-outcome.purged, outcome.sent, outcome.refused, outcome.not_applied
-await runner.empty("alice@example.com", "trash")  # what the mirror holds in the trash
+# Bounded change feed for updating your own read models or search indexes
+page = await runner.changes("alice@example.com", since=None)
+await runner.ack("alice@example.com", "indexer", page.next)
+await runner.compact("alice@example.com")  # drops commits every live consumer has acked
+
+# Effective message & thread views (pending local actions already overlaid)
+views = await runner.messages("alice@example.com", ["18c..."])
+threads = await runner.threads("alice@example.com", ["18c..."])
+
+# Labels, Gmail search pass-through, and ranged attachment reads
+labels = await runner.labels("alice@example.com")
+label = await runner.create_label("alice@example.com", "Work/2026")
+hits = await runner.search("alice@example.com", "from:bob has:attachment")
+
+content = views[0].content
+if content and content.attachments:
+    pdf = await runner.read_part("alice@example.com", "18c...", content.attachments[0].part)
 ```
 
-Each delete gets a new Gmail history check and mirror read. The two-second
-bound runs from the start of the check to the hand-off of the request to
-the transport. Connection setup inside the transport happens after
-hand-off. Purge stops after three consecutive expired checks for a request.
-Gmail can still publish a restore late or accept it between the check and
-the delete. Purge sends each id at most once per call and records a deletion
-only on a `messagesDeleted` history record. `not_applied` covers undispatched
-deletes and Gmail's 401, 429 or rate-limit 403 responses. `sent` lacks
-confirmation that a history-backed tombstone was recorded.
-It needs a token with `https://mail.google.com/`. A missing scope raises
-`PurgeScopeRequired` before any possible application, and mail stays put.
+- `ThreadView` is folded from the mirror on every read: oldest-first messages, label union of non-draft messages with pending actions applied, `unread`, `latest`, counts, and `participants`. Feed your own thread-list table from `changes` (each entry carries its thread ID; fetch affected threads in one `threads()` call).
+- `await runner.prioritise("alice@example.com", ["18c..."])` bumps opened messages ahead of backfill in the foreground quota class without preempting a running sync.
+- `await runner.status("alice@example.com")` inspects sync state without claiming the account.
+- `await runner.refresh_facts("alice@example.com")` backfills extracted MIME facts from stored blobs without calling Gmail.
 
-No event loop? `mailtide.BlockingRunner` has the same methods, blocking.
+### Actions, drafts, and sending
 
-## Layout
+```python
+# Queue a mailbox action from a request path (reflected in messages() immediately)
+await runner.admit("alice@example.com", "archive", thread_id="18c...")
 
-| Path | What |
-|---|---|
-| `crates/mailtide` | Pure Rust sans-IO engine (no I/O, no PyO3) |
-| `crates/mailtide-py` | PyO3 bindings, built by maturin as `mailtide._core` |
-| `crates/mailtide-sim` | Deterministic Gmail simulator for testing (SPEC §12) |
-| `crates/mailtide-gmail` | Gmail wire layer (pure) |
-| `crates/mailtide-store` | Store trait; memory, SQLite, Postgres stores; conformance suite |
-| `crates/mailtide-io` | Async driver: HTTP, quota gate, blobs, runner |
-| `crates/mailtide-mime` | MIME: message facts, part ranges and chunked decoding; composing messages to send or save as drafts |
-| `python/mailtide` | Thin Python shell: re-exports and type stubs |
-| `scripts/zero_tests.py` | Tracks Zero's sync tests ported by name (see below) |
+# Compose RFC 5322 bytes carrying a unique X-Mailtide-Id tracking header
+msg = mailtide.OutgoingMessage(
+    "alice@example.com",
+    to=["bob@example.com"],
+    subject="Hello",
+    text="Hi Bob.",
+)
 
-See [ARCHITECTURE.md](ARCHITECTURE.md). Module layout follows Zero's mailbox sync (Mail-0/Zero, MIT); each module's
-doc comment names its Zero counterpart and SPEC section.
+# Drafts (saved immediately with Gmail's draft ID, reconciled on send)
+draft_raw = mailtide.compose_message(msg, purpose="draft").raw
+draft = await runner.create_draft("alice@example.com", draft_raw)
+draft = await runner.update_draft("alice@example.com", draft.draft_id, draft_raw)
+sent = await runner.send_draft("alice@example.com", draft.draft_id)  # at most once
+drafts = await runner.drafts("alice@example.com")
+
+# Durable raw mail submission (scheduled or immediate)
+send_raw = mailtide.compose_message(msg).raw
+scheduled = await runner.submit("alice@example.com", send_raw, send_at_ms=send_at_ms)
+await runner.cancel_submission("alice@example.com", scheduled.key)  # before worker claim
+result = await runner.send("alice@example.com", send_raw)           # submit and run now
+```
+
+- Gmail replaces `Message-ID` on every draft save and send; `X-Mailtide-Id` survives so lost HTTP answers reconcile cleanly against imported `SENT` messages (see [SPEC.md](SPEC.md) §7a–§7b).
+- The default RFC 5322 size limit is 34 MiB (`Config.max_message_bytes`).
+
+### Permanent deletion
+
+Permanent deletion is off by default (`Config.purge="off"`). Switch it on explicitly and supply a token with the `https://mail.google.com/` scope (a missing scope raises `PurgeScopeRequired` before deleting anything):
+
+```python
+config = Config(database=..., blobs=..., purge="trash_and_spam")
+outcome = await runner.purge("alice@example.com", message_ids=["18c..."])
+# outcome.purged, outcome.sent, outcome.refused, outcome.not_applied
+await runner.empty("alice@example.com", "trash")
+```
+
+### Errors and account lifecycle
+
+- Invalid configuration raises `ValueError` naming the offending field.
+- Runtime failures are typed subclasses of `MailtideError` (`StoreUnavailable`, `OutcomeUnknown`, `CorruptState`, `BlobUnavailable`, `QuotaGateError`, `Superseded`, `BlobNotFound`, `PartNotFound`, `PartTooLarge`, `PurgeScopeRequired`, etc.).
+- Raising `DelegationRevoked` from `token_source` blocks the account until `await runner.resume(account)`.
+- `await runner.forget(account)` deletes all mirrored rows and stored blobs for an account.
+
+## Reference
+
+- [Specification](SPEC.md)
+- [Architecture](ARCHITECTURE.md)
+- [Feature plans](docs/features/README.md)
 
 ## Development
 
-```sh
-uv sync                     # builds the extension with maturin
-uv run pytest
-cargo test --workspace      # Postgres conformance too with MAILTIDE_TEST_POSTGRES_URL
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run --release -p mailtide-sim --example campaign -- 0 500 1000   # simulation
-cargo deny check
-```
-
-The toolchain is pinned in `rust-toolchain.toml` (rustup).
-With Nix, `nix develop` gives that toolchain plus `uv` and `cargo-deny`
-(Linux and Apple Silicon macOS); everything above applies unchanged inside it.
-
-## Parity with Zero's tests
-
-`tests/zero/manifest.json` pins 86 test names from Zero's sync suites
-(commit `4b642dfd9890`). Each one has a Rust test named after it in the crate
-that owns the behaviour (`crates/*/tests/zero_*.rs`); tests mailtide has no
-equivalent for are marked `zero-na` with the reason.
-
-```sh
-uv run --no-project scripts/zero_tests.py report                       # counts per suite
-uv run --no-project scripts/zero_tests.py port                         # add stubs for new names
-uv run --no-project scripts/zero_tests.py extract --zero <zero-checkout>   # refresh the manifest
-```
+See [docs/development.md](docs/development.md) for local setup, operational notes, crate layout, simulation testing, and Zero test parity.
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Dual-licensed under [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.

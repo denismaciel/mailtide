@@ -241,8 +241,7 @@ impl Store for MemoryStore {
         Ok(self
             .lock()?
             .get(account)
-            .map(|mirror| mirror.message_ids(after, limit))
-            .unwrap_or_default())
+            .map_or_default(|mirror| mirror.message_ids(after, limit)))
     }
 
     async fn status(&self, account: &AccountId) -> Result<Option<AccountStatus>, StoreError> {

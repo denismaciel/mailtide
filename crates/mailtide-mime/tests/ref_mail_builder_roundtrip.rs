@@ -452,19 +452,16 @@ fn seeded_address_lists_round_trip() {
         accepted += 1;
         let header = header(&raw, "To");
         validate(header, "To: ".len());
-        let list: Vec<(Option<String>, Option<String>)> = parsed(&raw)
-            .to()
-            .map(|to| {
-                to.mailboxes()
-                    .map(|addr| {
-                        (
-                            addr.name().map(str::to_owned),
-                            addr.address().map(str::to_owned),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let list: Vec<(Option<String>, Option<String>)> = parsed(&raw).to().map_or_default(|to| {
+            to.mailboxes()
+                .map(|addr| {
+                    (
+                        addr.name().map(str::to_owned),
+                        addr.address().map(str::to_owned),
+                    )
+                })
+                .collect()
+        });
         assert_eq!(
             list.len(),
             to.len(),
@@ -555,8 +552,7 @@ fn seeded_reference_lists_round_trip() {
         validate(header, "References: ".len());
         let parsed: Vec<String> = parsed(&raw)
             .references()
-            .map(|ids| ids.iter().map(str::to_owned).collect())
-            .unwrap_or_default();
+            .map_or_default(|ids| ids.iter().map(str::to_owned).collect());
         assert_eq!(parsed, ids, "{:?}", String::from_utf8_lossy(header));
     }
 }

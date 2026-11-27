@@ -234,8 +234,7 @@ impl Mailbox {
             versions: job
                 .group()
                 .as_ref()
-                .map(|group| group.versions.clone())
-                .unwrap_or_default(),
+                .map_or_default(|group| group.versions.clone()),
             at: Timestamp(at),
             by: job.attempt,
         }];

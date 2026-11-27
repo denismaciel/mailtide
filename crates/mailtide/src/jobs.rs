@@ -214,7 +214,7 @@ impl ClaimedJob {
     /// The intent versions a delivery sends.
     #[must_use]
     pub fn delivery_versions(&self) -> Vec<crate::outbox::Delivery> {
-        self.group().map(|g| g.versions.clone()).unwrap_or_default()
+        self.group().map_or_default(|g| g.versions.clone())
     }
 
     /// The claim reference a finishing commit carries.

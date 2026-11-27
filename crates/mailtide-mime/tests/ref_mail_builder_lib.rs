@@ -141,7 +141,7 @@ fn non_ascii_names_bodies_and_file_names_parse_back() {
     assert!(raw.is_ascii());
     let parsed = MessageParser::new().parse(&raw).expect("parse");
     let names = |list: Option<mail_parser::AddressList<'_>>| -> Vec<(String, String)> {
-        list.map(|list| {
+        list.map_or_default(|list| {
             list.mailboxes()
                 .map(|m| {
                     (
@@ -151,7 +151,6 @@ fn non_ascii_names_bodies_and_file_names_parse_back() {
                 })
                 .collect()
         })
-        .unwrap_or_default()
     };
     let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
         pairs

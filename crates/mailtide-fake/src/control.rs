@@ -1272,8 +1272,7 @@ fn handle_sent_list(ctx: &Arc<AppContext>, raw_email: &str) -> HttpReply {
     let sent: Vec<_> = guard
         .accounts
         .get(&email)
-        .map(|a| a.sent_log.iter().rev().cloned().collect())
-        .unwrap_or_default();
+        .map_or_default(|a| a.sent_log.iter().rev().cloned().collect());
     json_reply(StatusCode::OK, &json!({ "sent": sent }))
 }
 

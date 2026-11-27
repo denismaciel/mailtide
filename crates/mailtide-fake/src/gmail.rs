@@ -1124,13 +1124,11 @@ fn decode_base64url(raw: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 fn string_array(val: Option<&Value>) -> Vec<String> {
-    val.and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    val.and_then(Value::as_array).map_or_default(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    })
 }
 
 pub(crate) fn parse_query(query: &str) -> BTreeMap<String, Vec<String>> {

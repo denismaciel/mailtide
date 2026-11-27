@@ -6,7 +6,7 @@ members = ["crates/*"]
 license = "MIT OR Apache-2.0"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 repository = "https://github.com/denismaciel/mailtide"
 authors = ["Denis Maciel <denispmaciel@gmail.com>"]
 
@@ -19,3 +19,4 @@ pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 # Sync impls of async traits (memory store, test fakes) are intended.
 unused_async_trait_impl = "allow"
+assert_is_empty = "allow"

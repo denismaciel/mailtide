@@ -63,8 +63,7 @@ fn the_headers_a_classifier_reads_are_stored_facts() {
         assert_eq!(
             facts.list_unsubscribe,
             header("List-Unsubscribe")
-                .map(|value| vec![value.trim_matches(['<', '>']).to_owned()])
-                .unwrap_or_default()
+                .map_or_default(|value| vec![value.trim_matches(['<', '>']).to_owned()])
         );
         assert_eq!(facts.precedence.as_deref(), header("Precedence"));
         assert_eq!(facts.auto_submitted.as_deref(), header("Auto-Submitted"));

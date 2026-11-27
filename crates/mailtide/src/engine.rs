@@ -1972,7 +1972,7 @@ impl Engine {
                 // that may be gone are blocked (all of it if nothing else
                 // is left), and the rest, still pending, goes on its own.
                 JobKind::Deliver(message) => {
-                    let doubtful = job.group().map(doubtful_adds).unwrap_or_default();
+                    let doubtful = job.group().map_or_default(doubtful_adds);
                     let (adds, rest): (Vec<_>, Vec<_>) = job
                         .delivery_versions()
                         .into_iter()

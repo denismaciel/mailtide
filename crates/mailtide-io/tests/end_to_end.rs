@@ -79,15 +79,12 @@ impl Mailbox {
         self.modified += 1;
         self.history_id += 1;
         let names = |key: &str| -> Vec<String> {
-            body[key]
-                .as_array()
-                .map(|labels| {
-                    labels
-                        .iter()
-                        .filter_map(|l| l.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
+            body[key].as_array().map_or_default(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|l| l.as_str().map(str::to_owned))
+                    .collect()
+            })
         };
         let (add, remove) = (names("addLabelIds"), names("removeLabelIds"));
         let message = self.messages.get_mut(id).expect("message");

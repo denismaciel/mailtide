@@ -26,8 +26,7 @@ pub fn facts(rfc822: &[u8], snippet: Option<&str>) -> HeaderFacts {
         rfc822_message_id: first("message-id"),
         in_reply_to: first("in-reply-to"),
         references: first("references")
-            .map(|v| v.split_whitespace().map(str::to_owned).collect())
-            .unwrap_or_default(),
+            .map_or_default(|v| v.split_whitespace().map(str::to_owned).collect()),
         from: first("from"),
         to: addresses("to"),
         cc: addresses("cc"),

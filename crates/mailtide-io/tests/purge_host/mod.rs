@@ -409,14 +409,11 @@ impl Mailbox {
                         serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
                             .expect("json");
                     let names = |key: &str| -> Vec<String> {
-                        body[key]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|l| l.as_str().map(str::to_owned))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
+                        body[key].as_array().map_or_default(|a| {
+                            a.iter()
+                                .filter_map(|l| l.as_str().map(str::to_owned))
+                                .collect()
+                        })
                     };
                     let (add, remove) = (names("addLabelIds"), names("removeLabelIds"));
                     let add: Vec<&str> = add.iter().map(String::as_str).collect();

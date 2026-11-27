@@ -85,7 +85,7 @@ impl QuotaGate for Gate {
     ) -> Result<Admission, GateError> {
         let deferring = self
             .defer_first
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if deferring {
             return Ok(Admission::Deferred {

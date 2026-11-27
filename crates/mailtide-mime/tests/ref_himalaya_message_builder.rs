@@ -41,7 +41,7 @@ fn mailboxes(raw: &[u8], header: &str) -> Vec<(Option<String>, String)> {
         "To" => parsed.to(),
         _ => parsed.cc(),
     };
-    list.map(|list| {
+    list.map_or_default(|list| {
         list.mailboxes()
             .map(|mailbox| {
                 (
@@ -51,7 +51,6 @@ fn mailboxes(raw: &[u8], header: &str) -> Vec<(Option<String>, String)> {
             })
             .collect()
     })
-    .unwrap_or_default()
 }
 
 #[test]

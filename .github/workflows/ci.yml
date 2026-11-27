@@ -1,21 +1,28 @@
 name: CI
+
 on:
   push:
     branches: [main]
   pull_request:
   workflow_call:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy, rustfmt
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          persist-credentials: false
+      - run: rustup toolchain install 1.100.0 --profile minimal --component clippy,rustfmt
+      - run: cargo +1.100.0 fmt --all --check
+      - run: cargo +1.100.0 clippy --workspace --all-targets -- -D warnings
+      - run: cargo +1.100.0 test --workspace --locked
 
   python:
     runs-on: ubuntu-latest
@@ -25,27 +32,41 @@ jobs:
         # Free-threaded: the bindings must keep the GIL off and be thread safe.
         python: ["3.12", "3.15t"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v6
-      - run: uv sync --python ${{ matrix.python }}
-      - run: uv run --python ${{ matrix.python }} ruff check .
-      - run: uv run --python ${{ matrix.python }} ruff format --check .
-      - run: uv run --python ${{ matrix.python }} pytest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.100.0 --profile minimal
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.4"
+          enable-cache: false
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --python ${{ matrix.python }}
+      - run: uv run --no-sync --python ${{ matrix.python }} ruff check python tests build_backend.py scripts
+      - run: uv run --no-sync --python ${{ matrix.python }} ruff format --check python tests build_backend.py scripts
+      - run: uv run --no-sync --python ${{ matrix.python }} ty check
+      - run: uv run --no-sync --python ${{ matrix.python }} pytest
 
   zero-parity:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.4"
+          enable-cache: false
       - run: uv run --no-project scripts/zero_tests.py report --min-implemented 69
 
   simulation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --release -p mailtide-sim --example campaign -- 0 500 1000
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.100.0 --profile minimal
+      - run: cargo +1.100.0 run --locked --release -p mailtide-sim --example campaign -- 0 500 1000
 
   postgres:
     runs-on: ubuntu-latest
@@ -62,14 +83,18 @@ jobs:
     env:
       MAILTIDE_TEST_POSTGRES_URL: postgres://mailtide:mailtide@localhost:5432/mailtide_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p mailtide-store postgres
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.100.0 --profile minimal
+      - run: cargo +1.100.0 test --locked -p mailtide-store postgres
 
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check

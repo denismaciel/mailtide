@@ -1061,20 +1061,17 @@ pub(crate) fn derive_metadata(raw: &[u8], explicit_date_ms: Option<i64>) -> Deri
             .unwrap_or_default()
     };
     let header_all = |name: &str| -> Vec<String> {
-        parsed
-            .as_ref()
-            .map(|p| {
-                p.headers
-                    .iter()
-                    .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                    .flat_map(|(_, v)| {
-                        mailtide_mime::parse_addresses(v)
-                            .into_iter()
-                            .map(|a| a.email)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        parsed.as_ref().map_or_default(|p| {
+            p.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .flat_map(|(_, v)| {
+                    mailtide_mime::parse_addresses(v)
+                        .into_iter()
+                        .map(|a| a.email)
+                })
+                .collect()
+        })
     };
 
     let internal_date_ms = explicit_date_ms

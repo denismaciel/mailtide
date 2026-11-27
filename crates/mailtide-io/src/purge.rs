@@ -192,8 +192,7 @@ where
                 .await
                 .map_err(store_error)?
                 .first()
-                .map(|view| mailtide::purge::thread_targets(&view.messages))
-                .unwrap_or_default(),
+                .map_or_default(|view| mailtide::purge::thread_targets(&view.messages)),
         };
         too_many(ids.len())?;
         let cursor = self.purge_cursor(account).await?;

@@ -186,8 +186,7 @@ pub fn fetched(body: &[u8]) -> Result<Option<FetchedDraft>, DecodeError> {
     let labels: LabelSet = message
         .label_ids
         .as_ref()
-        .map(|ids| labels::set(ids.iter().map(String::as_str)))
-        .unwrap_or_default();
+        .map_or_default(|ids| labels::set(ids.iter().map(String::as_str)));
     if message.label_ids.is_some() && !labels::is_draft(&labels) {
         return Ok(None);
     }

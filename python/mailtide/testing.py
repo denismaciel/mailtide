@@ -230,7 +230,7 @@ def decode(raw: str) -> bytes:
 
 def handler_for(mailbox: Mailbox) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args: object) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
         def reply(self, status: int, body: dict) -> None:

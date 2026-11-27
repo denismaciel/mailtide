@@ -304,14 +304,11 @@ impl Mailbox {
 
     fn modify_request(&mut self, id: &str, body: &Value) -> HttpResponse {
         let names = |key: &str| -> Vec<String> {
-            body[key]
-                .as_array()
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(|l| l.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
+            body[key].as_array().map_or_default(|ids| {
+                ids.iter()
+                    .filter_map(|l| l.as_str().map(str::to_owned))
+                    .collect()
+            })
         };
         let (add, remove) = (names("addLabelIds"), names("removeLabelIds"));
         if !self.messages.contains_key(id) {

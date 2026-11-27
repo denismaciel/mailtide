@@ -22,8 +22,7 @@ pub fn facts(raw: &[u8]) -> MessageFacts {
     let headers = root.headers();
     let sender = headers.all_from().next().and_then(|from| from.first());
     let list_unsubscribe = first_value(&headers, HeaderName::ListUnsubscribe)
-        .map(|value| unsubscribe_uris(&value))
-        .unwrap_or_default();
+        .map_or_default(|value| unsubscribe_uris(&value));
     let one_click = first_value(&headers, HeaderName::ListUnsubscribePost).is_some_and(|value| {
         value
             .trim()
